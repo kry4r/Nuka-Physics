@@ -101,6 +101,8 @@ public:
 
     // Re-poses instances, cameras and lights from one environment's poses.
     void ApplyPoses(const std::vector<math::Transform>& links, const std::vector<math::Transform>& bodies);
+    // Poses the ghost copies of the physics-driven instances; empty poses clear them.
+    void ApplyGhost(const std::vector<math::Transform>& links, const std::vector<math::Transform>& bodies);
     // Rebuilds the particle surfaces from one environment's particles; per-particle residuals
     // colour them as a heatmap, an empty `heat` draws their materials.
     void ApplyParticles(const std::vector<math::Vec3>& positions, const std::vector<float>& heat, float alert);
@@ -128,6 +130,7 @@ private:
     render::RenderWorld render_world_;
     std::vector<Surface> surfaces_;
     uint32_t heat_material_ = render::kNoId;
+    uint32_t ghost_material_ = render::kNoId;
     std::vector<PoseWrite> pose_writes_;
     uint64_t static_revision_ = 0u;
 };

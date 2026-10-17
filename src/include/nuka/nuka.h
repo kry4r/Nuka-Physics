@@ -379,6 +379,10 @@ nuka_result_t nuka_checkpoint_write(nuka_checkpoint_handle checkpoint, const cha
 // Reads a written checkpoint into a world of the same layout; host configuration comes from that world.
 nuka_result_t nuka_world_checkpoint_read(nuka_world_handle world, const char* path,
                                          nuka_checkpoint_handle* out);
+// The persistent physics bytes a checkpoint holds on the host.
+nuka_result_t nuka_checkpoint_byte_size(nuka_checkpoint_handle checkpoint, uint64_t* out_bytes);
+// 1 when both checkpoints hold the same layout, step count and persistent physics bytes, else 0.
+nuka_result_t nuka_checkpoint_equal(nuka_checkpoint_handle a, nuka_checkpoint_handle b, uint32_t* out_equal);
 // Hashes persistent physics, observation output/history, and host state in fixed order.
 nuka_result_t nuka_world_state_hash(nuka_world_handle world, uint64_t* out_hash);
 

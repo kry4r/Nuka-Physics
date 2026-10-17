@@ -31,6 +31,14 @@ bool SameSource(const render::PoseSource& a, const render::PoseSource& b) {
     return a.kind == b.kind && a.row == b.row;
 }
 
+// A seek right before an absolute one lands nowhere the later one keeps.
+bool Superseded(const std::vector<TickCommand>& cmds, size_t i) {
+    const auto seek = [&](size_t k) {
+        return k < cmds.size() && cmds[k].kind == CommandKind::Timeline && cmds[k].timeline == TimelineOp::Seek;
+    };
+    return seek(i) && seek(i + 1u) && !cmds[i + 1u].relative;
+}
+
 }  // namespace
 
 // An iteration that throws reports the error and pauses the transport.
@@ -204,6 +212,7 @@ uint64_t PhysicsWorker::Bind(WorkerBinding binding) {
         CheckResult(nuka_world_get_velocity_iterations(bind_.world, &solver_.iterations),
                     "nuka_world_get_velocity_iterations");
     }
+    ResetHistory();
     Publish();
     return epoch_;
 }
@@ -215,6 +224,7 @@ void PhysicsWorker::Unbind() {
     playing_ = false;
     step_budget_ = 0u;
     perturbs_.clear();
+    branches_.clear();
 }
 
 uint64_t PhysicsWorker::Push(TickCommand cmd) {
@@ -322,8 +332,16 @@ void PhysicsWorker::Loop() {
 
 bool PhysicsWorker::ApplyCommands(std::vector<TickCommand>& cmds) {
     bool publish = false;
-    for (const TickCommand& cmd : cmds) {
-        if (bound_ || cmd.kind == CommandKind::ScriptCall) publish = Apply(cmd) || publish;
+    for (size_t i = 0; i < cmds.size(); ++i) {
+        TickCommand& cmd = cmds[i];
+        if (!bound_) {
+            if (cmd.kind == CommandKind::ScriptCall) Apply(cmd);
+        } else if (!Superseded(cmds, i)) {
+            if (cmd.kind == CommandKind::EditApply || cmd.kind == CommandKind::Teleport) cmd.env = bind_.env;
+            cmd.perturb.env = bind_.env;
+            if (Recorded(cmd)) Record(cmd);
+            publish = (cmd.kind == CommandKind::ScriptCall ? ApplyScript(cmd) : Apply(cmd)) || publish;
+        }
         acked_ = cmd.seq;
     }
     return publish && bound_;
@@ -334,7 +352,7 @@ bool PhysicsWorker::Apply(const TickCommand& cmd) {
     switch (cmd.kind) {
         case CommandKind::EditApply:
         case CommandKind::Teleport:
-            ApplyPoseWrite(bind_.world, bind_.layout, bind_.env, cmd.pose);
+            ApplyPoseWrite(bind_.world, bind_.layout, cmd.env, cmd.pose);
             return true;
         case CommandKind::ParamSet:
             switch (cmd.param) {
@@ -401,7 +419,7 @@ bool PhysicsWorker::Apply(const TickCommand& cmd) {
             return false;
         case CommandKind::Perturb: {
             const auto it = std::find_if(perturbs_.begin(), perturbs_.end(), [&](const Perturbation& p) {
-                return SameSource(p.source, cmd.perturb.source);
+                return p.env == cmd.perturb.env && SameSource(p.source, cmd.perturb.source);
             });
             if (it != perturbs_.end()) perturbs_.erase(it);
             if (Nonzero(cmd.perturb.force) || Nonzero(cmd.perturb.torque)) perturbs_.push_back(cmd.perturb);
@@ -430,6 +448,7 @@ bool PhysicsWorker::Apply(const TickCommand& cmd) {
                     step_budget_ = 0u;
                     last_mirror_ = WorkerClock::time_point{};
                     Report(cmd.seq, scripts_->DispatchReset());
+                    ResetHistory();
                     break;
             }
             return true;
@@ -442,6 +461,9 @@ bool PhysicsWorker::Apply(const TickCommand& cmd) {
             last_mirror_ = WorkerClock::time_point{};
             return true;
         }
+        case CommandKind::Timeline:
+            ApplyTimeline(cmd);
+            return true;
     }
     return false;
 }
@@ -484,11 +506,9 @@ double PhysicsWorker::Advance() {
     bool healthy = true;
     uint32_t done = 0u;
     while (done < due) {
-        WritePerturbations();
-        if (bind_.controller != nullptr) bind_.controller->OnStep(bind_.world, bind_.env);
-        healthy = nuka_world_step(bind_.world) == NUKA_RESULT_OK && healthy;
-        SetTick(tick_ + 1u);
-        sim_time_ += dt;
+        // Replayed ticks already ran their callbacks when they were recorded.
+        const bool recording = !Replaying();
+        healthy = StepOnce() && healthy;
         ++done;
         // A queued command or park request ends the batch so it lands at this boundary.
         const bool yield = done < due && interrupt_.load(std::memory_order_relaxed);
@@ -498,7 +518,7 @@ double PhysicsWorker::Advance() {
             telemetry_.batch_steps = done;
             Publish();
         }
-        DispatchTick();
+        if (recording) DispatchTick();
         if (yield) break;
     }
     // Steps a yield left return: explicit ones to the step budget, the rest to the clock.
@@ -509,10 +529,48 @@ double PhysicsWorker::Advance() {
     return 0.0;
 }
 
+// One step. At the head it may capture a keyframe first; behind it the log replays, and a
+// recorded keyframe the replay misses replaces the replayed state.
+bool PhysicsWorker::StepOnce() {
+    const bool recording = !Replaying();
+    if (recording && (key_due_ || tick_ >= Current().keys.back()->tick + key_interval_)) {
+        CaptureKey(key_due_);
+        key_due_ = false;
+    }
+    WritePerturbations();
+    if (bind_.controller != nullptr) bind_.controller->OnStep(bind_.world, bind_.env);
+    const bool healthy = nuka_world_step(bind_.world) == NUKA_RESULT_OK;
+    SetTick(tick_ + 1u);
+    sim_time_ += static_cast<double>(bind_.dt);
+    HistoryBranch& b = Current();
+    if (recording) {
+        b.head = tick_;
+        return healthy;
+    }
+    const auto at = std::lower_bound(b.keys.begin(), b.keys.end(), tick_,
+                                     [](const std::shared_ptr<Keyframe>& k, uint64_t t) { return k->tick < t; });
+    if (at == b.keys.end() || (*at)->tick != tick_) {
+        ApplyLogged();
+        return healthy;
+    }
+    const Keyframe& key = **at;
+    ApplyLogged(key.log_pos);
+    if (key.pinned) {
+        Restore(key);
+    } else if (!Matches(key.state)) {
+        b.exact = false;
+        ++history_revision_;
+        Restore(key);
+    } else {
+        ApplyLogged();
+    }
+    return healthy;
+}
+
 void PhysicsWorker::WritePerturbations() {
     const WorldLayout& layout = bind_.layout;
-    const size_t env = bind_.env;
     for (const Perturbation& p : perturbs_) {
+        const size_t env = p.env;
         if (p.source.kind == render::PoseSource::Kind::Link) {
             perturb_scratch_.assign({p.force[0], p.force[1], p.force[2], p.torque[0], p.torque[1], p.torque[2]});
             const size_t at = (env * layout.links_per_env + p.source.row) * 6u * sizeof(float);
@@ -572,7 +630,8 @@ void PhysicsWorker::Publish() {
                                slot, ++timeline_value_);
         slots_.Publish(slot, timeline_value_);
     }
-    if (bind_.scatter == nullptr || !playing_ || start - last_mirror_ >= kMirrorPeriod) {
+    mirrored_ = bind_.scatter == nullptr || !playing_ || start - last_mirror_ >= kMirrorPeriod;
+    if (mirrored_) {
         DownloadEnvPoses(bind_.world, bind_.layout, bind_.env, &mirror_links_, &mirror_bodies_);
         DownloadEnvParticles(bind_.world, bind_.layout, bind_.env, &mirror_particles_);
         ReadOverlayData(bind_.world, bind_.layout, bind_.env, bind_.colliders, bind_.contacts, &overlay_);
@@ -599,6 +658,7 @@ void PhysicsWorker::Publish() {
     last_publish_ = s.published;
     telemetry_.publish_ms = Ms(s.published - start);
     s.telemetry = telemetry_;
+    PublishTimeline(s);
     ring_.Publish();
 }
 

@@ -286,6 +286,10 @@ struct RenderWorld {
     // ignore it, so a non-overlay frame is byte-identical to the real instance set.
     std::vector<RenderInstance>        debug_instances;
 
+    // Another history branch's poses of the instances, drawn translucent behind the
+    // opaque scene by the raster present pass only; empty while no branch is compared.
+    std::vector<RenderInstance>        ghost_instances;
+
     MeshLibrary                        meshes;
     std::vector<scene::RenderMaterial> materials;  // indexed by render_material_id
     std::vector<RenderCamera>          cameras;

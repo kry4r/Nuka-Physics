@@ -417,6 +417,9 @@ struct PresentRenderer::Impl {
     // through the scene). Wireframe when the device offers fillModeNonSolid, else a
     // translucent fill. Built/destroyed with `pipeline` (render-pass dependent).
     VkPipeline       debug_pipeline = VK_NULL_HANDLE;
+    // RenderWorld::ghost_instances: a translucent fill tested against the scene's depth
+    // without writing it, built and destroyed with debug_pipeline.
+    VkPipeline       ghost_pipeline = VK_NULL_HANDLE;
     bool             wireframe_capable_ = false;
     VkShaderModule   vert_module = VK_NULL_HANDLE;
     VkShaderModule   frag_module = VK_NULL_HANDLE;
@@ -1092,20 +1095,30 @@ struct PresentRenderer::Impl {
         CheckVk(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1u, &info, nullptr, &pipeline),
                 "vkCreateGraphicsPipelines(present)");
 
-        CreateDebugPipeline();
+        CreateOverlayPipelines();
     }
 
-    // The see-through debug-overlay pipeline. Shares pipeline_layout (set 0 + the
-    // PushBlock) and the shared mesh shaders; the ONLY differences from the opaque
-    // pipeline are depth-test/-write OFF (so collider proxies read THROUGH the visual
-    // meshes) and a wireframe rasterizer (POLYGON_MODE_LINE), with a translucent
-    // alpha-blended fill as the fallback where fillModeNonSolid is absent.
-    void CreateDebugPipeline() {
+    // The overlay pipelines share pipeline_layout (set 0 + the PushBlock) and the mesh
+    // shaders. The debug one never tests depth, so collider proxies read THROUGH the visual
+    // meshes, and draws wireframe (POLYGON_MODE_LINE), with a translucent alpha-blended fill
+    // as the fallback where fillModeNonSolid is absent. The ghost one is a blended fill
+    // hidden behind the scene.
+    void CreateOverlayPipelines() {
         if (pipeline_layout == VK_NULL_HANDLE) return;
-        if (debug_pipeline != VK_NULL_HANDLE) {
-            vkDestroyPipeline(device, debug_pipeline, nullptr); debug_pipeline = VK_NULL_HANDLE;
-        }
+        DestroyOverlayPipelines();
+        debug_pipeline = OverlayPipeline(wireframe_capable_ ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL,
+                                         VK_CULL_MODE_NONE, false, !wireframe_capable_,
+                                         "vkCreateGraphicsPipelines(present-debug)");
+        ghost_pipeline = OverlayPipeline(VK_POLYGON_MODE_FILL, VK_CULL_MODE_BACK_BIT, true, true,
+                                         "vkCreateGraphicsPipelines(present-ghost)");
+    }
 
+    void DestroyOverlayPipelines() {
+        if (debug_pipeline != VK_NULL_HANDLE) { vkDestroyPipeline(device, debug_pipeline, nullptr); debug_pipeline = VK_NULL_HANDLE; }
+        if (ghost_pipeline != VK_NULL_HANDLE) { vkDestroyPipeline(device, ghost_pipeline, nullptr); ghost_pipeline = VK_NULL_HANDLE; }
+    }
+
+    VkPipeline OverlayPipeline(VkPolygonMode mode, VkCullModeFlags cull, bool depth_test, bool blend, const char* what) {
         std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
         stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -1148,8 +1161,8 @@ struct PresentRenderer::Impl {
 
         VkPipelineRasterizationStateCreateInfo rasterization{};
         rasterization.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-        rasterization.polygonMode = wireframe_capable_ ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
-        rasterization.cullMode = VK_CULL_MODE_NONE;
+        rasterization.polygonMode = mode;
+        rasterization.cullMode = cull;
         rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
         rasterization.lineWidth = 1.0f;  // 1.0 needs no wideLines feature
 
@@ -1157,19 +1170,17 @@ struct PresentRenderer::Impl {
         multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
         multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
-        // See-through: never test or write depth, so the overlay is visible through
-        // (and never occludes) the opaque scene drawn before it.
+        // Neither writes depth, so an overlay never occludes the opaque scene drawn before it.
         VkPipelineDepthStencilStateCreateInfo depth_stencil{};
         depth_stencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        depth_stencil.depthTestEnable = VK_FALSE;
+        depth_stencil.depthTestEnable = depth_test ? VK_TRUE : VK_FALSE;
         depth_stencil.depthWriteEnable = VK_FALSE;
-        depth_stencil.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+        depth_stencil.depthCompareOp = depth_test ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_ALWAYS;
 
-        // Wireframe lines are opaque; the fill fallback blends so it stays see-through.
         VkPipelineColorBlendAttachmentState blend_attachment{};
         blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                                           VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-        blend_attachment.blendEnable = wireframe_capable_ ? VK_FALSE : VK_TRUE;
+        blend_attachment.blendEnable = blend ? VK_TRUE : VK_FALSE;
         blend_attachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
         blend_attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
         blend_attachment.colorBlendOp = VK_BLEND_OP_ADD;
@@ -1203,8 +1214,9 @@ struct PresentRenderer::Impl {
         info.layout = pipeline_layout;
         info.renderPass = present_pass;
         info.subpass = 0u;
-        CheckVk(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1u, &info, nullptr, &debug_pipeline),
-                "vkCreateGraphicsPipelines(present-debug)");
+        VkPipeline out = VK_NULL_HANDLE;
+        CheckVk(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1u, &info, nullptr, &out), what);
+        return out;
     }
 
     // INT-F1: build the OPT-IN instanced pipeline (mesh_instanced.vert reads the
@@ -1419,9 +1431,9 @@ struct PresentRenderer::Impl {
         if (depth_image != VK_NULL_HANDLE) { vkDestroyImage(device, depth_image, nullptr); depth_image = VK_NULL_HANDLE; }
         if (depth_memory != VK_NULL_HANDLE) { vkFreeMemory(device, depth_memory, nullptr); depth_memory = VK_NULL_HANDLE; }
         if (pipeline != VK_NULL_HANDLE) { vkDestroyPipeline(device, pipeline, nullptr); pipeline = VK_NULL_HANDLE; }
-        // The debug pipeline is built against present_pass + shares pipeline_layout;
-        // destroy it before the layout so a swapchain recreate rebuilds both.
-        if (debug_pipeline != VK_NULL_HANDLE) { vkDestroyPipeline(device, debug_pipeline, nullptr); debug_pipeline = VK_NULL_HANDLE; }
+        // The overlay pipelines are built against present_pass + share pipeline_layout;
+        // destroy them before the layout so a swapchain recreate rebuilds them all.
+        DestroyOverlayPipelines();
         if (pipeline_layout != VK_NULL_HANDLE) { vkDestroyPipelineLayout(device, pipeline_layout, nullptr); pipeline_layout = VK_NULL_HANDLE; }
         // INT-F1: the instanced pipeline + its layout are render-pass-dependent too
         // (built against present_pass) -> destroy here so a swapchain recreate rebuilds
@@ -1911,15 +1923,15 @@ struct PresentRenderer::Impl {
             vkCmdDrawIndexed(cmd, draw.index_count, 1u, 0u, 0, first_instance);
         }
 
-        // See-through debug overlay: draw RenderWorld::debug_instances (collider
-        // wireframes + contact markers) AFTER the opaque scene with the depth-test-off
-        // debug pipeline, so they read THROUGH the visual meshes. Model rides the push
-        // constant (no interop SSBO); empty + skipped when the toggles are off.
-        if (!scene_rect.Empty() && !world.debug_instances.empty() && debug_pipeline != VK_NULL_HANDLE) {
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, debug_pipeline);
+        // The overlays draw AFTER the opaque scene: the ghost behind it, then the debug
+        // overlay (collider wireframes + contact markers) THROUGH it. Model rides the push
+        // constant (no interop SSBO); an empty list is skipped.
+        const auto draw_overlay = [&](const std::vector<RenderInstance>& overlay, VkPipeline overlay_pipeline) {
+            if (scene_rect.Empty() || overlay.empty() || overlay_pipeline == VK_NULL_HANDLE) return;
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, overlay_pipeline);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
                                     0u, 1u, &ubo_slots[frame].set, 0u, nullptr);
-            for (const RenderInstance& inst : world.debug_instances) {
+            for (const RenderInstance& inst : overlay) {
                 if (inst.mesh_id == kNoId || inst.mesh_id >= world.meshes.Count()) continue;
                 if (inst.mesh_id >= mesh_cache.size()) continue;
                 const MeshCacheEntry& cached = mesh_cache[inst.mesh_id];
@@ -1947,7 +1959,9 @@ struct PresentRenderer::Impl {
                 vkCmdBindIndexBuffer(cmd, cached.idx.buffer, 0u, VK_INDEX_TYPE_UINT32);
                 vkCmdDrawIndexed(cmd, cached.index_count, 1u, 0u, 0, 0u);
             }
-        }
+        };
+        draw_overlay(world.ghost_instances, ghost_pipeline);
+        draw_overlay(world.debug_instances, debug_pipeline);
 
         // The scene alone is read between two passes; the second loads it back for the overlay.
         if (do_scene_capture) {

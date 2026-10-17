@@ -1,6 +1,7 @@
 #pragma once
 // The editor's physics thread. While it runs it makes every world call: typed commands
-// apply in order at tick boundaries, and each publish hands the UI a snapshot.
+// apply in order at tick boundaries, each publish hands the UI a snapshot, and a history of
+// keyframes and inputs lets the playhead seek, replay and fork.
 
 #include "math/transform.hpp"
 #include "nuka/nuka.h"
@@ -9,6 +10,7 @@
 #include "runtime/app/viewer/editor_world.hpp"
 #include "runtime/app/viewer/pose_scatter.hpp"
 #include "runtime/app/viewer/script_host.hpp"
+#include "runtime/app/viewer/timeline_view.hpp"
 #include "runtime/inference/world_controller.hpp"
 
 #include <array>
@@ -19,6 +21,8 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -28,16 +32,18 @@ namespace nuka::runtime::app::viewer {
 
 using WorkerClock = std::chrono::steady_clock;
 
-enum class CommandKind : uint8_t { EditApply, Teleport, ParamSet, Perturb, Transport, ScriptCall };
+enum class CommandKind : uint8_t { EditApply, Teleport, ParamSet, Perturb, Transport, ScriptCall, Timeline };
 enum class ParamKind : uint8_t {
     Field, HoldGains, ControllerCommand, DisplayEnv, ScatterRows, Overlay, Registry, Telemetry, Iterations, Heatmap
 };
 enum class TransportOp : uint8_t { Play, Pause, Step, Speed, Reset };
+enum class TimelineOp : uint8_t { Seek, Fork, Branch, Rename, Ghost, Configure, Clear };
 
 // A held load on one link (wrench) or free body (force and torque), rewritten before
 // every step until a zero load replaces it.
 struct Perturbation {
     render::PoseSource source;
+    uint32_t env = 0u;  // the worker stamps the shown environment
     float force[3] = {0.0f, 0.0f, 0.0f};
     float torque[3] = {0.0f, 0.0f, 0.0f};
 };
@@ -53,9 +59,9 @@ struct TickCommand {
     uint32_t index = 0u;                  // Registry parameter
     uint32_t element = 0u;                // Registry element
     // Field values, gains (kp, kd), command, overlay flags, registry value, telemetry (mask, alert),
-    // sweep budget or heatmap flag.
+    // sweep budget, heatmap flag, ghost flag or the keyframe interval and budget [MB].
     std::vector<float> values;
-    uint32_t env = 0u;                    // DisplayEnv
+    uint32_t env = 0u;                    // DisplayEnv; the worker stamps pose writes with the shown one
     std::vector<ScatterRow> rows;         // ScatterRows
     Perturbation perturb;                 // Perturb
     TransportOp op = TransportOp::Pause;  // Transport
@@ -64,10 +70,60 @@ struct TickCommand {
     std::string code;                     // ScriptCall
     std::string filename;                 // ScriptCall: what tracebacks name; empty for the console
     bool echo = false;                    // ScriptCall: print a final expression's value
+    TimelineOp timeline = TimelineOp::Seek;  // Timeline
+    uint64_t tick = 0u;                      // Seek target
+    int64_t delta = 0;                       // Seek offset from the playhead when `relative`
+    bool relative = false;
+    uint32_t branch = kNoBranch;             // Branch, Rename, Ghost
+    std::string label;                       // Fork, Rename
 
     static TickCommand Transport(TransportOp op);
     static TickCommand Param(ParamKind param, std::vector<float> values);
     static TickCommand Script(std::string code, std::string filename = std::string(), bool echo = false);
+    static TickCommand Timeline(TimelineOp op);
+};
+
+// The world after every input of its tick so far, with the loads then held.
+struct Keyframe {
+    uint64_t tick = 0u;
+    double sim_time = 0.0;
+    size_t log_pos = 0u;  // the branch inputs already in this state
+    std::vector<Perturbation> perturbs;
+    nuka_checkpoint_handle state = nullptr;
+    uint64_t bytes = 0u;
+    bool pinned = false;  // holds writes the input log cannot replay
+
+    Keyframe() = default;
+    Keyframe(const Keyframe&) = delete;
+    Keyframe& operator=(const Keyframe&) = delete;
+    ~Keyframe() { nuka_checkpoint_destroy(state); }
+};
+
+struct LoggedInput {
+    uint64_t tick = 0u;
+    TickCommand cmd;
+};
+
+// The shown environment's poses at one tick, for the ghost.
+struct PoseSample {
+    uint64_t tick = 0u;
+    uint32_t env = 0u;
+    std::vector<math::Transform> links;
+    std::vector<math::Transform> bodies;
+};
+
+// One line of history. Its log and the keyframes before its fork are the parent's up to there.
+struct HistoryBranch {
+    uint32_t id = 0u;
+    uint32_t parent = kNoBranch;
+    uint64_t fork_tick = 0u;
+    uint64_t head = 0u;
+    std::string label;
+    bool exact = true;
+    uint64_t used = 0u;  // the switch count when it was last current
+    std::vector<std::shared_ptr<Keyframe>> keys;  // by tick
+    std::vector<LoggedInput> log;                 // by tick, from the history's start
+    std::deque<PoseSample> track;                 // from the fork on
 };
 
 struct TickResult {
@@ -118,6 +174,11 @@ struct Snapshot {
     std::vector<float> heat;            // its per-particle residuals while the heatmap reads them
     OverlayData overlay;
     WorkerTelemetry telemetry;
+    uint32_t branch = 0u;  // the history branch the playhead is on
+    uint64_t head = 0u;    // its newest recorded tick
+    // The ghost branch's poses at this tick; empty while it matches or has none.
+    std::vector<math::Transform> ghost_links;
+    std::vector<math::Transform> ghost_bodies;
 };
 
 // Three snapshots passed from one writer to one reader by exchanging slot indices.
@@ -209,6 +270,8 @@ public:
     // Copies the kept records numbered `since` on, 0 being the first since the mask was set;
     // readable from any thread.
     SolverStats ReadSolver(uint64_t since, std::vector<nuka_telemetry_record_t>* out);
+    // Copies the history the last snapshot described; readable from any thread.
+    void ReadTimeline(TimelineInfo* info);
 
 private:
     void Loop();
@@ -217,6 +280,7 @@ private:
     bool ApplyCommands(std::vector<TickCommand>& cmds);
     bool Apply(const TickCommand& cmd);
     double Advance();
+    bool StepOnce();
     void WritePerturbations();
     void ReadTelemetry();
     void Publish();
@@ -224,6 +288,29 @@ private:
     void Report(uint64_t seq, std::string text, bool error = false);
     void Report(TickResult result);
     void SetTick(uint64_t tick);
+
+    // History (physics_history.cpp).
+    HistoryBranch& Current() { return branches_.at(branch_); }
+    bool Replaying() { return tick_ < Current().head; }
+    static bool Recorded(const TickCommand& cmd);
+    void ResetHistory();
+    void CaptureKey(bool pinned);
+    void Record(const TickCommand& cmd);
+    bool ApplyScript(const TickCommand& cmd);
+    void Fork(std::string label);
+    void KeyHead();
+    void SeekTo(uint64_t target);
+    void Restore(const Keyframe& key);
+    void ApplyLogged(size_t limit = ~size_t(0));
+    bool Matches(nuka_checkpoint_handle state);
+    void ApplyTimeline(const TickCommand& cmd);
+    void Evict();
+    bool EvictOne();
+    void Recount();
+    void SampleTrack();
+    const PoseSample* GhostSample();
+    uint64_t Divergence(uint32_t a, uint32_t b) const;
+    void PublishTimeline(Snapshot& s);
 
     ScriptHost* scripts_;
     std::mutex mu_;
@@ -276,6 +363,24 @@ private:
     std::mutex solver_mu_;
     std::deque<nuka_telemetry_record_t> solver_log_;
     SolverStats solver_;
+
+    // The history; behind the current branch's head its log replays from `cursor_`.
+    std::map<uint32_t, HistoryBranch> branches_;
+    uint32_t branch_ = 0u;
+    uint32_t next_branch_ = 0u;
+    size_t cursor_ = 0u;  // the current branch's inputs applied so far
+    uint64_t switches_ = 0u;
+    uint32_t key_interval_ = 16u;
+    uint64_t key_budget_ = uint64_t{1} << 30u;
+    uint64_t key_bytes_ = 0u;
+    uint32_t key_count_ = 0u;
+    bool key_due_ = false;  // a script changed the world since the last keyframe
+    uint32_t ghost_ = kNoBranch;
+    bool ghost_on_ = true;
+    bool mirrored_ = false;  // this publish downloaded the host pose mirror
+    uint64_t history_revision_ = 0u;
+    std::mutex timeline_mu_;
+    TimelineInfo timeline_;
 };
 
 }  // namespace nuka::runtime::app::viewer

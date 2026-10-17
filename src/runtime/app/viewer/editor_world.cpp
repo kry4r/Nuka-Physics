@@ -47,6 +47,20 @@ T DownloadRow(nuka_world_handle world, nuka_state_field_t field, size_t row) {
     return value;
 }
 
+// The link or body pose a source names; false for static sources and rows the poses lack.
+bool ResolvePose(const render::PoseSource& source, const std::vector<math::Transform>& links,
+                 const std::vector<math::Transform>& bodies, math::Transform* out) {
+    if (source.kind == render::PoseSource::Kind::Link && source.row < links.size()) {
+        *out = links[source.row];
+        return true;
+    }
+    if (source.kind == render::PoseSource::Kind::Body && source.row < bodies.size()) {
+        *out = bodies[source.row];
+        return true;
+    }
+    return false;
+}
+
 }  // namespace
 
 void CheckResult(nuka_result_t result, const char* what) {
@@ -306,6 +320,18 @@ EditorSim::EditorSim(WorldLayout layout, render::RenderWorld render_world, const
     heat.roughness = 0.85f;
     heat_material_ = render_world_.MaterialCount();
     render_world_.materials.push_back(heat);
+    // The ghost: the shell's info blue, translucent and faintly lit from within.
+    scene::RenderMaterial ghost;
+    ghost.base_color[0] = 0.34f;
+    ghost.base_color[1] = 0.71f;
+    ghost.base_color[2] = 0.94f;
+    ghost.emissive[0] = 0.04f;
+    ghost.emissive[1] = 0.10f;
+    ghost.emissive[2] = 0.16f;
+    ghost.roughness = 0.6f;
+    ghost.opacity = 0.35f;
+    ghost_material_ = render_world_.MaterialCount();
+    render_world_.materials.push_back(ghost);
     for (const ParticleSurfaceBinding& s : layout_.surfaces) {
         render::RenderInstance inst;
         inst.entity = scene.EntityOfMedia(s.info.medium);
@@ -345,24 +371,26 @@ void EditorSim::ApplyParticles(const std::vector<math::Vec3>& positions, const s
 
 void EditorSim::ApplyPoses(const std::vector<math::Transform>& links,
                            const std::vector<math::Transform>& bodies) {
-    const auto resolve = [&](const render::PoseSource& source, math::Transform* out) {
-        if (source.kind == render::PoseSource::Kind::Link && source.row < links.size()) {
-            *out = links[source.row];
-            return true;
-        }
-        if (source.kind == render::PoseSource::Kind::Body && source.row < bodies.size()) {
-            *out = bodies[source.row];
-            return true;
-        }
-        return false;
-    };
     math::Transform pose;
     for (render::RenderInstance& inst : render_world_.instances)
-        if (resolve(inst.pose_source, &pose)) inst.world_xform = pose * inst.cached_visual_local;
+        if (ResolvePose(inst.pose_source, links, bodies, &pose)) inst.world_xform = pose * inst.cached_visual_local;
     for (render::RenderCamera& cam : render_world_.cameras)
-        if (resolve(cam.pose_source, &pose)) cam.world_xform = pose * cam.cached_visual_local;
+        if (ResolvePose(cam.pose_source, links, bodies, &pose)) cam.world_xform = pose * cam.cached_visual_local;
     for (render::RenderLight& light : render_world_.lights)
-        if (resolve(light.pose_source, &pose)) light.world_xform = pose * light.cached_visual_local;
+        if (ResolvePose(light.pose_source, links, bodies, &pose)) light.world_xform = pose * light.cached_visual_local;
+}
+
+void EditorSim::ApplyGhost(const std::vector<math::Transform>& links,
+                           const std::vector<math::Transform>& bodies) {
+    std::vector<render::RenderInstance>& ghost = render_world_.ghost_instances;
+    ghost.clear();
+    math::Transform pose;
+    for (const render::RenderInstance& inst : render_world_.instances) {
+        if (!ResolvePose(inst.pose_source, links, bodies, &pose)) continue;
+        render::RenderInstance& g = ghost.emplace_back(inst);
+        g.world_xform = pose * inst.cached_visual_local;
+        g.render_material_id = ghost_material_;
+    }
 }
 
 }  // namespace nuka::runtime::app::viewer

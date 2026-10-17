@@ -686,6 +686,8 @@ struct EditorHost::State : DocumentHost {
     void RegisterSimActions();
     void RegisterViewActions();
     void RegisterSolverActions();
+    void RegisterTimelineActions();
+    json::Value TimelineStatus();
     void ConfigureExtensions();
     void Queue(const std::string& id, json::Value args, const std::string& source);
     void RunQueuedActions();
@@ -746,6 +748,7 @@ struct EditorHost::State : DocumentHost {
     void SyncSolver();
     void TakeWorkerResults();
     void PushTransport();
+    void PushPoseWrites();
     void PushEdits();
     void DrawWorld(const render::RenderWorld& rw, const render::RasterOptions& opts);
     void PrintSummary();
@@ -871,6 +874,7 @@ struct EditorHost::State : DocumentHost {
     uint64_t transport_seq_ = 0u;
     uint64_t reset_seq_ = 0u;
     uint64_t solver_seq_ = 0u;  // the last solver command
+    uint64_t timeline_seq_ = 0u;  // the last timeline command
     bool reset_framing_ = false;
     uint64_t run_script_seq_ = 0u;
     bool frame_pending_ = false;
@@ -1391,6 +1395,7 @@ void EditorHost::State::ApplySnapshot(const Snapshot& snap) {
     shown_ = loaded_ && snap.epoch == bound_epoch_ ? &snap : nullptr;
     if (shown_ == nullptr) return;
     loaded_->sim->ApplyPoses(snap.link_poses, snap.body_poses);
+    loaded_->sim->ApplyGhost(snap.ghost_links, snap.ghost_bodies);
     if (!snap.particles.empty()) loaded_->sim->ApplyParticles(snap.particles, snap.heat, ui_state_.solver.alert);
     last_telemetry_ = snap.telemetry;
     last_tick_ = snap.tick;
@@ -1480,9 +1485,10 @@ ScriptTab& EditorHost::State::TabArg(const json::Value& args) {
     return *tab;
 }
 
-// Transport and display changes become worker commands.
+// Transport and display changes become worker commands, after the moves made before them.
 void EditorHost::State::PushTransport() {
     if (!loaded_) return;
+    PushPoseWrites();
     if (ui_state_.speed != sent_speed_) {
         TickCommand cmd = TickCommand::Transport(TransportOp::Speed);
         cmd.speed = ui_state_.speed;
@@ -1508,15 +1514,19 @@ void EditorHost::State::PushTransport() {
     }
 }
 
-// Live edits of this frame become worker commands: teleports, static rows, drive targets.
-void EditorHost::State::PushEdits() {
-    if (!loaded_) return;
+void EditorHost::State::PushPoseWrites() {
     for (const PoseWrite& write : loaded_->sim->TakePoseWrites()) {
         TickCommand cmd;
         cmd.kind = CommandKind::EditApply;
         cmd.pose = write;
         worker_.Push(std::move(cmd));
     }
+}
+
+// Live edits of this frame become worker commands: teleports, static rows, drive targets.
+void EditorHost::State::PushEdits() {
+    if (!loaded_) return;
+    PushPoseWrites();
     if (scatter_ && loaded_->sim->StaticRevision() != sent_static_revision_) {
         TickCommand cmd = TickCommand::Param(ParamKind::ScatterRows, {});
         cmd.rows = BuildScatterRows(loaded_->sim->GetRenderWorld());
@@ -1966,6 +1976,7 @@ void EditorHost::State::RegisterActions() {
     RegisterSimActions();
     RegisterViewActions();
     RegisterSolverActions();
+    RegisterTimelineActions();
     RegisterScriptActions();
     ui_.RegisterActions(actions_);
 }
@@ -2722,6 +2733,7 @@ void EditorHost::State::RegisterSimActions() {
                   [this](const json::Value& args) {
                       TickCommand cmd = TickCommand::Transport(TransportOp::Step);
                       cmd.steps = static_cast<uint32_t>(std::max(NumArg(args, "steps", 1.0), 1.0));
+                      PushTransport();
                       worker_.Push(std::move(cmd));
                       return Ok();
                   }});
@@ -2938,6 +2950,132 @@ void EditorHost::State::RegisterSolverActions() {
                                         {"entity", json::Value::Str(PathOfEntity(e.entity))},
                                         {"residual", json::Value::Float(record.worst_residual)},
                                         {"capped", json::Value::Bool((record.flags & NUKA_TELEMETRY_CAP) != 0u)}}));
+                  }});
+}
+
+json::Value EditorHost::State::TimelineStatus() {
+    const TimelineInfo& t = ui_state_.timeline;
+    const auto ticks = [](const std::vector<uint64_t>& values) {
+        json::Value list = json::Value::Array();
+        for (const uint64_t v : values) list.PushBack(json::Value::Int(static_cast<int64_t>(v)));
+        return list;
+    };
+    const auto id = [](uint32_t branch) {
+        return branch == kNoBranch ? json::Value::Null() : json::Value::Int(branch);
+    };
+    json::Value branches = json::Value::Array();
+    for (const TimelineBranchInfo& b : t.branches)
+        branches.PushBack(Object({{"id", json::Value::Int(b.id)},
+                                  {"parent", id(b.parent)},
+                                  {"fork_tick", json::Value::Int(static_cast<int64_t>(b.fork_tick))},
+                                  {"head", json::Value::Int(static_cast<int64_t>(b.head))},
+                                  {"label", json::Value::Str(b.label)},
+                                  {"exact", json::Value::Bool(b.exact)}}));
+    const bool ghost_shown = shown_ != nullptr && (!shown_->ghost_links.empty() || !shown_->ghost_bodies.empty());
+    return Object({{"tick", json::Value::Int(static_cast<int64_t>(t.tick))},
+                   {"start", json::Value::Int(static_cast<int64_t>(t.start))},
+                   {"head", json::Value::Int(static_cast<int64_t>(t.head))},
+                   {"replaying", json::Value::Bool(t.tick < t.head)},
+                   {"branch", json::Value::Int(t.branch)},
+                   {"branches", std::move(branches)},
+                   {"keys", ticks(t.keys)},
+                   {"pinned", ticks(t.pinned)},
+                   {"ghost", id(t.ghost)},
+                   {"ghost_on", json::Value::Bool(t.ghost_on)},
+                   {"ghost_shown", json::Value::Bool(ghost_shown)},
+                   {"interval", json::Value::Int(t.interval)},
+                   {"keyframes", json::Value::Int(t.keyframes)},
+                   {"bytes", json::Value::Int(static_cast<int64_t>(t.bytes))},
+                   {"budget_mb", json::Value::Float(static_cast<double>(t.budget) / 1048576.0)},
+                   {"applied", json::Value::Bool(shown_ != nullptr && shown_->acked >= timeline_seq_)}});
+}
+
+void EditorHost::State::RegisterTimelineActions() {
+    const auto has_scene = [this] { return loaded_ != nullptr; };
+    const auto push = [this](TickCommand cmd) {
+        PushTransport();
+        timeline_seq_ = worker_.Push(std::move(cmd));
+        return Ok();
+    };
+    // Seeking and switching branches pause first, so the playhead stays where it lands.
+    const auto pause = [this] {
+        ui_state_.playing = false;
+        PushTransport();
+    };
+    actions_.Add({"timeline.status", "Timeline Status", "timeline", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value&) { return Ok(TimelineStatus()); }});
+    // {tick}, {delta} ticks from the playhead, or {to: "start" | "head"}.
+    actions_.Add({"timeline.seek", "Seek", "timeline", "", ShortcutScope::Global, has_scene, {},
+                  [push, pause](const json::Value& args) {
+                      TickCommand cmd = TickCommand::Timeline(TimelineOp::Seek);
+                      const std::string to = StrArg(args, "to");
+                      if (to == "start" || to == "head") {
+                          cmd.tick = to == "head" ? ~uint64_t(0) : 0u;
+                      } else if (args.Find("delta") != nullptr) {
+                          cmd.relative = true;
+                          cmd.delta = static_cast<int64_t>(NumArg(args, "delta", 0.0));
+                      } else if (args.Find("tick") != nullptr) {
+                          cmd.tick = static_cast<uint64_t>(std::max(NumArg(args, "tick", 0.0), 0.0));
+                      } else {
+                          return ActionResult::Fail("timeline.seek takes tick, delta, or to: start or head");
+                      }
+                      pause();
+                      return push(std::move(cmd));
+                  }});
+    actions_.Add({"timeline.fork", "Fork Branch", "timeline", "", ShortcutScope::Global, has_scene, {},
+                  [push](const json::Value& args) {
+                      TickCommand cmd = TickCommand::Timeline(TimelineOp::Fork);
+                      cmd.label = StrArg(args, "label");
+                      return push(std::move(cmd));
+                  }});
+    actions_.Add({"timeline.branch", "Switch Branch", "timeline", "", ShortcutScope::Global, has_scene, {},
+                  [push, pause](const json::Value& args) {
+                      if (args.Find("id") == nullptr) return ActionResult::Fail("timeline.branch takes id");
+                      TickCommand cmd = TickCommand::Timeline(TimelineOp::Branch);
+                      cmd.branch = static_cast<uint32_t>(NumArg(args, "id", 0.0));
+                      pause();
+                      return push(std::move(cmd));
+                  }});
+    actions_.Add({"timeline.rename", "Rename Branch", "timeline", "", ShortcutScope::Global, has_scene, {},
+                  [this, push](const json::Value& args) {
+                      TickCommand cmd = TickCommand::Timeline(TimelineOp::Rename);
+                      cmd.branch = static_cast<uint32_t>(NumArg(args, "id", ui_state_.timeline.branch));
+                      cmd.label = StrArg(args, "label");
+                      return push(std::move(cmd));
+                  }});
+    // {on, branch}: without `on` it toggles; `branch` picks what it shows, else the last parent.
+    actions_.Add({"timeline.ghost", "Ghost of Other Branch", "timeline", "", ShortcutScope::Global, has_scene,
+                  [this] { return ui_state_.timeline.ghost_on; },
+                  [this, push](const json::Value& args) {
+                      TickCommand cmd = TickCommand::Timeline(TimelineOp::Ghost);
+                      const bool on = BoolArg(args, "on", !ui_state_.timeline.ghost_on);
+                      cmd.values = {on ? 1.0f : 0.0f};
+                      if (args.Find("branch") != nullptr) cmd.branch = static_cast<uint32_t>(NumArg(args, "branch", 0.0));
+                      ui_state_.timeline.ghost_on = on;
+                      return push(std::move(cmd));
+                  }});
+    actions_.Add({"timeline.configure", "Keyframe Settings", "timeline", "", ShortcutScope::Global, has_scene, {},
+                  [this, push](const json::Value& args) {
+                      const TimelineInfo& t = ui_state_.timeline;
+                      const double interval = NumArg(args, "interval", t.interval);
+                      const double budget = NumArg(args, "budget_mb", static_cast<double>(t.budget) / 1048576.0);
+                      if (interval < 1.0 || budget <= 0.0)
+                          return ActionResult::Fail("interval: ticks >= 1; budget_mb: a positive size");
+                      TickCommand cmd = TickCommand::Timeline(TimelineOp::Configure);
+                      cmd.values = {static_cast<float>(interval), static_cast<float>(budget)};
+                      return push(std::move(cmd));
+                  }});
+    actions_.Add({"timeline.clear", "Clear History", "timeline", "", ShortcutScope::Global, has_scene, {},
+                  [push](const json::Value&) { return push(TickCommand::Timeline(TimelineOp::Clear)); }});
+    // The world's state hash once every command queued before it applied.
+    actions_.Add({"timeline.hash", "State Hash", "timeline", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value&) {
+                      uint64_t hash = 0u;
+                      worker_.Exclusive([&] { CheckResult(nuka_world_state_hash(world_, &hash), "nuka_world_state_hash"); });
+                      char text[17];
+                      std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(hash));
+                      return Ok(Object({{"hash", json::Value::Str(text)},
+                                        {"tick", json::Value::Int(static_cast<int64_t>(worker_.Tick()))}}));
                   }});
 }
 
@@ -3246,6 +3384,7 @@ void EditorHost::State::Frame(bool step_physics) {
     const auto apply_t0 = Clock::now();
     if (const Snapshot* snap = worker_.AcquireSnapshot()) ApplySnapshot(*snap);
     if (loaded_) SyncSolver();
+    if (loaded_) worker_.ReadTimeline(&ui_state_.timeline);
     double apply_ms = Ms(Clock::now() - apply_t0);
 
     const render::RenderWorld& render_world = ShownWorld();

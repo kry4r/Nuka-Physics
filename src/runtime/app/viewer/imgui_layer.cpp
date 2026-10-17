@@ -85,7 +85,8 @@ struct PanelSpec {
 const PanelSpec kPanels[] = {{"stage", "Stage", icon::kStage},       {"property", "Properties", icon::kProperty},
                              {"file", "File", icon::kFile},          {"assets", "Assets", icon::kFolder},
                              {"stats", "Stats", icon::kStats},       {"debug", "Debug", icon::kDebug},
-                             {"solver", "Solver", icon::kPlot},      {"camera", "Camera", icon::kCamera},
+                             {"solver", "Solver", icon::kPlot},      {"timeline", "Timeline", icon::kTimeline},
+                             {"camera", "Camera", icon::kCamera},
                              {"drive", "Drive", icon::kDrive},
                              {"script", "Script", icon::kScript},    {"console", "Console", icon::kConsole},
                              {"nui", "UI Inspector", icon::kInspector}};
@@ -97,11 +98,12 @@ struct LayoutPreset {
     std::vector<const char*> left, right, bottom;
 };
 const LayoutPreset kLayouts[] = {
-    {"authoring", "Authoring", {"stage", "file"}, {"property", "camera"}, {"assets", "console", "script", "stats"}},
-    {"debug", "Debug", {"stage"}, {"solver", "debug", "stats", "property"}, {"console", "script", "assets"}},
-    {"robot", "Robot", {"stage"}, {"drive", "property"}, {"console", "stats", "assets"}},
-    {"data", "Data", {"file", "stage"}, {"stats", "camera", "property"}, {"assets", "console", "script"}},
-    {"training", "Training", {"stats", "stage"}, {"drive", "camera"}, {"console", "script", "assets"}},
+    {"authoring", "Authoring", {"stage", "file"}, {"property", "camera"},
+     {"assets", "console", "script", "stats", "timeline"}},
+    {"debug", "Debug", {"stage"}, {"solver", "debug", "stats", "property"}, {"console", "timeline", "script", "assets"}},
+    {"robot", "Robot", {"stage"}, {"drive", "property"}, {"console", "timeline", "stats", "assets"}},
+    {"data", "Data", {"file", "stage"}, {"stats", "camera", "property"}, {"assets", "console", "script", "timeline"}},
+    {"training", "Training", {"stats", "stage"}, {"drive", "camera"}, {"console", "script", "assets", "timeline"}},
 };
 
 const LayoutPreset* FindLayout(std::string_view name) {
@@ -153,8 +155,9 @@ const std::vector<MenuSpec>& Menus() {
               "view.colliders", "view.contacts", "view.hide_overlays", "-", "scene.expand_all", "scene.collapse_all", "-",
               "view.ui_scale_up", "view.ui_scale_down", "view.ui_scale_reset", "view.toggle_language", "-", "view.screenshot"}},
             {"Simulation",
-             {"sim", "solver"},
-             {"sim.toggle_play", "sim.step", "sim.reset", "-", "solver.telemetry", "solver.heatmap", "solver.locate"}},
+             {"sim", "solver", "timeline"},
+             {"sim.toggle_play", "sim.step", "sim.reset", "-", "timeline.fork", "timeline.ghost", "timeline.clear", "-",
+              "solver.telemetry", "solver.heatmap", "solver.locate"}},
             {"Tools",
              {"script", "tools"},
              {"script.new", "script.open", "script.save", "-", "script.run", "script.stop", "script.toggle_rerun", "-",
@@ -414,6 +417,7 @@ const std::vector<ImGuiLayer::BuiltinExtension>& ImGuiLayer::Builtins() {
         {"nuka.stats", "Stats", "Frame and physics timings.", {"stats"}},
         {"nuka.debug", "Debug Draw", "Collider and contact overlays.", {"debug"}},
         {"nuka.solver", "Solver", "Solver residuals, sweep budget alerts and the residual heatmap.", {"solver"}},
+        {"nuka.timeline", "Timeline", "Seek, replay and fork the run, and compare branches with a ghost.", {"timeline"}},
         {"nuka.camera", "Camera", "Camera pose, framing and controls.", {"camera"}},
         {"nuka.drive", "Drive", "Joint drive targets and keyboard teleop.", {"drive"}},
         {"nuka.script", "Script", "The Python script editor and the console.", {"script", "console"}},
@@ -426,8 +430,9 @@ void ImGuiLayer::AddBuiltinPanel(const std::string& panel_id) {
     using Builder = void (ImGuiLayer::*)(nui::VStack&);
     const Builder builders[] = {&ImGuiLayer::BuildStage,  &ImGuiLayer::BuildProperties, &ImGuiLayer::BuildFile,
                                 &ImGuiLayer::BuildAssets, &ImGuiLayer::BuildStats,      &ImGuiLayer::BuildDebug,
-                                &ImGuiLayer::BuildSolver, &ImGuiLayer::BuildCamera,     &ImGuiLayer::BuildDrive,
-                                &ImGuiLayer::BuildScript, &ImGuiLayer::BuildConsole,    &ImGuiLayer::BuildInspector};
+                                &ImGuiLayer::BuildSolver, &ImGuiLayer::BuildTimeline,   &ImGuiLayer::BuildCamera,
+                                &ImGuiLayer::BuildDrive,  &ImGuiLayer::BuildScript,     &ImGuiLayer::BuildConsole,
+                                &ImGuiLayer::BuildInspector};
     const size_t i = static_cast<size_t>(
         std::find_if(std::begin(kPanels), std::end(kPanels), [&](const PanelSpec& p) { return panel_id == p.id; }) -
         std::begin(kPanels));
@@ -537,7 +542,8 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
         {"scene.set_locked", icon::kLock},  {"assets.add_folder", icon::kFolderPlus}, {"assets.rescan", icon::kReset}};
     for (const auto& [id, glyph] : icons) registry.Decorate(id, glyph, false);
     for (const auto& [id, glyph] : {std::pair{"solver.telemetry", icon::kPlot}, std::pair{"solver.heatmap", icon::kPalette},
-                                    std::pair{"solver.locate", icon::kTarget}})
+                                    std::pair{"solver.locate", icon::kTarget}, std::pair{"timeline.fork", icon::kFork},
+                                    std::pair{"timeline.ghost", icon::kGhost}, std::pair{"timeline.clear", icon::kTrash}})
         registry.Decorate(id, glyph, false);
     const std::pair<const char*, const char*> script_icons[] = {
         {"script.new", icon::kNew},   {"script.open", icon::kOpen},     {"script.save", icon::kSave},
@@ -549,7 +555,8 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
     for (const char* id : {"edit.apply", "edit.rename", "edit.reparent", "scene.spawn", "scene.select", "sim.play",
                            "sim.pause", "sim.speed", "view.stats", "file.unload", "file.open_recent", "file.forget_recent",
                            "file.recover", "file.autosave", "app.answer_prompt", "app.check", "solver.status",
-                           "solver.records", "solver.set_iterations", "window.restore", "window.state"})
+                           "solver.records", "solver.set_iterations", "window.restore", "window.state", "timeline.status",
+                           "timeline.seek", "timeline.branch", "timeline.rename", "timeline.configure", "timeline.hash"})
         registry.Decorate(id, "", true);
     registry.Rebind("file.open", "Ctrl+O");
     registry.Rebind("file.save", "Ctrl+S");

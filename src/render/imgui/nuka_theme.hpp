@@ -178,5 +178,12 @@ inline constexpr const char kPaste[] = "\xEE\x86\x98";
 inline constexpr const char kGrid[] = "\xEE\x91\xA4";
 inline constexpr const char kHull[] = "\xEE\x9B\x90";
 inline constexpr const char kMeshShape[] = "\xEE\xB1\xBC";
+inline constexpr const char kTimeline[] = "\xEE\x9E\x92";   // film-strip
+inline constexpr const char kFork[] = "\xEE\x89\xBE";       // git-fork
+inline constexpr const char kBranch[] = "\xEE\x89\xB8";     // git-branch
+inline constexpr const char kGhost[] = "\xEE\x98\xAA";
+inline constexpr const char kSkipBack[] = "\xEE\x96\xA4";
+inline constexpr const char kCaretLeft[] = "\xEE\x84\xB8";
+inline constexpr const char kKeyframe[] = "\xEE\x87\xAC";   // diamond
 
 }  // namespace nuka::render::imgui::icon

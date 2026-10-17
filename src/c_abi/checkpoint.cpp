@@ -479,6 +479,24 @@ nuka_result_t nuka_world_checkpoint_read(nuka_world_handle world, const char* pa
     }
 }
 
+nuka_result_t nuka_checkpoint_byte_size(nuka_checkpoint_handle checkpoint, uint64_t* out_bytes) {
+    const auto* saved = nuka::c_abi::CheckpointTable().Get(checkpoint);
+    if (saved == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    if (out_bytes == nullptr) return NUKA_RESULT_INVALID_ARG;
+    *out_bytes = saved->persistent.size();
+    return NUKA_RESULT_OK;
+}
+
+nuka_result_t nuka_checkpoint_equal(nuka_checkpoint_handle a, nuka_checkpoint_handle b, uint32_t* out_equal) {
+    const auto* x = nuka::c_abi::CheckpointTable().Get(a);
+    const auto* y = nuka::c_abi::CheckpointTable().Get(b);
+    if (x == nullptr || y == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    if (out_equal == nullptr) return NUKA_RESULT_INVALID_ARG;
+    *out_equal = x->layout_hash == y->layout_hash && x->simulated_step_count == y->simulated_step_count &&
+                 x->persistent == y->persistent ? 1u : 0u;
+    return NUKA_RESULT_OK;
+}
+
 nuka_result_t nuka_world_state_hash(nuka_world_handle world, uint64_t* out_hash) {
     if (out_hash == nullptr) {
         return NUKA_RESULT_INVALID_ARG;

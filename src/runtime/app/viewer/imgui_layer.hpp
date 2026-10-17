@@ -10,6 +10,7 @@
 #include "runtime/app/viewer/property_schema.hpp"
 #include "runtime/app/viewer/scene_viewport.hpp"
 #include "runtime/app/viewer/script_tabs.hpp"
+#include "runtime/app/viewer/timeline_view.hpp"
 #include "scene/ecs/entity.hpp"
 
 #include <cstdint>
@@ -268,6 +269,7 @@ struct ViewerUiState {
     uint64_t properties_version = 0u;  // bumped with every rebuild of `properties`
     std::vector<StagedEdit> staged;
     SolverView solver;
+    TimelineInfo timeline;  // the physics thread's history, refreshed every frame
 };
 
 // Per-frame physics and render facts the panels show.
@@ -375,6 +377,7 @@ private:
     void BuildStats(nui::VStack& root);
     void BuildDebug(nui::VStack& root);
     void BuildSolver(nui::VStack& root);
+    void BuildTimeline(nui::VStack& root);
     void BuildCamera(nui::VStack& root);
     void BuildDrive(nui::VStack& root);
     void BuildScript(nui::VStack& root);
@@ -445,6 +448,8 @@ private:
     nui::Plot* step_plot_ = nullptr;
     uint64_t staged_version_ = 0u;               // bumped whenever the UI changes the staged edits
     std::unordered_map<std::string, bool> folds_;  // Properties groups the user opened or closed
+    uint64_t scrub_sent_ = ~0ull;  // the tick the timeline drag last asked for
+    char branch_name_[64] = {0};   // the branch rename field
 
     bool palette_open_ = false;
     bool palette_focus_ = false;
