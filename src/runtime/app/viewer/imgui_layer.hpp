@@ -174,6 +174,22 @@ public:
     const std::string& Layout() const { return layout_; }
     nui::Host& Nui() { return host_; }
 
+    // The built-in panels, grouped as the editor's own extensions.
+    struct BuiltinExtension {
+        std::string id;
+        std::string title;
+        std::string description;
+        std::vector<std::string> panels;
+    };
+    static const std::vector<BuiltinExtension>& Builtins();
+    // A built-in panel comes back open in the column the current layout gives it.
+    void AddBuiltinPanel(const std::string& panel_id);
+    void RemoveBuiltinPanel(const std::string& panel_id);
+    // The actions that come and go with a built-in extension's panels.
+    std::vector<Action> BuiltinActions(const BuiltinExtension& ext);
+    // Column-major view and GL-style projection of the scene viewport.
+    void CameraMatrices(const CameraController& camera, float* view, float* proj) const;
+
     // Records the frame's UI between NewFrame and Render. `scene` is null without a scene.
     void RecordUi(const render::RenderWorld& world, const ViewerStats& stats, CameraController& camera,
                   ViewerUiState& ui_state, const nuka::scene::SceneIR* scene = nullptr,
@@ -198,7 +214,6 @@ public:
 
 private:
     void Queue(const std::string& id, nui::json::Value args = nui::json::Value::Object());
-    void AddPanels();
     void BuildStage(nui::VStack& root);
     void BuildProperties(nui::VStack& root);
     void BuildFile(nui::VStack& root);

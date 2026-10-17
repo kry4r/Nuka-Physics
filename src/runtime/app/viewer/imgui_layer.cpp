@@ -34,6 +34,7 @@ namespace icon = nuka::render::imgui::icon;
 namespace draw = nuka::nui::draw;
 using nuka::nui::TextStyle;
 using nuka::nui::Tone;
+using nuka::nui::Tr;
 using nuka::render::imgui::FontRole;
 using nuka::render::imgui::GetNukaFont;
 
@@ -134,6 +135,14 @@ bool Builtin(std::string_view id) {
     return std::any_of(std::begin(kPanels), std::end(kPanels), [&](const PanelSpec& p) { return id == p.id; });
 }
 
+// The dock column a layout gives a panel: "left", "right", "bottom", or "" when it has none.
+const char* LayoutColumn(const LayoutPreset& preset, std::string_view id) {
+    const auto has = [&](const std::vector<const char*>& ids) {
+        return std::any_of(ids.begin(), ids.end(), [&](const char* p) { return id == p; });
+    };
+    return has(preset.left) ? "left" : has(preset.right) ? "right" : has(preset.bottom) ? "bottom" : "";
+}
+
 // A menu lists its actions in this order; actions of its categories it does not name follow.
 struct MenuSpec {
     std::string title;
@@ -157,12 +166,12 @@ const std::vector<MenuSpec>& Menus() {
              {"view"},
              {"app.command_palette", "-", "view.frame_all", "view.frame_selected", "view.reset_camera", "-",
               "view.colliders", "view.contacts", "view.hide_overlays", "-", "scene.expand_all", "scene.collapse_all", "-",
-              "view.ui_scale_up", "view.ui_scale_down", "view.ui_scale_reset", "-", "view.screenshot"}},
+              "view.ui_scale_up", "view.ui_scale_down", "view.ui_scale_reset", "view.toggle_language", "-", "view.screenshot"}},
             {"Simulation", {"sim"}, {"sim.toggle_play", "sim.step", "sim.reset"}},
             {"Tools", {"script", "tools"}, {"script.run", "script.attach", "script.load", "script.clear_console", "-", "tools.nui_inspector"}},
             {"Window", {"window"}, window},
             {"Help", {"help"}, {"help.about"}},
-            {"Extensions", {"extensions"}, {}},
+            {"Extensions", {"extensions"}, {"extensions.manager", "extensions.rescan", "-"}},
         };
     }();
     return menus;
@@ -228,10 +237,10 @@ std::string SelectionPath(const ImGuiLayer::Frame& f) {
 std::string MeshText(const ImGuiLayer::Frame& f) {
     for (const render::RenderInstance& ri : f.world->instances) {
         if (ri.entity != f.ui->selected_entity) continue;
-        if (ri.mesh_id == render::kNoId || ri.mesh_id >= f.world->meshes.Count()) return "none";
-        return f.world->meshes.Source(ri.mesh_id) == render::MeshSource::NkaMesh ? "mesh" : "primitive";
+        if (ri.mesh_id == render::kNoId || ri.mesh_id >= f.world->meshes.Count()) return Tr("none");
+        return Tr(f.world->meshes.Source(ri.mesh_id) == render::MeshSource::NkaMesh ? "mesh" : "primitive");
     }
-    return "none";
+    return Tr("none");
 }
 
 nui::ModelPtr<nui::Vec3> Floats3(float* v) {
@@ -347,7 +356,10 @@ public:
         }
         out = entries_.at(item).children;
     }
-    std::string_view Label(uint64_t item) const override { return entries_.at(item).label; }
+    std::string_view Label(uint64_t item) const override {
+        const Entry& e = entries_.at(item);
+        return e.named ? std::string_view(e.label) : std::string_view(Tr(e.label));
+    }
     const char* Icon(uint64_t item) const override { return entries_.at(item).kind.glyph; }
     ImVec4 IconColor(uint64_t item) const override { return entries_.at(item).kind.color; }
     std::string_view Badge(uint64_t item) const override { return entries_.at(item).kind.badge; }
@@ -357,6 +369,7 @@ public:
 private:
     struct Entry {
         std::string label;
+        bool named = false;
         std::string path;
         nuka::scene::EntityId entity;
         StageKind kind;
@@ -375,6 +388,7 @@ private:
             stack.pop_back();
             Entry& entry = entries_[node->id + 1u];
             entry.label = !node->name.empty() ? node->name : path.empty() ? "Scene" : "(unnamed)";
+            entry.named = !node->name.empty();
             entry.entity = node->entity;
             entry.kind = ClassifyNode(reg, node->entity);
             for (auto child = node->first_child; child; child = child->next_sibling) {
@@ -392,7 +406,9 @@ private:
 
 // ---- setup --------------------------------------------------------------------------------
 
-ImGuiLayer::ImGuiLayer() : stage_items_(std::make_shared<SceneItems>(frame_)) { AddPanels(); }
+ImGuiLayer::ImGuiLayer() : stage_items_(std::make_shared<SceneItems>(frame_)) {
+    nui::LoadTranslationDir(nui::BuiltinTranslationDir(), "nuka");
+}
 
 ImGuiLayer::~ImGuiLayer() = default;
 
@@ -403,21 +419,79 @@ void ImGuiLayer::EnableDocking() {
     io.IniFilename = nullptr;
 }
 
-void ImGuiLayer::AddPanels() {
+const std::vector<ImGuiLayer::BuiltinExtension>& ImGuiLayer::Builtins() {
+    static const std::vector<BuiltinExtension> builtins = {
+        {"nuka.stage", "Stage", "The scene tree: select, rename, reparent and spawn.", {"stage"}},
+        {"nuka.properties", "Properties", "Transform and material of the selection.", {"property"}},
+        {"nuka.file", "File", "Open, save and load scenes.", {"file"}},
+        {"nuka.stats", "Stats", "Frame and physics timings.", {"stats"}},
+        {"nuka.debug", "Debug Draw", "Collider and contact overlays.", {"debug"}},
+        {"nuka.camera", "Camera", "Camera pose, framing and controls.", {"camera"}},
+        {"nuka.drive", "Drive", "Joint drive targets and keyboard teleop.", {"drive"}},
+        {"nuka.script", "Script", "The Python script editor and the console.", {"script", "console"}},
+        {"nuka.ui_inspector", "UI Inspector", "The nui component tree, for extension authors.", {"nui"}},
+    };
+    return builtins;
+}
+
+void ImGuiLayer::AddBuiltinPanel(const std::string& panel_id) {
     using Builder = void (ImGuiLayer::*)(nui::VStack&);
     const Builder builders[] = {&ImGuiLayer::BuildStage,  &ImGuiLayer::BuildProperties, &ImGuiLayer::BuildFile,
                                 &ImGuiLayer::BuildStats,  &ImGuiLayer::BuildDebug,      &ImGuiLayer::BuildCamera,
                                 &ImGuiLayer::BuildDrive,  &ImGuiLayer::BuildScript,     &ImGuiLayer::BuildConsole,
                                 &ImGuiLayer::BuildInspector};
-    for (size_t i = 0; i < std::size(kPanels); ++i) {
-        nui::Panel& panel = host_.AddPanel(kPanels[i].id, kPanels[i].title, kPanels[i].glyph);
-        const Builder build = builders[i];
-        panel.build = [this, build](nui::VStack& root) { (this->*build)(root); };
-        panel.open = false;
+    const size_t i = static_cast<size_t>(
+        std::find_if(std::begin(kPanels), std::end(kPanels), [&](const PanelSpec& p) { return panel_id == p.id; }) -
+        std::begin(kPanels));
+    std::lock_guard<std::recursive_mutex> lock(host_.Mutex());
+    nui::Panel& panel = host_.AddPanel(kPanels[i].id, kPanels[i].title, kPanels[i].glyph);
+    const Builder build = builders[i];
+    panel.build = [this, build](nui::VStack& root) { (this->*build)(root); };
+    panel.dock = LayoutColumn(*FindLayout(layout_), panel_id);
+    panel.open = !panel.dock.empty();
+    if (panel_id == "drive")
+        panel.key = [this] {
+            return static_cast<uint64_t>(frame_.ui->drive_targets.size()) * 7919u + frame_.ui->dof_labels.size();
+        };
+}
+
+void ImGuiLayer::RemoveBuiltinPanel(const std::string& panel_id) {
+    if (panel_id == "stage") stage_tree_ = nullptr;
+    if (panel_id == "stats") frame_plot_ = step_plot_ = nullptr;
+    host_.RemovePanel(panel_id);
+}
+
+std::vector<Action> ImGuiLayer::BuiltinActions(const BuiltinExtension& ext) {
+    std::vector<Action> actions;
+    for (const std::string& pid : ext.panels) {
+        const PanelSpec& p = *std::find_if(std::begin(kPanels), std::end(kPanels),
+                                           [&](const PanelSpec& spec) { return pid == spec.id; });
+        actions.push_back({"window.toggle_" + pid, p.title, "window", "", ShortcutScope::Global, {},
+                           [this, pid] {
+                               std::lock_guard<std::recursive_mutex> lock(host_.Mutex());
+                               return host_.FindPanel(pid)->open;
+                           },
+                           [this, pid](const json::Value&) {
+                               std::lock_guard<std::recursive_mutex> lock(host_.Mutex());
+                               nui::Panel* panel = host_.FindPanel(pid);
+                               panel->open = !panel->open;
+                               panel->focus_request = panel->open;
+                               return ActionResult{};
+                           },
+                           p.glyph});
     }
-    host_.FindPanel("drive")->key = [this] {
-        return static_cast<uint64_t>(frame_.ui->drive_targets.size()) * 7919u + frame_.ui->dof_labels.size();
-    };
+    if (ext.id == "nuka.ui_inspector") {
+        Action inspector = actions.front();
+        inspector.id = "tools.nui_inspector";
+        inspector.category = "tools";
+        actions.push_back(std::move(inspector));
+    }
+    return actions;
+}
+
+void ImGuiLayer::CameraMatrices(const CameraController& camera, float* view, float* proj) const {
+    ViewMatrix(camera.ResolvedEye(), camera.ResolvedTarget(), math::Vec3{0.0f, 0.0f, 1.0f}, view);
+    ProjMatrixGL(camera.fov_degrees * 3.14159265358979323846f / 180.0f, viewport_.Aspect(), 0.05f, 500.0f, proj);
 }
 
 void ImGuiLayer::Queue(const std::string& id, json::Value args) {
@@ -498,22 +572,6 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
                       },
                       icon::kLayout});
     }
-    for (const PanelSpec& p : kPanels) {
-        const std::string pid = p.id;
-        registry.Add({"window.toggle_" + pid, p.title, "window", "", ShortcutScope::Global, {},
-                      [this, pid] {
-                          std::lock_guard<std::recursive_mutex> lock(host_.Mutex());
-                          return host_.FindPanel(pid)->open;
-                      },
-                      [this, pid](const json::Value&) {
-                          std::lock_guard<std::recursive_mutex> lock(host_.Mutex());
-                          nui::Panel* panel = host_.FindPanel(pid);
-                          panel->open = !panel->open;
-                          panel->focus_request = panel->open;
-                          return ActionResult{};
-                      },
-                      p.glyph});
-    }
     registry.Add({"window.reset_layout", "Reset Layout", "window", "", ShortcutScope::Global, {}, {},
                   [this](const json::Value&) {
                       layout_pending_ = true;
@@ -566,19 +624,6 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
                       return ActionResult{};
                   },
                   icon::kChevronRight});
-    registry.Add({"tools.nui_inspector", "UI Inspector", "tools", "", ShortcutScope::Global, {},
-                  [this] {
-                      std::lock_guard<std::recursive_mutex> lock(host_.Mutex());
-                      return host_.FindPanel("nui")->open;
-                  },
-                  [this](const json::Value&) {
-                      std::lock_guard<std::recursive_mutex> lock(host_.Mutex());
-                      nui::Panel* panel = host_.FindPanel("nui");
-                      panel->open = !panel->open;
-                      panel->focus_request = panel->open;
-                      return ActionResult{};
-                  },
-                  icon::kInspector});
     registry.Add({"help.about", "About Nuka Editor", "help", "", ShortcutScope::Global, {}, {},
                   [this](const json::Value&) {
                       about_open_ = true;
@@ -597,6 +642,35 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
                       return ActionResult{};
                   },
                   "", true});
+    // The switch steps through every locale with a table; English is always first.
+    registry.Add({"view.toggle_language", "Switch Language", "view", "Ctrl+Shift+L", ShortcutScope::Global, {}, {},
+                  [this](const json::Value&) {
+                      const std::vector<nui::LocaleInfo> locales = nui::Locales();
+                      const std::string current = nui::Locale();
+                      const auto it = std::find_if(locales.begin(), locales.end(), [&](const auto& l) { return l.id == current; });
+                      const nui::LocaleInfo& next = it == locales.end() || it + 1 == locales.end() ? locales.front() : *(it + 1);
+                      nui::SetLocale(next.id);
+                      host_.Toast(nui::Level::Info, next.name);
+                      return ActionResult{true, json::Value::Str(next.id), std::string()};
+                  },
+                  icon::kTranslate});
+    registry.Add({"view.language", "Language", "view", "", ShortcutScope::Global, {}, {},
+                  [](const json::Value& args) {
+                      const std::string locale = args.At("locale").AsString();
+                      const std::vector<nui::LocaleInfo> locales = nui::Locales();
+                      if (std::none_of(locales.begin(), locales.end(), [&](const auto& l) { return l.id == locale; }))
+                          return ActionResult::Fail("no string table for locale '" + locale + "'");
+                      nui::SetLocale(locale);
+                      return ActionResult{true, json::Value::Str(locale), std::string()};
+                  },
+                  "", true});
+    registry.Add({"view.missing_strings", "Missing Strings", "view", "", ShortcutScope::Global, {}, {},
+                  [](const json::Value&) {
+                      json::Value out = json::Value::Array();
+                      for (const std::string& text : nui::MissingStrings()) out.PushBack(json::Value::Str(text));
+                      return ActionResult{true, std::move(out), std::string()};
+                  },
+                  "", true});
 }
 
 // ---- panels -------------------------------------------------------------------------------
@@ -606,26 +680,26 @@ void ImGuiLayer::BuildStage(nui::VStack& root) {
         const float s = nui::Scale();
         const float buttons = 3.0f * (ImGui::GetFrameHeight() + 2.0f * s + ImGui::GetStyle().ItemSpacing.x);
         ImGui::SetNextItemWidth(std::max(ImGui::GetContentRegionAvail().x - buttons, 60.0f * s));
-        const std::string hint = Iconed(icon::kFilter, "Filter");
+        const std::string hint = Iconed(icon::kFilter, Tr("Filter"));
         ImGui::InputTextWithHint("##filter", hint.c_str(), stage_filter_, sizeof(stage_filter_));
         ImGui::SameLine();
         ImGui::BeginDisabled(!frame_.ui->has_scene);
-        if (draw::IconButton("##add", icon::kAdd, false, "Add primitive")) ImGui::OpenPopup("##add_menu");
+        if (draw::IconButton("##add", icon::kAdd, false, Tr("Add primitive"))) ImGui::OpenPopup("##add_menu");
         ImGui::EndDisabled();
         if (ImGui::BeginPopup("##add_menu")) {
             for (const SpawnChoice& c : kSpawns)
-                if (ImGui::MenuItemEx(c.label, c.glyph)) Queue(std::string("scene.add_") + c.kind);
+                if (ImGui::MenuItemEx(Tr(c.label), c.glyph)) Queue(std::string("scene.add_") + c.kind);
             ImGui::EndPopup();
         }
         ImGui::SameLine();
-        if (draw::IconButton("##expand", icon::kChevronDown, false, "Expand all")) stage_tree_->ExpandAll();
+        if (draw::IconButton("##expand", icon::kChevronDown, false, Tr("Expand all"))) stage_tree_->ExpandAll();
         ImGui::SameLine();
-        if (draw::IconButton("##collapse", icon::kChevronRight, false, "Collapse all")) stage_tree_->CollapseAll();
+        if (draw::IconButton("##collapse", icon::kChevronRight, false, Tr("Collapse all"))) stage_tree_->CollapseAll();
     });
     auto& counts = root.Add<nui::Label>(std::string(), Tone::Dim, TextStyle::Label);
     counts.text_fn = [this] {
         const render::RenderWorld& w = *frame_.world;
-        return Fmt("%u inst   %u mesh   %u mat", w.InstanceCount(), w.meshes.Count(), w.MaterialCount());
+        return Fmt(Tr("%u inst   %u mesh   %u mat"), w.InstanceCount(), w.meshes.Count(), w.MaterialCount());
     };
     counts.visible_if = [this] { return frame_.ui->has_scene; };
     auto& empty = root.Add<nui::Label>("No scene loaded. Open one with Ctrl+O.", Tone::Dim);
@@ -656,24 +730,24 @@ void ImGuiLayer::BuildStage(nui::VStack& root) {
             std::snprintf(ui.rename_buf, sizeof(ui.rename_buf), "%.*s", static_cast<int>(name.size()), name.data());
         }
         nui::PushTextStyle(TextStyle::Label);
-        ImGui::TextColored(theme::kFgDim, "%s", Upper(path.empty() ? "scene root" : path).c_str());
+        ImGui::TextColored(theme::kFgDim, "%s", Upper(path.empty() ? std::string(Tr("scene root")) : path).c_str());
         nui::PopTextStyle();
         ImGui::Separator();
         ImGui::SetNextItemWidth(170.0f * nui::Scale());
-        const bool enter = ImGui::InputTextWithHint("##rename", "New name", ui.rename_buf, sizeof(ui.rename_buf),
+        const bool enter = ImGui::InputTextWithHint("##rename", Tr("New name"), ui.rename_buf, sizeof(ui.rename_buf),
                                                     ImGuiInputTextFlags_EnterReturnsTrue);
         ImGui::SameLine();
-        if (ImGui::SmallButton("Rename") || enter) {
+        if (ImGui::SmallButton(Tr("Rename")) || enter) {
             Queue("edit.rename", Args({{"path", json::Value::Str(path)}, {"name", json::Value::Str(ui.rename_buf)}}));
             ImGui::CloseCurrentPopup();
         }
-        if (ImGui::BeginMenuEx("Add primitive", icon::kAdd)) {
+        if (ImGui::BeginMenuEx(Tr("Add primitive"), icon::kAdd)) {
             for (const SpawnChoice& c : kSpawns)
-                if (ImGui::MenuItemEx(c.label, c.glyph)) Queue("scene.spawn", Args({{"kind", json::Value::Str(c.kind)}}));
+                if (ImGui::MenuItemEx(Tr(c.label), c.glyph)) Queue("scene.spawn", Args({{"kind", json::Value::Str(c.kind)}}));
             ImGui::EndMenu();
         }
-        if (ImGui::MenuItemEx("Frame", icon::kTarget, "F")) Queue("view.frame_selected");
-        if (ImGui::MenuItemEx("Delete subtree", icon::kTrash, "Delete"))
+        if (ImGui::MenuItemEx(Tr("Frame"), icon::kTarget, "F")) Queue("view.frame_selected");
+        if (ImGui::MenuItemEx(Tr("Delete subtree"), icon::kTrash, "Delete"))
             Queue("edit.delete", Args({{"path", json::Value::Str(path)}}));
     };
 }
@@ -694,10 +768,10 @@ void ImGuiLayer::BuildProperties(nui::VStack& root) {
     auto& name = head.Add<nui::Label>(std::string(), Tone::Normal, TextStyle::Strong);
     name.text_fn = [this] {
         const auto node = SelectedNode(frame_);
-        return !node ? std::string() : node->name.empty() ? std::string("(unnamed)") : node->name;
+        return !node ? std::string() : node->name.empty() ? std::string(Tr("(unnamed)")) : node->name;
     };
     auto& mobility = head.Add<nui::Badge>();
-    mobility.text_fn = [this] { return std::string(frame_.ui->inspector.movable ? "movable" : "fixed"); };
+    mobility.text_fn = [this] { return std::string(Tr(frame_.ui->inspector.movable ? "movable" : "fixed")); };
     mobility.tone_fn = [this] { return frame_.ui->inspector.movable ? Tone::Accent : Tone::Dim; };
     mobility.visible_if = editable;
     root.Add<nui::Stat>("Entity", [this] { return Fmt("%u", frame_.ui->selected_entity.index); }).visible_if = selected;
@@ -722,11 +796,12 @@ void ImGuiLayer::BuildProperties(nui::VStack& root) {
     auto& gizmo = root.Add<nui::Collapsible>("Gizmo", false, icon::kGizmo);
     gizmo.visible_if = editable;
     auto& modes = gizmo.Add<nui::HStack>();
-    modes.Add<nui::Segmented>(std::vector<std::string>{Iconed(icon::kMove, "Move"), Iconed(icon::kRotate, "Rotate")},
-                              nui::Bind<int>([gz] { return gz->op == GizmoState::Op::Rotate ? 1 : 0; },
-                                             [gz](const int& v) {
-                                                 gz->op = v == 1 ? GizmoState::Op::Rotate : GizmoState::Op::Translate;
-                                             }));
+    auto& op = modes.Add<nui::Segmented>(std::vector<std::string>{"Move", "Rotate"},
+                                         nui::Bind<int>([gz] { return gz->op == GizmoState::Op::Rotate ? 1 : 0; },
+                                                        [gz](const int& v) {
+                                                            gz->op = v == 1 ? GizmoState::Op::Rotate : GizmoState::Op::Translate;
+                                                        }));
+    op.icons = {icon::kMove, icon::kRotate};
     modes.Add<nui::ToggleButton>("Local", nui::Ref(&gz->local));
     modes.Add<nui::ToggleButton>("Snap", nui::Ref(&gz->snap_on));
     auto& ggrid = gizmo.Add<nui::PropertyGrid>();
@@ -767,7 +842,7 @@ void ImGuiLayer::BuildFile(nui::VStack& root) {
     auto& scene_box = root.Add<nui::Collapsible>("Scene", true, icon::kScene);
     auto& current = scene_box.Add<nui::Label>();
     current.wrap = true;
-    current.text_fn = [this] { return frame_.ui->has_scene ? frame_.ui->loaded_path : std::string("No scene loaded"); };
+    current.text_fn = [this] { return frame_.ui->has_scene ? frame_.ui->loaded_path : std::string(Tr("No scene loaded")); };
     current.tone_fn = [this] { return frame_.ui->has_scene ? Tone::Accent : Tone::Dim; };
     auto& error = scene_box.Add<nui::Label>(std::string(), Tone::Err);
     error.wrap = true;
@@ -804,11 +879,11 @@ void ImGuiLayer::BuildStats(nui::VStack& root) {
     auto& hero = root.Add<nui::HStack>();
     auto& step = hero.Add<nui::Label>(std::string(), Tone::Accent, TextStyle::Hero);
     step.text_fn = [this] {
-        return frame_.stats->cpu_timing_available ? Fmt("%.2f ms", frame_.stats->step_time_ms) : std::string("N/A");
+        return frame_.stats->cpu_timing_available ? Fmt("%.2f ms", frame_.stats->step_time_ms) : std::string(Tr("N/A"));
     };
     step.tone_fn = [this] { return frame_.stats->step_healthy ? Tone::Accent : Tone::Warn; };
     auto& live = hero.Add<nui::Badge>();
-    live.text_fn = [this] { return std::string(frame_.ui->playing ? "live" : "idle"); };
+    live.text_fn = [this] { return std::string(Tr(frame_.ui->playing ? "live" : "idle")); };
     live.tone_fn = [this] { return frame_.ui->playing ? Tone::Ok : Tone::Dim; };
     root.Add<nui::Label>("Physics step", Tone::Dim, TextStyle::Label);
     auto& step_plot = root.Add<nui::Plot>();
@@ -821,9 +896,9 @@ void ImGuiLayer::BuildStats(nui::VStack& root) {
         return root.Add<nui::Stat>(label, std::move(fn));
     };
     root.Add<nui::Separator>("Timing");
-    stat("fps", [this] { return frame_.stats->frame_timing_available ? Fmt("%.0f", frame_.stats->fps) : std::string("N/A"); });
+    stat("fps", [this] { return frame_.stats->frame_timing_available ? Fmt("%.0f", frame_.stats->fps) : std::string(Tr("N/A")); });
     stat("frame", [this] {
-        return frame_.stats->frame_timing_available ? Fmt("%.2f ms", frame_.stats->frame_time_ms) : std::string("N/A");
+        return frame_.stats->frame_timing_available ? Fmt("%.2f ms", frame_.stats->frame_time_ms) : std::string(Tr("N/A"));
     });
     auto& frame_plot = root.Add<nui::Plot>();
     frame_plot.sparkline = true;
@@ -833,12 +908,12 @@ void ImGuiLayer::BuildStats(nui::VStack& root) {
     stat("sub-steps", [this] { return Fmt("x%u", frame_.stats->sub_steps); });
     stat("ticks", [this] { return Fmt("%llu", static_cast<unsigned long long>(frame_.stats->sim_ticks)); });
     stat("snapshot age", [this] {
-        return frame_.stats->cpu_timing_available ? Fmt("%.1f ms", frame_.stats->snapshot_age_ms) : std::string("N/A");
+        return frame_.stats->cpu_timing_available ? Fmt("%.1f ms", frame_.stats->snapshot_age_ms) : std::string(Tr("N/A"));
     });
     stat("dropped", [this] { return Fmt("%llu", static_cast<unsigned long long>(frame_.stats->snapshot_drops)); });
     stat("capped batches", [this] { return Fmt("%llu", static_cast<unsigned long long>(frame_.stats->capped_batches)); })
         .tone_fn = [this] { return frame_.stats->capped_batches != 0u ? Tone::Warn : Tone::Normal; };
-    stat("publish", [this] { return std::string(frame_.stats->zero_copy ? "ZERO-COPY" : "HOST"); }).tone_fn = [this] {
+    stat("publish", [this] { return std::string(Tr(frame_.stats->zero_copy ? "ZERO-COPY" : "HOST")); }).tone_fn = [this] {
         return frame_.stats->zero_copy ? Tone::Accent : Tone::Warn;
     };
     auto& reason = root.Add<nui::Label>(std::string(), Tone::Dim);
@@ -855,12 +930,12 @@ void ImGuiLayer::BuildStats(nui::VStack& root) {
 
     root.Add<nui::Separator>("Render");
     stat("draw calls", [this] {
-        return frame_.stats->draw_calls_available ? Fmt("%u", frame_.stats->draw_calls) : std::string("N/A");
+        return frame_.stats->draw_calls_available ? Fmt("%u", frame_.stats->draw_calls) : std::string(Tr("N/A"));
     });
     stat("instances", [this] { return Fmt("%u", frame_.world->InstanceCount()); });
     stat("lit pixels", [this] {
         return frame_.stats->pixel_count_available ? Fmt("%llu", static_cast<unsigned long long>(frame_.stats->non_bg_pixels))
-                                                   : std::string("N/A");
+                                                   : std::string(Tr("N/A"));
     });
     auto& device = root.Add<nui::Label>(std::string(), Tone::Dim, TextStyle::Label);
     device.text_fn = [this] { return frame_.stats->device_name; };
@@ -891,16 +966,16 @@ void ImGuiLayer::BuildDebug(nui::VStack& root) {
                           3.0f * s, U32(color), 0u);
             ImGui::Dummy(ImVec2(20.0f * s, h));
             ImGui::SameLine();
-            ImGui::TextUnformatted(text);
+            ImGui::TextUnformatted(Tr(text));
         }
     });
 
     root.Add<nui::Separator>("Last overlay");
     root.Add<nui::Stat>("proxies", [this] {
-        return frame_.stats->debug_colliders_available ? Fmt("%u", frame_.stats->debug_colliders) : std::string("N/A");
+        return frame_.stats->debug_colliders_available ? Fmt("%u", frame_.stats->debug_colliders) : std::string(Tr("N/A"));
     });
     root.Add<nui::Stat>("markers", [this] {
-        return frame_.stats->debug_contacts_available ? Fmt("%u", frame_.stats->debug_contacts) : std::string("N/A");
+        return frame_.stats->debug_contacts_available ? Fmt("%u", frame_.stats->debug_contacts) : std::string(Tr("N/A"));
     });
     const auto warning = [&root, has_scene](std::function<std::string()> text, std::function<bool()> when) {
         auto& label = root.Add<nui::Label>(std::string(), Tone::Warn);
@@ -908,21 +983,21 @@ void ImGuiLayer::BuildDebug(nui::VStack& root) {
         label.text_fn = std::move(text);
         label.visible_if = [has_scene, when = std::move(when)] { return has_scene() && when(); };
     };
-    warning([this] { return Fmt("%u unsupported collider shapes skipped", frame_.stats->debug_skipped_shapes); },
+    warning([this] { return Fmt(Tr("%u unsupported collider shapes skipped"), frame_.stats->debug_skipped_shapes); },
             [this] { return frame_.stats->debug_skipped_shapes != 0u; });
     warning(
         [this] {
-            return Fmt("Invalid data skipped: %u colliders, %u contact points", frame_.stats->debug_invalid_colliders,
+            return Fmt(Tr("Invalid data skipped: %u colliders, %u contact points"), frame_.stats->debug_invalid_colliders,
                        frame_.stats->debug_invalid_contacts);
         },
         [this] { return frame_.stats->debug_invalid_colliders != 0u || frame_.stats->debug_invalid_contacts != 0u; });
     warning(
         [this] {
-            return Fmt("Overlay limit %u: %llu valid instances omitted", frame_.stats->debug_capacity,
+            return Fmt(Tr("Overlay limit %u: %llu valid instances omitted"), frame_.stats->debug_capacity,
                        static_cast<unsigned long long>(frame_.stats->debug_omitted_instances));
         },
         [this] { return frame_.stats->debug_omitted_instances != 0u; });
-    warning([] { return std::string("Contacts not read: collider proxies used the overlay budget."); },
+    warning([] { return std::string(Tr("Contacts not read: collider proxies used the overlay budget.")); },
             [this] { return frame_.stats->debug_contacts_budget_skipped; });
     root.Add<nui::Label>("N/A: disabled, unavailable or not read. Markers show positions, not forces.", Tone::Dim).wrap = true;
 }
@@ -956,7 +1031,7 @@ void ImGuiLayer::BuildDrive(nui::VStack& root) {
     const size_t n = ui.drive_targets.size();
     root.Add<nui::Label>("No articulation DOFs", Tone::Dim).visible = n == 0u;
     auto& summary = root.Add<nui::Label>(std::string(), Tone::Dim, TextStyle::Label);
-    summary.text_fn = [this, n] { return Fmt("%zu DOF   env %u", n, frame_.ui->env_index); };
+    summary.text_fn = [this, n] { return Fmt(Tr("%zu DOF   env %u"), n, frame_.ui->env_index); };
     summary.visible = n != 0u;
     auto& grid = root.Add<nui::PropertyGrid>();
     const bool labelled = ui.dof_labels.size() == n;
@@ -976,7 +1051,7 @@ void ImGuiLayer::BuildDrive(nui::VStack& root) {
     auto& tgrid = teleop.Add<nui::PropertyGrid>();
     tgrid.Add<nui::BoolField>("Keyboard", nui::Ref(&ui.teleop_enabled));
     tgrid.Add<nui::IntField>("DOF", nui::Ref(&ui.teleop_dof), 0, std::max(static_cast<int>(n) - 1, 0));
-    tgrid.Add<nui::FloatField>("Step", nui::Ref(&ui.teleop_step), 0.005f);
+    tgrid.Add<nui::FloatField>("Step size", nui::Ref(&ui.teleop_step), 0.005f);
     tgrid.Add<nui::BoolField>("PD hold", nui::Ref(&ui.teleop_hold));
     tgrid.Add<nui::FloatField>("kp", nui::Ref(&ui.teleop_kp), 0.5f);
     tgrid.Add<nui::FloatField>("kd", nui::Ref(&ui.teleop_kd), 0.05f);
@@ -998,11 +1073,11 @@ void ImGuiLayer::BuildScript(nui::VStack& root) {
     bar.Add<nui::Button>("Attach", icon::kScriptNode).Action("script.attach");
     bar.Add<nui::Button>("Load", icon::kFile).Action("script.load");
     bar.Add<nui::Label>(std::string(), Tone::Dim, TextStyle::Label).text_fn = [this] {
-        return Fmt("%d script nodes", frame_.ui->script_node_count);
+        return Fmt(Tr("%d script nodes"), frame_.ui->script_node_count);
     };
     root.Add<nui::Label>(std::string(), Tone::Dim).text_fn = [this] {
-        return std::string(frame_.ui->has_scene ? "Ctrl+Enter runs against the loaded world (nuka.*)"
-                                                : "Load a scene, then nuka.* drives it");
+        return std::string(Tr(frame_.ui->has_scene ? "Ctrl+Enter runs against the loaded world (nuka.*)"
+                                                   : "Load a scene, then nuka.* drives it"));
     };
     auto& code = root.Add<nui::CodeEditor>(ui.script_buf, sizeof(ui.script_buf));
     code.height = -1.0f;
@@ -1013,10 +1088,10 @@ void ImGuiLayer::BuildConsole(nui::VStack& root) {
     root.Add<nui::Custom>([this] {
         const float s = nui::Scale();
         ImGui::SetNextItemWidth(std::max(ImGui::GetContentRegionAvail().x - ImGui::GetFrameHeight() - 8.0f * s, 60.0f * s));
-        const std::string hint = Iconed(icon::kFilter, "Filter output");
+        const std::string hint = Iconed(icon::kFilter, Tr("Filter output"));
         ImGui::InputTextWithHint("##filter", hint.c_str(), console_filter_, sizeof(console_filter_));
         ImGui::SameLine();
-        if (draw::IconButton("##clear", icon::kClear, false, "Clear console")) Queue("script.clear_console");
+        if (draw::IconButton("##clear", icon::kClear, false, Tr("Clear console"))) Queue("script.clear_console");
     });
     auto& log = root.Add<nui::LogView>(&frame_.ui->console_log);
     log.filter = nui::Bind<std::string>([this] { return std::string(console_filter_); });
@@ -1026,7 +1101,7 @@ void ImGuiLayer::BuildInspector(nui::VStack& root) {
     root.Add<nui::Label>("Every panel's nui tree; #N is the node's C API handle.", Tone::Dim).wrap = true;
     root.Add<nui::Custom>([this] {
         for (const auto& panel : host_.Panels()) {
-            const std::string head = Fmt("%s  [%s]  %s  rebuilds %llu  draws %llu", panel->title.c_str(), panel->id.c_str(),
+            const std::string head = Fmt("%s  [%s]  %s  rebuilds %llu  draws %llu", Tr(panel->title).c_str(), panel->id.c_str(),
                                          panel->open ? "open" : "closed", static_cast<unsigned long long>(panel->rebuilds),
                                          static_cast<unsigned long long>(panel->draws));
             if (ImGui::TreeNode(panel->id.c_str(), "%s", head.c_str())) {
@@ -1110,13 +1185,14 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
         const ImVec2 vmin(viewport_.x, viewport_.y), vmax(viewport_.x + viewport_.width, viewport_.y + viewport_.height);
         if (ui_state.has_scene) {
             draw::ViewportFrame(vmin, vmax,
-                                {"PERSPECTIVE", Fmt("FOV %.0f\xC2\xB0", camera.fov_degrees), ui_state.playing ? "LIVE" : "PAUSED",
-                                 Fmt("TICK %llu", static_cast<unsigned long long>(stats.sim_ticks))});
+                                {Tr("PERSPECTIVE"), Fmt(Tr("FOV %.0f\xC2\xB0"), camera.fov_degrees),
+                                 Tr(ui_state.playing ? "LIVE" : "PAUSED"),
+                                 Fmt(Tr("TICK %llu"), static_cast<unsigned long long>(stats.sim_ticks))});
         } else {
             const float s = nui::Scale();
             ImFont* font = GetNukaFont(FontRole::Display);
             const float px = theme::kFontLabel * s * 1.3f;
-            const char* text = "NO SCENE   CTRL+O TO OPEN   CTRL+P FOR ACTIONS";
+            const char* text = Tr("NO SCENE   CTRL+O TO OPEN   CTRL+P FOR ACTIONS");
             const ImVec2 size = font->CalcTextSizeA(px, FLT_MAX, 0.0f, text);
             ImGui::GetBackgroundDrawList()->AddText(font, px,
                                                     ImVec2((vmin.x + vmax.x - size.x) * 0.5f, (vmin.y + vmax.y - size.y) * 0.5f),
@@ -1141,14 +1217,20 @@ void ImGuiLayer::DockLayout(ImGuiID dockspace) {
     dock_right_ = ImGui::DockBuilderSplitNode(center, ImGuiDir_Right, 0.28f, nullptr, &center);
     dock_bottom_ = ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.30f, nullptr, &center);
     std::lock_guard<std::recursive_mutex> lock(host_.Mutex());
-    for (const PanelSpec& p : kPanels) host_.FindPanel(p.id)->open = false;
-    // Focusing a column's first panel selects its tab once the windows have docked.
+    for (const PanelSpec& p : kPanels)
+        if (nui::Panel* panel = host_.FindPanel(p.id)) panel->open = false;
+    // Focusing a column's first panel selects its tab once the windows have docked; disabled
+    // built-in extensions leave gaps.
     const auto place = [this](const std::vector<const char*>& ids, ImGuiID node) {
+        nui::Panel* first = nullptr;
         for (const char* id : ids) {
-            host_.FindPanel(id)->open = true;
+            nui::Panel* panel = host_.FindPanel(id);
+            if (panel == nullptr) continue;
+            panel->open = true;
+            if (first == nullptr) first = panel;
             ImGui::DockBuilderDockWindow((std::string("###") + id).c_str(), node);
         }
-        host_.FindPanel(ids.front())->focus_request = true;
+        if (first != nullptr) first->focus_request = true;
     };
     place(preset.left, dock_left_);
     place(preset.right, dock_right_);
@@ -1168,7 +1250,7 @@ bool ImGuiLayer::MenuAction(const std::string& id) {
     const Action* a = registry_->Find(id);
     if (a == nullptr || a->hidden) return false;
     const std::string keys = ShortcutText(a->shortcut);
-    if (ImGui::MenuItemEx(a->label.c_str(), a->icon.empty() ? nullptr : a->icon.c_str(), keys.empty() ? nullptr : keys.c_str(),
+    if (ImGui::MenuItemEx(Tr(a->label).c_str(), a->icon.empty() ? nullptr : a->icon.c_str(), keys.empty() ? nullptr : keys.c_str(),
                           a->checked && a->checked(), !a->enabled || a->enabled()))
         Queue(id);
     return true;
@@ -1185,7 +1267,8 @@ void ImGuiLayer::DrawMenuBar() {
     ImGui::SameLine(0.0f, 14.0f * s);
 
     for (const MenuSpec& menu : Menus()) {
-        if (!ImGui::BeginMenu(menu.title.c_str())) continue;
+        const std::string title = Tr(menu.title) + "###" + menu.title;
+        if (!ImGui::BeginMenu(title.c_str())) continue;
         bool any = false, separator = false;
         for (const std::string& id : menu.items) {
             if (id == "-") {
@@ -1210,7 +1293,7 @@ void ImGuiLayer::DrawMenuBar() {
         }
         if (menu.title == "Simulation") {
             ImGui::Separator();
-            if (ImGui::BeginMenuEx("Speed", icon::kSpeed)) {
+            if (ImGui::BeginMenuEx(Tr("Speed"), icon::kSpeed)) {
                 for (size_t i = 0; i < std::size(kSpeeds); ++i)
                     if (ImGui::MenuItem(kSpeedLabels[i], nullptr, std::fabs(frame_.ui->speed - kSpeeds[i]) < 1e-3f))
                         Queue("sim.speed", Args({{"value", json::Value::Float(kSpeeds[i])}}));
@@ -1218,7 +1301,7 @@ void ImGuiLayer::DrawMenuBar() {
             }
             any = true;
         }
-        if (!any) ImGui::MenuItem("Nothing here yet", nullptr, false, false);
+        if (!any) ImGui::MenuItem(Tr("Nothing here yet"), nullptr, false, false);
         ImGui::EndMenu();
     }
 
@@ -1227,7 +1310,7 @@ void ImGuiLayer::DrawMenuBar() {
     ImFont* label_font = GetNukaFont(FontRole::Display);
     const float label_px = theme::kFontLabel * s;
     const ImVec2 ksize = label_font->CalcTextSizeA(label_px, FLT_MAX, 0.0f, keys);
-    const std::string full = Iconed(icon::kSearch, "Search actions");
+    const std::string full = Iconed(icon::kSearch, Tr("Search actions"));
     const float room = ImGui::GetWindowWidth() - ImGui::GetCursorPosX() - 18.0f * s;
     const bool compact = ImGui::CalcTextSize(full.c_str()).x + ksize.x + 40.0f * s > room;
     const std::string text = compact ? std::string(icon::kSearch) : full;
@@ -1266,7 +1349,7 @@ void ImGuiLayer::DrawToolbar() {
         const auto action = [&](const char* id, const char* glyph, bool checked) {
             const Action* a = registry_->Find(id);
             const std::string keys = ShortcutText(a->shortcut);
-            const std::string tip = keys.empty() ? a->label : a->label + "   " + keys;
+            const std::string tip = keys.empty() ? Tr(a->label) : Tr(a->label) + "   " + keys;
             ImGui::BeginDisabled(a->enabled && !a->enabled());
             if (draw::IconButton(id, glyph, checked, tip.c_str())) Queue(id);
             ImGui::EndDisabled();
@@ -1311,21 +1394,41 @@ void ImGuiLayer::DrawToolbar() {
         action("edit.redo", icon::kRedo, false);
         divider();
         GizmoState& gz = ui.gizmo;
-        if (toggle("##gizmo", icon::kGizmo, gz.enabled, "Gizmo")) gz.enabled = !gz.enabled;
+        if (toggle("##gizmo", icon::kGizmo, gz.enabled, Tr("Gizmo"))) gz.enabled = !gz.enabled;
         ImGui::BeginDisabled(!gz.enabled);
-        if (toggle("##move", icon::kMove, gz.op == GizmoState::Op::Translate, "Move")) gz.op = GizmoState::Op::Translate;
-        if (toggle("##rotate", icon::kRotate, gz.op == GizmoState::Op::Rotate, "Rotate")) gz.op = GizmoState::Op::Rotate;
-        if (toggle("##space", gz.local ? icon::kLocalSpace : icon::kWorldSpace, gz.local, gz.local ? "Local space" : "World space"))
+        if (toggle("##move", icon::kMove, gz.op == GizmoState::Op::Translate, Tr("Move"))) gz.op = GizmoState::Op::Translate;
+        if (toggle("##rotate", icon::kRotate, gz.op == GizmoState::Op::Rotate, Tr("Rotate"))) gz.op = GizmoState::Op::Rotate;
+        if (toggle("##space", gz.local ? icon::kLocalSpace : icon::kWorldSpace, gz.local, Tr(gz.local ? "Local space" : "World space")))
             gz.local = !gz.local;
-        if (toggle("##snap", icon::kSnap, gz.snap_on, "Snap")) gz.snap_on = !gz.snap_on;
+        if (toggle("##snap", icon::kSnap, gz.snap_on, Tr("Snap"))) gz.snap_on = !gz.snap_on;
         ImGui::EndDisabled();
         const float limit = ImGui::GetCursorScreenPos().x + 12.0f * s;
 
-        // Status chips from the right edge; one that would cover the buttons is left out.
+        // The language switch holds the right edge and the status chips line up to its left;
+        // a chip that would cover the buttons is left out.
         float x = wpos.x + wsize.x - 10.0f * s;
         const float cy = wpos.y + wsize.y * 0.5f;
         ImFont* label_font = GetNukaFont(FontRole::Display);
         const float label_px = theme::kFontLabel * s;
+        {
+            const std::vector<nui::LocaleInfo> locales = nui::Locales();
+            const std::string current = nui::Locale();
+            const auto it = std::find_if(locales.begin(), locales.end(), [&](const auto& l) { return l.id == current; });
+            const std::string tag = it != locales.end() ? it->tag : current;
+            const ImVec2 ts = label_font->CalcTextSizeA(label_px, FLT_MAX, 0.0f, tag.c_str());
+            const float bw = ts.x + 34.0f * s, bh = 22.0f * s;
+            const ImVec2 b0(x - bw, cy - bh * 0.5f), b1(x, cy + bh * 0.5f);
+            ImGui::SetCursorScreenPos(b0);
+            if (ImGui::InvisibleButton("##language", ImVec2(bw, bh))) Queue("view.toggle_language");
+            const bool hovered = ImGui::IsItemHovered();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
+                ImGui::SetTooltip("%s   %s", Tr("Switch Language"), ShortcutText(registry_->Find("view.toggle_language")->shortcut).c_str());
+            draw::Chamfer(list, b0, b1, 4.0f * s, U32(hovered ? theme::kBg2 : theme::Alpha(theme::kAccent, 0.08f)),
+                          U32(hovered ? theme::kAccent : theme::kLineHi));
+            draw::Glyph(list, ImVec2(b0.x + 13.0f * s, cy), icon::kTranslate, U32(theme::kAccent), false, 13.0f);
+            list->AddText(label_font, label_px, ImVec2(b0.x + 24.0f * s, cy - ts.y * 0.5f), U32(theme::kFg), tag.c_str());
+            x = b0.x - 6.0f * s;
+        }
         const auto chip = [&](const std::string& text, const ImVec4& color, const char* glyph, bool dot, bool pulse) {
             const ImVec2 ts = label_font->CalcTextSizeA(label_px, FLT_MAX, 0.0f, text.c_str());
             const float lead = glyph != nullptr || dot ? 16.0f * s : 0.0f;
@@ -1343,16 +1446,16 @@ void ImGuiLayer::DrawToolbar() {
             list->AddText(label_font, label_px, ImVec2(c0.x + 8.0f * s + lead, cy - ts.y * 0.5f), U32(color), text.c_str());
             x = c0.x - 6.0f * s;
         };
-        chip(!ui.has_scene ? "NO SCENE" : ui.playing ? "LIVE" : "PAUSED",
+        chip(Tr(!ui.has_scene ? "NO SCENE" : ui.playing ? "LIVE" : "PAUSED"),
              !ui.has_scene ? theme::kFgDim : ui.playing ? theme::kOk : theme::kFgMuted, nullptr, true, ui.playing);
         if (ui.has_scene) {
-            chip(Fmt("T %llu", static_cast<unsigned long long>(stats.sim_ticks)), theme::kFgMuted, icon::kTimer, false, false);
-            chip(stats.zero_copy ? "ZERO-COPY" : "HOST COPY", stats.zero_copy ? theme::kAccent : theme::kWarn,
+            chip(Fmt(Tr("T %llu"), static_cast<unsigned long long>(stats.sim_ticks)), theme::kFgMuted, icon::kTimer, false, false);
+            chip(Tr(stats.zero_copy ? "ZERO-COPY" : "HOST COPY"), stats.zero_copy ? theme::kAccent : theme::kWarn,
                  stats.zero_copy ? icon::kZeroCopy : icon::kHostCopy, false, false);
             if (stats.capped_batches != 0u)
-                chip(Fmt("CAP \xC3\x97%llu", static_cast<unsigned long long>(stats.capped_batches)), theme::kWarn, icon::kWarn,
+                chip(Fmt(Tr("CAP \xC3\x97%llu"), static_cast<unsigned long long>(stats.capped_batches)), theme::kWarn, icon::kWarn,
                      false, false);
-            if (ui.save_dirty) chip("UNSAVED", theme::kWarn, icon::kEdit, false, false);
+            if (ui.save_dirty) chip(Tr("UNSAVED"), theme::kWarn, icon::kEdit, false, false);
         }
     }
     ImGui::End();
@@ -1376,9 +1479,9 @@ void ImGuiLayer::DrawStatusBar() {
         const float px = theme::kFontLabel * s;
         const float cy = wpos.y + wsize.y * 0.5f;
         const std::string path = SelectionPath(frame_);
-        const std::string left = Iconed(icon::kTarget, path.empty() ? "NO SELECTION" : Upper(path).c_str()) + "      " +
-                                 Iconed(icon::kLayout, Upper(layout_).c_str()) + "      " +
-                                 Fmt("UI %.0f%%", static_cast<double>(ui_scale_) * 100.0);
+        const std::string left = Iconed(icon::kTarget, path.empty() ? Tr("NO SELECTION") : Upper(path).c_str()) + "      " +
+                                 Iconed(icon::kLayout, Upper(Tr(FindLayout(layout_)->label)).c_str()) + "      " +
+                                 Fmt(Tr("UI %.0f%%"), static_cast<double>(ui_scale_) * 100.0);
         const ImVec2 lsize = font->CalcTextSizeA(px, FLT_MAX, 0.0f, left.c_str());
         list->AddText(font, px, ImVec2(wpos.x + 10.0f * s, cy - lsize.y * 0.5f), U32(theme::kFgDim), left.c_str());
         const std::string right = Fmt("%.0f FPS   %.2f MS   ", stats.fps, stats.frame_time_ms) + Upper(stats.device_name);
@@ -1412,7 +1515,7 @@ void ImGuiLayer::DrawPalette() {
         list->AddLine(wpos, ImVec2(wpos.x + ImGui::GetWindowWidth(), wpos.y), U32(theme::kAccent), 2.0f * s);
         if (first) ImGui::SetKeyboardFocusHere();
         ImGui::SetNextItemWidth(-FLT_MIN);
-        const std::string hint = Iconed(icon::kCommand, "Run an action");
+        const std::string hint = Iconed(icon::kCommand, Tr("Run an action"));
         if (ImGui::InputTextWithHint("##query", hint.c_str(), palette_query_, sizeof(palette_query_))) palette_index_ = 0;
 
         const std::string query = Lower(palette_query_);
@@ -1424,7 +1527,8 @@ void ImGuiLayer::DrawPalette() {
                 const auto it = std::find(palette_recent_.begin(), palette_recent_.end(), a.id);
                 score = it == palette_recent_.end() ? 0 : 100 - static_cast<int>(it - palette_recent_.begin());
             } else {
-                score = Fuzzy(query, Lower(a.label + " " + CategoryTitle(a.category) + " " + a.id));
+                const char* category = CategoryTitle(a.category);
+                score = Fuzzy(query, Lower(Tr(a.label) + " " + a.label + " " + Tr(category) + " " + category + " " + a.id));
                 if (score < 0) continue;
             }
             matches.emplace_back(score, &a);
@@ -1462,12 +1566,13 @@ void ImGuiLayer::DrawPalette() {
             if (!a.icon.empty())
                 draw::Glyph(list, ImVec2(p.x + 16.0f * s, mid), a.icon.c_str(), U32(current ? theme::kAccent : theme::kFgMuted), false,
                             15.0f);
+            const std::string& label = Tr(a.label);
             list->AddText(ImVec2(p.x + 34.0f * s, mid - ImGui::GetTextLineHeight() * 0.5f), U32(enabled ? theme::kFg : theme::kFgDim),
-                          a.label.c_str());
-            const std::string category = Upper(CategoryTitle(a.category));
+                          label.c_str());
+            const std::string category = Upper(Tr(CategoryTitle(a.category)));
             const ImVec2 csize = label_font->CalcTextSizeA(label_px, FLT_MAX, 0.0f, category.c_str());
             list->AddText(label_font, label_px,
-                          ImVec2(p.x + 44.0f * s + ImGui::CalcTextSize(a.label.c_str()).x, mid - csize.y * 0.5f),
+                          ImVec2(p.x + 44.0f * s + ImGui::CalcTextSize(label.c_str()).x, mid - csize.y * 0.5f),
                           U32(theme::kFgDim), category.c_str());
             const std::string keys = ShortcutText(a.shortcut);
             if (!keys.empty()) {
@@ -1478,7 +1583,7 @@ void ImGuiLayer::DrawPalette() {
             ImGui::PopID();
         }
         ImGui::PopItemFlag();
-        if (shown == 0) ImGui::TextColored(theme::kFgDim, "No matching action");
+        if (shown == 0) ImGui::TextColored(theme::kFgDim, "%s", Tr("No matching action"));
         if (enter && shown > 0) {
             const Action& a = *matches[static_cast<size_t>(palette_index_)].second;
             if (!a.enabled || a.enabled()) chosen = &a;
@@ -1498,14 +1603,15 @@ void ImGuiLayer::DrawPalette() {
 }
 
 void ImGuiLayer::DrawAbout() {
+    const std::string title = std::string(Tr("About Nuka Editor")) + "###about";
     if (about_open_) {
-        ImGui::OpenPopup("About Nuka Editor");
+        ImGui::OpenPopup(title.c_str());
         about_open_ = false;
     }
     const float s = nui::Scale();
     ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSizeConstraints(ImVec2(460.0f * s, 0.0f), ImVec2(460.0f * s, FLT_MAX));
-    if (!ImGui::BeginPopupModal("About Nuka Editor", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize))
+    if (!ImGui::BeginPopupModal(title.c_str(), nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize))
         return;
     render::imgui::DrawNukaLogo(40.0f * s);
     ImGui::SameLine(0.0f, 12.0f * s);
@@ -1513,16 +1619,16 @@ void ImGuiLayer::DrawAbout() {
     nui::PushTextStyle(TextStyle::Hero);
     ImGui::TextUnformatted("NUKA EDITOR");
     nui::PopTextStyle();
-    ImGui::TextColored(theme::kFgMuted, "Physics-first scene editor");
+    ImGui::TextColored(theme::kFgMuted, "%s", Tr("Physics-first scene editor"));
     ImGui::EndGroup();
-    draw::SectionHeader("Versions");
+    draw::SectionHeader(Tr("Versions"));
     ImGui::TextColored(theme::kFgMuted, "nui API v%u    Dear ImGui %s", NUKA_NUI_API_VERSION, IMGUI_VERSION);
-    draw::SectionHeader("Open source");
+    draw::SectionHeader(Tr("Open source"));
     for (const char* credit : {"Phosphor Icons 2.1.1  MIT", "Nerd Fonts 3.4.0: Ubuntu Sans, Martian Mono, Geist Mono  OFL 1.1",
                                "Noto Sans CJK SC  OFL 1.1", "Dear ImGui, ImPlot, ImGuizmo  MIT", "SDL3  zlib"})
         ImGui::TextColored(theme::kFgMuted, "%s", credit);
     ImGui::Dummy(ImVec2(0.0f, 8.0f * s));
-    if (ImGui::Button("Close", ImVec2(-FLT_MIN, 0.0f)) || ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
+    if (ImGui::Button(Tr("Close"), ImVec2(-FLT_MIN, 0.0f)) || ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
     ImGui::EndPopup();
 }
 
@@ -1537,8 +1643,7 @@ void ImGuiLayer::DrawGizmo(CameraController& camera, uint32_t vp_w, uint32_t vp_
         return;
     }
     float view[16], proj[16], model[16];
-    ViewMatrix(camera.ResolvedEye(), camera.ResolvedTarget(), math::Vec3{0.0f, 0.0f, 1.0f}, view);
-    ProjMatrixGL(camera.fov_degrees * 3.14159265358979323846f / 180.0f, viewport_.Aspect(), 0.05f, 500.0f, proj);
+    CameraMatrices(camera, view, proj);
     ModelMatrix(world, model);
 
     ImGuizmo::Enable(viewport_hovered_ || ImGuizmo::IsUsing());

@@ -19,6 +19,7 @@
 #include "runtime/app/viewer/editor_actions.hpp"
 #include "runtime/app/viewer/editor_document.hpp"
 #include "runtime/app/viewer/editor_edits.hpp"
+#include "runtime/app/viewer/editor_extensions.hpp"
 #include "runtime/app/viewer/editor_scene.hpp"
 #include "runtime/app/viewer/entity_drag.hpp"
 #include "runtime/app/viewer/file_dialog.hpp"
@@ -42,6 +43,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -121,6 +123,9 @@ struct LaunchOptions {
     float perturb[3] = {0.0f, 0.0f, 0.0f};
     std::string layout;
     float ui_scale = 1.0f;
+    std::string locale;
+    std::vector<std::string> ext_ids;
+    std::vector<std::string> ext_folders;
 };
 
 bool ReadEntireFile(const std::string& path, std::string* out) {
@@ -157,6 +162,8 @@ void PrintUsage() {
                 "  [--speed X sets the transport speed; --publish auto|host|zero-copy picks the pose path]\n"
                 "  [--perturb FX,FY,FZ holds a world force [N] on the --select entity's link or body]\n"
                 "  [--layout authoring|debug|robot|data|training picks the panel layout; --ui-scale X]\n"
+                "  [--locale en|zh-CN picks the UI language]\n"
+                "  [--ext ID enables an installed extension; --ext-folder DIR adds a search folder]\n"
                 "  default -> Nuka Dynamics Lab; --empty opens a blank workspace\n"
                 "  --offscreen renders to a display-less surface\n"
                 "  --policy attaches a trained locomotion controller to each load\n"
@@ -237,6 +244,9 @@ bool ParseOptions(const std::vector<std::string>& args, LaunchOptions* opt) {
         }
         else if (a == "--layout" && has_value) opt->layout = args[++i];
         else if (a == "--ui-scale" && has_value) opt->ui_scale = static_cast<float>(std::atof(args[++i].c_str()));
+        else if (a == "--locale" && has_value) opt->locale = args[++i];
+        else if (a == "--ext" && has_value) opt->ext_ids.push_back(args[++i]);
+        else if (a == "--ext-folder" && has_value) opt->ext_folders.push_back(args[++i]);
         else if (a == "--help") {
             PrintUsage();
             return false;
@@ -437,6 +447,7 @@ struct EditorHost::State : DocumentHost {
     void RegisterEditActions();
     void RegisterSimActions();
     void RegisterViewActions();
+    void ConfigureExtensions();
     void Queue(const std::string& id, json::Value args, const std::string& source);
     void RunQueuedActions();
     ActionResult RunAction(const std::string& id, const json::Value& args, const std::string& source);
@@ -507,6 +518,8 @@ struct EditorHost::State : DocumentHost {
     std::unique_ptr<render::PresentRenderer> present_;
     render::imgui::NukaImGuiContext imgui_;
     ImGuiLayer ui_;
+    ExtensionManager extensions_;
+    bool extensions_started_ = false;
     CameraController camera_;
     ViewerUiState ui_state_;
     DebugOverlay debug_overlay_;
@@ -608,9 +621,11 @@ EditorHost::State::State(const std::vector<std::string>& args, nuka_world_handle
 
     ui_.EnableDocking();  // must precede the first NewFrame
     RegisterActions();
+    ConfigureExtensions();
     if (!opt_.layout.empty() && !ui_.SetLayout(opt_.layout))
         std::fprintf(stderr, "[nuka_editor] unknown --layout '%s'\n", opt_.layout.c_str());
     ui_.SetUiScale(opt_.ui_scale);
+    if (!opt_.locale.empty()) nui::SetLocale(opt_.locale);
     ui_state_.show_colliders = opt_.show_colliders;
     ui_state_.show_contacts = opt_.show_contacts;
     ui_state_.speed = opt_.speed;
@@ -625,6 +640,7 @@ EditorHost::State::State(const std::vector<std::string>& args, nuka_world_handle
 }
 
 EditorHost::State::~State() {
+    extensions_.Shutdown();
     worker_.StopThread();
     if (present_) {
         present_->WaitIdle();
@@ -660,6 +676,33 @@ void EditorHost::State::DrainConsoleInbox() {
         text.swap(console_inbox_);
     }
     ConsoleAppend(text);
+}
+
+// Search order: --ext-folder, so a working copy wins over an installed one, then next to the
+// module, the Python package's folder and the user's.
+void EditorHost::State::ConfigureExtensions() {
+    std::vector<std::filesystem::path> folders;
+    for (const std::string& folder : opt_.ext_folders) folders.emplace_back(std::u8string(folder.begin(), folder.end()));
+    const std::filesystem::path module = render::ViewerModuleDirectory();
+    folders.push_back(module / "extensions");
+    folders.push_back(module / "editor" / "extensions");
+#if defined(_WIN32)
+    const char* home = std::getenv("USERPROFILE");
+#else
+    const char* home = std::getenv("HOME");
+#endif
+    if (home != nullptr) folders.push_back(std::filesystem::path(home) / ".nuka" / "extensions");
+    ExtensionServices services;
+    services.actions = &actions_;
+    services.ui = &ui_;
+    services.run = [this](const std::string& id, const json::Value& args, const std::string& source) {
+        return RunAction(id, args, source);
+    };
+    services.console = [this](const std::string& text) {
+        std::fputs(text.c_str(), stdout);
+        ConsoleAppend(text);
+    };
+    extensions_.Configure(std::move(services), std::move(folders), opt_.ext_ids);
 }
 
 void EditorHost::State::PrintSummary() {
@@ -1200,6 +1243,8 @@ void EditorHost::State::RunQueuedActions() {
 }
 
 ActionResult EditorHost::State::RunAction(const std::string& id, const json::Value& args, const std::string& source) {
+    const Action* action = actions_.Find(id);
+    const std::string owner = action != nullptr ? action->owner : std::string();
     ActionResult result = actions_.Run(id, args, source, frame_index_);
     if (!result.ok) {
         last_error_ = result.error;
@@ -1208,6 +1253,7 @@ ActionResult EditorHost::State::RunAction(const std::string& id, const json::Val
         ConsoleAppend(msg);
         ui_.Nui().Toast(nui::Level::Err, id + ": " + result.error);
     }
+    if (!owner.empty()) extensions_.Report(owner, id, result.ok);
     return result;
 }
 
@@ -1216,7 +1262,7 @@ ActionResult EditorHost::State::SaveScene(const std::string& path) {
     doc_.MarkSaved();
     std::snprintf(ui_state_.save_path, sizeof(ui_state_.save_path), "%s", path.c_str());
     std::printf("[nuka_editor] saved %s\n", path.c_str());
-    ui_.Nui().Toast(nui::Level::Ok, "Saved " + FileName(path));
+    ui_.Nui().Toast(nui::Level::Ok, std::string(nui::Tr("Saved")) + " " + FileName(path));
     return Ok(Object({{"path", json::Value::Str(path)}}));
 }
 
@@ -1233,12 +1279,12 @@ void EditorHost::State::RegisterFileActions() {
     actions_.Add({"file.open", "Open Scene...", "file", "", ShortcutScope::Global, {}, {},
                   [this](const json::Value& args) {
                       std::string path = StrArg(args, "path");
-                      if (path.empty()) path = OpenFileDialog("Open Scene", "Nuka scenes", "*.nks");
+                      if (path.empty()) path = OpenFileDialog(nui::Tr("Open Scene"), nui::Tr("Nuka scenes"), "*.nks");
                       if (path.empty()) return ActionResult::Fail("no scene chosen");
                       std::snprintf(ui_state_.load_path, sizeof(ui_state_.load_path), "%s", path.c_str());
                       worker_.Exclusive([&] { ApplyLoad(path); });
                       if (!ui_state_.load_error.empty()) return ActionResult::Fail(ui_state_.load_error);
-                      ui_.Nui().Toast(nui::Level::Ok, "Opened " + FileName(path));
+                      ui_.Nui().Toast(nui::Level::Ok, std::string(nui::Tr("Opened")) + " " + FileName(path));
                       return Ok(Object({{"path", json::Value::Str(path)}}));
                   }});
     actions_.Add({"file.unload", "Unload", "file", "", ShortcutScope::Global, has_scene, {},
@@ -1254,7 +1300,7 @@ void EditorHost::State::RegisterFileActions() {
     actions_.Add({"file.save_as", "Save As...", "file", "", ShortcutScope::Global, has_scene, {},
                   [this](const json::Value& args) {
                       std::string path = StrArg(args, "path");
-                      if (path.empty()) path = SaveFileDialog("Save Scene", "Nuka scenes", "*.nks", ui_state_.save_path);
+                      if (path.empty()) path = SaveFileDialog(nui::Tr("Save Scene"), nui::Tr("Nuka scenes"), "*.nks", ui_state_.save_path);
                       return path.empty() ? ActionResult::Fail("no save path chosen") : SaveScene(path);
                   }});
 }
@@ -1627,6 +1673,12 @@ void EditorHost::State::Frame(bool step_physics) {
     if (opt_.redo && frame_index_ == 2u) Queue("edit.redo", json::Value::Object(), "cli");
     if (opt_.reset_at_frame >= 0 && static_cast<int>(frame_index_) == opt_.reset_at_frame)
         Queue("sim.reset", json::Value::Object(), "cli");
+    // Extensions start once the host has installed its hooks, so Python ones can load.
+    if (!extensions_started_) {
+        extensions_started_ = true;
+        extensions_.Start();
+    }
+    extensions_.Poll();
     ui_.Nui().DispatchEvents();
     // Queued loads and edits land at a tick boundary, before this frame takes a render-world reference.
     RunQueuedActions();
@@ -1784,6 +1836,7 @@ void EditorHost::State::Frame(bool step_physics) {
         }
         last_framing_rect_ = rect;
     }
+    extensions_.DrawOverlays(camera_, last_tick_);
 
     CameraController render_camera = camera_;
 
@@ -2006,6 +2059,7 @@ EditorHost::EditorHost(const std::vector<std::string>& args, nuka_world_handle w
 EditorHost::~EditorHost() = default;
 
 void EditorHost::SetScriptHooks(const nuka_editor_script_hooks_t& hooks) { state_->SetHooks(hooks); }
+void EditorHost::SetPythonHooks(const nuka_editor_python_hooks_t& hooks) { state_->extensions_.SetPythonHooks(hooks); }
 void EditorHost::Update(bool step_physics) { state_->Frame(step_physics); }
 void EditorHost::StopPhysics() { state_->worker_.StopThread(); }
 bool EditorHost::Running() const { return state_->running_; }
@@ -2037,5 +2091,8 @@ std::string EditorHost::Actions() const { return state_->actions_.List().Dump(0)
 std::string EditorHost::ActionLog(uint64_t since) const { return state_->actions_.LogSince(since).Dump(0); }
 std::string EditorHost::DocumentState() { return state_->DocumentState().Dump(0); }
 const nuka_nui_api_t* EditorHost::Nui() { return state_->ui_.Nui().Api(); }
+const nuka_editor_host_api_t* EditorHost::ExtensionHost(const std::string& id) const {
+    return state_->extensions_.HostApi(id);
+}
 
 }  // namespace nuka::runtime::app::viewer

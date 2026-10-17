@@ -18,6 +18,7 @@ From a script, over a world the script owns::
 ``launch`` returns an ``EditorApp`` or, headless, a ``HeadlessApp`` with the same
 running/update/run/on_tick/stop/close surface that never loads the editor library,
 SDL3 or Vulkan. ``EditorApp.ui`` builds panels in the editor shell (see ``nuka.editor.ui``).
+Editor extensions in Python subclass ``Extension`` (see ``nuka.editor.extension``).
 """
 
 from __future__ import annotations
@@ -27,10 +28,11 @@ import sys
 from typing import Optional, Sequence
 
 from .app import ActionError, Actions, EditorApp, HeadlessApp, ScriptRunner
+from .extension import Context, Extension
 from .ui import UI, Node
 
-__all__ = ["ActionError", "Actions", "EditorApp", "HeadlessApp", "Node", "ScriptRunner", "UI", "add_launcher_args",
-           "launch", "main"]
+__all__ = ["ActionError", "Actions", "Context", "EditorApp", "Extension", "HeadlessApp", "Node", "ScriptRunner", "UI",
+           "add_launcher_args", "launch", "main"]
 
 
 def add_launcher_args(parser: argparse.ArgumentParser) -> None:

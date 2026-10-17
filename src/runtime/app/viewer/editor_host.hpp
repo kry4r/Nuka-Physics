@@ -21,6 +21,7 @@ public:
     EditorHost& operator=(const EditorHost&) = delete;
 
     void SetScriptHooks(const nuka_editor_script_hooks_t& hooks);
+    void SetPythonHooks(const nuka_editor_python_hooks_t& hooks);
     void Update(bool step_physics);
     void StopPhysics();
     bool Running() const;
@@ -36,6 +37,8 @@ public:
     std::string DocumentState();
     // The shell's nui C API; valid for the editor's lifetime.
     const nuka_nui_api_t* Nui();
+    // The host table of an enabled extension, or null; valid until it is disabled.
+    const nuka_editor_host_api_t* ExtensionHost(const std::string& id) const;
 
 private:
     struct State;

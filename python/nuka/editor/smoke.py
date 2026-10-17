@@ -193,13 +193,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         crash = traceback.format_exc()
         print(crash, file=sys.stderr, flush=True)
     log = app.actions.log()
+    extensions = app.actions.run("extensions.list")
     app.close()
 
     passed = crash is None and len(steps) == len(scenario["steps"]) and all(s["ok"] for s in steps)
     report = {
         "scenario": scenario["name"], "passed": passed, "crash": crash, "steps": steps, "marks": run.marks,
         "frame_ms_p50": stats.get("frame_ms_p50"), "frame_ms_p95": stats.get("frame_ms_p95"),
-        "snapshot_age_ms_p95": stats.get("age_ms_p95"), "stats": stats, "extension_errors": [],
+        "snapshot_age_ms_p95": stats.get("age_ms_p95"), "stats": stats,
+        "extension_errors": [{"id": e["id"], "error": e["error"]} for e in extensions if e["error"]],
         "screenshots": run.screenshots, "action_log": [e for e in log if e["id"] != "view.stats"],
     }
     (out / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")

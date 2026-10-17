@@ -1,0 +1,11 @@
+[package]
+id = "hello_cpp"
+version = "1.0.0"
+title = "Hello C++"
+description = "A sample native extension: a panel, an action, a viewport overlay and a Dear ImGui panel."
+
+[native]
+library = "bin/${platform}/hello_cpp"
+
+[settings]
+greeting = "Hello from C++"

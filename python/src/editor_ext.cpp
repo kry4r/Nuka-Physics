@@ -2,11 +2,13 @@
 // with the GIL released; script hooks and UI events take it back to call into Python.
 
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/array.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
 #include "nuka/nuka_editor.h"
 
+#include <array>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -23,10 +25,174 @@ void Check(nuka_result_t result, const char* what) {
                                  std::to_string(static_cast<int>(result)));
 }
 
+using Point = std::array<float, 3>;
+
+// One overlay draw call's frame; it stops working when the call returns.
+class OverlayFrame {
+public:
+    explicit OverlayFrame(const nuka_editor_overlay_frame_t* frame) : frame_(frame) {}
+    std::vector<float> view() const { return std::vector<float>(Frame().view, Frame().view + 16); }
+    std::vector<float> proj() const { return std::vector<float>(Frame().proj, Frame().proj + 16); }
+    std::vector<float> viewport() const { return std::vector<float>(Frame().viewport, Frame().viewport + 4); }
+    uint64_t tick() const { return Frame().tick; }
+    void line(const Point& a, const Point& b, uint32_t rgba, float thickness) const {
+        Frame().line(Frame().host, a.data(), b.data(), rgba, thickness);
+    }
+    void circle(const Point& center, float radius_px, uint32_t rgba, float thickness) const {
+        Frame().circle(Frame().host, center.data(), radius_px, rgba, thickness);
+    }
+    void text(const Point& at, uint32_t rgba, const std::string& content) const {
+        Frame().text(Frame().host, at.data(), rgba, content.c_str());
+    }
+    void Drop() { frame_ = nullptr; }
+
+private:
+    const nuka_editor_overlay_frame_t& Frame() const {
+        if (frame_ == nullptr) throw std::runtime_error("an overlay frame draws only during its call");
+        return *frame_;
+    }
+    const nuka_editor_overlay_frame_t* frame_;
+};
+
+// A Python callable the editor holds for an extension; released with the GIL taken.
+struct Callback {
+    nb::object fn;
+    std::string reply;
+    static void Release(void* self) {
+        nb::gil_scoped_acquire acquire;
+        delete static_cast<Callback*>(self);
+    }
+};
+
+// The editor as one extension sees it (nuka_editor_host_api_t): what it builds or registers
+// here goes away when the extension is disabled, and the table with it.
+class ExtHost {
+public:
+    explicit ExtHost(const nuka_editor_host_api_t* api) : api_(api) {}
+
+    std::string id() const { return Api().extension_id; }
+    std::string dir() const { return Api().extension_dir; }
+    std::string settings_json() const { return Api().settings_json; }
+
+    uint32_t nui_panel(const std::string& panel_id, const std::string& title, const std::string& dock) {
+        return Made(Nui().panel(Nui().host, panel_id.c_str(), title.c_str(), dock.c_str()));
+    }
+    uint32_t nui_add(uint32_t parent, const std::string& kind, const std::string& props_json) {
+        return Made(Nui().add(Nui().host, parent, kind.c_str(), props_json.c_str()));
+    }
+    void nui_set(uint32_t node, const std::string& props_json) { Done(Nui().set(Nui().host, node, props_json.c_str())); }
+    void nui_remove(uint32_t node) { Done(Nui().remove(Nui().host, node)); }
+    void nui_clear(uint32_t node) { Done(Nui().clear(Nui().host, node)); }
+    std::string nui_get(uint32_t node) {
+        const char* text = Nui().get(Nui().host, node);
+        if (text == nullptr) throw std::runtime_error(Nui().last_error(Nui().host));
+        return text;
+    }
+    void nui_listen(uint32_t node) { Done(Nui().on_event(Nui().host, node, &UiEvent, this)); }
+    void set_ui_handler(nb::object handler) { ui_handler_ = std::move(handler); }
+    void toast(int level, const std::string& text) {
+        Nui().toast(Nui().host, static_cast<nuka_nui_level_t>(level), text.c_str());
+    }
+    void progress(const std::string& entry_id, const std::string& label, float fraction) {
+        Nui().progress(Nui().host, entry_id.c_str(), label.c_str(), fraction);
+    }
+
+    // fn(args_json) returns (ok, value_json or reason).
+    void register_action(const std::string& action_id, const std::string& label, const std::string& category,
+                         const std::string& shortcut, const std::string& icon, bool hidden, nb::object fn) {
+        nuka_editor_action_desc_t desc{};
+        desc.struct_size = static_cast<uint32_t>(sizeof(desc));
+        desc.id = action_id.c_str();
+        desc.label = label.c_str();
+        desc.category = category.empty() ? nullptr : category.c_str();
+        desc.shortcut = shortcut.empty() ? nullptr : shortcut.c_str();
+        desc.icon = icon.empty() ? nullptr : icon.c_str();
+        desc.hidden = hidden ? 1u : 0u;
+        desc.run = &RunAction;
+        desc.user = new Callback{std::move(fn), std::string()};
+        desc.release = &Callback::Release;
+        if (Api().register_action(Api().host, &desc) != NUKA_RESULT_OK)
+            throw std::runtime_error("cannot register action '" + action_id + "'; see the extension log");
+    }
+    // fn(frame) returns whether it drew.
+    void register_overlay(const std::string& overlay_id, nb::object fn) {
+        nuka_editor_overlay_desc_t desc{};
+        desc.struct_size = static_cast<uint32_t>(sizeof(desc));
+        desc.id = overlay_id.c_str();
+        desc.draw = &DrawOverlay;
+        desc.user = new Callback{std::move(fn), std::string()};
+        desc.release = &Callback::Release;
+        Check(Api().register_overlay(Api().host, &desc), "register_overlay");
+    }
+    void log(int level, const std::string& text) {
+        Api().log(Api().host, static_cast<nuka_nui_level_t>(level), text.c_str());
+    }
+    // The extension stops; the table goes with it.
+    void close() {
+        api_ = nullptr;
+        ui_handler_ = nb::object();
+    }
+
+private:
+    const nuka_editor_host_api_t& Api() const {
+        if (api_ == nullptr) throw std::runtime_error("the extension is disabled");
+        return *api_;
+    }
+    const nuka_nui_api_t& Nui() const { return *Api().nui; }
+    uint32_t Made(uint32_t node) const {
+        if (node == 0u) throw std::runtime_error(Nui().last_error(Nui().host));
+        return node;
+    }
+    void Done(int32_t ok) const {
+        if (ok == 0) throw std::runtime_error(Nui().last_error(Nui().host));
+    }
+
+    static void UiEvent(void* self, uint32_t node, const char* event_json) {
+        ExtHost& host = *static_cast<ExtHost*>(self);
+        nb::gil_scoped_acquire acquire;
+        if (!host.ui_handler_.is_valid()) return;
+        try {
+            host.ui_handler_(node, event_json);
+        } catch (nb::python_error& error) {
+            error.discard_as_unraisable("nuka.editor extension ui handler");
+        }
+    }
+    static int32_t RunAction(void* user, const char* args_json, const char** out_json) {
+        Callback& callback = *static_cast<Callback*>(user);
+        nb::gil_scoped_acquire acquire;
+        bool ok = false;
+        try {
+            nb::tuple reply = nb::cast<nb::tuple>(callback.fn(args_json));
+            ok = nb::cast<bool>(reply[0]);
+            callback.reply = nb::cast<std::string>(reply[1]);
+        } catch (nb::python_error& error) {
+            callback.reply = error.what();
+        }
+        *out_json = callback.reply.c_str();
+        return ok ? 1 : 0;
+    }
+    static int32_t DrawOverlay(void* user, const nuka_editor_overlay_frame_t* frame) {
+        Callback& callback = *static_cast<Callback*>(user);
+        nb::gil_scoped_acquire acquire;
+        nb::object view = nb::cast(OverlayFrame(frame));
+        bool ok = false;
+        try {
+            ok = nb::cast<bool>(callback.fn(view));
+        } catch (nb::python_error& error) {
+            error.discard_as_unraisable("nuka.editor overlay");
+        }
+        nb::cast<OverlayFrame&>(view).Drop();
+        return ok ? 1 : 0;
+    }
+
+    const nuka_editor_host_api_t* api_;
+    nb::object ui_handler_;
+};
+
 class App {
 public:
-    App(const std::vector<std::string>& args, std::uintptr_t world, float dt, nb::object runner)
-        : runner_(std::move(runner)) {
+    App(const std::vector<std::string>& args, std::uintptr_t world, float dt, nb::object runner, nb::object extensions)
+        : runner_(std::move(runner)), extensions_(std::move(extensions)) {
         std::vector<const char*> argv;
         argv.reserve(args.size());
         for (const std::string& arg : args) argv.push_back(arg.c_str());
@@ -39,6 +205,8 @@ public:
         Check(result, "nuka_editor_create");
         const nuka_editor_script_hooks_t hooks{this, &Run, &Register, &Unregister, &Clear, &Dispatch};
         Check(nuka_editor_set_script_hooks(editor_, &hooks), "nuka_editor_set_script_hooks");
+        const nuka_editor_python_hooks_t python{this, &LoadExtension, &UnloadExtension};
+        Check(nuka_editor_set_python_hooks(editor_, &python), "nuka_editor_set_python_hooks");
         api_ = nuka_editor_nui(editor_);
     }
     ~App() { destroy(); }
@@ -120,6 +288,12 @@ public:
     void progress(const std::string& id, const std::string& label, float fraction) {
         Nui().progress(api_->host, id.c_str(), label.c_str(), fraction);
     }
+    // An enabled extension's scoped host; the loader asks for it while the extension loads.
+    ExtHost extension_host(const std::string& id) const {
+        const nuka_editor_host_api_t* host = nuka_editor_extension_host(Editor(), id.c_str());
+        if (host == nullptr) throw std::runtime_error("no enabled extension '" + id + "'");
+        return ExtHost(host);
+    }
 
     void destroy() {
         if (editor_ == nullptr) return;
@@ -190,7 +364,39 @@ private:
         return Call(self, [&](nb::object& runner) { return runner.attr("dispatch")(static_cast<int>(callback)); });
     }
 
+    // The loader replies (ok, text): the log on success, the traceback on failure.
+    static const char* LoadExtension(void* self, const char* id, const char* module, const char* dir,
+                                     int32_t* failed) {
+        App& app = *static_cast<App*>(self);
+        static thread_local std::string text;
+        nb::gil_scoped_acquire acquire;
+        *failed = 1;
+        try {
+            nb::tuple reply = nb::cast<nb::tuple>(app.extensions_.attr("load")(id, module, dir));
+            *failed = nb::cast<bool>(reply[0]) ? 0 : 1;
+            text = nb::cast<std::string>(reply[1]);
+        } catch (nb::python_error& error) {
+            text = error.what();
+        }
+        return text.empty() ? nullptr : text.c_str();
+    }
+    static const char* UnloadExtension(void* self, const char* id) {
+        App& app = *static_cast<App*>(self);
+        static thread_local std::string text;
+        nb::gil_scoped_acquire acquire;
+        try {
+            nb::object reply = app.extensions_.attr("unload")(id);
+            if (reply.is_none()) return nullptr;
+            text = nb::cast<std::string>(reply);
+            return text.c_str();
+        } catch (nb::python_error& error) {
+            error.discard_as_unraisable("nuka.editor extension unload");
+            return nullptr;
+        }
+    }
+
     nb::object runner_;
+    nb::object extensions_;
     nb::object ui_handler_;
     nuka_editor_handle editor_ = nullptr;
     const nuka_nui_api_t* api_ = nullptr;
@@ -201,11 +407,42 @@ private:
 NB_MODULE(_editor_ext, m) {
     m.doc() = "The Nuka editor library; use nuka.editor.";
 
+    nb::class_<OverlayFrame>(m, "OverlayFrame", "One overlay draw over the scene viewport; rgba is 0xRRGGBBAA.")
+        .def_prop_ro("view", &OverlayFrame::view, "The column-major view matrix.")
+        .def_prop_ro("proj", &OverlayFrame::proj, "The column-major GL-style projection.")
+        .def_prop_ro("viewport", &OverlayFrame::viewport, "x, y, width, height in window pixels.")
+        .def_prop_ro("tick", &OverlayFrame::tick)
+        .def("line", &OverlayFrame::line, nb::arg("a"), nb::arg("b"), nb::arg("rgba"), nb::arg("thickness") = 1.5f)
+        .def("circle", &OverlayFrame::circle, nb::arg("center"), nb::arg("radius_px"), nb::arg("rgba"),
+             nb::arg("thickness") = 1.5f)
+        .def("text", &OverlayFrame::text, nb::arg("at"), nb::arg("rgba"), nb::arg("text"));
+
+    nb::class_<ExtHost>(m, "ExtHost", "One extension's host table; use nuka.editor.extension.Context.")
+        .def_prop_ro("id", &ExtHost::id)
+        .def_prop_ro("dir", &ExtHost::dir)
+        .def_prop_ro("settings_json", &ExtHost::settings_json)
+        .def("nui_panel", &ExtHost::nui_panel, nb::arg("id"), nb::arg("title"), nb::arg("dock"))
+        .def("nui_add", &ExtHost::nui_add, nb::arg("parent"), nb::arg("kind"), nb::arg("props_json"))
+        .def("nui_set", &ExtHost::nui_set, nb::arg("node"), nb::arg("props_json"))
+        .def("nui_remove", &ExtHost::nui_remove, nb::arg("node"))
+        .def("nui_clear", &ExtHost::nui_clear, nb::arg("node"))
+        .def("nui_get", &ExtHost::nui_get, nb::arg("node"))
+        .def("nui_listen", &ExtHost::nui_listen, nb::arg("node"))
+        .def("set_ui_handler", &ExtHost::set_ui_handler, nb::arg("handler"))
+        .def("toast", &ExtHost::toast, nb::arg("level"), nb::arg("text"))
+        .def("progress", &ExtHost::progress, nb::arg("id"), nb::arg("label"), nb::arg("fraction"))
+        .def("register_action", &ExtHost::register_action, nb::arg("id"), nb::arg("label"), nb::arg("category"),
+             nb::arg("shortcut"), nb::arg("icon"), nb::arg("hidden"), nb::arg("fn"))
+        .def("register_overlay", &ExtHost::register_overlay, nb::arg("id"), nb::arg("fn"))
+        .def("log", &ExtHost::log, nb::arg("level"), nb::arg("text"))
+        .def("close", &ExtHost::close);
+
     nb::class_<App>(m, "App")
-        .def(nb::init<const std::vector<std::string>&, std::uintptr_t, float, nb::object>(),
-             nb::arg("args"), nb::arg("world"), nb::arg("dt"), nb::arg("runner"),
+        .def(nb::init<const std::vector<std::string>&, std::uintptr_t, float, nb::object, nb::object>(),
+             nb::arg("args"), nb::arg("world"), nb::arg("dt"), nb::arg("runner"), nb::arg("extensions"),
              "Open the editor over a world handle (0: it creates one at the first load). "
-             "runner receives run/register/unregister/clear/dispatch calls for scripts.")
+             "runner receives run/register/unregister/clear/dispatch calls for scripts, extensions "
+             "load/unload calls for Python extensions.")
         .def("update", &App::update, nb::arg("step"),
              "One frame. Physics advances with the editor transport only when step is True.")
         .def("stop_physics", &App::stop_physics,
@@ -234,5 +471,6 @@ NB_MODULE(_editor_ext, m) {
         .def("set_ui_handler", &App::set_ui_handler, nb::arg("handler"))
         .def("toast", &App::toast, nb::arg("level"), nb::arg("text"))
         .def("progress", &App::progress, nb::arg("id"), nb::arg("label"), nb::arg("fraction"))
+        .def("extension_host", &App::extension_host, nb::arg("id"))
         .def("destroy", &App::destroy, "Close the window and destroy any world the editor created.");
 }

@@ -344,6 +344,7 @@ if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)
             COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${target}>/docs/media"
             COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_SOURCE_DIR}/docs/media/nuka-logo.png" "$<TARGET_FILE_DIR:${target}>/docs/media/nuka-logo.png"
             COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/examples/assets/nuka_lab" "$<TARGET_FILE_DIR:${target}>/examples/assets/nuka_lab"
+            COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/assets/editor" "$<TARGET_FILE_DIR:${target}>/assets/editor"
             VERBATIM)
     endfunction()
     nuka_set_warnings(nuka_imgui)
@@ -394,12 +395,14 @@ if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)
         runtime/app/viewer/nui/nui_capi.cpp
         runtime/app/viewer/nui/nui_core.cpp
         runtime/app/viewer/nui/nui_data.cpp
+        runtime/app/viewer/nui/nui_i18n.cpp
         runtime/app/viewer/nui/nui_widgets.cpp
     )
     set_target_properties(nuka_viewer PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_include_directories(nuka_viewer PUBLIC ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/include)
     target_compile_definitions(nuka_viewer PUBLIC NK_BUILD_VULKAN_VALIDATION)
-    target_link_libraries(nuka_viewer PUBLIC nuka_scene nuka_present nuka_imgui imgui)
+    target_compile_definitions(nuka_viewer PRIVATE NUKA_EDITOR_I18N_DIR="${CMAKE_SOURCE_DIR}/assets/editor/i18n")
+    target_link_libraries(nuka_viewer PUBLIC nuka_scene nuka_present nuka_imgui imgui PRIVATE nuka_toml)
     nuka_set_warnings(nuka_viewer)
 endif()
 
@@ -1218,6 +1221,7 @@ if(CMAKE_CUDA_COMPILER)
         add_library(nuka_editor SHARED
             runtime/app/viewer/editor_host.cpp
             runtime/app/viewer/editor_api.cpp
+            runtime/app/viewer/editor_extensions.cpp
         )
         add_dependencies(nuka_editor nuka_render_shaders)
         set_target_properties(nuka_editor PROPERTIES
@@ -1237,6 +1241,7 @@ if(CMAKE_CUDA_COMPILER)
                 nuka_render
                 nuka_import
                 imgui
+                nuka_toml
                 Vulkan::Vulkan
         )
         if(NOT WIN32)

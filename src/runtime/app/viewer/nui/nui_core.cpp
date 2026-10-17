@@ -78,7 +78,9 @@ const char* IconOf(const std::string& name) {
         {"cylinder", icon::kCylinder}, {"chip", icon::kChip}, {"timer", icon::kTimer},
         {"keyboard", icon::kKeyboard}, {"hexagon", icon::kHexagon}, {"command", icon::kCommand},
         {"atom", icon::kAtom}, {"palette", icon::kPalette}, {"lock", icon::kLock}, {"filter", icon::kFilter},
-        {"plot", icon::kPlot}, {"waves", icon::kWaves}};
+        {"plot", icon::kPlot}, {"waves", icon::kWaves}, {"translate", icon::kTranslate}, {"power", icon::kPower},
+        {"prohibit", icon::kProhibit}, {"plug", icon::kPlug}, {"package", icon::kPackage}, {"code", icon::kCode},
+        {"file_py", icon::kFilePy}, {"file_cpp", icon::kFileCpp}};
     const auto it = table.find(name);
     return it != table.end() ? it->second : name.c_str();
 }
@@ -121,7 +123,7 @@ std::string WithIcon(const std::string& glyph, const std::string& text) {
 
 std::string ActionTip(const std::string& action) {
     const ActionHooks& hooks = Host::Current()->actions;
-    std::string tip = hooks.label(action);
+    std::string tip = Tr(hooks.label(action));
     const std::string keys = hooks.shortcut(action);
     if (!keys.empty()) tip += "   " + keys;
     return tip;
@@ -131,8 +133,9 @@ void RunAction(const std::string& action, const json::Value& args) { Host::Curre
 
 bool InGrid(const Node* parent) { return parent != nullptr && std::string_view(parent->Kind()) == "property_grid"; }
 
-void FieldLabel(const std::string& label, Tier tier, bool in_grid) {
+void FieldLabel(const std::string& caption, Tier tier, bool in_grid) {
     const float s = Scale();
+    const std::string& label = Tr(caption);
     if (in_grid) {
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);
@@ -334,7 +337,7 @@ void Node::Draw() {
     rect_min = ImGui::GetItemRectMin();
     rect_max = ImGui::GetItemRectMax();
     if (!tooltip.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip | ImGuiHoveredFlags_AllowWhenDisabled))
-        ImGui::SetTooltip("%s", tooltip.c_str());
+        ImGui::SetTooltip("%s", Tr(tooltip).c_str());
     if (disabled) ImGui::EndDisabled();
     ++draws;
 }
@@ -470,7 +473,7 @@ void Separator::SetProps(const json::Value& props) {
 
 void Separator::DrawSelf() {
     if (label.empty()) ImGui::Separator();
-    else draw::SectionHeader(label.c_str());
+    else draw::SectionHeader(Tr(label).c_str());
 }
 
 void Collapsible::SetProps(const json::Value& props) {
@@ -504,7 +507,7 @@ void Collapsible::DrawSelf() {
         x += 20.0f * s;
     }
     PushTextStyle(TextStyle::Label);
-    const std::string text = Upper(title);
+    const std::string text = Upper(Tr(title));
     const ImVec2 size = ImGui::CalcTextSize(text.c_str());
     list->AddText(ImVec2(x, mid - size.y * 0.5f), U32(hovered || open ? theme::kFg : theme::kFgMuted), text.c_str());
     if (!trailing.empty()) {
@@ -532,7 +535,8 @@ void Tab::SetProps(const json::Value& props) {
 }
 
 void Tab::DrawSelf() {
-    if (!ImGui::BeginTabItem(title.c_str())) return;
+    const std::string name = Tr(title) + "###" + title;
+    if (!ImGui::BeginTabItem(name.c_str())) return;
     DrawChildren();
     ImGui::EndTabItem();
 }
@@ -553,7 +557,7 @@ Panel::Panel(std::string panel_id, std::string caption, const char* glyph)
     : id(std::move(panel_id)), title(std::move(caption)), icon(glyph != nullptr ? glyph : ""),
       root_(std::make_unique<VStack>()) {}
 
-std::string Panel::WindowName() const { return WithIcon(icon, title) + "###" + id; }
+std::string Panel::WindowName() const { return WithIcon(icon, Tr(title)) + "###" + id; }
 
 void Panel::Draw(Host&) {
     if (!open) return;
@@ -729,12 +733,20 @@ void Host::DrawNotifications(const ImVec2& min, const ImVec2& max) {
 }
 
 void Host::DispatchEvents() {
+    ApplyStrings();
     std::vector<Event> pending;
     {
         std::lock_guard<std::recursive_mutex> lock(mu_);
         pending.swap(events_);
     }
-    for (const Event& e : pending) e.fn(e.user, e.node, e.json.c_str());
+    // A node removed since its event queued, with the extension that listened, gets nothing.
+    for (const Event& e : pending) {
+        {
+            std::lock_guard<std::recursive_mutex> lock(mu_);
+            if (Lookup(e.node) == nullptr) continue;
+        }
+        e.fn(e.user, e.node, e.json.c_str());
+    }
 }
 
 uint32_t Host::Register(Node& node) {

@@ -1,0 +1,14 @@
+[meta]
+locale = "zh-CN"
+name = "简体中文"
+tag = "中"
+
+[strings]
+"Hello C++" = "你好 C++"
+"A sample native extension: a panel, an action, a viewport overlay and a Dear ImGui panel." = "原生扩展示例：一个面板、一个动作、一个视口叠加层和一个 Dear ImGui 面板。"
+"A native extension: its panel, action and overlay go away when it is disabled." = "原生扩展：停用后，它的面板、动作和叠加层随之移除。"
+"Greetings" = "问候次数"
+"Greet" = "问候"
+"Ring" = "圆环"
+"Greet from C++" = "C++ 问候"
+"Hello ImGui" = "你好 ImGui"

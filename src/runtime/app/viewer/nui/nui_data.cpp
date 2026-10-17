@@ -288,7 +288,7 @@ void TreeView::DrawSelf() {
                 float text_end = end.x - 6.0f * s;
                 const std::string_view label = model->Label(row.item);
                 const float label_w = ImGui::CalcTextSize(label.data(), label.data() + label.size()).x;
-                const std::string_view badge = model->Badge(row.item);
+                const std::string badge = Tr(std::string(model->Badge(row.item)));
                 if (!badge.empty()) {
                     const ImVec2 bsize = badge_font->CalcTextSizeA(badge_px, FLT_MAX, 0.0f, badge.data(), badge.data() + badge.size());
                     // The kind badge yields to the name when the row is too narrow for both.
@@ -337,7 +337,7 @@ void Table::DrawSelf() {
                                   ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_Resizable;
     if (!ImGui::BeginTable("##table", count, flags, ImVec2(0.0f, height > 0.0f ? height * Scale() : 0.0f))) return;
     ImGui::TableSetupScrollFreeze(0, 1);
-    for (const std::string& name : columns) ImGui::TableSetupColumn(name.c_str());
+    for (const std::string& name : columns) ImGui::TableSetupColumn(Tr(name).c_str());
     if (!columns.empty()) ImGui::TableHeadersRow();
     const size_t total = row_count ? row_count() : rows.size();
     ImGuiListClipper clipper;

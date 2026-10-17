@@ -15,8 +15,11 @@ runs ``update()``; what a callback prints, and its traceback, goes to the editor
 
 from __future__ import annotations
 
+import contextlib
 import inspect
+import io
 import json
+import traceback
 from typing import Callable, Optional, Sequence
 
 _LEVELS = {"info": 0, "ok": 1, "warn": 2, "error": 3}
@@ -31,6 +34,22 @@ def _adapt(fn: Callable) -> Callable:
     if any(p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD, p.VAR_POSITIONAL) for p in params):
         return fn
     return lambda _value: fn()
+
+
+def _capture(fn: Callable[[], object]):
+    """Run fn with stdout and stderr captured; a traceback lands in the text."""
+    sink = io.StringIO()
+    ok = True
+    with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+        try:
+            fn()
+        except SystemExit:
+            ok = False
+            print("SystemExit ignored (a script cannot exit the editor)")
+        except Exception:
+            ok = False
+            traceback.print_exc()
+    return ok, sink.getvalue()
 
 
 class Node:
@@ -206,17 +225,19 @@ class Node:
 
 
 class UI:
-    """The editor shell's script-built panels, toasts and progress entries."""
+    """The editor shell's script-built panels, toasts and progress entries. An extension's
+    UI builds through its own host table, so its panels go away with it."""
 
-    def __init__(self, app):
+    def __init__(self, app, native=None):
         self._app = app
+        self._own = native
         self._handlers = {}
-        app._native.set_ui_handler(self._dispatch)
+        self._native.set_ui_handler(self._dispatch)
 
     @property
     def _native(self):
         # Through the app's weak proxy: holding the native app here would keep it alive past close().
-        return self._app._native
+        return self._own if self._own is not None else self._app._native
 
     def panel(self, panel_id: str, title: Optional[str] = None, dock: str = "right",
               icon: Optional[str] = None) -> Node:

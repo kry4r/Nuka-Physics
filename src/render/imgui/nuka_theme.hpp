@@ -140,5 +140,13 @@ inline constexpr const char kLock[] = "\xEE\x8C\x88";
 inline constexpr const char kFilter[] = "\xEE\x89\xA8";
 inline constexpr const char kPlot[] = "\xEE\x85\x96";
 inline constexpr const char kWaves[] = "\xEE\x9B\x9E";
+inline constexpr const char kTranslate[] = "\xEE\x92\xA2";
+inline constexpr const char kPower[] = "\xEE\x8F\x9A";
+inline constexpr const char kProhibit[] = "\xEE\x8F\x9E";
+inline constexpr const char kPlug[] = "\xEE\xA5\x86";
+inline constexpr const char kPackage[] = "\xEE\x8E\x90";
+inline constexpr const char kCode[] = "\xEE\x86\xBC";
+inline constexpr const char kFilePy[] = "\xEE\xAC\xAC";
+inline constexpr const char kFileCpp[] = "\xEE\xAC\xAE";
 
 }  // namespace nuka::render::imgui::icon

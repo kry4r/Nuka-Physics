@@ -1,0 +1,13 @@
+[meta]
+locale = "zh-CN"
+name = "简体中文"
+tag = "中"
+
+[strings]
+"Hello Python" = "你好 Python"
+"A sample Python extension: a panel, an action and a viewport overlay." = "Python 扩展示例：一个面板、一个动作和一个视口叠加层。"
+"A Python extension: edit its files and it reloads." = "Python 扩展：改动它的文件后会自动重载。"
+"Greetings" = "问候次数"
+"Greet" = "问候"
+"Axes" = "坐标轴"
+"Greet from Python" = "Python 问候"

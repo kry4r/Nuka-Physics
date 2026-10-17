@@ -5,6 +5,7 @@
 // host owns, or one the editor creates from a scene file. Plain C crosses the boundary.
 
 #include "nuka/nuka.h"
+#include "nuka/nuka_editor_plugin.h"
 #include "nuka/nuka_nui.h"
 
 #if defined(_WIN32)
@@ -43,6 +44,17 @@ typedef struct nuka_editor_script_hooks_t {
     const char* (*dispatch)(void* user_data, nuka_editor_callback_t callback);
 } nuka_editor_script_hooks_t;
 
+// Hooks the host's Python runs extensions through, called on the UI thread. Returned text is
+// the call's output or failure, valid until the next hook call; NULL means none.
+typedef struct nuka_editor_python_hooks_t {
+    void* user_data;
+    // Imports `module` from `dir` and starts its extension; nonzero `failed` when it did not.
+    const char* (*load)(void* user_data, const char* extension_id, const char* module, const char* dir,
+                        int32_t* failed);
+    // Stops the extension and forgets its modules.
+    const char* (*unload)(void* user_data, const char* extension_id);
+} nuka_editor_python_hooks_t;
+
 // argv holds the launcher flags and an optional scene path. A non-NULL world is borrowed and
 // must outlive the editor; otherwise the first load creates a world the editor owns.
 NUKA_EDITOR_API nuka_result_t nuka_editor_create(int argc, const char* const* argv,
@@ -51,6 +63,8 @@ NUKA_EDITOR_API nuka_result_t nuka_editor_create(int argc, const char* const* ar
 NUKA_EDITOR_API void nuka_editor_destroy(nuka_editor_handle editor);
 NUKA_EDITOR_API nuka_result_t nuka_editor_set_script_hooks(nuka_editor_handle editor,
                                                            const nuka_editor_script_hooks_t* hooks);
+NUKA_EDITOR_API nuka_result_t nuka_editor_set_python_hooks(nuka_editor_handle editor,
+                                                           const nuka_editor_python_hooks_t* hooks);
 // One frame of input, edits and presentation. With step_physics nonzero a physics thread
 // advances the transport; with zero none runs and the host steps the world between updates.
 NUKA_EDITOR_API nuka_result_t nuka_editor_update(nuka_editor_handle editor, uint32_t step_physics);
@@ -78,6 +92,10 @@ NUKA_EDITOR_API nuka_result_t nuka_editor_document_state(nuka_editor_handle edit
 
 // The UI component table for panels built by Python or extensions; lives as long as the editor.
 NUKA_EDITOR_API const nuka_nui_api_t* nuka_editor_nui(nuka_editor_handle editor);
+// The host table of an enabled extension, for the Python half of its scope; NULL otherwise.
+// It lives until the extension is disabled.
+NUKA_EDITOR_API const nuka_editor_host_api_t* nuka_editor_extension_host(nuka_editor_handle editor,
+                                                                         const char* extension_id);
 
 #ifdef __cplusplus
 }

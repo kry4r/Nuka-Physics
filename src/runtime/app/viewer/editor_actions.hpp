@@ -34,6 +34,7 @@ struct Action {
     std::function<ActionResult(const scene::json::Value& args)> run;
     std::string icon;     // a UTF-8 icon glyph for menus, toolbars and the palette
     bool hidden = false;  // takes arguments or backs a widget, so menus and the palette skip it
+    std::string owner;    // the extension that registered it; empty for the editor's own
 };
 
 // A run queued for the next frame top, where the UI's own calls execute.
@@ -56,6 +57,7 @@ struct ActionLogEntry {
 class ActionRegistry {
 public:
     void Add(Action action);
+    void RemoveOwned(std::string_view owner);
     const Action* Find(std::string_view id) const;
     bool Rebind(std::string_view id, const std::string& shortcut);
     bool Decorate(std::string_view id, std::string icon, bool hidden);

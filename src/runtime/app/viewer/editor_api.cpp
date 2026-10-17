@@ -110,4 +110,13 @@ nuka_result_t nuka_editor_document_state(nuka_editor_handle editor, const char**
 
 const nuka_nui_api_t* nuka_editor_nui(nuka_editor_handle editor) { return editor->Nui(); }
 
+nuka_result_t nuka_editor_set_python_hooks(nuka_editor_handle editor, const nuka_editor_python_hooks_t* hooks) {
+    if (editor == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    return Guard([&] { editor->SetPythonHooks(hooks != nullptr ? *hooks : nuka_editor_python_hooks_t{}); });
+}
+
+const nuka_editor_host_api_t* nuka_editor_extension_host(nuka_editor_handle editor, const char* extension_id) {
+    return editor->ExtensionHost(extension_id);
+}
+
 }  // extern "C"

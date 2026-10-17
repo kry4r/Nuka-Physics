@@ -9,6 +9,7 @@
 #include <array>
 #include <cstdint>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -104,6 +105,37 @@ const char* IconOf(const std::string& name);
 float Scale();
 void PushTextStyle(TextStyle style);
 void PopTextStyle();
+
+// ---- strings ------------------------------------------------------------------------------
+
+// UI text is looked up by its English source, and text the active table lacks shows as
+// written. Tables change only in ApplyStrings, so a result stays valid for the frame.
+const std::string& Tr(const std::string& text);
+const char* Tr(const char* text);
+// A copy, for threads other than the UI thread.
+std::string TrCopy(const std::string& text);
+
+struct LocaleInfo {
+    std::string id;
+    std::string name;  // in its own language, e.g. "简体中文"
+    std::string tag;   // the toolbar's short form, e.g. "中"
+};
+// "en" first, then every locale a table names.
+std::vector<LocaleInfo> Locales();
+std::string Locale();
+void SetLocale(const std::string& locale);
+void AddTranslations(const std::string& locale, const std::string& owner,
+                     const std::vector<std::pair<std::string, std::string>>& strings);
+void RemoveTranslations(const std::string& owner);
+// A TOML table: [meta] locale, name, tag and [strings] "English" = "translated".
+void LoadTranslations(const std::filesystem::path& file, const std::string& owner);
+void LoadTranslationDir(const std::filesystem::path& dir, const std::string& owner);
+// The editor's own tables: next to the module once installed, else in the source tree.
+std::filesystem::path BuiltinTranslationDir();
+// Applies locale and table changes; the host calls it at the top of each frame.
+void ApplyStrings();
+// UI text with letters the active locale has no entry for, since the locale last changed.
+std::vector<std::string> MissingStrings();
 
 // Immediate helpers the widgets and the editor shell share.
 namespace draw {
@@ -387,6 +419,7 @@ public:
     void SetProps(const json::Value& props) override;
     json::Value GetValue() const override;
     std::vector<std::string> options;
+    std::vector<std::string> icons;
     std::vector<std::string> tips;
     ModelPtr<int> model;
     std::function<void(int)> on_change;
@@ -893,7 +926,8 @@ public:
     void Toast(Level level, std::string text);
     void Progress(const std::string& id, const std::string& label, float fraction);
     void DrawNotifications(const ImVec2& min, const ImVec2& max);
-    // Runs the C-API event callbacks queued since the last call, outside any draw.
+    // Applies string table changes, then runs the C-API event callbacks queued since the
+    // last call, outside any draw.
     void DispatchEvents();
 
     std::recursive_mutex& Mutex() { return mu_; }

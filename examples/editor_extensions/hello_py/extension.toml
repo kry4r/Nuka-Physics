@@ -1,0 +1,11 @@
+[package]
+id = "hello_py"
+version = "1.0.0"
+title = "Hello Python"
+description = "A sample Python extension: a panel, an action and a viewport overlay."
+
+[python]
+module = "hello_py"
+
+[settings]
+greeting = "Hello from Python"

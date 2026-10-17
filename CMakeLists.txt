@@ -205,6 +205,12 @@ add_library(nuka_stb INTERFACE)
 target_include_directories(nuka_stb SYSTEM INTERFACE
     ${CMAKE_SOURCE_DIR}/external)
 
+# --- toml++ 3.4.0 (MIT, external/tomlplusplus/LICENSE): editor extension manifests and UI
+# string tables. Header-only INTERFACE target.
+add_library(nuka_toml INTERFACE)
+target_include_directories(nuka_toml SYSTEM INTERFACE
+    ${CMAKE_SOURCE_DIR}/external/tomlplusplus)
+
 # --- Dear ImGui + SDL3: vendored ImGui (external/imgui/NUKA_VENDOR.md) and the SDL3
 # window layer, built only for the editor or Vulkan validation so the core build never fetches them.
 if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)
@@ -257,6 +263,16 @@ if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)
         ${CMAKE_SOURCE_DIR}/external/implot)
     target_link_libraries(imgui PUBLIC Vulkan::Vulkan SDL3::SDL3-static)
     set_target_properties(imgui PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+    # The Dear ImGui core alone, for editor plugins that draw into the editor's context.
+    add_library(nuka_imgui_plugin STATIC
+        ${CMAKE_SOURCE_DIR}/external/imgui/imgui.cpp
+        ${CMAKE_SOURCE_DIR}/external/imgui/imgui_draw.cpp
+        ${CMAKE_SOURCE_DIR}/external/imgui/imgui_tables.cpp
+        ${CMAKE_SOURCE_DIR}/external/imgui/imgui_widgets.cpp)
+    target_compile_definitions(nuka_imgui_plugin PUBLIC IMGUI_USE_WCHAR32)
+    target_include_directories(nuka_imgui_plugin SYSTEM PUBLIC ${CMAKE_SOURCE_DIR}/external/imgui)
+    set_target_properties(nuka_imgui_plugin PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 
 if(NK_BUILD_TESTS)
@@ -288,6 +304,11 @@ endif()
 # Subdirectories
 # ---------------------------------------------------------------------------
 add_subdirectory(src)
+
+if(NK_BUILD_EDITOR)
+    include(cmake/NukaEditorExtension.cmake)
+    add_subdirectory(examples/editor_extensions)
+endif()
 
 if(WIN32 AND CMAKE_CUDA_COMPILER)
     # Executables load the shared CUDA runtime from their own directory.

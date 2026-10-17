@@ -137,7 +137,7 @@ void Label::SetProps(const json::Value& props) {
 
 void Label::DrawSelf() {
     std::string dynamic;
-    const std::string* shown = &text;
+    const std::string* shown = &Tr(text);
     if (text_fn) {
         dynamic = text_fn();
         shown = &dynamic;
@@ -166,10 +166,10 @@ void Stat::SetProps(const json::Value& props) {
 }
 
 void Stat::DrawSelf() {
-    const std::string shown = value_fn ? value_fn() : value;
+    const std::string shown = value_fn ? value_fn() : Tr(value);
     const float right = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
     ImGui::PushStyleColor(ImGuiCol_Text, theme::kFgMuted);
-    ImGui::TextUnformatted(label.c_str());
+    ImGui::TextUnformatted(Tr(label).c_str());
     ImGui::PopStyleColor();
     PushTextStyle(TextStyle::Mono);
     const float w = ImGui::CalcTextSize(shown.c_str()).x;
@@ -206,7 +206,7 @@ void Button::DrawSelf() {
         if (caption.empty()) caption = hooks.label(action);
         can_run = hooks.enabled(action);
     }
-    const std::string text = WithIcon(icon, caption);
+    const std::string text = WithIcon(icon, Tr(caption));
     if (!can_run) ImGui::BeginDisabled();
     if (primary) {
         ImGui::PushStyleColor(ImGuiCol_Button, theme::kAccent);
@@ -280,7 +280,8 @@ void ToggleButton::DrawSelf() {
     const float h = ImGui::GetFrameHeight();
     bool on = action.empty() ? model->Get() : Host::Current()->actions.checked(action) > 0;
     const ImVec2 track(28.0f * s, 14.0f * s);
-    const float text_w = label.empty() ? 0.0f : ImGui::CalcTextSize(label.c_str()).x + 8.0f * s;
+    const std::string& caption = Tr(label);
+    const float text_w = caption.empty() ? 0.0f : ImGui::CalcTextSize(caption.c_str()).x + 8.0f * s;
     const ImVec2 pos = ImGui::GetCursorScreenPos();
     const bool clicked = ImGui::InvisibleButton("##toggle", ImVec2(track.x + text_w, h));
     const bool hovered = ImGui::IsItemHovered();
@@ -301,13 +302,17 @@ void ToggleButton::DrawSelf() {
     list->AddRectFilled(a, b, U32(on ? theme::kAccent : hovered ? theme::kLineHi : theme::kBg3), track.y * 0.5f);
     const ImVec2 knob(on ? b.x - track.y * 0.5f : a.x + track.y * 0.5f, (a.y + b.y) * 0.5f);
     list->AddCircleFilled(knob, track.y * 0.5f - 2.0f * s, U32(on ? theme::kAccentInk : theme::kFgMuted));
-    if (!label.empty())
-        list->AddText(ImVec2(b.x + 8.0f * s, pos.y + (h - ImGui::GetFontSize()) * 0.5f), U32(theme::kFg), label.c_str());
+    if (!caption.empty())
+        list->AddText(ImVec2(b.x + 8.0f * s, pos.y + (h - ImGui::GetFontSize()) * 0.5f), U32(theme::kFg), caption.c_str());
 }
 
 void Segmented::SetProps(const json::Value& props) {
     Node::SetProps(props);
     Read(props, "options", options);
+    if (const json::Value* v = props.Find("icons")) {
+        icons.clear();
+        for (const json::Value& e : v->Elements()) icons.push_back(IconOf(e.AsString()));
+    }
     Read(props, "tips", tips);
     if (const json::Value* v = props.Find("value")) model->Set(static_cast<int>(v->AsInt()));
 }
@@ -322,7 +327,8 @@ void Segmented::DrawSelf() {
     const ImVec2 start = ImGui::GetCursorScreenPos();
     ImGui::BeginGroup();
     for (size_t i = 0; i < options.size(); ++i) {
-        const ImVec2 text = ImGui::CalcTextSize(options[i].c_str());
+        const std::string caption = WithIcon(i < icons.size() ? icons[i] : std::string(), Tr(options[i]));
+        const ImVec2 text = ImGui::CalcTextSize(caption.c_str());
         const ImVec2 size(text.x + 16.0f * s, h);
         if (i > 0) ImGui::SameLine(0.0f, 0.0f);
         ImGui::PushID(static_cast<int>(i));
@@ -338,9 +344,9 @@ void Segmented::DrawSelf() {
             list->AddRectFilled(a, b, U32(theme::kBg2));
         }
         list->AddText(ImVec2(a.x + (size.x - text.x) * 0.5f, a.y + (h - text.y) * 0.5f),
-                      U32(selected ? theme::kAccent : hovered ? theme::kFg : theme::kFgMuted), options[i].c_str());
+                      U32(selected ? theme::kAccent : hovered ? theme::kFg : theme::kFgMuted), caption.c_str());
         if (i < tips.size() && !tips[i].empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
-            ImGui::SetTooltip("%s", tips[i].c_str());
+            ImGui::SetTooltip("%s", Tr(tips[i]).c_str());
         if (clicked && !selected) {
             model->Set(static_cast<int>(i));
             if (on_change) on_change(static_cast<int>(i));
@@ -363,16 +369,19 @@ json::Value ComboBox::GetValue() const { return json::Value::Int(model->Get()); 
 void ComboBox::DrawSelf() {
     if (!label.empty()) {
         ImGui::AlignTextToFramePadding();
-        ImGui::TextColored(theme::kFgMuted, "%s", label.c_str());
+        ImGui::TextColored(theme::kFgMuted, "%s", Tr(label).c_str());
         ImGui::SameLine();
     }
     const int value = model->Get();
-    const char* preview = value >= 0 && value < static_cast<int>(options.size()) ? options[static_cast<size_t>(value)].c_str() : "";
+    const char* preview = value >= 0 && value < static_cast<int>(options.size()) ? Tr(options[static_cast<size_t>(value)]).c_str() : "";
     ImGui::SetNextItemWidth(ItemWidth(160.0f * Scale()));
     if (!ImGui::BeginCombo("##combo", preview)) return;
     for (size_t i = 0; i < options.size(); ++i) {
         const bool selected = static_cast<int>(i) == value;
-        if (ImGui::Selectable(options[i].c_str(), selected) && !selected) {
+        ImGui::PushID(static_cast<int>(i));
+        const bool clicked = ImGui::Selectable(Tr(options[i]).c_str(), selected);
+        ImGui::PopID();
+        if (clicked && !selected) {
             model->Set(static_cast<int>(i));
             if (on_change) on_change(static_cast<int>(i));
             Emit("change", json::Value::Int(static_cast<int64_t>(i)));
@@ -495,7 +504,7 @@ void StringField::SetProps(const json::Value& props) {
     Read(props, "hint", hint);
 }
 
-bool StringField::Edit(std::string& value) { return InputString("##value", hint.c_str(), value, 0); }
+bool StringField::Edit(std::string& value) { return InputString("##value", Tr(hint).c_str(), value, 0); }
 
 bool PathField::Edit(std::string& value) {
     const float s = Scale();
@@ -503,7 +512,7 @@ bool PathField::Edit(std::string& value) {
     ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - button - theme::kSpace * s);
     const bool changed = InputString("##value", "", value, 0);
     ImGui::SameLine(0.0f, theme::kSpace * s);
-    if (draw::IconButton("##browse", icon::kOpen, false, "Browse")) {
+    if (draw::IconButton("##browse", icon::kOpen, false, Tr("Browse"))) {
         if (on_browse) on_browse();
         Emit("browse");
     }
@@ -513,7 +522,7 @@ bool PathField::Edit(std::string& value) {
 void TextBufferField::DrawSelf() {
     FieldLabel(label, Tier::None, InGrid(parent_));
     ImGui::SetNextItemWidth(-FLT_MIN);
-    if (ImGui::InputTextWithHint("##text", hint.c_str(), buffer_, capacity_, ImGuiInputTextFlags_EnterReturnsTrue)) {
+    if (ImGui::InputTextWithHint("##text", Tr(hint).c_str(), buffer_, capacity_, ImGuiInputTextFlags_EnterReturnsTrue)) {
         if (on_enter) on_enter();
         Emit("enter", json::Value::Str(buffer_));
     }
@@ -716,7 +725,7 @@ void LogView::DrawSelf() {
                           ImGuiWindowFlags_HorizontalScrollbar)) {
         const bool pinned = ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 1.0f;
         PushTextStyle(TextStyle::Mono);
-        if (count == 0u) ImGui::TextColored(theme::kFgDim, "%s", needle.empty() ? "(no output yet)" : "(no match)");
+        if (count == 0u) ImGui::TextColored(theme::kFgDim, "%s", Tr(needle.empty() ? "(no output yet)" : "(no match)"));
         ImGuiListClipper clipper;
         clipper.Begin(static_cast<int>(count));
         while (clipper.Step()) {
@@ -743,7 +752,7 @@ void Badge::SetProps(const json::Value& props) {
 }
 
 void Badge::DrawSelf() {
-    const std::string shown = text_fn ? text_fn() : text;
+    const std::string shown = text_fn ? text_fn() : Tr(text);
     draw::Badge(shown.c_str(), tone_fn ? tone_fn() : tone, icon.c_str());
 }
 
@@ -756,7 +765,7 @@ void StatusDot::SetProps(const json::Value& props) {
 
 void StatusDot::DrawSelf() {
     draw::StatusDot(tone_fn ? tone_fn() : tone, pulse);
-    const std::string shown = label_fn ? label_fn() : label;
+    const std::string shown = label_fn ? label_fn() : Tr(label);
     if (shown.empty()) return;
     ImGui::SameLine(0.0f, theme::kSpace * Scale());
     ImGui::AlignTextToFramePadding();
@@ -775,7 +784,7 @@ void ProgressBar::DrawSelf() {
     const float s = Scale();
     const float w = assigned_width > 0.0f ? assigned_width : width > 0.0f ? width * s : ImGui::GetContentRegionAvail().x;
     ImGui::BeginGroup();
-    if (!label.empty()) ImGui::TextColored(theme::kFgMuted, "%s", label.c_str());
+    if (!label.empty()) ImGui::TextColored(theme::kFgMuted, "%s", Tr(label).c_str());
     draw::ThinProgress(fraction->Get(), w);
     ImGui::EndGroup();
 }
@@ -787,7 +796,8 @@ void ContextMenu::DrawSelf() {
 }
 
 void Menu::DrawSelf() {
-    if (!ImGui::BeginMenu(label.c_str())) return;
+    const std::string name = Tr(label) + "###" + label;
+    if (!ImGui::BeginMenu(name.c_str())) return;
     DrawChildren();
     ImGui::EndMenu();
 }
@@ -817,7 +827,7 @@ void MenuItem::DrawSelf() {
         can_run = hooks.enabled(action);
         checked = hooks.checked(action) > 0;
     }
-    if (!ImGui::MenuItem(caption.c_str(), keys.empty() ? nullptr : keys.c_str(), checked, can_run)) return;
+    if (!ImGui::MenuItem(Tr(caption).c_str(), keys.empty() ? nullptr : keys.c_str(), checked, can_run)) return;
     if (on_click) on_click();
     if (!action.empty()) RunAction(action, args);
     Emit("click");

@@ -4,38 +4,20 @@ from __future__ import annotations
 
 import atexit
 import builtins
-import contextlib
-import io
 import json
-import traceback
 import weakref
 from typing import Callable, List, Optional, Sequence
 
 import nuka
 
-from .ui import UI
+from .extension import ExtensionLoader
+from .ui import UI, _capture
 
 _DEFAULT_DT = 1.0 / 240.0
 _CALLBACKS = ("on_ready", "on_step", "on_reset")
 _TICK = 3
 # A lifecycle callback that fails this many times in a row is disabled.
 _MAX_FAILURES = 3
-
-
-def _capture(fn: Callable[[], object]):
-    """Run fn with stdout and stderr captured; a traceback lands in the text."""
-    sink = io.StringIO()
-    ok = True
-    with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-        try:
-            fn()
-        except SystemExit:
-            ok = False
-            print("SystemExit ignored (a script cannot exit the editor)")
-        except Exception:
-            ok = False
-            traceback.print_exc()
-    return ok, sink.getvalue()
 
 
 class _Script:
@@ -171,7 +153,9 @@ class EditorApp:
         self._world = world
         self._borrowed = None
         self._runner = ScriptRunner(self)
-        self._native = _editor_ext.App(argv, world.handle if world is not None else 0, dt, self._runner)
+        self._extensions = ExtensionLoader(weakref.proxy(self))
+        self._native = _editor_ext.App(argv, world.handle if world is not None else 0, dt, self._runner,
+                                       self._extensions)
         self.actions = Actions(self)
         self.ui = UI(weakref.proxy(self))
         atexit.register(self.close)

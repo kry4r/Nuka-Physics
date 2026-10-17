@@ -67,6 +67,14 @@ void ActionRegistry::Add(Action action) {
     chords_.push_back(std::move(chords));
 }
 
+void ActionRegistry::RemoveOwned(std::string_view owner) {
+    for (size_t i = actions_.size(); i-- > 0u;) {
+        if (actions_[i].owner != owner) continue;
+        actions_.erase(actions_.begin() + static_cast<std::ptrdiff_t>(i));
+        chords_.erase(chords_.begin() + static_cast<std::ptrdiff_t>(i));
+    }
+}
+
 const Action* ActionRegistry::Find(std::string_view id) const {
     for (const Action& a : actions_)
         if (a.id == id) return &a;
@@ -96,6 +104,7 @@ bool ActionRegistry::Decorate(std::string_view id, std::string icon, bool hidden
 }
 
 // Arguments come from scripts and remote callers, so a run that throws on them fails instead.
+// The run is a copy: enabling or disabling an extension reshapes the registry mid-run.
 ActionResult ActionRegistry::Run(std::string_view id, const json::Value& args, const std::string& source,
                                  uint64_t frame) {
     ActionResult result;
@@ -106,7 +115,8 @@ ActionResult ActionRegistry::Run(std::string_view id, const json::Value& args, c
         result = ActionResult::Fail("'" + std::string(id) + "' is disabled now");
     } else {
         try {
-            result = action->run(args);
+            const auto run = action->run;
+            result = run(args);
         } catch (const std::exception& e) {
             result = ActionResult::Fail(e.what());
         }

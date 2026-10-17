@@ -157,6 +157,8 @@ constexpr std::array<const char*, kFaceCount> kFaceBuildPaths = {
     NUKA_IMGUI_FONT_BODY, NUKA_IMGUI_FONT_STRONG, NUKA_IMGUI_FONT_DISPLAY, NUKA_IMGUI_FONT_MONO};
 constexpr std::array<float, kFaceCount> kFaceSizes = {theme::kFontBody, theme::kFontBody, theme::kFontLabel,
                                                       theme::kFontMono};
+// The display face's caps stand tall for their size, so its CJK is merged a size up to match.
+constexpr std::array<float, kFaceCount> kCjkScale = {1.0f, 1.0f, 1.25f, 1.0f};
 // The Nerd faces give up their private-use glyphs so the merged Phosphor icons win.
 constexpr ImWchar kPrivateUse[] = {0xE000, 0xF8FF, 0};
 constexpr float kIconScale = theme::kFontIcon / theme::kFontBody;
@@ -237,7 +239,8 @@ bool LoadNukaFonts() {
         AddBlob(fonts.icon_data, icon_size, IconConfig(icon_size, true));
         ImFontConfig cjk;
         cjk.MergeMode = true;
-        fonts.cjk = AddBlob(fonts.cjk_data, kFaceSizes[i], cjk) != nullptr;
+        cjk.GlyphOffset = ImVec2(0.0f, (kCjkScale[i] - 1.0f) * 0.5f * kFaceSizes[i]);
+        fonts.cjk = AddBlob(fonts.cjk_data, kFaceSizes[i] * kCjkScale[i], cjk) != nullptr;
     }
     const bool loaded = fonts.faces[0] != nullptr;
     if (!loaded) fonts.faces[0] = io.Fonts->AddFontDefault();
