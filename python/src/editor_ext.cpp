@@ -208,7 +208,7 @@ public:
                                         reinterpret_cast<nuka_world_handle>(world), dt, &editor_);
         }
         if (result != NUKA_RESULT_OK) throw std::runtime_error(nuka_editor_create_error());
-        const nuka_editor_script_hooks_t hooks{this, &Run, &Register, &Unregister, &Clear, &Dispatch};
+        const nuka_editor_script_hooks_t hooks{this, &Run, &Register, &Unregister, &Clear, &Dispatch, &Interrupt, &Complete};
         Check(nuka_editor_set_script_hooks(editor_, &hooks), "nuka_editor_set_script_hooks");
         const nuka_editor_python_hooks_t python{this, &LoadExtension, &UnloadExtension};
         Check(nuka_editor_set_python_hooks(editor_, &python), "nuka_editor_set_python_hooks");
@@ -252,19 +252,38 @@ public:
         if (result != NUKA_RESULT_INVALID_ARG) Check(result, "nuka_editor_run_action");
         return reply;
     }
+    // Queries run on the editor's UI thread like actions, so they wait without the GIL too.
     std::string actions() const {
+        nuka_editor_handle editor = Editor();
         const char* text = nullptr;
-        Check(nuka_editor_actions(Editor(), &text), "nuka_editor_actions");
+        nuka_result_t result = NUKA_RESULT_OK;
+        {
+            nb::gil_scoped_release release;
+            result = nuka_editor_actions(editor, &text);
+        }
+        Check(result, "nuka_editor_actions");
         return text;
     }
     std::string action_log(uint64_t since) const {
+        nuka_editor_handle editor = Editor();
         const char* text = nullptr;
-        Check(nuka_editor_action_log(Editor(), since, &text), "nuka_editor_action_log");
+        nuka_result_t result = NUKA_RESULT_OK;
+        {
+            nb::gil_scoped_release release;
+            result = nuka_editor_action_log(editor, since, &text);
+        }
+        Check(result, "nuka_editor_action_log");
         return text;
     }
     std::string document() const {
+        nuka_editor_handle editor = Editor();
         const char* text = nullptr;
-        Check(nuka_editor_document_state(Editor(), &text), "nuka_editor_document_state");
+        nuka_result_t result = NUKA_RESULT_OK;
+        {
+            nb::gil_scoped_release release;
+            result = nuka_editor_document_state(editor, &text);
+        }
+        Check(result, "nuka_editor_document_state");
         return text;
     }
 
@@ -353,8 +372,13 @@ private:
             return nullptr;
         }
     }
-    static const char* Run(void* self, const char* code) {
-        return Call(self, [&](nb::object& runner) { return runner.attr("run")(code); });
+    // The runner answers (failed, text).
+    static const char* Run(void* self, const char* code, const char* filename, uint32_t echo, int32_t* failed) {
+        return Call(self, [&](nb::object& runner) {
+            nb::tuple reply = nb::cast<nb::tuple>(runner.attr("run")(code, filename, echo != 0u));
+            *failed = nb::cast<bool>(reply[0]) ? 1 : 0;
+            return nb::object(reply[1]);
+        });
     }
     static const char* Register(void* self, uint64_t script_id, const char* source) {
         return Call(self, [&](nb::object& runner) { return runner.attr("register")(script_id, source); });
@@ -367,6 +391,12 @@ private:
     }
     static const char* Dispatch(void* self, nuka_editor_callback_t callback) {
         return Call(self, [&](nb::object& runner) { return runner.attr("dispatch")(static_cast<int>(callback)); });
+    }
+    static void Interrupt(void* self) {
+        Call(self, [](nb::object& runner) { return runner.attr("interrupt")(); });
+    }
+    static const char* Complete(void* self, const char* code, int32_t line, int32_t column) {
+        return Call(self, [&](nb::object& runner) { return runner.attr("complete")(code, line, column); });
     }
 
     // The loader replies (ok, text): the log on success, the traceback on failure.

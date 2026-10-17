@@ -8,7 +8,7 @@ version = "0.3.0"
 description = "Nuka physics engine -- nanobind binding with zero-copy DLPack torch interop"
 requires-python = ">=3.8"
 readme = "README.md"
-dependencies = ["numpy"]
+dependencies = ["numpy", "jedi"]
 
 [project.scripts]
 # The editor, or with --headless the bare world; see nuka.editor.

@@ -344,6 +344,7 @@ if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)
             COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${target}>/docs/media"
             COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_SOURCE_DIR}/docs/media/nuka-logo.png" "$<TARGET_FILE_DIR:${target}>/docs/media/nuka-logo.png"
             COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/examples/assets/nuka_lab" "$<TARGET_FILE_DIR:${target}>/examples/assets/nuka_lab"
+            COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/examples/editor_scripts" "$<TARGET_FILE_DIR:${target}>/examples/editor_scripts"
             COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/assets/editor" "$<TARGET_FILE_DIR:${target}>/assets/editor"
             VERBATIM)
     endfunction()
@@ -393,6 +394,7 @@ if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)
         runtime/app/viewer/file_dialog.cpp
         runtime/app/viewer/imgui_layer.cpp
         runtime/app/viewer/scene_panels.cpp
+        runtime/app/viewer/script_tabs.cpp
         runtime/app/viewer/nui/nui_capi.cpp
         runtime/app/viewer/nui/nui_core.cpp
         runtime/app/viewer/nui/nui_data.cpp
@@ -1215,6 +1217,7 @@ if(CMAKE_CUDA_COMPILER)
             runtime/app/viewer/property_schema.cpp
             runtime/app/viewer/debug_overlay.cpp
             runtime/app/viewer/physics_worker.cpp
+            runtime/app/viewer/script_host.cpp
         )
         set_target_properties(nuka_editor_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
         target_include_directories(nuka_editor_core PUBLIC ${CMAKE_SOURCE_DIR}/src)

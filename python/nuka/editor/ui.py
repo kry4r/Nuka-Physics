@@ -15,10 +15,12 @@ runs ``update()``; what a callback prints, and its traceback, goes to the editor
 
 from __future__ import annotations
 
-import contextlib
 import inspect
 import io
 import json
+import os
+import sys
+import threading
 import traceback
 from typing import Callable, Optional, Sequence
 
@@ -36,19 +38,82 @@ def _adapt(fn: Callable) -> Callable:
     return lambda _value: fn()
 
 
-def _capture(fn: Callable[[], object]):
-    """Run fn with stdout and stderr captured; a traceback lands in the text."""
-    sink = io.StringIO()
+class ScriptInterrupted(BaseException):
+    """Raised in a running script when the editor stops it: Stop, or the time budget."""
+
+
+_PACKAGE = os.path.dirname(os.path.abspath(__file__))
+_sinks = threading.local()
+
+
+class _Sink(io.StringIO):
+    """What one hook call prints; with ``stream``, each line also goes on as it ends."""
+
+    def __init__(self, stream: Optional[Callable[[str], None]]):
+        super().__init__()
+        self._stream = stream
+        self._tail = ""
+
+    def write(self, text: str) -> int:
+        if self._stream is not None:
+            head, newline, self._tail = (self._tail + text).rpartition("\n")
+            if newline:
+                self._stream(head + newline)
+        return super().write(text)
+
+    def end(self) -> None:
+        if self._stream is not None and self._tail:
+            self._stream(self._tail)
+
+
+class _Route:
+    """Stands in for sys.stdout or sys.stderr: a thread inside a hook call writes to its own
+    sink, any other thread to the stream this one replaced."""
+
+    def __init__(self, base):
+        self._base = base
+
+    def _target(self):
+        return getattr(_sinks, "top", None) or self._base
+
+    def write(self, text: str) -> int:
+        target = self._target()
+        return target.write(text) if target is not None else len(text)
+
+    def flush(self) -> None:
+        target = self._target()
+        if target is not None:
+            target.flush()
+
+    def __getattr__(self, name: str):
+        return getattr(self._base, name)
+
+
+def _capture(fn: Callable[[], object], stream: Optional[Callable[[str], None]] = None):
+    """Run fn with what this thread prints captured, and handed to ``stream`` line by line when
+    given; a traceback lands in the text."""
+    for name in ("stdout", "stderr"):
+        if not isinstance(getattr(sys, name), _Route):
+            setattr(sys, name, _Route(getattr(sys, name)))
+    sink = _Sink(stream)
+    outer = getattr(_sinks, "top", None)
+    _sinks.top = sink
     ok = True
-    with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-        try:
-            fn()
-        except SystemExit:
-            ok = False
-            print("SystemExit ignored (a script cannot exit the editor)")
-        except Exception:
-            ok = False
-            traceback.print_exc()
+    try:
+        fn()
+    except SystemExit:
+        ok = False
+        print("SystemExit ignored (a script cannot exit the editor)")
+    except (Exception, ScriptInterrupted) as error:
+        ok = False
+        # The editor's own frames lead the traceback; the script's begin after them.
+        tb = error.__traceback__
+        while tb is not None and tb.tb_frame.f_code.co_filename.startswith(_PACKAGE):
+            tb = tb.tb_next
+        traceback.print_exception(type(error), error, tb)
+    finally:
+        _sinks.top = outer
+        sink.end()
     return ok, sink.getvalue()
 
 

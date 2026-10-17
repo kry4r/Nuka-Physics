@@ -80,7 +80,8 @@ const char* IconOf(const std::string& name) {
         {"atom", icon::kAtom}, {"palette", icon::kPalette}, {"lock", icon::kLock}, {"filter", icon::kFilter},
         {"plot", icon::kPlot}, {"waves", icon::kWaves}, {"translate", icon::kTranslate}, {"power", icon::kPower},
         {"prohibit", icon::kProhibit}, {"plug", icon::kPlug}, {"package", icon::kPackage}, {"code", icon::kCode},
-        {"file_py", icon::kFilePy}, {"file_cpp", icon::kFileCpp}};
+        {"file_py", icon::kFilePy}, {"file_cpp", icon::kFileCpp}, {"stop", icon::kStop}, {"repeat", icon::kRepeat},
+        {"cursor_text", icon::kCursorText}, {"function", icon::kFunction}, {"terminal", icon::kTerminal}};
     const auto it = table.find(name);
     return it != table.end() ? it->second : name.c_str();
 }

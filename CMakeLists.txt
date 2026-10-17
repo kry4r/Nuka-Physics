@@ -251,16 +251,23 @@ if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)
         # ImPlot (MIT, vendored): live curves in the editor panels.
         ${CMAKE_SOURCE_DIR}/external/implot/implot.cpp
         ${CMAKE_SOURCE_DIR}/external/implot/implot_items.cpp
+        # ImGuiColorTextEdit (MIT, vendored): the script editor with Python highlighting.
+        ${CMAKE_SOURCE_DIR}/external/imgui_color_text_edit/TextEditor.cpp
     )
     add_library(imgui STATIC ${NUKA_IMGUI_SOURCES})
     target_compile_definitions(imgui PUBLIC IMGUI_USE_WCHAR32)
+    # TextEditor.cpp carries UTF-8 comments; MSVC would read them in the system code page.
+    if(MSVC)
+        target_compile_options(imgui PRIVATE /utf-8)
+    endif()
     # SYSTEM include keeps ImGui warnings out of -Werror; backends include "imgui.h"
     # from the root and callers use "backends/...", so both directories are on the path.
     target_include_directories(imgui SYSTEM PUBLIC
         ${CMAKE_SOURCE_DIR}/external/imgui
         ${CMAKE_SOURCE_DIR}/external/imgui/backends
         ${CMAKE_SOURCE_DIR}/external/imguizmo
-        ${CMAKE_SOURCE_DIR}/external/implot)
+        ${CMAKE_SOURCE_DIR}/external/implot
+        ${CMAKE_SOURCE_DIR}/external/imgui_color_text_edit)
     target_link_libraries(imgui PUBLIC Vulkan::Vulkan SDL3::SDL3-static)
     set_target_properties(imgui PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

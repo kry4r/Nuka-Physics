@@ -67,7 +67,7 @@ class _Run:
         self.handlers = {
             "action": self.action, "tick": self.tick, "frames": self.frames, "mark": self.mark,
             "expect": self.expect, "undo": self.undo, "save_reopen": self.save_reopen,
-            "screenshot": self.screenshot, "python": self.python,
+            "screenshot": self.screenshot, "python": self.python, "wait": self.wait,
         }
 
     def run(self, action_id: str, args: Optional[dict] = None) -> dict:
@@ -100,6 +100,23 @@ class _Run:
         want = _resolve(step.get("expect_value", {}), self.vars)
         diffs = {k: {"want": v, "got": reply["value"].get(k)} for k, v in want.items() if reply["value"].get(k) != v}
         return reply["ok"] != step.get("expect_error", False) and not diffs, {"reply": reply, "diffs": diffs}
+
+    def wait(self, step: dict):
+        """``{"wait": id, "args", "until": {key: value}, "bind": name}`` draws frames until the
+        action's value holds every ``until`` key; bind keeps that value."""
+        args = _resolve(step.get("args", {}), self.vars)
+        until = _resolve(step["until"], self.vars)
+        replies = []
+
+        def done():
+            replies.append(self.run(step["wait"], args))
+            value = replies[-1]["value"]
+            return not replies[-1]["ok"] or all(value.get(k) == v for k, v in until.items())
+
+        self.pump_until(done, step["wait"])
+        if "bind" in step:
+            self.vars[step["bind"]] = replies[-1]["value"]
+        return replies[-1]["ok"], {"reply": replies[-1], "polls": len(replies)}
 
     def tick(self, step: dict):
         """``{"tick": n}``: sim.step when paused, the transport when playing."""

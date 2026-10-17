@@ -20,6 +20,8 @@
 #include <utility>
 #include <vector>
 
+class TextEditor;
+
 namespace nuka::nui {
 
 namespace json = nuka::scene::json;
@@ -762,42 +764,62 @@ protected:
     void DrawSelf() override;
 };
 
-// A monospace multiline editor over a char buffer (or its own text); Ctrl+Enter emits "run".
+// Python language, theme colors, line numbers and four-space indents for a code editor.
+void SetupCodeEditor(TextEditor& editor);
+// True for a traceback entry, `  File "...", line N`, with the file and 1-based line it names.
+bool ParseTraceEntry(std::string_view text, std::string* file, int* line);
+
+// A Python code editor over one the caller keeps (`source`), else over its own text.
+// Ctrl+Enter emits "run" instead of breaking the line.
 class CodeEditor : public Node {
 public:
-    CodeEditor(char* buffer = nullptr, size_t capacity = 0u) : buffer_(buffer), capacity_(capacity) {}
+    explicit CodeEditor(std::function<TextEditor*()> source = {});
+    ~CodeEditor() override;
     const char* Kind() const override { return "code"; }
     void SetProps(const json::Value& props) override;
     json::Value GetValue() const override;
-    float height = 0.0f;  // 0: half the remaining height, < 0: all of it
+    float height = 0.0f;  // 0: half the remaining height, < 0: all of it but -height
     std::function<void()> on_run;
 
 protected:
     void DrawSelf() override;
 
 private:
-    char* buffer_;
-    size_t capacity_;
-    std::vector<char> own_;
+    TextEditor& Editor() const;
+
+    std::function<TextEditor*()> source_;
+    std::unique_ptr<TextEditor> own_;
 };
 
-// A scrolling log view; lines are colored by the level words they carry.
+// A scrolling log view. Lines are colored by level: a traceback counts as an error, otherwise
+// the level words a line carries decide. `File "...", line N` entries are links.
 class LogView : public Node {
 public:
+    enum class LineLevel : uint8_t { Info, Warn, Err, Echo };
     explicit LogView(const std::string* text = nullptr) : text_(text) {}
     const char* Kind() const override { return "log"; }
     void SetProps(const json::Value& props) override;
     ModelPtr<std::string> filter;
-    float height = 0.0f;  // 0 fills the rest of the panel
+    ModelPtr<int> level;  // 0 every line, 1 info, 2 warnings, 3 errors
+    float height = 0.0f;  // 0 fills the rest of the panel, < 0 leaves -height below
+    // A link click: the file and 1-based line it names.
+    std::function<void(const std::string& file, int line)> on_link;
 
 protected:
     void DrawSelf() override;
 
 private:
+    struct Line {
+        size_t begin = 0u, end = 0u;
+        LineLevel level = LineLevel::Info;
+        bool in_trace = false;  // a traceback goes on after this line
+    };
+
     const std::string* text_;
     std::string own_;
     size_t indexed_size_ = ~size_t(0);
-    std::vector<std::pair<size_t, size_t>> lines_;
+    std::string head_;  // the text's first bytes when indexed: a trimmed front reindexes
+    std::vector<Line> lines_;
 };
 
 class Badge : public Node {

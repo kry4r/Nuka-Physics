@@ -33,15 +33,24 @@ typedef enum nuka_editor_callback_t {
     NUKA_EDITOR_CALLBACK_TICK = 3
 } nuka_editor_callback_t;
 
-// Hooks run in the host on the physics thread, else the updating thread. Returned text is
-// console output valid until that thread's next hook call; NULL means none.
+// Hooks run in the host on the physics thread, else the updating thread; interrupt and complete
+// may come from any thread. Returned text is valid until that thread's next hook call; NULL: none.
 typedef struct nuka_editor_script_hooks_t {
     void* user_data;
-    const char* (*run)(void* user_data, const char* code);
+    // Runs `code` compiled as `filename` ("" for the console); nonzero `echo` prints the value of
+    // a final expression. What it prints goes to nuka_editor_console_append line by line as it
+    // prints, and comes back whole; `failed` turns nonzero when the code raised.
+    const char* (*run)(void* user_data, const char* code, const char* filename, uint32_t echo,
+                       int32_t* failed);
     const char* (*register_script)(void* user_data, uint64_t script_id, const char* source);
     void (*unregister_script)(void* user_data, uint64_t script_id);
     void (*clear_scripts)(void* user_data);
     const char* (*dispatch)(void* user_data, nuka_editor_callback_t callback);
+    // Raises ScriptInterrupted in every hook call in progress.
+    void (*interrupt)(void* user_data);
+    // Completions of `code` at 1-based `line` and 0-based `column` in the console's namespace,
+    // as a JSON array of {"name", "type", "signature"}.
+    const char* (*complete)(void* user_data, const char* code, int32_t line, int32_t column);
 } nuka_editor_script_hooks_t;
 
 // Hooks the host's Python runs extensions through, called on the UI thread. Returned text is

@@ -26,7 +26,10 @@ public:
     // A string in settings.toml, or `fallback` when the key is not set.
     std::string Setting(const std::string& table, const std::string& key, const std::string& fallback) const;
     double SettingNumber(const std::string& table, const std::string& key, double fallback) const;
+    bool SettingBool(const std::string& table, const std::string& key, bool fallback) const;
     void SetSetting(const std::string& table, const std::string& key, const std::string& value);
+    void SetSettingNumber(const std::string& table, const std::string& key, double value);
+    void SetSettingBool(const std::string& table, const std::string& key, bool value);
     // A list of strings in settings.toml; empty when the key is not set.
     std::vector<std::string> SettingList(const std::string& table, const std::string& key) const;
     void SetSettingList(const std::string& table, const std::string& key, const std::vector<std::string>& values);
@@ -40,6 +43,9 @@ public:
     std::filesystem::path Thumbnail(const std::string& scene_path) const;
 
 private:
+    template <class T>
+    void Store(const std::string& table, const std::string& key, T value);
+
     std::filesystem::path dir_;
 };
 

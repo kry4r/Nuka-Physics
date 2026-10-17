@@ -2,6 +2,8 @@
 
 #include "runtime/app/viewer/nui/nui_internal.hpp"
 
+#include "TextEditor.h"
+#include "imgui_internal.h"
 #include "implot.h"
 
 #include <algorithm>
@@ -119,15 +121,27 @@ Quat EulerToQuat(const float* deg) {
     return Multiply(Multiply(qx, qy), qz);
 }
 
-ImVec4 LineTone(std::string_view line) {
+using LineLevel = LogView::LineLevel;
+
+LineLevel WordLevel(std::string_view line) {
+    if (line.rfind(">>>", 0) == 0) return LineLevel::Echo;
     const std::string lower = Lower(line);
-    if (lower.find("error") != std::string::npos || lower.find("traceback") != std::string::npos ||
-        lower.find("failed") != std::string::npos)
-        return theme::kErr;
-    if (lower.find("warn") != std::string::npos) return theme::kWarn;
-    if (line.rfind(">>>", 0) == 0) return theme::kAccent;
+    if (lower.find("error") != std::string::npos || lower.find("failed") != std::string::npos) return LineLevel::Err;
+    if (lower.find("warn") != std::string::npos) return LineLevel::Warn;
+    return LineLevel::Info;
+}
+
+ImVec4 LevelColor(LineLevel level) {
+    switch (level) {
+        case LineLevel::Warn: return theme::kWarn;
+        case LineLevel::Err: return theme::kErr;
+        case LineLevel::Echo: return theme::kAccent;
+        case LineLevel::Info: break;
+    }
     return theme::kFg;
 }
+
+ImU32 Rgba(const ImVec4& color) { return ImGui::ColorConvertFloat4ToU32(color); }
 
 }  // namespace
 
@@ -674,39 +688,101 @@ void Image::DrawSelf() {
     ImGui::Image(texture, ImVec2(size.x * s, size.y * s), uv0, uv1);
 }
 
+void SetupCodeEditor(TextEditor& editor) {
+    using C = TextEditor::Color;
+    TextEditor::Palette palette = TextEditor::GetDarkPalette();
+    const auto set = [&](C c, const ImVec4& color) { palette[static_cast<size_t>(c)] = Rgba(color); };
+    set(C::text, theme::kFg);
+    set(C::keyword, theme::kAccent);
+    set(C::declaration, theme::kInfo);
+    set(C::number, theme::kWarn);
+    set(C::string, theme::Hex(0xE8A87C));
+    set(C::punctuation, theme::kFgMuted);
+    set(C::preprocessor, theme::kInfo);
+    set(C::identifier, theme::kFg);
+    set(C::knownIdentifier, theme::kInfo);
+    set(C::comment, theme::kFgDim);
+    set(C::background, theme::kBg0);
+    set(C::cursor, theme::kAccent);
+    set(C::selection, theme::Alpha(theme::kAccent, 0.22f));
+    set(C::whitespace, theme::Alpha(theme::kFgDim, 0.45f));
+    set(C::matchingBracketBackground, theme::Alpha(theme::kLineHi, 0.8f));
+    set(C::matchingBracketActive, theme::kAccent);
+    set(C::matchingBracketLevel1, theme::kInfo);
+    set(C::matchingBracketLevel2, theme::kAccent);
+    set(C::matchingBracketLevel3, theme::kWarn);
+    set(C::matchingBracketError, theme::kErr);
+    set(C::lineNumber, theme::kFgDim);
+    set(C::currentLineNumber, theme::kAccent);
+    set(C::currentLineHighlight, theme::kBg1);
+    set(C::currentLineHighlightBorder, theme::kLine);
+    editor.SetPalette(palette);
+    editor.SetLanguage(TextEditor::Language::Python());
+    editor.SetTabSize(4);
+    editor.SetInsertSpacesOnTabs(true);
+    editor.SetAutoIndentEnabled(true);
+    editor.SetShowLineNumbersEnabled(true);
+    editor.SetShowMatchingBrackets(true);
+    editor.SetCompletePairedGlyphs(true);
+    editor.SetLineSpacing(1.15f);
+}
+
+bool ParseTraceEntry(std::string_view text, std::string* file, int* line) {
+    const size_t at = text.find_first_not_of(' ');
+    if (at == std::string_view::npos || at == 0u || text.compare(at, 6, "File \"") != 0) return false;
+    const size_t start = at + 6u;
+    const size_t end = text.find("\", line ", start);
+    if (end == std::string_view::npos) return false;
+    size_t p = end + 8u;
+    int number = 0;
+    while (p < text.size() && text[p] >= '0' && text[p] <= '9') number = number * 10 + (text[p++] - '0');
+    if (p == end + 8u) return false;
+    *file = std::string(text.substr(start, end - start));
+    *line = number;
+    return true;
+}
+
+CodeEditor::CodeEditor(std::function<TextEditor*()> source) : source_(std::move(source)) {
+    if (source_) return;
+    own_ = std::make_unique<TextEditor>();
+    SetupCodeEditor(*own_);
+}
+
+CodeEditor::~CodeEditor() = default;
+
+TextEditor& CodeEditor::Editor() const { return source_ ? *source_() : *own_; }
+
 void CodeEditor::SetProps(const json::Value& props) {
     Node::SetProps(props);
     Read(props, "height", height);
-    if (const json::Value* v = props.Find("text")) {
-        const std::string& text = v->AsString();
-        own_.assign(std::max<size_t>(64u * 1024u, text.size() + 1u), '\0');
-        std::memcpy(own_.data(), text.data(), text.size());
-    }
+    if (const json::Value* v = props.Find("text")) Editor().SetText(v->AsString());
 }
 
-json::Value CodeEditor::GetValue() const {
-    if (buffer_ != nullptr) return json::Value::Str(buffer_);
-    return json::Value::Str(own_.empty() ? std::string() : std::string(own_.data()));
-}
+json::Value CodeEditor::GetValue() const { return json::Value::Str(Editor().GetText()); }
 
 void CodeEditor::DrawSelf() {
-    if (buffer_ == nullptr && own_.empty()) own_.assign(64u * 1024u, '\0');
-    char* buf = buffer_ != nullptr ? buffer_ : own_.data();
-    const size_t cap = buffer_ != nullptr ? capacity_ : own_.size();
+    TextEditor& editor = Editor();
     const float s = Scale();
     const float avail = ImGui::GetContentRegionAvail().y;
-    const float h = height > 0.0f ? height * s : std::max(height < 0.0f ? avail : avail * 0.5f, 80.0f * s);
+    const float h = height > 0.0f ? height * s : std::max(height < 0.0f ? avail + height * s : avail * 0.5f, 48.0f * s);
     PushTextStyle(TextStyle::Mono);
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, theme::kBg0);
-    ImGui::InputTextMultiline("##code", buf, cap, ImVec2(ItemWidth(-FLT_MIN), h), ImGuiInputTextFlags_AllowTabInput);
+    ImGui::PushStyleColor(ImGuiCol_Border, theme::kLine);
+    if (ImGui::BeginChild("##code", ImVec2(ItemWidth(-FLT_MIN), h), ImGuiChildFlags_Borders,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+        // Claimed before the editor draws, Ctrl+Enter runs instead of breaking the line.
+        if (ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) && ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Enter)) {
+            ImGui::SetKeyOwner(ImGuiKey_Enter, ImGui::GetID("##run"), ImGuiInputFlags_LockThisFrame);
+            if (on_run) on_run();
+            Emit("run", json::Value::Str(editor.GetText()));
+        }
+        // Each editor keeps a child window, and so its scroll, of its own.
+        ImGui::PushID(&editor);
+        editor.Render("##text");
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
     ImGui::PopStyleColor();
     PopTextStyle();
-    // Ctrl+Enter ends the edit without a newline; it runs while this panel has focus.
-    const ImGuiIO& io = ImGui::GetIO();
-    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Enter, false)) {
-        if (on_run) on_run();
-        Emit("run", json::Value::Str(buf));
-    }
 }
 
 void LogView::SetProps(const json::Value& props) {
@@ -718,46 +794,78 @@ void LogView::SetProps(const json::Value& props) {
 
 void LogView::DrawSelf() {
     const std::string& text = text_ != nullptr ? *text_ : own_;
-    if (indexed_size_ == ~size_t(0) || text.size() < indexed_size_) {
+    if (indexed_size_ == ~size_t(0) || text.size() < indexed_size_ || text.compare(0, head_.size(), head_) != 0) {
         lines_.clear();
         indexed_size_ = 0u;
     }
     if (text.size() != indexed_size_) {
         size_t start = 0u;
         if (!lines_.empty()) {
-            start = lines_.back().first;
+            start = lines_.back().begin;
             lines_.pop_back();
         }
+        std::string file;
+        int number = 0;
         while (start < text.size()) {
             const size_t nl = text.find('\n', start);
             const size_t end = nl == std::string::npos ? text.size() : nl;
-            lines_.emplace_back(start, end);
+            const std::string_view s = std::string_view(text).substr(start, end - start);
+            const bool after_trace = !lines_.empty() && lines_.back().in_trace;
+            const bool indented = !s.empty() && (s.front() == ' ' || s.front() == '\t');
+            Line line{start, end, LineLevel::Err, false};
+            // A traceback runs from its header (or a bare entry) through its indented lines to the error.
+            if (s.rfind("Traceback (most recent call last)", 0) == 0) line.in_trace = true;
+            else if (after_trace) line.in_trace = indented;
+            else if (ParseTraceEntry(s, &file, &number)) line.in_trace = true;
+            else line.level = WordLevel(s);
+            lines_.push_back(line);
             start = end + 1u;
         }
         indexed_size_ = text.size();
+        head_ = text.substr(0, 64);
     }
-    std::vector<size_t> shown;
     const std::string needle = filter ? Lower(filter->Get()) : std::string();
-    if (!needle.empty())
+    const int want = level ? level->Get() : 0;
+    const auto keep = [&](const Line& l) {
+        if (want == 1 && l.level != LineLevel::Info && l.level != LineLevel::Echo) return false;
+        if (want == 2 && l.level != LineLevel::Warn) return false;
+        if (want == 3 && l.level != LineLevel::Err) return false;
+        return needle.empty() || Lower(std::string_view(text).substr(l.begin, l.end - l.begin)).find(needle) != std::string::npos;
+    };
+    std::vector<size_t> shown;
+    const bool all = needle.empty() && want == 0;
+    if (!all)
         for (size_t i = 0; i < lines_.size(); ++i)
-            if (Lower(std::string_view(text).substr(lines_[i].first, lines_[i].second - lines_[i].first)).find(needle) != std::string::npos)
-                shown.push_back(i);
-    const size_t count = needle.empty() ? lines_.size() : shown.size();
+            if (keep(lines_[i])) shown.push_back(i);
+    const size_t count = all ? lines_.size() : shown.size();
     ImGui::PushStyleColor(ImGuiCol_ChildBg, theme::kBg0);
-    if (ImGui::BeginChild("##log", ImVec2(0.0f, height > 0.0f ? height * Scale() : 0.0f), ImGuiChildFlags_Borders,
+    if (ImGui::BeginChild("##log", ImVec2(0.0f, height * Scale()), ImGuiChildFlags_Borders,
                           ImGuiWindowFlags_HorizontalScrollbar)) {
         const bool pinned = ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 1.0f;
         PushTextStyle(TextStyle::Mono);
-        if (count == 0u) ImGui::TextColored(theme::kFgDim, "%s", Tr(needle.empty() ? "(no output yet)" : "(no match)"));
+        if (count == 0u) ImGui::TextColored(theme::kFgDim, "%s", Tr(all ? "(no output yet)" : "(no match)"));
+        std::string file;
+        int number = 0;
         ImGuiListClipper clipper;
         clipper.Begin(static_cast<int>(count));
         while (clipper.Step()) {
             for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
-                const auto& span = lines_[needle.empty() ? static_cast<size_t>(row) : shown[static_cast<size_t>(row)]];
-                const std::string_view line = std::string_view(text).substr(span.first, span.second - span.first);
-                ImGui::PushStyleColor(ImGuiCol_Text, LineTone(line));
+                const Line& span = lines_[all ? static_cast<size_t>(row) : shown[static_cast<size_t>(row)]];
+                const std::string_view line = std::string_view(text).substr(span.begin, span.end - span.begin);
+                const bool link = span.level == LineLevel::Err && ParseTraceEntry(line, &file, &number);
+                ImGui::PushStyleColor(ImGuiCol_Text, link ? theme::kInfo : LevelColor(span.level));
                 ImGui::TextUnformatted(line.data(), line.data() + line.size());
                 ImGui::PopStyleColor();
+                if (!link || !ImGui::IsItemHovered()) continue;
+                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                const ImVec2 lo = ImGui::GetItemRectMin(), hi = ImGui::GetItemRectMax();
+                ImGui::GetWindowDrawList()->AddLine(ImVec2(lo.x, hi.y), hi, Rgba(theme::kInfo));
+                if (!ImGui::IsItemClicked(ImGuiMouseButton_Left)) continue;
+                if (on_link) on_link(file, number);
+                json::Value value = json::Value::Object();
+                value.Set("file", json::Value::Str(file));
+                value.Set("line", json::Value::Int(number));
+                Emit("link", value);
             }
         }
         PopTextStyle();

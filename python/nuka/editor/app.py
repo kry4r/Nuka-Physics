@@ -2,18 +2,26 @@
 
 from __future__ import annotations
 
+import ast
 import atexit
 import builtins
+import ctypes
 import json
+import linecache
 import os
 import sys
+import textwrap
+import threading
 import weakref
 from typing import Callable, List, Optional, Sequence
 
+import numpy
+
 import nuka
 
+from . import scripting
 from .extension import ExtensionLoader
-from .ui import UI, _capture
+from .ui import UI, ScriptInterrupted, _capture
 
 _DEFAULT_DT = 1.0 / 240.0
 _CALLBACKS = ("on_ready", "on_step", "on_reset")
@@ -31,34 +39,103 @@ class _Script:
 
 
 class ScriptRunner:
-    """Runs the editor console and the scene's /script nodes in this interpreter.
+    """Runs the editor console, its script tabs and the scene's /script nodes in this interpreter.
 
-    Each script gets its own namespace holding ``app``, ``world`` and ``nuka`` and
-    may define ``on_ready``, ``on_step`` and ``on_reset``. Callbacks run on the
-    editor's physics thread while one runs.
+    The console and the tabs share one namespace; every namespace holds ``app``, ``world``,
+    ``ui``, ``nuka``, ``np`` and the helpers of ``nuka.editor.scripting``. A /script node gets
+    its own and may define ``on_ready``, ``on_step`` and ``on_reset``; console runs also see
+    ``sel``, the selected path when they start. Code runs on the editor's physics thread while
+    one runs, and ``interrupt`` stops it with ScriptInterrupted.
     """
 
     def __init__(self, app):
         self._app = weakref.proxy(app)
-        self._console = self._namespace("__console__")
+        self._console = self._namespace("__main__")
         self._scripts = {}
         self._ticks: List[list] = []
+        self._active = {}  # thread id -> hook calls in progress there
+        self._lock = threading.Lock()
 
     def _namespace(self, name: str) -> dict:
-        return {"__builtins__": builtins, "__name__": name, "app": self._app, "nuka": nuka}
+        ns = {"__builtins__": builtins, "__name__": name, "app": self._app, "nuka": nuka, "np": numpy}
+        ns.update(scripting.helpers(self._app))
+        return ns
 
     def _bind(self, ns: dict) -> None:
         ns["world"] = self._app.world
+        ns["ui"] = self._app.ui
 
-    def run(self, code: str) -> Optional[str]:
+    def _guarded(self, fn: Callable[[], object], stream: Optional[Callable[[str], None]] = None):
+        """_capture(fn, stream), interruptible while it runs."""
+        tid = threading.get_ident()
+        with self._lock:
+            self._active[tid] = self._active.get(tid, 0) + 1
+        try:
+            return _capture(fn, stream)
+        finally:
+            with self._lock:
+                self._active[tid] -= 1
+                last = self._active[tid] == 0
+                if last:
+                    del self._active[tid]
+            # An interrupt that came as the code ended must not land in the editor's frames.
+            if last:
+                ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(tid), None)
+
+    def run(self, code: str, filename: str = "", echo: bool = False):
+        """Run code in the console namespace, compiled as ``filename`` ("" for a console line);
+        with ``echo`` the value of a final expression prints. What it prints reaches the
+        console line by line as it runs; returns (failed, text)."""
+        name = filename or "<console>"
+        ns = self._console
+        self._bind(ns)
+        ns["sel"] = self._app.document()["selection"]
+        if echo:
+            code = textwrap.dedent(code)
+        # Tracebacks quote the text that ran, saved or not.
+        linecache.cache[name] = (len(code), None, code.splitlines(True), name)
+
+        def body():
+            tree = ast.parse(code, name, "exec")
+            last = tree.body.pop() if echo and tree.body and isinstance(tree.body[-1], ast.Expr) else None
+            if filename and not filename.startswith("<"):
+                ns["__file__"] = filename
+            exec(compile(tree, name, "exec"), ns)
+            if last is not None:
+                value = eval(compile(ast.Expression(last.value), name, "eval"), ns)
+                if value is not None:
+                    ns["_"] = value
+                    print(repr(value))
+
+        ok, text = self._guarded(body, self._app._native.console_append)
+        return not ok, text
+
+    def interrupt(self) -> None:
+        """Raise ScriptInterrupted in every script running now."""
+        with self._lock:
+            ids = list(self._active)
+        for tid in ids:
+            ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(tid), ctypes.py_object(ScriptInterrupted))
+
+    def complete(self, code: str, line: int, column: int) -> str:
+        """Up to 50 completions at 1-based ``line``, 0-based ``column`` of ``code``, against the
+        console namespace, as JSON [{name, type, signature}]."""
+        import jedi
+
         self._bind(self._console)
-        return _capture(lambda: exec(compile(code, "<console>", "exec"), self._console))[1] or None
+        found = jedi.Interpreter(code, [self._console]).complete(line, column)
+        out = []
+        for c in found[:50]:
+            signatures = c.get_signatures() if c.type == "function" and len(out) < 12 else []
+            out.append({"name": c.name, "type": c.type,
+                        "signature": signatures[0].to_string() if signatures else ""})
+        return json.dumps(out)
 
     def register(self, script_id: int, source: str) -> Optional[str]:
         ns = self._namespace("<nuka_script>")
         self._scripts[script_id] = _Script(ns)
         self._bind(ns)
-        return _capture(lambda: exec(compile(source, f"<script {script_id}>", "exec"), ns))[1] or None
+        return self._guarded(lambda: exec(compile(source, f"<script {script_id}>", "exec"), ns))[1] or None
 
     def unregister(self, script_id: int) -> None:
         self._scripts.pop(script_id, None)
@@ -69,11 +146,14 @@ class ScriptRunner:
     def add_tick(self, fn: Callable) -> None:
         self._ticks.append([fn, 0])
 
+    def remove_tick(self, fn: Callable) -> None:
+        self._ticks[:] = [entry for entry in self._ticks if entry[0] is not fn]
+
     def _dispatch_ticks(self) -> Optional[str]:
         out = []
         for entry in list(self._ticks):
             fn = entry[0]
-            ok, text = _capture(lambda: fn(self._app))
+            ok, text = self._guarded(lambda: fn(self._app))
             out.append(text)
             entry[1] = 0 if ok else entry[1] + 1
             if entry[1] >= _MAX_FAILURES:
@@ -95,7 +175,7 @@ class ScriptRunner:
             if not callable(fn) or name in script.disabled:
                 continue
             self._bind(script.ns)
-            ok, text = _capture(fn)
+            ok, text = self._guarded(fn)
             if ok:
                 script.failures[name] = 0
                 out.append(text)
@@ -219,6 +299,10 @@ class EditorApp:
         self._runner.add_tick(fn)
         return fn
 
+    def off_tick(self, fn: Callable) -> None:
+        """Stop calling fn at the tick boundary."""
+        self._runner.remove_tick(fn)
+
     def update(self, step: bool = False) -> None:
         """One frame. With step=True the editor transport advances physics; otherwise
         no physics thread runs and the caller steps the world between updates."""
@@ -253,7 +337,8 @@ class EditorApp:
     def edit(self, *ops: dict, label: str = "Script edit") -> bool:
         """Apply one undoable transaction of ``{"target", "field", "after"}`` ops (an optional
         ``before`` overrides the recorded prior value). False when an op failed; see
-        ``document()["last_error"]``. Not from tick callbacks: an edit parks the physics thread."""
+        ``document()["last_error"]``. From a script on the physics thread it waits for the
+        editor's next frame."""
         return self._run("edit.apply", {"label": label, "ops": list(ops)}, "api")["ok"]
 
     def undo(self) -> bool:
@@ -329,11 +414,15 @@ class HeadlessApp:
         self._ticks.append(fn)
         return fn
 
+    def off_tick(self, fn: Callable) -> None:
+        """Stop calling fn after updates."""
+        self._ticks.remove(fn)
+
     def update(self, step: bool = False) -> None:
         """With step=True advance the world one step, then run the tick callbacks."""
         if step:
             self._world.step()
-        for fn in self._ticks:
+        for fn in list(self._ticks):
             fn(self)
 
     def run(self, steps: Optional[int] = None) -> None:

@@ -85,6 +85,9 @@ if(WIN32)
                              "${CUDAToolkit_BIN_DIR}/x64/cudart64_*.dll")
   install(FILES ${NUKA_CUDART_DLLS} DESTINATION nuka)
 endif()
+# Typed stubs, for IDEs and the editor's completion, come from the installed modules; they
+# import as top-level modules so that a nuka installed elsewhere cannot shadow them.
+nanobind_add_stub(_nuka_ext_stub INSTALL_TIME MODULE _nuka_ext OUTPUT nuka/_nuka_ext.pyi PYTHON_PATH nuka)
 
 # The editor extension exists only when the engine was built with NK_BUILD_EDITOR.
 if(EXISTS "${NUKA_EDITOR_LIB}")
@@ -100,6 +103,7 @@ if(EXISTS "${NUKA_EDITOR_LIB}")
   if(WIN32)
     install(FILES "${NUKA_EDITOR_RUNTIME}" DESTINATION nuka)
   endif()
+  nanobind_add_stub(_editor_ext_stub INSTALL_TIME MODULE _editor_ext OUTPUT nuka/_editor_ext.pyi PYTHON_PATH nuka)
   # Fonts, the logo and the default scene resolve next to the editor library.
   install(DIRECTORY "${NUKA_BUILD_DIR}/src/assets" "${NUKA_BUILD_DIR}/src/docs"
                     "${NUKA_BUILD_DIR}/src/examples" DESTINATION nuka)

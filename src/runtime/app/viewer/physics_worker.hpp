@@ -57,16 +57,19 @@ struct TickCommand {
     uint32_t steps = 0u;
     float speed = 1.0f;
     std::string code;                     // ScriptCall
+    std::string filename;                 // ScriptCall: what tracebacks name; empty for the console
+    bool echo = false;                    // ScriptCall: print a final expression's value
 
     static TickCommand Transport(TransportOp op);
     static TickCommand Param(ParamKind param, std::vector<float> values);
-    static TickCommand Script(std::string code);
+    static TickCommand Script(std::string code, std::string filename = std::string(), bool echo = false);
 };
 
 struct TickResult {
     uint64_t seq = 0u;  // the command answered; 0 for callback output
     std::string text;
     bool error = false;
+    bool streamed = false;       // the text reached the console as it printed
     uint64_t pushed_tick = 0u;   // registry writes: the tick when queued
     uint64_t applied_tick = 0u;  // and the tick the write landed after
 };
@@ -155,8 +158,13 @@ public:
 
     // The thread paces the transport; without it, Pump runs one boundary per frame.
     void StartThread();
-    void StopThread();
+    // Joins the thread; `serve` runs meanwhile, so calls the thread waits on can finish.
+    void StopThread(const std::function<void()>& serve = {});
     bool Threaded() const { return thread_.joinable(); }
+    bool OnThread() const { return std::this_thread::get_id() == thread_.get_id(); }
+    // On the worker thread: waits in `wait` counted as parked, so Exclusive sections may run
+    // meanwhile, and resumes once none is pending.
+    void ParkWhile(const std::function<void()>& wait);
 
     // Runs fn on the calling thread while the worker is parked at a tick boundary, after
     // every command queued before it.
@@ -200,6 +208,7 @@ private:
     bool stop_ = false;
     bool park_ = false;
     bool parked_ = false;
+    std::atomic<bool> exited_{false};
     // Set with a queued command or a park request so a running batch yields at its next step.
     std::atomic<bool> interrupt_{false};
     std::atomic<uint64_t> tick_mirror_{0u};

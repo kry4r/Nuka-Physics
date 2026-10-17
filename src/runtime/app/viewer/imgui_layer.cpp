@@ -6,6 +6,7 @@
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "ImGuizmo.h"
+#include "TextEditor.h"
 
 #include "render/imgui/nuka_imgui.hpp"
 #include "render/imgui/nuka_theme.hpp"
@@ -151,7 +152,10 @@ const std::vector<MenuSpec>& Menus() {
               "view.colliders", "view.contacts", "view.hide_overlays", "-", "scene.expand_all", "scene.collapse_all", "-",
               "view.ui_scale_up", "view.ui_scale_down", "view.ui_scale_reset", "view.toggle_language", "-", "view.screenshot"}},
             {"Simulation", {"sim"}, {"sim.toggle_play", "sim.step", "sim.reset"}},
-            {"Tools", {"script", "tools"}, {"script.run", "script.attach", "script.load", "script.clear_console", "-", "tools.nui_inspector"}},
+            {"Tools",
+             {"script", "tools"},
+             {"script.new", "script.open", "script.save", "-", "script.run", "script.stop", "script.toggle_rerun", "-",
+              "script.attach", "script.load", "script.clear_console", "-", "tools.nui_inspector"}},
             {"Window", {"window"}, window},
             {"Help", {"help"}, {"help.about"}},
             {"Extensions", {"extensions"}, {"extensions.manager", "extensions.rescan", "-"}},
@@ -319,6 +323,11 @@ void ProjMatrixGL(float fov_y_rad, float aspect, float znear, float zfar, float*
 }  // namespace
 
 // ---- stage model --------------------------------------------------------------------------
+
+std::string NodeKind(const nuka::scene::Registry& reg, nuka::scene::EntityId e) {
+    const char* badge = ClassifyNode(reg, e).badge;
+    return *badge != '\0' ? badge : "group";
+}
 
 // The scene graph as tree items: node id + 1, so item 0 stays the hidden root. Rebuilt when
 // the host bumps the scene version.
@@ -532,6 +541,13 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
         {"file.import", icon::kImport},     {"scene.collision_dialog", icon::kHull},  {"scene.set_visible", icon::kEyeSlash},
         {"scene.set_locked", icon::kLock},  {"assets.add_folder", icon::kFolderPlus}, {"assets.rescan", icon::kReset}};
     for (const auto& [id, glyph] : icons) registry.Decorate(id, glyph, false);
+    const std::pair<const char*, const char*> script_icons[] = {
+        {"script.new", icon::kNew},   {"script.open", icon::kOpen},     {"script.save", icon::kSave},
+        {"script.stop", icon::kStop}, {"script.toggle_rerun", icon::kRepeat}, {"script.eval", icon::kTerminal}};
+    for (const auto& [id, glyph] : script_icons) registry.Decorate(id, glyph, false);
+    for (const char* id : {"script.close", "script.complete", "script.tabs", "script.goto", "script.console",
+                           "script.result", "script.reload", "script.set_budget", "scene.nodes"})
+        registry.Decorate(id, "", true);
     for (const char* id : {"edit.apply", "edit.rename", "edit.reparent", "scene.spawn", "scene.select", "sim.play",
                            "sim.pause", "sim.speed", "view.stats", "file.unload", "file.open_recent", "file.forget_recent",
                            "file.recover", "file.autosave", "app.answer_prompt", "app.check"})
@@ -542,6 +558,8 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
     registry.Rebind("app.exit", "Ctrl+Q");
     registry.Rebind("edit.delete", "Delete");
     registry.Rebind("sim.toggle_play", "Space");
+    registry.Rebind("script.run", "F5");
+    registry.Rebind("script.stop", "Shift+F5");
 
     const Action* spawn = registry.Find("scene.spawn");
     const auto spawn_enabled = spawn->enabled;
@@ -1093,27 +1111,162 @@ void ImGuiLayer::BuildDrive(nui::VStack& root) {
 }
 
 void ImGuiLayer::BuildScript(nui::VStack& root) {
-    ViewerUiState& ui = *frame_.ui;
     auto& bar = root.Add<nui::HStack>();
     auto& run = bar.Add<nui::Button>("Run", icon::kRun);
     run.primary = true;
     run.Action("script.run");
-    bar.Add<nui::Button>("Attach", icon::kScriptNode).Action("script.attach");
-    bar.Add<nui::Button>("Load", icon::kFile).Action("script.load");
-    bar.Add<nui::Label>(std::string(), Tone::Dim, TextStyle::Label).text_fn = [this] {
-        return Fmt(Tr("%d script nodes"), frame_.ui->script_node_count);
+    bar.Add<nui::IconButton>(icon::kCursorText).Action("script.run", Args({{"selection", json::Value::Bool(true)}}));
+    bar.Add<nui::IconButton>(icon::kStop).Action("script.stop");
+    bar.Add<nui::IconButton>(icon::kNew).Action("script.new");
+    bar.Add<nui::IconButton>(icon::kOpen).Action("script.open");
+    bar.Add<nui::IconButton>(icon::kSave).Action("script.save");
+    bar.Add<nui::IconButton>(icon::kScriptNode).Action("script.attach");
+    bar.Add<nui::IconButton>(icon::kFile).Action("script.load");
+    bar.Add<nui::IconButton>(icon::kRepeat).Action("script.toggle_rerun");
+    auto& status = bar.Add<nui::Label>(std::string(), Tone::Dim, TextStyle::Label);
+    status.text_fn = [this] {
+        const ViewerUiState& ui = *frame_.ui;
+        if (ui.script_busy_s > 0.0) return Fmt(Tr("running %.1f s"), ui.script_busy_s);
+        return Fmt(Tr("%d script nodes"), ui.script_node_count);
     };
-    root.Add<nui::Label>(std::string(), Tone::Dim).text_fn = [this] {
-        return std::string(Tr(frame_.ui->has_scene ? "Ctrl+Enter runs against the loaded world (nuka.*)"
-                                                   : "Load a scene, then nuka.* drives it"));
-    };
-    auto& code = root.Add<nui::CodeEditor>(ui.script_buf, sizeof(ui.script_buf));
-    code.height = -1.0f;
-    code.on_run = [this] { Queue("script.run"); };
+    root.Add<nui::Custom>([this] { DrawScriptTabs(); });
+    auto& code = root.Add<nui::CodeEditor>([this] { return frame_.ui->scripts.Active().editor.get(); });
+    code.height = -26.0f;
+    code.on_run = [this] { Queue("script.run", Args({{"selection", json::Value::Bool(true)}})); };
+    root.Add<nui::Custom>([this] { DrawScriptStatus(); });
+}
+
+void ImGuiLayer::DrawScriptTabs() {
+    ViewerUiState& ui = *frame_.ui;
+    ScriptTabs& tabs = ui.scripts;
+    ScriptTab& active = tabs.Active();
+    // Run, stop and save keys while the code has the keyboard; otherwise the global shortcuts act.
+    if (ImGui::GetIO().WantCaptureKeyboard && ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
+        if (ImGui::IsKeyChordPressed(ImGuiKey_F5)) Queue("script.run");
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Shift | ImGuiKey_F5)) Queue("script.stop");
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_S)) Queue("script.save");
+    }
+    for (const std::unique_ptr<ScriptTab>& tab : tabs.tabs) {
+        if (tab->completion_set || !ui.complete) continue;
+        TextEditor::AutoCompleteConfig config;
+        config.triggerDelay = std::chrono::milliseconds(120);
+        config.noSuggestionsLabel = "\xE2\x80\xA6";
+        config.suggestionWidth = 40;
+        // Asks the runner off the UI thread; the answer lands in a later frame.
+        config.callback = [this, id = tab->id](TextEditor::AutoCompleteState& state) {
+            ScriptTab* t = frame_.ui->scripts.Find(id);
+            const TextEditor::DocPos pos = t->editor->GetMainCursorPosition();
+            t->completion = frame_.ui->complete(t->Text(), static_cast<int>(pos.line) + 1, static_cast<int>(pos.index));
+            std::vector<std::string>& shown = state.suggestions;
+            shown.erase(std::remove_if(shown.begin(), shown.end(),
+                                       [&](const std::string& s) { return s.rfind(state.searchTerm, 0) != 0; }),
+                        shown.end());
+            state.suggestionsPromise = true;
+        };
+        tab->editor->SetAutoCompleteConfig(&config);
+        tab->completion_set = true;
+    }
+    std::string answer;
+    if (active.completion != 0u && ui.take_completion(active.completion, &answer)) {
+        std::vector<std::string> names;
+        for (const json::Value& c : json::Value::Parse(answer).Elements()) names.push_back(c.At("name").AsString());
+        active.editor->SetAutoCompleteSuggestions(names);
+        active.completion = 0u;
+    }
+
+    const bool pending = shown_tab_ != tabs.active;
+    if (ImGui::BeginTabBar("##scripts", ImGuiTabBarFlags_Reorderable | ImGuiTabBarFlags_FittingPolicyScroll)) {
+        for (const std::unique_ptr<ScriptTab>& tab : tabs.tabs) {
+            ImGuiTabItemFlags flags = tab->Dirty() ? ImGuiTabItemFlags_UnsavedDocument : 0;
+            if (pending && tab->id == tabs.active) flags |= ImGuiTabItemFlags_SetSelected;
+            const std::string glyph = tab->node.empty() ? icon::kFilePy : icon::kScriptNode;
+            const std::string label = glyph + " " + tab->title + "###tab" + std::to_string(tab->id);
+            bool open = true;
+            if (ImGui::BeginTabItem(label.c_str(), &open, flags)) {
+                // A switch the host asked for wins until the tab bar shows it.
+                if (!pending && tab->id != tabs.active) tabs.Activate(tab->id);
+                if (tab->id == tabs.active) shown_tab_ = tab->id;
+                ImGui::EndTabItem();
+            }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip)) ImGui::SetTooltip("%s", tab->Name().c_str());
+            if (open) continue;
+            if (tab->Dirty()) close_ask_ = tab->id;
+            else Queue("script.close", Args({{"tab", json::Value::Int(static_cast<int64_t>(tab->id))}}));
+        }
+        if (ImGui::TabItemButton(icon::kAdd, ImGuiTabItemFlags_Trailing | ImGuiTabItemFlags_NoTooltip)) Queue("script.new");
+        ImGui::EndTabBar();
+    }
+
+    ScriptTab& shown = tabs.Active();
+    const json::Value tab_arg = Args({{"tab", json::Value::Int(static_cast<int64_t>(shown.id))}});
+    if (shown.disk_changed) {
+        const float s = nui::Scale();
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, theme::Alpha(theme::kWarn, 0.12f));
+        if (ImGui::BeginChild("##disk", ImVec2(0.0f, ImGui::GetFrameHeightWithSpacing() + 4.0f * s), ImGuiChildFlags_None,
+                              ImGuiWindowFlags_NoScrollbar)) {
+            ImGui::SetCursorPos(ImVec2(6.0f * s, 2.0f * s));
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextColored(theme::kWarn, "%s", Iconed(icon::kWarnCircle, Tr("Changed on disk")).c_str());
+            ImGui::SameLine();
+            if (ImGui::SmallButton(Tr("Reload"))) Queue("script.reload", tab_arg);
+            ImGui::SameLine();
+            if (ImGui::SmallButton(Tr("Keep mine"))) {
+                json::Value keep = tab_arg;
+                keep.Set("keep", json::Value::Bool(true));
+                Queue("script.reload", keep);
+            }
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+    }
+
+    if (close_ask_ != 0u) ImGui::OpenPopup("##close_script");
+    if (ImGui::BeginPopupModal("##close_script", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar)) {
+        const ScriptTab* asked = tabs.Find(close_ask_);
+        const json::Value args = Args({{"tab", json::Value::Int(static_cast<int64_t>(close_ask_))}});
+        ImGui::TextUnformatted(Fmt(Tr("%s has unsaved edits."), asked != nullptr ? asked->title.c_str() : "?").c_str());
+        if (ImGui::Button(Tr("Save"))) {
+            Queue("script.save", args);
+            Queue("script.close", args);
+            close_ask_ = 0u;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(Tr("Discard"))) {
+            json::Value discard = args;
+            discard.Set("discard", json::Value::Bool(true));
+            Queue("script.close", discard);
+            close_ask_ = 0u;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(Tr("Cancel")) || ImGui::IsKeyPressed(ImGuiKey_Escape)) close_ask_ = 0u;
+        if (close_ask_ == 0u) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+}
+
+void ImGuiLayer::DrawScriptStatus() {
+    const ScriptTab& tab = frame_.ui->scripts.Active();
+    const TextEditor::DocPos pos = tab.editor->GetMainCursorPosition();
+    PushTextStyle(TextStyle::Label);
+    ImGui::TextColored(theme::kFgDim, "%s", Fmt(Tr("Ln %zu, Col %zu"), pos.line + 1u, pos.index + 1u).c_str());
+    ImGui::SameLine();
+    ImGui::TextColored(theme::kFgDim, "\xC2\xB7  Python  \xC2\xB7  %s", tab.title.c_str());
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tab.Name().c_str());
+    if (!tab.markers.empty()) {
+        const ScriptMarker& first = tab.markers.front();
+        ImGui::SameLine();
+        ImGui::TextColored(theme::kErr, "%s", Iconed(icon::kWarnCircle, Fmt("%d: %s", first.line, first.message.c_str()).c_str()).c_str());
+        if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (ImGui::IsItemClicked()) frame_.ui->scripts.Goto(frame_.ui->scripts.Active(), first.line);
+    }
+    nui::PopTextStyle();
 }
 
 void ImGuiLayer::BuildConsole(nui::VStack& root) {
-    root.Add<nui::Custom>([this] {
+    auto& bar = root.Add<nui::HStack>();
+    auto& levels = bar.Add<nui::Segmented>(std::vector<std::string>{"All", "Info", "Warn", "Error"}, nui::Ref(&frame_.ui->console_level));
+    levels.icons = {"", icon::kInfo, icon::kWarn, icon::kError};
+    bar.Add<nui::Custom>([this] {
         const float s = nui::Scale();
         ImGui::SetNextItemWidth(std::max(ImGui::GetContentRegionAvail().x - ImGui::GetFrameHeight() - 8.0f * s, 60.0f * s));
         const std::string hint = Iconed(icon::kFilter, Tr("Filter output"));
@@ -1123,6 +1276,101 @@ void ImGuiLayer::BuildConsole(nui::VStack& root) {
     });
     auto& log = root.Add<nui::LogView>(&frame_.ui->console_log);
     log.filter = nui::Bind<std::string>([this] { return std::string(console_filter_); });
+    log.level = nui::Ref(&frame_.ui->console_level);
+    log.height = -30.0f;
+    log.on_link = [this](const std::string& file, int line) {
+        Queue("script.goto", Args({{"path", json::Value::Str(file)}, {"line", json::Value::Int(line)}}));
+    };
+    root.Add<nui::Custom>([this] { DrawRepl(); });
+}
+
+void ImGuiLayer::DrawRepl() {
+    ViewerUiState& ui = *frame_.ui;
+    std::string answer;
+    if (repl_ticket_ != 0u && ui.take_completion(repl_ticket_, &answer)) {
+        repl_ticket_ = 0u;
+        repl_options_.clear();
+        for (const json::Value& c : json::Value::Parse(answer).Elements()) repl_options_.push_back(c.At("name").AsString());
+        // One option, or the longest prefix they share, goes straight into the line.
+        if (!repl_options_.empty()) {
+            std::string common = repl_options_.front();
+            for (const std::string& o : repl_options_) {
+                size_t n = 0u;
+                while (n < common.size() && n < o.size() && common[n] == o[n]) ++n;
+                common.resize(n);
+            }
+            if (common.size() > repl_word_) repl_insert_ = common;
+            if (repl_options_.size() == 1u) repl_options_.clear();
+        }
+    }
+    const float s = nui::Scale();
+    PushTextStyle(TextStyle::Mono);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(theme::kAccent, ">>>");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (repl_focus_) {
+        ImGui::SetKeyboardFocusHere();
+        repl_focus_ = false;
+    }
+    const ImGuiInputTextFlags flags = ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CallbackCompletion |
+                                      ImGuiInputTextFlags_CallbackHistory | ImGuiInputTextFlags_CallbackAlways;
+    const auto callback = [](ImGuiInputTextCallbackData* data) -> int {
+        ImGuiLayer& self = *static_cast<ImGuiLayer*>(data->UserData);
+        if (data->EventFlag == ImGuiInputTextFlags_CallbackCompletion && self.frame_.ui->complete) {
+            size_t start = static_cast<size_t>(data->CursorPos);
+            while (start > 0u && (std::isalnum(static_cast<unsigned char>(data->Buf[start - 1u])) || data->Buf[start - 1u] == '_')) --start;
+            self.repl_word_ = static_cast<size_t>(data->CursorPos) - start;
+            self.repl_ticket_ = self.frame_.ui->complete(std::string(data->Buf, static_cast<size_t>(data->CursorPos)), 1, data->CursorPos);
+        } else if (data->EventFlag == ImGuiInputTextFlags_CallbackHistory && !self.repl_history_.empty()) {
+            const size_t n = self.repl_history_.size();
+            if (data->EventKey == ImGuiKey_UpArrow && self.repl_back_ < n) ++self.repl_back_;
+            else if (data->EventKey == ImGuiKey_DownArrow && self.repl_back_ > 0u) --self.repl_back_;
+            data->DeleteChars(0, data->BufTextLen);
+            if (self.repl_back_ > 0u) data->InsertChars(0, self.repl_history_[n - self.repl_back_].c_str());
+        } else if (data->EventFlag == ImGuiInputTextFlags_CallbackAlways && !self.repl_insert_.empty()) {
+            const int word = static_cast<int>(self.repl_word_);
+            data->DeleteChars(data->CursorPos - word, word);
+            data->InsertChars(data->CursorPos, self.repl_insert_.c_str());
+            self.repl_insert_.clear();
+            self.repl_word_ = 0u;
+        }
+        return 0;
+    };
+    if (ImGui::InputTextWithHint("##repl", Tr("Python  (Enter runs, Tab completes, Up/Down history)"), repl_, sizeof(repl_), flags,
+                                 callback, this)) {
+        const std::string line = repl_;
+        if (!line.empty()) {
+            if (repl_history_.empty() || repl_history_.back() != line) repl_history_.push_back(line);
+            Queue("script.eval", Args({{"code", json::Value::Str(line)}}));
+        }
+        repl_[0] = '\0';
+        repl_back_ = 0u;
+        repl_options_.clear();
+        repl_focus_ = true;
+    }
+    const ImVec2 input = ImGui::GetItemRectMin();
+    nui::PopTextStyle();
+    if (repl_options_.empty()) return;
+    // The choices float above the input line, so the log keeps its height.
+    const float max_w = std::max(ImGui::GetContentRegionAvail().x, 120.0f * s);
+    ImGui::SetNextWindowPos(ImVec2(input.x, input.y - 4.0f * s), ImGuiCond_Always, ImVec2(0.0f, 1.0f));
+    ImGui::BeginTooltip();
+    PushTextStyle(TextStyle::Label);
+    const float gap = 10.0f * s;
+    float x = 0.0f;
+    for (size_t i = 0; i < repl_options_.size() && i < 24u; ++i) {
+        const float w = ImGui::CalcTextSize(repl_options_[i].c_str()).x;
+        if (i > 0u && x + gap + w <= max_w) {
+            ImGui::SameLine(0.0f, gap);
+            x += gap + w;
+        } else {
+            x = w;
+        }
+        ImGui::TextColored(theme::kFgMuted, "%s", repl_options_[i].c_str());
+    }
+    nui::PopTextStyle();
+    ImGui::EndTooltip();
 }
 
 void ImGuiLayer::BuildInspector(nui::VStack& root) {

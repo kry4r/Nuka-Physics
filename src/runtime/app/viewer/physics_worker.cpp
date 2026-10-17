@@ -55,10 +55,12 @@ TickCommand TickCommand::Param(ParamKind param, std::vector<float> values) {
     return cmd;
 }
 
-TickCommand TickCommand::Script(std::string code) {
+TickCommand TickCommand::Script(std::string code, std::string filename, bool echo) {
     TickCommand cmd;
     cmd.kind = CommandKind::ScriptCall;
     cmd.code = std::move(code);
+    cmd.filename = std::move(filename);
+    cmd.echo = echo;
     return cmd;
 }
 
@@ -118,17 +120,35 @@ void PoseSlotPool::Release(uint32_t slot) {
 void PhysicsWorker::StartThread() {
     if (thread_.joinable()) return;
     stop_ = false;
+    exited_.store(false, std::memory_order_relaxed);
     thread_ = std::thread([this] { Loop(); });
 }
 
-void PhysicsWorker::StopThread() {
+void PhysicsWorker::StopThread(const std::function<void()>& serve) {
     if (!thread_.joinable()) return;
     {
         std::lock_guard<std::mutex> lock(mu_);
         stop_ = true;
     }
     cv_.notify_all();
+    while (serve && !exited_.load(std::memory_order_acquire)) serve();
     thread_.join();
+}
+
+void PhysicsWorker::ParkWhile(const std::function<void()>& wait) {
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        parked_ = true;
+    }
+    cv_.notify_all();
+    wait();
+    {
+        std::unique_lock<std::mutex> lock(mu_);
+        cv_.wait(lock, [this] { return !park_ || stop_; });
+        parked_ = false;
+    }
+    clock_reset_ = true;
+    if (bound_) Guarded([&] { BindWorldDevice(bind_.world); });
 }
 
 void PhysicsWorker::Exclusive(const std::function<void()>& fn) {
@@ -277,6 +297,7 @@ void PhysicsWorker::Loop() {
             cv_.wait_for(lock, std::chrono::duration<double>(wait_s),
                          [this] { return stop_ || park_ || !queue_.empty(); });
     }
+    exited_.store(true, std::memory_order_release);
 }
 
 bool PhysicsWorker::ApplyCommands(std::vector<TickCommand>& cmds) {
@@ -371,10 +392,15 @@ bool PhysicsWorker::Apply(const TickCommand& cmd) {
                     break;
             }
             return true;
-        case CommandKind::ScriptCall:
-            Report(cmd.seq, scripts_->RunString(cmd.code));
+        case CommandKind::ScriptCall: {
+            TickResult result;
+            result.seq = cmd.seq;
+            result.text = scripts_->RunString(cmd.code, cmd.filename, cmd.echo, &result.error);
+            result.streamed = true;
+            Report(std::move(result));
             last_mirror_ = WorkerClock::time_point{};
             return true;
+        }
     }
     return false;
 }

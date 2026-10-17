@@ -8,10 +8,12 @@
 #include "runtime/app/viewer/nui/nui.hpp"
 #include "runtime/app/viewer/property_schema.hpp"
 #include "runtime/app/viewer/scene_viewport.hpp"
+#include "runtime/app/viewer/script_tabs.hpp"
 #include "scene/ecs/entity.hpp"
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -20,11 +22,15 @@
 
 namespace nuka::scene {
 class SceneIR;
+class Registry;
 }
 
 namespace nuka::runtime::app::viewer {
 
 class CameraController;
+
+// What the Stage panel shows a node as: "artic", "body", "joint", "script", ... or "group".
+std::string NodeKind(const nuka::scene::Registry& reg, nuka::scene::EntityId e);
 
 // Editable values of the selected entity. The host seeds them; widgets write them and latch
 // `*_changed` (live preview) or `*_commit` (the gesture ended, record the edit).
@@ -196,8 +202,15 @@ struct ViewerUiState {
     bool save_dirty = false;
     char rename_buf[256] = {0};
 
-    char script_buf[16384] = {0};
+    ScriptTabs scripts;
+    // Completions from the host's script runner, asked and taken without waiting; unset when
+    // the editor has no scripting.
+    std::function<uint64_t(std::string code, int line, int column)> complete;
+    std::function<bool(uint64_t ticket, std::string* json)> take_completion;
+    double script_busy_s = 0.0;  // how long the running script has run; 0 when idle
+    bool script_rerun = false;   // saving a tab runs it again
     std::string console_log;
+    int console_level = 0;  // the console's level filter, see nui::LogView::level
     int script_node_count = 0;
 
     // A script owns the world: New and Open start another editor, closing keeps the world.
@@ -325,6 +338,11 @@ private:
     void BuildDrive(nui::VStack& root);
     void BuildScript(nui::VStack& root);
     void BuildConsole(nui::VStack& root);
+    // The script tab bar with its keys, completions, disk-change bar and close prompt.
+    void DrawScriptTabs();
+    void DrawScriptStatus();
+    // The console's Python line: Enter runs it, Tab completes, Up/Down walk the history.
+    void DrawRepl();
     void BuildInspector(nui::VStack& root);
     void BuildAssets(nui::VStack& root);
     // The schema groups of the selection's fields, after the transform and material.
@@ -369,6 +387,16 @@ private:
     int stage_fold_ = 0;
     char stage_filter_[128] = {0};
     char console_filter_[128] = {0};
+    char repl_[2048] = {0};
+    std::vector<std::string> repl_history_;
+    size_t repl_back_ = 0u;           // history steps back from the newest; 0 is the line being typed
+    uint64_t repl_ticket_ = 0u;       // the console completion in flight
+    std::vector<std::string> repl_options_;
+    std::string repl_insert_;         // completion text the input takes on its next callback
+    size_t repl_word_ = 0u;           // bytes of the word the insert replaces
+    bool repl_focus_ = false;
+    uint64_t shown_tab_ = 0u;         // the script tab the tab bar shows as selected
+    uint64_t close_ask_ = 0u;         // the script tab waiting on save, discard or cancel
     nui::Plot* frame_plot_ = nullptr;
     nui::Plot* step_plot_ = nullptr;
     uint64_t staged_version_ = 0u;               // bumped whenever the UI changes the staged edits

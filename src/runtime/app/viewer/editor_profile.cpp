@@ -128,13 +128,30 @@ double EditorProfile::SettingNumber(const std::string& table, const std::string&
     return Settings(dir_)[table][key].value_or(fallback);
 }
 
-void EditorProfile::SetSetting(const std::string& table, const std::string& key, const std::string& value) {
+bool EditorProfile::SettingBool(const std::string& table, const std::string& key, bool fallback) const {
+    return Settings(dir_)[table][key].value_or(fallback);
+}
+
+template <class T>
+void EditorProfile::Store(const std::string& table, const std::string& key, T value) {
     toml::table settings = Settings(dir_);
     if (settings[table].as_table() == nullptr) settings.insert_or_assign(table, toml::table{});
-    settings[table].as_table()->insert_or_assign(key, value);
+    settings[table].as_table()->insert_or_assign(key, std::move(value));
     std::ostringstream text;
     text << settings << "\n";
     WriteText(dir_ / "settings.toml", text.str());
+}
+
+void EditorProfile::SetSetting(const std::string& table, const std::string& key, const std::string& value) {
+    Store(table, key, value);
+}
+
+void EditorProfile::SetSettingNumber(const std::string& table, const std::string& key, double value) {
+    Store(table, key, value);
+}
+
+void EditorProfile::SetSettingBool(const std::string& table, const std::string& key, bool value) {
+    Store(table, key, value);
 }
 
 std::vector<std::string> EditorProfile::SettingList(const std::string& table, const std::string& key) const {

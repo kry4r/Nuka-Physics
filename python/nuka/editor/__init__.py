@@ -36,10 +36,10 @@ from typing import Optional, Sequence
 
 from .app import ActionError, Actions, EditorApp, EditorStartupError, HeadlessApp, ScriptRunner, forward
 from .extension import Context, Extension
-from .ui import UI, Node
+from .ui import UI, Node, ScriptInterrupted
 
 __all__ = ["ActionError", "Actions", "Context", "EditorApp", "EditorStartupError", "Extension", "HeadlessApp", "Node",
-           "ScriptRunner", "UI", "add_launcher_args", "launch", "main"]
+           "ScriptInterrupted", "ScriptRunner", "UI", "add_launcher_args", "launch", "main"]
 
 
 def add_launcher_args(parser: argparse.ArgumentParser) -> None:

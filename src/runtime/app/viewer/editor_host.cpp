@@ -3,6 +3,7 @@
 #include <vulkan/vulkan.h>
 
 #include "imgui.h"
+#include "TextEditor.h"
 // The SDL3 platform backend feeds ImGui input, IME and cursors; imgui_impl_vulkan draws.
 #include "backends/imgui_impl_sdl3.h"
 #include <SDL3/SDL_events.h>
@@ -45,12 +46,14 @@
 #include <cstdarg>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -78,6 +81,7 @@ constexpr float kDefaultDt = 1.0f / 240.0f;
 // ImGui's frame interval clamps to this so a hitch (load, resize, debugger) never jumps time.
 constexpr double kMaxFrameDt = 0.25;
 constexpr size_t kConsoleLogCap = 256u * 1024u;
+constexpr size_t kScriptRunsKept = 64u;
 // A spawned primitive starts this far above its reference so a free body drops in.
 constexpr float kSpawnDropHeight = 0.75f;
 constexpr uint64_t kFpsWarmup = 30u;
@@ -656,6 +660,18 @@ struct EditorHost::State : DocumentHost {
     void ConsoleAppend(const std::string& s);
     void DrainConsoleInbox();
     void SetHooks(const nuka_editor_script_hooks_t& hooks);
+    // Runs `fn` on the UI thread. Other threads wait for it to run there between frames; the
+    // physics thread counts as parked meanwhile, so `fn` may edit the world.
+    void OnUi(const std::function<void()>& fn);
+    // Runs the calls other threads queued, waiting for more until `until`.
+    void ServeRemote(Clock::time_point until);
+    void StopWorker();
+    void RegisterScriptActions();
+    // Queues `code` for the physics side, compiled as `name` ("" for the console); the seq
+    // script.result answers for.
+    uint64_t RunScript(const std::string& code, const std::string& name, bool echo);
+    // The tab `args` names by id, else the active one.
+    ScriptTab& TabArg(const json::Value& args);
 
     void FrameWorld(const render::RenderWorld& rw);
     std::string PathOfEntity(scene::EntityId e) const;
@@ -770,6 +786,7 @@ struct EditorHost::State : DocumentHost {
     DebugOverlay debug_overlay_;
     ScriptHost script_host_;
     PhysicsWorker worker_{&script_host_};
+    ScriptCompleter completer_{&script_host_};
     std::unique_ptr<render::InteropTransformSsbo> interop_;
     std::unique_ptr<PoseScatter> scatter_;
     std::string publish_reason_;          // why poses publish through host downloads
@@ -814,10 +831,30 @@ struct EditorHost::State : DocumentHost {
     std::atomic<bool> playing_mirror_{false};  // read by script callbacks off the UI thread
     std::mutex inbox_mu_;
     std::string console_inbox_;                // host console text, appended from any thread
+    struct RemoteCall {
+        std::function<void()> fn;
+        bool done = false;
+        std::exception_ptr error;
+    };
+    std::atomic<std::thread::id> ui_thread_{};
+    std::mutex remote_mu_;
+    std::condition_variable remote_cv_;
+    std::deque<RemoteCall*> remote_;
+    bool closing_ = false;  // queued calls fail instead of running
+    struct ScriptRun {
+        std::string name;
+        bool done = false;
+        bool failed = false;
+        std::string output;
+    };
+    std::map<uint64_t, ScriptRun> script_runs_;  // by seq; the oldest go beyond kScriptRunsKept
+    Clock::time_point scripts_polled_{};
+    size_t console_base_ = 0u;  // console bytes trimmed off the front so far
 };
 
 EditorHost::State::State(const std::vector<std::string>& args, nuka_world_handle world, float dt)
     : world_(world), borrowed_(world != nullptr) {
+    ui_thread_ = std::this_thread::get_id();
     if (dt > 0.0f) {
         opt_.dt = dt;
         opt_.dt_set = true;
@@ -831,6 +868,8 @@ EditorHost::State::State(const std::vector<std::string>& args, nuka_world_handle
     thumbnails_ = std::make_unique<ThumbnailCache>(profile_->Dir() / "thumbnails" / "assets");
     if (opt_.locale.empty()) opt_.locale = profile_->Setting("ui", "locale", "");
     autosave_seconds_ = profile_->SettingNumber("editor", "autosave_seconds", kAutosaveSeconds);
+    script_host_.SetBudget(profile_->SettingNumber("script", "budget_s", script_host_.Budget()));
+    ui_state_.script_rerun = profile_->SettingBool("script", "rerun_on_save", false);
     autosave_file_ = PathText(profile_->Dir() / "autosave" /
                               (std::to_string(UnixNow()) + "-" + std::to_string(ProcessId()) + ".nks"));
     if (const char* env = std::getenv("NUKA_VIEWER_FRAMES")) opt_.max_frames = std::atoi(env);
@@ -948,12 +987,16 @@ void EditorHost::State::StartChecks() {
 }
 
 EditorHost::State::~State() {
+    {
+        std::lock_guard<std::mutex> lock(remote_mu_);
+        closing_ = true;
+    }
     if (profile_ && present_) {
         DropAutosave();
         if (nui::Locale() != start_locale_) profile_->SetSetting("ui", "locale", nui::Locale());
     }
     extensions_.Shutdown();
-    worker_.StopThread();
+    StopWorker();
     if (present_) {
         present_->WaitIdle();
         if (native_window_ != nullptr) ImGui_ImplSDL3_Shutdown();
@@ -985,13 +1028,18 @@ void EditorHost::State::WriteLog(const std::string& text) {
     log_.flush();
 }
 
-// The Console panel's text also lands in the session log.
+// The Console panel's text also lands in the session log. Past the cap the oldest quarter goes,
+// whole lines at a time.
 void EditorHost::State::ConsoleAppend(const std::string& s) {
     if (s.empty()) return;
     WriteLog(s);
-    ui_state_.console_log += s;
-    if (ui_state_.console_log.size() > kConsoleLogCap)
-        ui_state_.console_log.erase(0, ui_state_.console_log.size() - kConsoleLogCap);
+    std::string& log = ui_state_.console_log;
+    log += s;
+    if (log.size() <= kConsoleLogCap) return;
+    const size_t nl = log.find('\n', log.size() - kConsoleLogCap * 3u / 4u);
+    const size_t cut = nl == std::string::npos ? log.size() : nl + 1u;
+    log.erase(0, cut);
+    console_base_ += cut;
 }
 
 void EditorHost::State::DrainConsoleInbox() {
@@ -1016,7 +1064,9 @@ void EditorHost::State::ConfigureExtensions() {
     services.actions = &actions_;
     services.ui = &ui_;
     services.run = [this](const std::string& id, const json::Value& args, const std::string& source) {
-        return RunAction(id, args, source);
+        ActionResult result;
+        OnUi([&] { result = RunAction(id, args, source); });
+        return result;
     };
     services.console = [this](const std::string& text) { Emit(stdout, text, /*console=*/true); };
     services.state_file = profile_->Dir() / "extensions.toml";
@@ -1043,8 +1093,61 @@ void EditorHost::State::PrintSummary() {
 
 void EditorHost::State::SetHooks(const nuka_editor_script_hooks_t& hooks) {
     script_host_.SetHooks(hooks);
+    ui_state_.complete = [this](std::string code, int line, int column) {
+        return completer_.Request(std::move(code), line, column);
+    };
+    ui_state_.take_completion = [this](uint64_t ticket, std::string* json) { return completer_.Take(ticket, json); };
     live_scripts_.clear();
     SyncScripts();
+}
+
+void EditorHost::State::OnUi(const std::function<void()>& fn) {
+    if (std::this_thread::get_id() == ui_thread_.load()) {
+        fn();
+        return;
+    }
+    RemoteCall call;
+    call.fn = fn;
+    const auto served = [&] {
+        std::unique_lock<std::mutex> lock(remote_mu_);
+        remote_cv_.wait(lock, [&] { return call.done; });
+    };
+    {
+        std::lock_guard<std::mutex> lock(remote_mu_);
+        if (closing_) throw std::runtime_error("the editor is closing");
+        remote_.push_back(&call);
+    }
+    remote_cv_.notify_all();
+    if (worker_.OnThread()) worker_.ParkWhile(served);
+    else served();
+    if (call.error) std::rethrow_exception(call.error);
+}
+
+void EditorHost::State::ServeRemote(Clock::time_point until) {
+    std::unique_lock<std::mutex> lock(remote_mu_);
+    for (;;) {
+        while (!remote_.empty()) {
+            RemoteCall* call = remote_.front();
+            remote_.pop_front();
+            const bool closing = closing_;
+            lock.unlock();
+            try {
+                if (closing) throw std::runtime_error("the editor is closing");
+                call->fn();
+            } catch (...) {
+                call->error = std::current_exception();
+            }
+            lock.lock();
+            call->done = true;
+            remote_cv_.notify_all();
+        }
+        if (!remote_cv_.wait_until(lock, until, [&] { return !remote_.empty(); })) return;
+    }
+}
+
+// A script on the physics thread may be waiting on a UI call; the join serves it.
+void EditorHost::State::StopWorker() {
+    worker_.StopThread([this] { ServeRemote(Clock::now() + std::chrono::milliseconds(2)); });
 }
 
 void EditorHost::State::FrameWorld(const render::RenderWorld& rw) {
@@ -1237,8 +1340,31 @@ void EditorHost::State::TakeWorkerResults() {
                                 r.text.size()));
             std::fflush(stdout);
         }
-        ConsoleAppend(r.text);
+        const auto run = script_runs_.find(r.seq);
+        if (run != script_runs_.end()) {
+            run->second.done = true;
+            run->second.failed = r.error;
+            run->second.output = r.text;
+            if (!run->second.name.empty()) ui_state_.scripts.Mark(r.text, r.error);
+        }
+        if (!r.streamed) ConsoleAppend(r.text);
     }
+}
+
+uint64_t EditorHost::State::RunScript(const std::string& code, const std::string& name, bool echo) {
+    const uint64_t seq = worker_.Push(TickCommand::Script(code, name, echo));
+    ScriptRun& run = script_runs_[seq];
+    run.name = name;
+    while (script_runs_.size() > kScriptRunsKept) script_runs_.erase(script_runs_.begin());
+    return seq;
+}
+
+ScriptTab& EditorHost::State::TabArg(const json::Value& args) {
+    if (args.Find("tab") == nullptr) return ui_state_.scripts.Active();
+    const uint64_t id = static_cast<uint64_t>(args.At("tab").AsInt());
+    ScriptTab* tab = ui_state_.scripts.Find(id);
+    if (tab == nullptr) throw std::runtime_error("no script tab " + std::to_string(id));
+    return *tab;
 }
 
 // Transport and display changes become worker commands.
@@ -1726,6 +1852,7 @@ void EditorHost::State::RegisterActions() {
     RegisterAssetActions();
     RegisterSimActions();
     RegisterViewActions();
+    RegisterScriptActions();
     ui_.RegisterActions(actions_);
 }
 
@@ -1963,40 +2090,197 @@ void EditorHost::State::RegisterEditActions() {
                       ui_state_.selected_entity = kept ? e : sel.empty() ? scene::kInvalidEntity : sel.back();
                       return Ok(Object({{"path", json::Value::Str(SelectedPath())}, {"selection", StrList(SelectionPaths())}}));
                   }});
+}
+
+void EditorHost::State::RegisterScriptActions() {
+    const auto has_scene = [this] { return loaded_ != nullptr; };
+    const auto tab_json = [](const ScriptTab& tab) {
+        return Object({{"tab", json::Value::Int(static_cast<int64_t>(tab.id))},
+                       {"title", json::Value::Str(tab.title)},
+                       {"path", json::Value::Str(tab.path)}});
+    };
+    actions_.Add({"script.new", "New Script", "script", "", ShortcutScope::Global, {}, {},
+                  [this, tab_json](const json::Value& args) { return Ok(tab_json(ui_state_.scripts.Add(StrArg(args, "text")))); }});
+    actions_.Add({"script.open", "Open Script...", "script", "", ShortcutScope::Global, {}, {},
+                  [this, tab_json](const json::Value& args) {
+                      std::string path = StrArg(args, "path");
+                      if (path.empty()) path = OpenFileDialog(nui::Tr("Open Script"), nui::Tr("Python scripts"), "*.py");
+                      if (path.empty()) return ActionResult::Fail("no file chosen");
+                      ScriptTab& tab = ui_state_.scripts.Open(path);
+                      if (const json::Value* line = args.Find("line")) ui_state_.scripts.Goto(tab, static_cast<int>(line->AsInt()));
+                      return Ok(tab_json(tab));
+                  }});
+    // A buffer saves to the path given, else where the dialog says; saving runs it when asked to.
+    actions_.Add({"script.save", "Save Script", "script", "", ShortcutScope::Global, {}, {},
+                  [this, tab_json](const json::Value& args) {
+                      ScriptTab& tab = TabArg(args);
+                      std::string path = StrArg(args, "path");
+                      if (path.empty() && tab.path.empty())
+                          path = SaveFileDialog(nui::Tr("Save Script"), nui::Tr("Python scripts"), "*.py", "script.py");
+                      if (path.empty() && tab.path.empty()) return ActionResult::Fail("no file chosen");
+                      ui_state_.scripts.Save(tab, path);
+                      if (ui_state_.script_rerun) RunScript(tab.Text(), tab.Name(), false);
+                      return Ok(tab_json(tab));
+                  }});
+    actions_.Add({"script.close", "Close Script", "script", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value& args) {
+                      ScriptTab& tab = TabArg(args);
+                      if (tab.Dirty() && !BoolArg(args, "discard", false))
+                          return ActionResult::Fail(tab.title + " has unsaved edits; pass discard to drop them");
+                      ui_state_.scripts.Close(tab.id);
+                      return Ok();
+                  }});
+    // One of `code`, `path` (a file on disk) or a tab; `selection` runs the tab's selection, or
+    // its caret line, and prints the value of a final expression. Answers at once with the seq.
     actions_.Add({"script.run", "Run Script", "script", "", ShortcutScope::Global, {}, {},
                   [this](const json::Value& args) {
-                      worker_.Push(TickCommand::Script(StrArg(args, "code", ui_state_.script_buf)));
-                      return Ok();
+                      std::string code, name;
+                      bool echo = false;
+                      if (const json::Value* c = args.Find("code")) {
+                          code = c->AsString();
+                          name = StrArg(args, "name", "<run>");
+                      } else if (const json::Value* p = args.Find("path")) {
+                          name = NormalPath(p->AsString());
+                          if (!ReadEntireFile(name, &code)) return ActionResult::Fail("cannot read " + name);
+                      } else {
+                          ScriptTab& tab = TabArg(args);
+                          name = tab.Name();
+                          code = tab.Text();
+                          if (BoolArg(args, "selection", false)) {
+                              TextEditor::DocSelection sel = tab.editor->GetMainCursorSelection();
+                              if (sel.start == sel.end) {
+                                  sel.start.index = 0u;
+                                  sel.end = TextEditor::DocPos(sel.start.line + 1u, 0u);
+                              }
+                              // Leading newlines keep tracebacks on the tab's own line numbers.
+                              code = std::string(sel.start.line, '\n') + tab.editor->GetSectionText(sel);
+                              echo = true;
+                          }
+                      }
+                      const uint64_t seq = RunScript(code, name, echo);
+                      return Ok(Object({{"seq", json::Value::Int(static_cast<int64_t>(seq))}, {"name", json::Value::Str(name)}}));
+                  }});
+    // A console line: echoed, then run so the value of a final expression prints.
+    actions_.Add({"script.eval", "Evaluate in Console", "script", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value& args) {
+                      const std::string code = StrArg(args, "code");
+                      ConsoleAppend(">>> " + code + "\n");
+                      const uint64_t seq = RunScript(code, std::string(), true);
+                      return Ok(Object({{"seq", json::Value::Int(static_cast<int64_t>(seq))}}));
+                  }});
+    actions_.Add({"script.stop", "Stop Script", "script", "", ShortcutScope::Global,
+                  [this] { return script_host_.BusySeconds() > 0.0; }, {},
+                  [this](const json::Value&) {
+                      return Ok(Object({{"stopped", json::Value::Bool(script_host_.Interrupt("stopped by the user"))}}));
+                  }});
+    actions_.Add({"script.result", "Script Result", "script", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value& args) {
+                      const uint64_t seq = static_cast<uint64_t>(args.At("seq").AsInt());
+                      const auto run = script_runs_.find(seq);
+                      if (run == script_runs_.end()) return ActionResult::Fail("no script run " + std::to_string(seq));
+                      return Ok(Object({{"done", json::Value::Bool(run->second.done)},
+                                        {"failed", json::Value::Bool(run->second.failed)},
+                                        {"output", json::Value::Str(run->second.output)},
+                                        {"name", json::Value::Str(run->second.name)}}));
+                  }});
+    // Completions at a 1-based line and 0-based column, as {name, type, signature}.
+    actions_.Add({"script.complete", "Complete", "script", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value& args) {
+                      return Ok(json::Value::Parse(script_host_.Complete(StrArg(args, "code"),
+                                                                         static_cast<int>(NumArg(args, "line", 1.0)),
+                                                                         static_cast<int>(NumArg(args, "column", 0.0)))));
+                  }});
+    actions_.Add({"script.tabs", "Script Tabs", "script", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value&) { return Ok(ui_state_.scripts.List()); }});
+    // Shows a traceback's file at its line: an open tab by name, else the file.
+    actions_.Add({"script.goto", "Go to Script Line", "script", "", ShortcutScope::Global, {}, {},
+                  [this, tab_json](const json::Value& args) {
+                      const std::string path = StrArg(args, "path");
+                      ScriptTab* tab = ui_state_.scripts.Named(path);
+                      if (tab == nullptr) tab = &ui_state_.scripts.Open(path);
+                      ui_state_.scripts.Activate(tab->id);
+                      ui_state_.scripts.Goto(*tab, static_cast<int>(NumArg(args, "line", 1.0)));
+                      actions_.Run("window.focus", Object({{"panel", json::Value::Str("script")}}), "script.goto", frame_index_);
+                      return Ok(tab_json(*tab));
+                  }});
+    // Console text from byte `since` on (0: all that is kept); `next` continues from here.
+    actions_.Add({"script.console", "Console Text", "script", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value& args) {
+                      const size_t since = static_cast<size_t>(NumArg(args, "since", 0.0));
+                      const std::string& log = ui_state_.console_log;
+                      const size_t from = since > console_base_ ? std::min(since - console_base_, log.size()) : 0u;
+                      return Ok(Object({{"text", json::Value::Str(log.substr(from))},
+                                        {"next", json::Value::Int(static_cast<int64_t>(console_base_ + log.size()))},
+                                        {"dropped", json::Value::Bool(since < console_base_)}}));
                   }});
     actions_.Add({"script.clear_console", "Clear Console", "script", "", ShortcutScope::Global, {}, {},
                   [this](const json::Value&) {
+                      console_base_ += ui_state_.console_log.size();
                       ui_state_.console_log.clear();
                       return Ok();
                   }});
-    // Attach persists the source as a /script node; a selected one updates in place.
+    // A tab whose file changed under its edits reloads, or keeps them with `keep`.
+    actions_.Add({"script.reload", "Reload Script", "script", "", ShortcutScope::Global, {}, {},
+                  [this, tab_json](const json::Value& args) {
+                      ScriptTab& tab = TabArg(args);
+                      if (BoolArg(args, "keep", false)) tab.disk_changed = false;
+                      else ui_state_.scripts.Reload(tab);
+                      return Ok(tab_json(tab));
+                  }});
+    actions_.Add({"script.toggle_rerun", "Rerun on Save", "script", "", ShortcutScope::Global, {},
+                  [this] { return ui_state_.script_rerun; },
+                  [this](const json::Value& args) {
+                      ui_state_.script_rerun = OptBoolArg(args, "on").value_or(!ui_state_.script_rerun);
+                      profile_->SetSettingBool("script", "rerun_on_save", ui_state_.script_rerun);
+                      return Ok(json::Value::Bool(ui_state_.script_rerun));
+                  }});
+    // Seconds a script may run before it stops; 0 lets it run.
+    actions_.Add({"script.set_budget", "Script Time Budget", "script", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value& args) {
+                      script_host_.SetBudget(NumArg(args, "seconds", script_host_.Budget()));
+                      profile_->SetSettingNumber("script", "budget_s", script_host_.Budget());
+                      return Ok(json::Value::Float(script_host_.Budget()));
+                  }});
+    // Attach persists a tab as a /script node: the node it came from, else a selected script
+    // node, else a new one.
     actions_.Add({"script.attach", "Attach as Node", "script", "", ShortcutScope::Global, has_scene, {},
                   [this](const json::Value& args) {
+                      ScriptTab& tab = TabArg(args);
+                      std::string target = tab.node;
                       const scene::EntityId sel = ui_state_.selected_entity;
-                      std::string target;
-                      for (size_t i = 0; i < loaded_->scene.ScriptCount(); ++i)
-                          if (sel != scene::kInvalidEntity &&
-                              loaded_->scene.EntityOfScript(static_cast<scene::ScriptId>(i)) == sel)
-                              target = SelectedPath();
-                      const json::Value source = json::Value::Str(StrArg(args, "source", ui_state_.script_buf));
+                      if (target.empty() && sel != scene::kInvalidEntity &&
+                          loaded_->scene.Ecs().Get<scene::ScriptComponent>(sel) != nullptr)
+                          target = SelectedPath();
+                      const json::Value source = json::Value::Str(StrArg(args, "source", tab.Text()));
                       return SubmitTxn(EditTxn{"Attach script", {EditOp{target, "script", json::Value(), source}}});
                   }});
-    // An oversize source is refused, never truncated into the buffer.
-    actions_.Add({"script.load", "Load Node", "script", "", ShortcutScope::Global, has_scene, {},
-                  [this](const json::Value&) {
-                      const auto* sc = ui_state_.selected_entity == scene::kInvalidEntity
-                                           ? nullptr
-                                           : loaded_->scene.Ecs().Get<scene::ScriptComponent>(ui_state_.selected_entity);
-                      if (sc == nullptr) return ActionResult::Fail("the selection is not a /script node");
-                      if (sc->source.size() >= sizeof(ui_state_.script_buf))
-                          return ActionResult::Fail("script source (" + std::to_string(sc->source.size()) +
-                                                    " bytes) exceeds the editor buffer");
-                      std::memcpy(ui_state_.script_buf, sc->source.c_str(), sc->source.size() + 1u);
-                      return Ok();
+    // Opens a /script node's source in a tab: `path`, else the selection.
+    actions_.Add({"script.load", "Open Node Source", "script", "", ShortcutScope::Global, has_scene, {},
+                  [this, tab_json](const json::Value& args) {
+                      const std::string path = StrArg(args, "path", SelectedPath());
+                      const auto node = loaded_->scene.Tree().NodeOf(path);
+                      const auto* sc = node ? loaded_->scene.Ecs().Get<scene::ScriptComponent>(node->entity) : nullptr;
+                      if (sc == nullptr) return ActionResult::Fail("'" + path + "' is not a /script node");
+                      return Ok(tab_json(ui_state_.scripts.AddNode(path, sc->source)));
+                  }});
+    // The scene's nodes as {path, name, kind}: all, those under `under`, or of one `kind`.
+    actions_.Add({"scene.nodes", "List Nodes", "scene", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      const std::string under = StrArg(args, "under");
+                      const std::string kind = StrArg(args, "kind");
+                      const scene::SceneGraph& tree = loaded_->scene.Tree();
+                      const auto start = under.empty() ? tree.Root() : tree.NodeOf(under);
+                      if (!start) return ActionResult::Fail("no node '" + under + "'");
+                      json::Value out = json::Value::Array();
+                      tree.Traverse(start, [&](const std::shared_ptr<scene::SceneNode>& n) {
+                          if (n == tree.Root()) return;
+                          const std::string k = NodeKind(loaded_->scene.Ecs(), n->entity);
+                          if (!kind.empty() && k != kind) return;
+                          out.PushBack(Object({{"path", json::Value::Str(tree.PathOf(n))},
+                                               {"name", json::Value::Str(n->name)},
+                                               {"kind", json::Value::Str(k)}}));
+                      });
+                      return Ok(std::move(out));
                   }});
 }
 
@@ -2407,6 +2691,8 @@ json::Value EditorHost::State::DocumentState() {
     v.Set("last_error", json::Value::Str(last_error_));
     v.Set("selection", json::Value::Str(SelectedPath()));
     v.Set("playing", json::Value::Bool(ui_state_.playing));
+    v.Set("script_busy_s", json::Value::Float(script_host_.BusySeconds()));
+    v.Set("script_budget_s", json::Value::Float(script_host_.Budget()));
     v.Set("path", json::Value::Str(doc_path_));
     v.Set("title", json::Value::Str(SessionTitle()));
     v.Set("prompt", json::Value::Str(ui_state_.prompt));
@@ -2545,10 +2831,22 @@ void EditorHost::State::ApplyInspectorEdits() {
 void EditorHost::State::Frame(bool step_physics) {
     if (!running_) return;
     const auto now = Clock::now();
+    ui_thread_ = std::this_thread::get_id();
     if (step_physics) worker_.StartThread();
-    else worker_.StopThread();
+    else StopWorker();
     DrainConsoleInbox();
+    ServeRemote(now);
     ui_state_.script_driven = borrowed_ && !step_physics;
+    // Open script files follow the disk: clean tabs reload, and run again when asked to.
+    if (now - scripts_polled_ >= std::chrono::seconds(1)) {
+        scripts_polled_ = now;
+        for (const uint64_t id : ui_state_.scripts.Poll()) {
+            const ScriptTab& tab = *ui_state_.scripts.Find(id);
+            ui_.Nui().Toast(nui::Level::Info, std::string(nui::Tr("Reloaded")) + " " + tab.title);
+            if (ui_state_.script_rerun) RunScript(tab.Text(), tab.Name(), false);
+        }
+    }
+    ui_state_.script_busy_s = script_host_.BusySeconds();
 
     // Files that later launches hand over or that land on the window open like File > Open.
     if (instance_) {
@@ -2997,10 +3295,8 @@ void EditorHost::State::Frame(bool step_physics) {
     playing_mirror_ = ui_state_.playing;
 
     const auto work_end = Clock::now();
-    const auto spent = std::chrono::duration<double>(work_end - now);
-    const auto budget = std::chrono::duration<double>(kFrameBudgetSeconds);
-    if (spent < budget)
-        std::this_thread::sleep_for(std::chrono::duration_cast<std::chrono::microseconds>(budget - spent));
+    // The rest of the frame budget serves calls from other threads instead of sleeping.
+    ServeRemote(now + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(kFrameBudgetSeconds)));
     if (frame_dt > 0.0 && frame_index_ > kFpsWarmup) {
         const double fms = frame_dt * 1000.0;
         ++measured_;
@@ -3041,7 +3337,7 @@ bool EditorHost::Forward(const std::vector<std::string>& args) {
 void EditorHost::SetScriptHooks(const nuka_editor_script_hooks_t& hooks) { state_->SetHooks(hooks); }
 void EditorHost::SetPythonHooks(const nuka_editor_python_hooks_t& hooks) { state_->extensions_.SetPythonHooks(hooks); }
 void EditorHost::Update(bool step_physics) { state_->Frame(step_physics); }
-void EditorHost::StopPhysics() { state_->worker_.StopThread(); }
+void EditorHost::StopPhysics() { state_->StopWorker(); }
 bool EditorHost::Running() const { return state_->running_; }
 bool EditorHost::Playing() const { return state_->playing_mirror_; }
 void EditorHost::Close() { state_->running_ = false; }
@@ -3058,18 +3354,33 @@ std::string EditorHost::RunAction(const std::string& id, const std::string& args
     json::Value args = json::Value::Object();
     try {
         if (!args_json.empty()) args = json::Value::Parse(args_json);
-        result = state_->RunAction(id, args, source);
+        state_->OnUi([&] { result = state_->RunAction(id, args, source); });
     } catch (const json::ParseError& e) {
         result = ActionResult::Fail(std::string("bad action arguments: ") + e.what());
         state_->last_error_ = result.error;
+    } catch (const std::runtime_error& e) {
+        result = ActionResult::Fail(e.what());
     }
     *ok = result.ok;
     return Object({{"ok", json::Value::Bool(result.ok)}, {"value", result.value}, {"error", json::Value::Str(result.error)}})
         .Dump(0);
 }
-std::string EditorHost::Actions() const { return state_->actions_.List().Dump(0); }
-std::string EditorHost::ActionLog(uint64_t since) const { return state_->actions_.LogSince(since).Dump(0); }
-std::string EditorHost::DocumentState() { return state_->DocumentState().Dump(0); }
+// Queries read UI-thread state, so they run there like actions.
+std::string EditorHost::Actions() const {
+    std::string text;
+    state_->OnUi([&] { text = state_->actions_.List().Dump(0); });
+    return text;
+}
+std::string EditorHost::ActionLog(uint64_t since) const {
+    std::string text;
+    state_->OnUi([&] { text = state_->actions_.LogSince(since).Dump(0); });
+    return text;
+}
+std::string EditorHost::DocumentState() {
+    std::string text;
+    state_->OnUi([&] { text = state_->DocumentState().Dump(0); });
+    return text;
+}
 const nuka_nui_api_t* EditorHost::Nui() { return state_->ui_.Nui().Api(); }
 const nuka_editor_host_api_t* EditorHost::ExtensionHost(const std::string& id) const {
     return state_->extensions_.HostApi(id);
