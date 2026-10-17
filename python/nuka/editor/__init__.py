@@ -120,7 +120,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     add_launcher_args(parser)
     parser.add_argument("--new-window", action="store_true")
     parser.add_argument("--console", action="store_true")
+    parser.add_argument("--render", default=None, help=argparse.SUPPRESS)
     opts, rest = parser.parse_known_args(sys.argv[1:] if argv is None else argv)
+    if opts.render:
+        from .render_job import run
+        return run(opts.render)
     if opts.headless:
         headless = argparse.ArgumentParser(prog="nuka-editor --headless", allow_abbrev=False)
         headless.add_argument("scene")

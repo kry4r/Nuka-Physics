@@ -272,6 +272,14 @@ SolverStats PhysicsWorker::ReadSolver(uint64_t since, std::vector<nuka_telemetry
     return solver_;
 }
 
+bool PhysicsWorker::TakeBeauty(BeautyImage* out) {
+    std::lock_guard<std::mutex> lock(beauty_mu_);
+    if (!beauty_ready_) return false;
+    *out = std::move(beauty_);
+    beauty_ready_ = false;
+    return true;
+}
+
 void PhysicsWorker::Report(uint64_t seq, std::string text, bool error) {
     if (text.empty() && seq == 0u) return;
     TickResult result;
@@ -473,6 +481,25 @@ bool PhysicsWorker::Apply(const TickCommand& cmd) {
         case CommandKind::Timeline:
             ApplyTimeline(cmd);
             return true;
+        case CommandKind::Beauty: {
+            // Renders the live world at this boundary; physics waits, nothing is published.
+            BeautyImage image;
+            image.request = cmd.seq;
+            image.width = cmd.width;
+            image.height = cmd.height;
+            image.spp = cmd.spp;
+            image.rgb.resize(static_cast<size_t>(cmd.width) * cmd.height * 3u);
+            const nuka_result_t r = nuka_world_render_beauty(bind_.world, &cmd.camera, cmd.width, cmd.height, cmd.spp, 0u,
+                                                              image.rgb.data(), image.rgb.size(), nullptr);
+            if (r != NUKA_RESULT_OK) {
+                image.rgb.clear();
+                image.error = nuka_result_message(r);
+            }
+            std::lock_guard<std::mutex> lock(beauty_mu_);
+            beauty_ = std::move(image);
+            beauty_ready_ = true;
+            return false;
+        }
     }
     return false;
 }

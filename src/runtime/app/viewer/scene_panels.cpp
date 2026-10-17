@@ -74,25 +74,6 @@ json::Value GroundPose(const math::Vec3& at) {
     return Args({{"pos", pos}, {"quat", quat}});
 }
 
-// A small toggle chip; true when clicked.
-bool Chip(const char* id, const std::string& text, bool on) {
-    const float s = nui::Scale();
-    const ImVec2 size = ImGui::CalcTextSize(text.c_str());
-    const ImVec2 p = ImGui::GetCursorScreenPos();
-    const ImVec2 box(size.x + 16.0f * s, ImGui::GetFrameHeight() - 2.0f * s);
-    ImGui::PushID(id);
-    const bool clicked = ImGui::InvisibleButton("##chip", box);
-    ImGui::PopID();
-    const bool hot = ImGui::IsItemHovered();
-    ImDrawList* list = ImGui::GetWindowDrawList();
-    draw::Chamfer(list, p, ImVec2(p.x + box.x, p.y + box.y), 4.0f * s,
-                  U32(on ? theme::Alpha(theme::kAccent, 0.16f) : hot ? theme::kBg2 : theme::kBg1),
-                  U32(on ? theme::kAccent : hot ? theme::kLineHi : theme::kLine));
-    list->AddText(ImVec2(p.x + 8.0f * s, p.y + (box.y - size.y) * 0.5f), U32(on ? theme::kAccent : hot ? theme::kFg : theme::kFgMuted),
-                  text.c_str());
-    return clicked;
-}
-
 // A button in the accent fill, the one a dialog's Enter presses; a disabled one drops the fill.
 bool PrimaryButton(const char* label, float width, bool enabled) {
     ImGui::BeginDisabled(!enabled);
@@ -171,14 +152,14 @@ void ImGuiLayer::BuildAssets(nui::VStack& root) {
 
         // The folders as chips that wrap; a user folder can be dropped from its menu.
         const float row_right = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
-        if (Chip("all", Tr("All folders"), b.root.empty())) b.root.clear();
+        if (draw::Chip("all", Tr("All folders"), b.root.empty())) b.root.clear();
         for (size_t i = 0; i < b.roots.size(); ++i) {
             const std::string& folder = b.roots[i];
             const std::string text = Iconed(icon::kFolder, Leaf(folder).c_str());
             ImGui::SameLine(0.0f, 4.0f * s);
             if (ImGui::GetCursorScreenPos().x + ImGui::CalcTextSize(text.c_str()).x + 16.0f * s > row_right) ImGui::NewLine();
             ImGui::PushID(static_cast<int>(i));
-            if (Chip("folder", text, b.root == folder)) b.root = folder;
+            if (draw::Chip("folder", text, b.root == folder)) b.root = folder;
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip)) ImGui::SetTooltip("%s", folder.c_str());
             const bool user = std::find(b.user_roots.begin(), b.user_roots.end(), folder) != b.user_roots.end();
             if (user && ImGui::BeginPopupContextItem("##folder_menu")) {

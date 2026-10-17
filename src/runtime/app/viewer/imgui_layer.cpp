@@ -1440,12 +1440,19 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
     if (viewport_.Valid()) {
         const ImVec2 vmin(viewport_.x, viewport_.y), vmax(viewport_.x + viewport_.width, viewport_.y + viewport_.height);
         if (ui_state.has_scene) {
-            draw::ViewportFrame(vmin, vmax,
-                                {Fmt(Tr("FOV %.0f\xC2\xB0"), camera.fov_degrees), Tr(ui_state.playing ? "LIVE" : "PAUSED"),
-                                 Fmt(Tr("TICK %llu"), static_cast<unsigned long long>(stats.sim_ticks))});
+            DrawRtImage(vmin, vmax);
+            std::vector<std::string> hud = {Fmt(Tr("FOV %.0f\xC2\xB0"), camera.fov_degrees),
+                                            Tr(ui_state.playing ? "LIVE" : "PAUSED"),
+                                            Fmt(Tr("TICK %llu"), static_cast<unsigned long long>(stats.sim_ticks))};
+            const RtView& rt = ui_state.rt;
+            if (rt.on)
+                hud.push_back(rt.converged ? Fmt(Tr("RT %u SPP"), rt.spp) + " " + icon::kOk
+                                           : Fmt(Tr("RT %u/%u SPP"), rt.spp, rt.max_spp));
+            draw::ViewportFrame(vmin, vmax, hud);
             DrawSolverHud(vmin, vmax);
             DrawPerturbHud(vmin, vmax);
-            DrawViewModeMenu(vmin, vmax);
+            DrawViewTools(vmin, vmax);
+            DrawBookmarkBar(vmin, vmax);
         } else if (!ui_state.start.shown) {
             const float s = nui::Scale();
             ImFont* font = GetNukaFont(FontRole::Display);
@@ -2380,15 +2387,40 @@ void ImGuiLayer::DrawPerturbHud(const ImVec2& vmin, const ImVec2& vmax) {
     list->PopClipRect();
 }
 
-void ImGuiLayer::DrawViewModeMenu(const ImVec2& vmin, const ImVec2& vmax) {
+// The floating windows over the viewport: no frame, no background, sized to their content.
+constexpr ImGuiWindowFlags kOverlayFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground |
+                                           ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking |
+                                           ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
+                                           ImGuiWindowFlags_AlwaysAutoResize;
+
+void ImGuiLayer::DrawViewTools(const ImVec2& vmin, const ImVec2& vmax) {
     const ViewerUiState& ui = *frame_.ui;
     const float s = nui::Scale();
     ImGui::SetNextWindowPos(ImVec2(vmax.x - 16.0f * s, vmin.y + 14.0f * s), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
-    constexpr ImGuiWindowFlags kFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground |
-                                        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking |
-                                        ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
-                                        ImGuiWindowFlags_AlwaysAutoResize;
-    if (ImGui::Begin("##view_mode", nullptr, kFlags)) {
+    if (ImGui::Begin("##view_tools", nullptr, kOverlayFlags)) {
+        if (draw::IconButton("##rt", icon::kSparkle, ui.rt.on, Tr("RT Preview"))) Queue("view.rt_preview");
+        ImGui::SameLine(0.0f, 4.0f * s);
+        if (draw::IconButton("##render", icon::kCamera, ui.rendering, Tr("Render This View..."))) ImGui::OpenPopup("##render_view");
+        if (ImGui::BeginPopup("##render_view")) {
+            ImGui::TextUnformatted(Tr("Render This View"));
+            ImGui::SetNextItemWidth(280.0f * s);
+            ImGui::InputTextWithHint("##path", Tr("Output PNG (empty asks)"), render_path_, sizeof(render_path_));
+            ImGui::SetNextItemWidth(180.0f * s);
+            ImGui::InputInt2(Tr("Size"), render_size_);
+            ImGui::SetNextItemWidth(180.0f * s);
+            ImGui::InputInt(Tr("Samples"), &render_spp_);
+            ImGui::BeginDisabled(ui.rendering);
+            if (ImGui::Button(Tr("Render"))) {
+                Queue("view.render", Args({{"path", json::Value::Str(render_path_)},
+                                           {"width", json::Value::Int(std::max(render_size_[0], 16))},
+                                           {"height", json::Value::Int(std::max(render_size_[1], 16))},
+                                           {"spp", json::Value::Int(std::max(render_spp_, 1))}}));
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndDisabled();
+            ImGui::EndPopup();
+        }
+        ImGui::SameLine(0.0f, 4.0f * s);
         ImGui::SetNextItemWidth(130.0f * s);
         const ViewModeInfo& shown = kViewModes[static_cast<size_t>(ui.view_mode)];
         if (ImGui::BeginCombo("##mode", Tr(shown.label))) {
@@ -2407,6 +2439,76 @@ void ImGuiLayer::DrawViewModeMenu(const ImVec2& vmin, const ImVec2& vmax) {
     list->AddRectFilled(a, b, U32(theme::Alpha(theme::kAccent, 0.10f)));
     list->AddRect(a, b, U32(theme::Alpha(theme::kAccent, 0.8f)), 0.0f, 0, 1.0f * s);
     list->PopClipRect();
+}
+
+void ImGuiLayer::DrawRtImage(const ImVec2& vmin, const ImVec2& vmax) {
+    const RtView& rt = frame_.ui->rt;
+    // A replaced texture waits out the frames in flight before the backend destroys it.
+    for (auto it = rt_retired_.begin(); it != rt_retired_.end();) {
+        if ((*it)->Status == ImTextureStatus_Destroyed) {
+            ImGui::UnregisterUserTexture(it->get());
+            it = rt_retired_.erase(it);
+        } else {
+            ++(*it)->UnusedFrames;
+            ++it;
+        }
+    }
+    if (!rt.on || !rt.shown) return;
+    if (rt_version_ != rt.version) {
+        rt_version_ = rt.version;
+        const int w = static_cast<int>(rt.width), h = static_cast<int>(rt.height);
+        if (rt_texture_ && (rt_texture_->Width != w || rt_texture_->Height != h)) {
+            rt_texture_->SetStatus(ImTextureStatus_WantDestroy);
+            rt_retired_.push_back(std::move(rt_texture_));
+        }
+        if (!rt_texture_) {
+            rt_texture_ = std::make_unique<ImTextureData>();
+            rt_texture_->Create(ImTextureFormat_RGBA32, w, h);
+            ImGui::RegisterUserTexture(rt_texture_.get());
+        } else {
+            rt_texture_->UpdateRect = ImTextureRect{0, 0, static_cast<unsigned short>(w), static_cast<unsigned short>(h)};
+            if (rt_texture_->Status == ImTextureStatus_OK) rt_texture_->SetStatus(ImTextureStatus_WantUpdates);
+        }
+        unsigned char* pixels = static_cast<unsigned char*>(rt_texture_->GetPixels());
+        for (size_t i = 0; i < static_cast<size_t>(w) * static_cast<size_t>(h); ++i) {
+            pixels[i * 4u + 0u] = rt.rgb[i * 3u + 0u];
+            pixels[i * 4u + 1u] = rt.rgb[i * 3u + 1u];
+            pixels[i * 4u + 2u] = rt.rgb[i * 3u + 2u];
+            pixels[i * 4u + 3u] = 255u;
+        }
+    }
+    ImGui::GetBackgroundDrawList()->AddImage(rt_texture_->GetTexRef(), vmin, vmax);
+}
+
+void ImGuiLayer::DrawBookmarkBar(const ImVec2& vmin, const ImVec2& vmax) {
+    const ViewerUiState& ui = *frame_.ui;
+    const float s = nui::Scale();
+    ImGui::SetNextWindowPos(ImVec2(vmin.x + 16.0f * s, vmax.y - 14.0f * s), ImGuiCond_Always, ImVec2(0.0f, 1.0f));
+    if (ImGui::Begin("##bookmarks", nullptr, kOverlayFlags)) {
+        for (size_t i = 0; i < ui.bookmarks.size(); ++i) {
+            const std::string& name = ui.bookmarks[i];
+            ImGui::PushID(static_cast<int>(i));
+            if (draw::Chip("bookmark", Iconed(icon::kCameraNode, name.c_str()), false))
+                Queue("view.bookmark_goto", Args({{"name", json::Value::Str(name)}}));
+            if (ImGui::BeginPopupContextItem("##bookmark_menu")) {
+                if (ImGui::IsWindowAppearing()) std::snprintf(bookmark_name_, sizeof(bookmark_name_), "%s", name.c_str());
+                ImGui::SetNextItemWidth(160.0f * s);
+                const bool enter = ImGui::InputText("##name", bookmark_name_, sizeof(bookmark_name_),
+                                                    ImGuiInputTextFlags_EnterReturnsTrue);
+                ImGui::SameLine();
+                if ((ImGui::SmallButton(Tr("Rename")) || enter) && bookmark_name_[0] != '\0') {
+                    Queue("view.bookmark_rename", Args({{"name", json::Value::Str(name)}, {"to", json::Value::Str(bookmark_name_)}}));
+                    ImGui::CloseCurrentPopup();
+                }
+                if (ImGui::MenuItemEx(Tr("Remove"), icon::kTrash)) Queue("view.bookmark_remove", Args({{"name", json::Value::Str(name)}}));
+                ImGui::EndPopup();
+            }
+            ImGui::PopID();
+            ImGui::SameLine(0.0f, 4.0f * s);
+        }
+        if (draw::IconButton("##add_bookmark", icon::kAdd, false, Tr("Add Camera Bookmark"))) Queue("view.bookmark_add");
+    }
+    ImGui::End();
 }
 
 void ImGuiLayer::DrawGizmo(CameraController& camera, uint32_t vp_w, uint32_t vp_h, ViewerUiState& ui_state,

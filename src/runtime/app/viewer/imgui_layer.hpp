@@ -215,6 +215,19 @@ struct HeldLoad {
     bool body = false;                     // a link or body load, labelled with its force
 };
 
+// The RT preview as the viewport shows it; the host bumps `version` with each new image.
+struct RtView {
+    bool on = false;
+    bool shown = false;  // the image shows the current view
+    bool converged = false;
+    uint32_t spp = 0u;
+    uint32_t max_spp = 64u;
+    uint32_t width = 0u;
+    uint32_t height = 0u;
+    uint64_t version = 0u;
+    std::vector<uint8_t> rgb;
+};
+
 // Transport, selection and panel state. The UI queues actions for anything that changes the
 // world and edits only this plain state in place.
 struct ViewerUiState {
@@ -228,6 +241,9 @@ struct ViewerUiState {
     bool show_colliders = false;
     bool show_contacts = false;
     nuka::render::ViewMode view_mode = nuka::render::ViewMode::Lit;
+    RtView rt;
+    std::vector<std::string> bookmarks;  // camera bookmark names, in bar order
+    bool rendering = false;              // an offline render is running
 
     nuka::scene::EntityId selected_entity = nuka::scene::kInvalidEntity;
     // Every selected node, the primary `selected_entity` among them.
@@ -446,8 +462,12 @@ private:
     void DrawSolverHud(const ImVec2& vmin, const ImVec2& vmax);
     // Each held load's pull from its grab point toward its target.
     void DrawPerturbHud(const ImVec2& vmin, const ImVec2& vmax);
-    // The shading menu at the viewport's top right and the box of a box selection.
-    void DrawViewModeMenu(const ImVec2& vmin, const ImVec2& vmax);
+    // The viewport's top-right tools (RT preview, Render, shading) and the box of a box selection.
+    void DrawViewTools(const ImVec2& vmin, const ImVec2& vmax);
+    // The RT preview image over the viewport, under its HUD.
+    void DrawRtImage(const ImVec2& vmin, const ImVec2& vmax);
+    // Camera bookmark chips along the viewport's bottom edge.
+    void DrawBookmarkBar(const ImVec2& vmin, const ImVec2& vmax);
     // While an asset card is dragged, the viewport takes the drop at the ground under the pointer.
     void DrawAssetDrop();
     // The texture of a PPM file, reloaded when the file changes; null without the file.
@@ -492,6 +512,13 @@ private:
     std::unordered_map<std::string, bool> folds_;  // Properties groups the user opened or closed
     uint64_t scrub_sent_ = ~0ull;  // the tick the timeline drag last asked for
     char branch_name_[64] = {0};   // the branch rename field
+    std::unique_ptr<ImTextureData> rt_texture_;
+    uint64_t rt_version_ = 0u;
+    std::vector<std::unique_ptr<ImTextureData>> rt_retired_;  // until the backend destroys them
+    char render_path_[512] = {0};  // the Render dialog's fields
+    int render_size_[2] = {1920, 1080};
+    int render_spp_ = 64;
+    char bookmark_name_[128] = {0};  // the bookmark rename field
 
     bool palette_open_ = false;
     bool palette_focus_ = false;

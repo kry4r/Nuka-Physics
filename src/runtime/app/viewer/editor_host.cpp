@@ -41,6 +41,10 @@
 #include "scene/format/nks.hpp"
 #include "scene/scene_ir.hpp"
 
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#define STBIW_WINDOWS_UTF8
+#include "stb/stb_image_write.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cstdarg>
@@ -101,6 +105,8 @@ constexpr float kClickSlop = 4.0f;
 constexpr float kGrabHz = 3.0f;
 // The viewport draws a plain held force as an arrow this long [m].
 constexpr float kForceArrow = 0.3f;
+// The RT preview renders the viewport scaled down to this many pixels on its long side.
+constexpr float kRtMaxSide = 1920.0f;
 
 struct LaunchOptions {
     std::string scene_path;
@@ -118,6 +124,7 @@ struct LaunchOptions {
     bool cam_on = false;
     math::Vec3 cam_target{};
     float cam_dist = 0.0f, cam_yaw = 0.0f, cam_pitch = 0.0f;
+    std::string cams_path;  // camera bookmarks for the first scene opened
     std::string select_path;
     bool edit_color_on = false;
     float edit_color[3] = {0.0f, 0.0f, 0.0f};
@@ -243,6 +250,7 @@ void WriteThumbnail(const std::string& capture, const fs::path& out) {
 void PrintUsage() {
     std::printf("usage: nuka-editor [scene.nks] [--policy <bin>] [--play] [--frames N] [--dt SECONDS]\n"
                 "  [--offscreen] [--cam tx,ty,tz,dist,yaw_deg,pitch_deg]\n"
+                "  [--cams FILE.json loads camera bookmarks for the scene it opens]\n"
                 "  [--capture-frame N --capture-out FILE.ppm]\n"
                 "  [--run-script FILE.py runs a script once against the loaded scene]\n"
                 "  [--undo / --redo fire one undo/redo after a headless load edit]\n"
@@ -297,6 +305,7 @@ bool ParseOptions(const std::vector<std::string>& args, LaunchOptions* opt) {
                 std::fprintf(stderr, "[nuka_editor] --cam wants tx,ty,tz,dist,yaw_deg,pitch_deg\n");
             }
         }
+        else if (a == "--cams" && has_value) opt->cams_path = args[++i];
         else if (a == "--select" && has_value) opt->select_path = args[++i];
         else if (a == "--edit-color" && has_value) {
             opt->edit_color_on = std::sscanf(args[++i].c_str(), "%f,%f,%f", &opt->edit_color[0],
@@ -697,6 +706,61 @@ std::string Hex(uint64_t value) {
     return text;
 }
 
+// What one RT preview image shows: the view, its pixel size and the snapshot it was asked at.
+struct RtKey {
+    nuka_beauty_camera_t camera{};
+    uint32_t width = 0u;
+    uint32_t height = 0u;
+    uint64_t sequence = 0u;
+    bool SameView(const RtKey& o) const {
+        return std::memcmp(&camera, &o.camera, sizeof(camera)) == 0 && width == o.width && height == o.height;
+    }
+    bool Same(const RtKey& o) const { return SameView(o) && sequence == o.sequence; }
+};
+
+// A named orbit view of a document; angles in degrees.
+struct CameraBookmark {
+    std::string name;
+    math::Vec3 target = math::Vec3::Zero();
+    float distance = 1.0f;
+    float yaw = 0.0f;
+    float pitch = 0.0f;
+    float fov = 45.0f;
+};
+
+// {"cameras": [{name, target, distance, yaw, pitch, fov}]}, the file --cams reads.
+json::Value BookmarksJson(const std::vector<CameraBookmark>& marks) {
+    json::Value list = json::Value::Array();
+    for (const CameraBookmark& b : marks)
+        list.PushBack(Object({{"name", json::Value::Str(b.name)},
+                              {"target", Vec3Json(b.target)},
+                              {"distance", json::Value::Float(b.distance)},
+                              {"yaw", json::Value::Float(b.yaw)},
+                              {"pitch", json::Value::Float(b.pitch)},
+                              {"fov", json::Value::Float(b.fov)}}));
+    return Object({{"cameras", std::move(list)}});
+}
+
+// The bookmarks a file holds; false when it cannot be read.
+bool ReadBookmarks(const std::string& path, std::vector<CameraBookmark>* out) {
+    std::string text;
+    if (!ReadEntireFile(path, &text)) return false;
+    const json::Value doc = json::Value::Parse(text);
+    std::vector<CameraBookmark> marks;
+    for (const json::Value& c : doc.At("cameras").Elements()) {
+        CameraBookmark b;
+        b.name = c.At("name").AsString();
+        Vec3Arg(c, "target", &b.target);
+        b.distance = c.At("distance").AsFloat();
+        b.yaw = c.At("yaw").AsFloat();
+        b.pitch = c.At("pitch").AsFloat();
+        b.fov = c.At("fov").AsFloat();
+        marks.push_back(std::move(b));
+    }
+    *out = std::move(marks);
+    return true;
+}
+
 // The most recent samples of one frame timing.
 struct SampleWindow {
     std::vector<double> values;
@@ -793,6 +857,16 @@ struct EditorHost::State : DocumentHost {
     // scene.select's arguments for the bodies a box pick saw, after the selection when `add`.
     json::Value BoxSelectArgs(const render::PickResult& pick, bool add);
     void SetViewMode(render::ViewMode mode);
+    // Shows the worker's RT images of the view through `camera` and asks for the next one, each
+    // with twice the samples; a changed view or snapshot starts again at one.
+    void StepRt(const CameraController& camera);
+    // Reports an offline render once its process exits.
+    void StepRender();
+    // The document's bookmark file in the profile; empty while untitled.
+    std::string BookmarkFile() const;
+    CameraBookmark* FindBookmark(const std::string& name);
+    // Shows the bookmarks' names and, with `save`, writes them to the document's file.
+    void SyncBookmarks(bool save);
     // A load on the link or free body `inst` draws, acting at the world point `at` with a spring of
     // `gain` times the default toward it; false for an instance no dynamics move.
     bool BodyLoad(const render::RenderInstance& inst, const math::Vec3& at, float gain, Perturbation* out) const;
@@ -911,6 +985,29 @@ struct EditorHost::State : DocumentHost {
     };
     std::optional<VideoExport> video_;
     json::Value exported_;  // the last export's path and frames, with an error when it failed
+    // The RT preview; one request is in flight at a time and `chain` is the view its samples refine.
+    struct RtPreview {
+        bool on = false;
+        uint32_t max_spp = 64u;
+        uint64_t inflight = 0u;  // the Beauty command not yet answered
+        RtKey asked;
+        RtKey chain;
+        RtKey shown;
+        uint32_t spp = 0u;           // the most samples shown of `chain`
+        std::vector<uint32_t> done;  // the samples of each image shown of `chain`
+        std::string error;
+    };
+    RtPreview rt_;
+    // An offline render: another process path-traces a copy of the scene and its state.
+    struct RenderJob {
+        std::string path;
+        std::string result;  // the JSON file it answers in
+        uint64_t process = 0u;
+        Clock::time_point started{};
+    };
+    std::optional<RenderJob> render_;
+    json::Value rendered_;  // the last render's answer
+    std::vector<CameraBookmark> bookmarks_;
     std::unique_ptr<ThumbnailCache> thumbnails_;  // asset and example pictures
     uint64_t start_thumb_version_ = 0u;
     std::vector<AssetFile> asset_files_;
@@ -1732,6 +1829,105 @@ render::RasterOptions EditorHost::State::ViewOptions(const CameraController& cam
     return opts;
 }
 
+void EditorHost::State::StepRt(const CameraController& camera) {
+    RtPreview& rt = rt_;
+    RtView& view = ui_state_.rt;
+    const SceneViewportRect& rect = ui_.Viewport();
+    RtKey key;
+    if (rect.Valid()) {
+        const float w = static_cast<float>(rect.pixels.width), h = static_cast<float>(rect.pixels.height);
+        const float scale = std::min(1.0f, kRtMaxSide / std::max(w, h));
+        key.width = std::max(1u, static_cast<uint32_t>(std::lround(w * scale)));
+        key.height = std::max(1u, static_cast<uint32_t>(std::lround(h * scale)));
+    }
+    const math::Vec3 eye = camera.ResolvedEye(), look = camera.ResolvedTarget();
+    key.camera = nuka_beauty_camera_t{{eye.x, eye.y, eye.z}, {look.x, look.y, look.z}, {0.0f, 0.0f, 1.0f}, camera.fov_degrees};
+    key.sequence = shown_ != nullptr ? shown_->sequence : 0u;
+    // An unbound worker drops what it is asked.
+    if (!loaded_) rt.inflight = 0u;
+    BeautyImage image;
+    if (worker_.TakeBeauty(&image) && image.request == rt.inflight) {
+        rt.inflight = 0u;
+        if (!image.error.empty()) {
+            rt.error = image.error;
+        } else if (rt.on && rt.asked.SameView(key)) {
+            view.rgb = std::move(image.rgb);
+            view.width = image.width;
+            view.height = image.height;
+            view.spp = image.spp;
+            ++view.version;
+            rt.shown = rt.asked;
+            if (rt.asked.Same(rt.chain)) {
+                rt.spp = image.spp;
+                rt.done.push_back(image.spp);
+            }
+        }
+    }
+    if (rt.on && loaded_ && rt.error.empty() && key.width > 0u) {
+        if (!key.Same(rt.chain)) {
+            rt.chain = key;
+            rt.spp = 0u;
+            rt.done.clear();
+        }
+        if (rt.inflight == 0u && rt.spp < rt.max_spp) {
+            TickCommand cmd;
+            cmd.kind = CommandKind::Beauty;
+            cmd.camera = key.camera;
+            cmd.width = key.width;
+            cmd.height = key.height;
+            cmd.spp = rt.spp == 0u ? 1u : std::min(2u * rt.spp, rt.max_spp);
+            rt.asked = key;
+            rt.inflight = worker_.Push(std::move(cmd));
+        }
+    }
+    view.on = rt.on;
+    view.max_spp = rt.max_spp;
+    view.shown = rt.on && !view.rgb.empty() && rt.shown.SameView(key);
+    view.converged = view.shown && rt.shown.Same(rt.chain) && rt.spp >= rt.max_spp;
+}
+
+void EditorHost::State::StepRender() {
+    if (!render_ || ProcessAlive(static_cast<uint32_t>(render_->process))) return;
+    std::string text;
+    rendered_ = ReadEntireFile(render_->result, &text)
+                    ? json::Value::Parse(text)
+                    : Object({{"ok", json::Value::Bool(false)},
+                              {"path", json::Value::Str(render_->path)},
+                              {"error", json::Value::Str("the render process exited without an answer")}});
+    if (rendered_.At("ok").AsBool()) {
+        Emit(stdout, "[nuka_editor] rendered " + render_->path + "\n");
+        ui_.Nui().Toast(nui::Level::Ok, std::string(nui::Tr("Rendered")) + " " + FileName(render_->path));
+    } else {
+        const std::string error = rendered_.At("error").AsString();
+        Emit(stderr, "[nuka_editor] render failed: " + error + "\n");
+        ui_.Nui().Toast(nui::Level::Err, std::string(nui::Tr("Render failed")) + ": " + error);
+    }
+    render_.reset();
+    ui_state_.rendering = false;
+}
+
+std::string EditorHost::State::BookmarkFile() const {
+    return doc_path_.empty() ? std::string() : PathText(profile_->Dir() / "bookmarks" / (Hex(Fnv1a(doc_path_)) + ".json"));
+}
+
+CameraBookmark* EditorHost::State::FindBookmark(const std::string& name) {
+    const auto it = std::find_if(bookmarks_.begin(), bookmarks_.end(), [&](const CameraBookmark& b) { return b.name == name; });
+    return it == bookmarks_.end() ? nullptr : &*it;
+}
+
+void EditorHost::State::SyncBookmarks(bool save) {
+    ui_state_.bookmarks.clear();
+    for (const CameraBookmark& b : bookmarks_) ui_state_.bookmarks.push_back(b.name);
+    const std::string file = BookmarkFile();
+    if (!save || file.empty()) return;
+    if (bookmarks_.empty()) {
+        fs::remove(Utf8Path(file));
+        return;
+    }
+    fs::create_directories(Utf8Path(file).parent_path());
+    std::ofstream(Utf8Path(file), std::ios::binary | std::ios::trunc) << BookmarksJson(bookmarks_).Dump(2);
+}
+
 const std::vector<std::string>& EditorHost::State::InstancePaths() {
     const render::RenderWorld& w = ShownWorld();
     if (instance_paths_.size() != w.InstanceCount() || instance_paths_version_ != ui_state_.scene_version) {
@@ -2087,6 +2283,7 @@ ActionResult EditorHost::State::SaveScene(const std::string& path) {
     doc_path_ = NormalPath(path);
     std::snprintf(ui_state_.save_path, sizeof(ui_state_.save_path), "%s", doc_path_.c_str());
     profile_->TouchRecent(doc_path_);
+    SyncBookmarks(true);
     start_stale_ = true;
     assets_stale_ = true;
     // The recent list shows the viewport as it was saved.
@@ -2108,6 +2305,13 @@ ActionResult EditorHost::State::OpenDocument(const std::string& file, const std:
     doc_path_ = doc_path.empty() ? std::string() : NormalPath(doc_path);
     std::snprintf(ui_state_.save_path, sizeof(ui_state_.save_path), "%s", doc_path_.c_str());
     if (!doc_path_.empty()) profile_->TouchRecent(doc_path_);
+    bookmarks_.clear();
+    if (!doc_path_.empty()) ReadBookmarks(BookmarkFile(), &bookmarks_);
+    if (!opt_.cams_path.empty()) {
+        if (!ReadBookmarks(opt_.cams_path, &bookmarks_)) Emit(stderr, "[nuka_editor] --cams cannot read " + opt_.cams_path + "\n");
+        opt_.cams_path.clear();
+    }
+    SyncBookmarks(false);
     start_stale_ = true;
     assets_stale_ = true;
     Emit(stdout, "[nuka_editor] opened " + file + "\n");
@@ -3307,6 +3511,177 @@ void EditorHost::State::RegisterViewActions() {
                                   at("x1", rect.x, rect.width, 1.0), at("y1", rect.y, rect.height, 1.0));
                       return RunAction("scene.select", BoxSelectArgs(pick, mode == "add"), "view");
                   }});
+    // Path-traced frames of the view over the raster one, refined up to max_spp samples while nothing moves.
+    actions_.Add({"view.rt_preview", "RT Preview", "view", "", ShortcutScope::Global, has_scene,
+                  [this] { return rt_.on; },
+                  [this](const json::Value& args) {
+                      const double max_spp = NumArg(args, "max_spp", rt_.max_spp);
+                      if (max_spp < 1.0) return ActionResult::Fail("max_spp: at least one sample");
+                      rt_.on = BoolArg(args, "on", !rt_.on);
+                      rt_.max_spp = static_cast<uint32_t>(max_spp);
+                      rt_.chain = RtKey{};
+                      rt_.error.clear();
+                      return Ok(Object({{"on", json::Value::Bool(rt_.on)}, {"max_spp", json::Value::Int(rt_.max_spp)}}));
+                  }});
+    actions_.Add({"view.rt_status", "RT Preview Status", "view", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value&) {
+                      json::Value done = json::Value::Array();
+                      for (const uint32_t s : rt_.done) done.PushBack(json::Value::Int(s));
+                      return Ok(Object({{"on", json::Value::Bool(rt_.on)},
+                                        {"spp", json::Value::Int(rt_.spp)},
+                                        {"max_spp", json::Value::Int(rt_.max_spp)},
+                                        {"converged", json::Value::Bool(ui_state_.rt.converged)},
+                                        {"shown", json::Value::Bool(ui_state_.rt.shown)},
+                                        {"pending", json::Value::Bool(rt_.inflight != 0u)},
+                                        {"done", std::move(done)},
+                                        {"width", json::Value::Int(rt_.chain.width)},
+                                        {"height", json::Value::Int(rt_.chain.height)},
+                                        {"error", rt_.error.empty() ? json::Value::Null() : json::Value::Str(rt_.error)}}));
+                  }});
+    // The RT image the viewport shows, as a PNG; the dialog asks without `path`.
+    actions_.Add({"view.rt_save", "Save RT Image...", "view", "", ShortcutScope::Global,
+                  [this] { return ui_state_.rt.shown; }, {},
+                  [this](const json::Value& args) {
+                      const RtView& v = ui_state_.rt;
+                      std::string path = StrArg(args, "path");
+                      if (path.empty()) path = SaveFileDialog(nui::Tr("Save RT Image"), nui::Tr("PNG images"), "*.png", "preview.png");
+                      if (path.empty()) return ActionResult::Fail("no image path chosen");
+                      const int w = static_cast<int>(v.width), h = static_cast<int>(v.height);
+                      if (stbi_write_png(path.c_str(), w, h, 3, v.rgb.data(), w * 3) == 0)
+                          return ActionResult::Fail("cannot write " + path);
+                      return Ok(Object({{"path", json::Value::Str(path)}, {"width", json::Value::Int(w)},
+                                        {"height", json::Value::Int(h)}, {"spp", json::Value::Int(v.spp)}}));
+                  }});
+    // A path-traced PNG of the view at {width, height, spp}, rendered by another process from a copy of
+    // the scene and its state; view.render_status reports it.
+    actions_.Add({"view.render", "Render This View...", "view", "", ShortcutScope::Global,
+                  [this] { return loaded_ != nullptr && !render_; }, {},
+                  [this](const json::Value& args) {
+                      const double width = NumArg(args, "width", 1920.0), height = NumArg(args, "height", 1080.0);
+                      const double spp = NumArg(args, "spp", 64.0);
+                      if (width < 1.0 || height < 1.0 || spp < 1.0) return ActionResult::Fail("width, height, spp: at least one");
+                      if (opt_.relaunch.empty()) return ActionResult::Fail("this session has no command to start a render");
+                      std::string path = StrArg(args, "path");
+                      if (path.empty()) path = SaveFileDialog(nui::Tr("Render This View"), nui::Tr("PNG images"), "*.png", "render.png");
+                      if (path.empty()) return ActionResult::Fail("no image path chosen");
+                      const fs::path out = fs::absolute(Utf8Path(path));
+                      if (!fs::is_directory(out.parent_path())) return ActionResult::Fail("no folder " + PathText(out.parent_path()));
+                      const fs::path dir = Utf8Path(cache_.File("render"));
+                      fs::remove_all(dir);
+                      fs::create_directories(dir);
+                      const std::string scene = PathText(dir / "scene.nks"), state = PathText(dir / "state.ckpt");
+                      const std::string job = PathText(dir / "job.json"), result = PathText(dir / "result.json");
+                      scene::nks::Save(loaded_->scene, scene);
+                      worker_.Exclusive([&] {
+                          nuka_checkpoint_handle cp = nullptr;
+                          CheckResult(nuka_world_checkpoint_capture(world_, &cp), "nuka_world_checkpoint_capture");
+                          const nuka_result_t r = nuka_checkpoint_write(cp, state.c_str());
+                          nuka_checkpoint_destroy(cp);
+                          CheckResult(r, "nuka_checkpoint_write");
+                      });
+                      const json::Value camera = Object({{"eye", Vec3Json(camera_.ResolvedEye())},
+                                                         {"look", Vec3Json(camera_.ResolvedTarget())},
+                                                         {"up", Vec3Json(math::Vec3{0.0f, 0.0f, 1.0f})},
+                                                         {"fov", json::Value::Float(camera_.fov_degrees)}});
+                      const json::Value spec = Object({{"scene", json::Value::Str(scene)},
+                                                       {"checkpoint", json::Value::Str(state)},
+                                                       {"output", json::Value::Str(PathText(out))},
+                                                       {"result", json::Value::Str(result)},
+                                                       {"width", json::Value::Int(static_cast<int64_t>(width))},
+                                                       {"height", json::Value::Int(static_cast<int64_t>(height))},
+                                                       {"spp", json::Value::Int(static_cast<int64_t>(spp))},
+                                                       {"dt", json::Value::Float(opt_.dt)},
+                                                       {"envs", json::Value::Int(loaded_->Layout().env_count)},
+                                                       {"camera", camera}});
+                      std::ofstream(Utf8Path(job), std::ios::binary | std::ios::trunc) << spec.Dump(2);
+                      std::vector<std::string> argv = opt_.relaunch;
+                      argv.insert(argv.end(), {"--render", job});
+                      std::string error;
+                      const uint64_t pid = SpawnDetached(argv, &error);
+                      if (pid == 0u) return ActionResult::Fail(error);
+                      render_ = RenderJob{PathText(out), result, pid, Clock::now()};
+                      ui_state_.rendering = true;
+                      return Ok(Object({{"path", json::Value::Str(PathText(out))},
+                                        {"process", json::Value::Int(static_cast<int64_t>(pid))}}));
+                  }});
+    actions_.Add({"view.render_status", "Render Status", "view", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value&) {
+                      return Ok(Object({{"running", json::Value::Bool(render_.has_value())},
+                                        {"path", render_ ? json::Value::Str(render_->path) : json::Value::Null()},
+                                        {"seconds", render_ ? json::Value::Float(std::chrono::duration<double>(
+                                                                                     Clock::now() - render_->started).count())
+                                                            : json::Value::Null()},
+                                        {"last", rendered_}}));
+                  }});
+    actions_.Add({"view.bookmarks", "Camera Bookmarks", "view", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value&) { return Ok(BookmarksJson(bookmarks_).At("cameras")); }});
+    // Keeps the view as `name`, replacing a bookmark of that name; without one it is "View N".
+    actions_.Add({"view.bookmark_add", "Add Camera Bookmark", "view", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      std::string name = StrArg(args, "name");
+                      for (size_t n = bookmarks_.size() + 1u; name.empty(); ++n)
+                          if (FindBookmark(Format("View %zu", n)) == nullptr) name = Format("View %zu", n);
+                      CameraBookmark* b = FindBookmark(name);
+                      if (b == nullptr) b = &bookmarks_.emplace_back();
+                      *b = CameraBookmark{name, camera_.ResolvedTarget(), camera_.Distance(), camera_.Yaw() * 180.0f / kPi,
+                                          camera_.Pitch() * 180.0f / kPi, camera_.fov_degrees};
+                      SyncBookmarks(true);
+                      return Ok(Object({{"name", json::Value::Str(name)},
+                                        {"count", json::Value::Int(static_cast<int64_t>(bookmarks_.size()))}}));
+                  }});
+    actions_.Add({"view.bookmark_goto", "Go to Camera Bookmark", "view", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      const std::string name = StrArg(args, "name");
+                      const CameraBookmark* b = FindBookmark(name);
+                      if (b == nullptr) return ActionResult::Fail("no camera bookmark '" + name + "'");
+                      camera_.SetView(b->target, b->distance, b->yaw * kPi / 180.0f, b->pitch * kPi / 180.0f);
+                      camera_.fov_degrees = b->fov;
+                      return Ok(Object({{"name", json::Value::Str(name)}}));
+                  }});
+    actions_.Add({"view.bookmark_rename", "Rename Camera Bookmark", "view", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      const std::string name = StrArg(args, "name"), to = StrArg(args, "to");
+                      CameraBookmark* b = FindBookmark(name);
+                      if (b == nullptr) return ActionResult::Fail("no camera bookmark '" + name + "'");
+                      if (to.empty() || (to != name && FindBookmark(to) != nullptr))
+                          return ActionResult::Fail("the new name is empty or taken");
+                      b->name = to;
+                      SyncBookmarks(true);
+                      return Ok(Object({{"name", json::Value::Str(to)}}));
+                  }});
+    actions_.Add({"view.bookmark_remove", "Remove Camera Bookmark", "view", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      const std::string name = StrArg(args, "name");
+                      const CameraBookmark* b = FindBookmark(name);
+                      if (b == nullptr) return ActionResult::Fail("no camera bookmark '" + name + "'");
+                      bookmarks_.erase(bookmarks_.begin() + (b - bookmarks_.data()));
+                      SyncBookmarks(true);
+                      return Ok(Object({{"count", json::Value::Int(static_cast<int64_t>(bookmarks_.size()))}}));
+                  }});
+    // Writes the bookmarks in the format --cams reads; the dialog asks without `path`.
+    actions_.Add({"view.bookmarks_save", "Export Camera Bookmarks...", "view", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      std::string path = StrArg(args, "path");
+                      if (path.empty())
+                          path = SaveFileDialog(nui::Tr("Export Camera Bookmarks"), nui::Tr("Camera bookmarks"), "*.json", "cameras.json");
+                      if (path.empty()) return ActionResult::Fail("no bookmark file chosen");
+                      std::ofstream out(Utf8Path(path), std::ios::binary | std::ios::trunc);
+                      out << BookmarksJson(bookmarks_).Dump(2);
+                      if (!out) return ActionResult::Fail("cannot write " + path);
+                      return Ok(Object({{"path", json::Value::Str(path)},
+                                        {"count", json::Value::Int(static_cast<int64_t>(bookmarks_.size()))}}));
+                  }});
+    // Replaces the bookmarks with a file's.
+    actions_.Add({"view.bookmarks_load", "Import Camera Bookmarks...", "view", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      std::string path = StrArg(args, "path");
+                      if (path.empty()) path = OpenFileDialog(nui::Tr("Import Camera Bookmarks"), nui::Tr("Camera bookmarks"), "*.json");
+                      if (path.empty()) return ActionResult::Fail("no bookmark file chosen");
+                      if (!ReadBookmarks(path, &bookmarks_)) return ActionResult::Fail("cannot read " + path);
+                      SyncBookmarks(true);
+                      return Ok(Object({{"path", json::Value::Str(path)},
+                                        {"count", json::Value::Int(static_cast<int64_t>(bookmarks_.size()))}}));
+                  }});
 }
 
 void EditorHost::State::RegisterSolverActions() {
@@ -4365,6 +4740,7 @@ void EditorHost::State::Frame(bool step_physics) {
     PushTransport();
     PushEdits();
 
+    StepRt(render_camera);
     const render::RasterOptions opts = ViewOptions(render_camera);
 
     // Debug overlays rebuild from the shown snapshot; off leaves the real instance set untouched.
@@ -4375,6 +4751,7 @@ void EditorHost::State::Frame(bool step_physics) {
     apply_ms += Ms(Clock::now() - overlay_t0);
 
     if (video_) StepVideo();
+    StepRender();
     ui_state_.exporting = video_.has_value();
     ui_state_.export_done = !video_ ? 0.0f
                             : video_->encoder != 0u

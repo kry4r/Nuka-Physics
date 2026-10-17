@@ -33,7 +33,7 @@ namespace nuka::runtime::app::viewer {
 
 using WorkerClock = std::chrono::steady_clock;
 
-enum class CommandKind : uint8_t { EditApply, Teleport, ParamSet, Perturb, Transport, ScriptCall, Timeline };
+enum class CommandKind : uint8_t { EditApply, Teleport, ParamSet, Perturb, Transport, ScriptCall, Timeline, Beauty };
 enum class ParamKind : uint8_t {
     Field, HoldGains, ControllerCommand, DisplayEnv, ScatterRows, Overlay, Registry, Telemetry, Iterations, Heatmap
 };
@@ -90,6 +90,10 @@ struct TickCommand {
     bool relative = false;
     uint32_t branch = kNoBranch;             // Branch, Rename, Ghost
     std::string label;                       // Fork, Rename
+    nuka_beauty_camera_t camera{};           // Beauty: the view, its pixel size and samples per pixel
+    uint32_t width = 0u;
+    uint32_t height = 0u;
+    uint32_t spp = 0u;
 
     static TickCommand Transport(TransportOp op);
     static TickCommand Param(ParamKind param, std::vector<float> values);
@@ -155,6 +159,16 @@ struct WorkerTelemetry {
     uint32_t batch_steps = 0u;
     uint64_t capped_batches = 0u;
     double dropped_sim_s = 0.0;
+};
+
+// A path-traced image of environment 0; `error` when the render failed.
+struct BeautyImage {
+    uint64_t request = 0u;  // the Beauty command's seq
+    uint32_t width = 0u;
+    uint32_t height = 0u;
+    uint32_t spp = 0u;
+    std::vector<uint8_t> rgb;
+    std::string error;
 };
 
 // The newest records of this many count toward SolverStats::recent_caps.
@@ -296,6 +310,8 @@ public:
     SolverStats ReadSolver(uint64_t since, std::vector<nuka_telemetry_record_t>* out);
     // Copies the history the last snapshot described; readable from any thread.
     void ReadTimeline(TimelineInfo* info);
+    // Moves the newest finished beauty render into `out` once; readable from any thread.
+    bool TakeBeauty(BeautyImage* out);
 
 private:
     void Loop();
@@ -405,6 +421,9 @@ private:
     uint64_t history_revision_ = 0u;
     std::mutex timeline_mu_;
     TimelineInfo timeline_;
+    std::mutex beauty_mu_;
+    BeautyImage beauty_;
+    bool beauty_ready_ = false;
 };
 
 }  // namespace nuka::runtime::app::viewer

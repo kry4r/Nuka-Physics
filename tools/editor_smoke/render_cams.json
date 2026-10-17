@@ -1,0 +1,5 @@
+{
+  "cameras": [
+    {"name": "hero", "target": [0.0, 0.0, 0.4], "distance": 3.5, "yaw": 35.0, "pitch": 22.0, "fov": 50.0}
+  ]
+}

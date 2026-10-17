@@ -1294,6 +1294,7 @@ if(CMAKE_CUDA_COMPILER)
                 nuka_import
                 imgui
                 nuka_toml
+                nuka_stb
                 Vulkan::Vulkan
         )
         if(NOT WIN32)

@@ -325,6 +325,24 @@ void ViewportFrame(const ImVec2& min, const ImVec2& max, const std::vector<std::
     }
 }
 
+bool Chip(const char* id, const std::string& text, bool on) {
+    const float s = Scale();
+    const ImVec2 size = ImGui::CalcTextSize(text.c_str());
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const ImVec2 box(size.x + 16.0f * s, ImGui::GetFrameHeight() - 2.0f * s);
+    ImGui::PushID(id);
+    const bool clicked = ImGui::InvisibleButton("##chip", box);
+    ImGui::PopID();
+    const bool hot = ImGui::IsItemHovered();
+    ImDrawList* list = ImGui::GetWindowDrawList();
+    Chamfer(list, p, ImVec2(p.x + box.x, p.y + box.y), 4.0f * s,
+            U32(on ? theme::Alpha(theme::kAccent, 0.16f) : hot ? theme::kBg2 : theme::kBg1),
+            U32(on ? theme::kAccent : hot ? theme::kLineHi : theme::kLine));
+    list->AddText(ImVec2(p.x + 8.0f * s, p.y + (box.y - size.y) * 0.5f), U32(on ? theme::kAccent : hot ? theme::kFg : theme::kFgMuted),
+                  text.c_str());
+    return clicked;
+}
+
 }  // namespace draw
 
 // ---- items --------------------------------------------------------------------------------
