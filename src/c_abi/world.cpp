@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -716,6 +717,106 @@ nuka_result_t nuka_world_get_velocity_iterations(nuka_world_handle world, uint32
     if (!record) return NUKA_RESULT_NULL_HANDLE;
     if (!record->world) return NUKA_RESULT_NOT_SUPPORTED;
     *out_iterations = record->world->VelocityIterations();
+    return NUKA_RESULT_OK;
+}
+
+static_assert(sizeof(nuka_telemetry_record_t) == sizeof(nuka::nk::TelemetryRecord) &&
+              offsetof(nuka_telemetry_record_t, sample_residual) == offsetof(nuka::nk::TelemetryRecord, sample_residual) &&
+              NUKA_TELEMETRY_SAMPLES == nuka::nk::kTelemetrySamples, "telemetry record ABI");
+
+nuka_result_t nuka_world_set_telemetry_mask(nuka_world_handle world, uint32_t mask, float alert_velocity) {
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (!record) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->world) return NUKA_RESULT_NOT_SUPPORTED;
+    try {
+        return nuka::c_abi::MapStatusToResult(record->world->SetTelemetry(mask, alert_velocity));
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+nuka_result_t nuka_world_get_telemetry_mask(nuka_world_handle world, uint32_t* out_mask) {
+    if (out_mask == nullptr) return NUKA_RESULT_INVALID_ARG;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (!record) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->world) return NUKA_RESULT_NOT_SUPPORTED;
+    *out_mask = record->world->TelemetryMask();
+    return NUKA_RESULT_OK;
+}
+
+nuka_result_t nuka_world_read_telemetry(nuka_world_handle world, nuka_telemetry_record_t* out, uint32_t capacity,
+                                        uint32_t* out_count, uint32_t* out_dropped) {
+    if (out_count == nullptr || out_dropped == nullptr || (out == nullptr && capacity != 0u))
+        return NUKA_RESULT_INVALID_ARG;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (!record) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->world) return NUKA_RESULT_NOT_SUPPORTED;
+    try {
+        std::vector<nuka::nk::TelemetryRecord> records;
+        const auto status = record->world->ReadTelemetry(&records, capacity, out_dropped);
+        *out_count = static_cast<uint32_t>(records.size());
+        if (!records.empty()) std::memcpy(out, records.data(), records.size() * sizeof(records[0]));
+        return nuka::c_abi::MapStatusToResult(status);
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+nuka_result_t nuka_world_read_telemetry_vertices(nuka_world_handle world, float* out, size_t capacity,
+                                                 size_t* out_count) {
+    if (out_count == nullptr || (out == nullptr && capacity != 0u)) return NUKA_RESULT_INVALID_ARG;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (!record) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->world) return NUKA_RESULT_NOT_SUPPORTED;
+    try {
+        std::vector<float> vertices;
+        const auto status = record->world->ReadTelemetryVertices(&vertices);
+        *out_count = vertices.size();
+        std::copy_n(vertices.begin(), std::min(capacity, vertices.size()), out);
+        return nuka::c_abi::MapStatusToResult(status);
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+nuka_result_t nuka_world_get_particle_surface_count(nuka_world_handle world, uint32_t* out_count) {
+    if (out_count == nullptr) return NUKA_RESULT_INVALID_ARG;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (!record) return NUKA_RESULT_NULL_HANDLE;
+    *out_count = static_cast<uint32_t>(record->particle_surfaces.size());
+    return NUKA_RESULT_OK;
+}
+
+nuka_result_t nuka_world_get_particle_surface(nuka_world_handle world, uint32_t index,
+                                              nuka_particle_surface_t* out, uint32_t* triangles,
+                                              size_t capacity) {
+    if (out == nullptr || (triangles == nullptr && capacity != 0u)) return NUKA_RESULT_INVALID_ARG;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (!record) return NUKA_RESULT_NULL_HANDLE;
+    if (index >= record->particle_surfaces.size()) return NUKA_RESULT_INVALID_ARG;
+    const auto& s = record->particle_surfaces[index];
+    *out = {};
+    out->triangle_count = static_cast<uint32_t>(s.triangles.size() / 3u);
+    out->particle_first = s.particle_first;
+    out->particle_count = s.particle_count;
+    out->smooth_iters = s.smooth_iters;
+    out->smooth_lambda = s.smooth_lambda;
+    out->normal_offset = s.normal_offset;
+    out->render_material_id = s.render_material_id;
+    out->medium = s.medium;
+    std::copy_n(s.triangles.begin(), std::min(capacity, s.triangles.size()), triangles);
     return NUKA_RESULT_OK;
 }
 

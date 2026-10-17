@@ -22,6 +22,9 @@
 
 layout(location = 0) in vec3 inPosition;  // object-space position
 layout(location = 1) in vec3 inNormal;    // object-space normal (flat-synthesized if absent)
+#ifdef NUKA_VERTEX_COLOR
+layout(location = 2) in vec3 inColor;     // per-vertex tint of the material colour
+#endif
 
 // Per-frame scene environment (camera + light rig). Bound once per render; see
 // the matching SceneUbo in mesh_pbr.frag.
@@ -68,6 +71,9 @@ void main() {
     vWorldNormal = mat3(pc.model) * inNormal;
     vUv = vec2(0.0, 0.0);
     vBaseColor = pc.base_color;
+#ifdef NUKA_VERTEX_COLOR
+    vBaseColor.rgb *= inColor;
+#endif
     vMr = pc.mr;
     vEmissive = pc.emissive;
     // Shadow: the same world position projected into the sun's clip space (only

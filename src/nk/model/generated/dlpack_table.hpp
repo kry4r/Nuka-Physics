@@ -414,6 +414,7 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::DatParticleParent, DlpackDtype::kU32, 1, false},  // dat_particle_parent
     {FieldId::DatBodyParent, DlpackDtype::kU32, 1, false},  // dat_body_parent
     {FieldId::DatArticParent, DlpackDtype::kU32, 1, false},  // dat_artic_parent
+    {FieldId::Telemetry, DlpackDtype::kU32, 1, true},  // telemetry
 };
 
 } // namespace nuka::nk

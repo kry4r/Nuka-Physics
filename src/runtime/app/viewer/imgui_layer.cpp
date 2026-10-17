@@ -85,7 +85,8 @@ struct PanelSpec {
 const PanelSpec kPanels[] = {{"stage", "Stage", icon::kStage},       {"property", "Properties", icon::kProperty},
                              {"file", "File", icon::kFile},          {"assets", "Assets", icon::kFolder},
                              {"stats", "Stats", icon::kStats},       {"debug", "Debug", icon::kDebug},
-                             {"camera", "Camera", icon::kCamera},    {"drive", "Drive", icon::kDrive},
+                             {"solver", "Solver", icon::kPlot},      {"camera", "Camera", icon::kCamera},
+                             {"drive", "Drive", icon::kDrive},
                              {"script", "Script", icon::kScript},    {"console", "Console", icon::kConsole},
                              {"nui", "UI Inspector", icon::kInspector}};
 
@@ -97,7 +98,7 @@ struct LayoutPreset {
 };
 const LayoutPreset kLayouts[] = {
     {"authoring", "Authoring", {"stage", "file"}, {"property", "camera"}, {"assets", "console", "script", "stats"}},
-    {"debug", "Debug", {"stage"}, {"debug", "stats", "property"}, {"console", "script", "assets"}},
+    {"debug", "Debug", {"stage"}, {"solver", "debug", "stats", "property"}, {"console", "script", "assets"}},
     {"robot", "Robot", {"stage"}, {"drive", "property"}, {"console", "stats", "assets"}},
     {"data", "Data", {"file", "stage"}, {"stats", "camera", "property"}, {"assets", "console", "script"}},
     {"training", "Training", {"stats", "stage"}, {"drive", "camera"}, {"console", "script", "assets"}},
@@ -151,7 +152,9 @@ const std::vector<MenuSpec>& Menus() {
              {"app.command_palette", "-", "view.frame_all", "view.frame_selected", "view.reset_camera", "-",
               "view.colliders", "view.contacts", "view.hide_overlays", "-", "scene.expand_all", "scene.collapse_all", "-",
               "view.ui_scale_up", "view.ui_scale_down", "view.ui_scale_reset", "view.toggle_language", "-", "view.screenshot"}},
-            {"Simulation", {"sim"}, {"sim.toggle_play", "sim.step", "sim.reset"}},
+            {"Simulation",
+             {"sim", "solver"},
+             {"sim.toggle_play", "sim.step", "sim.reset", "-", "solver.telemetry", "solver.heatmap", "solver.locate"}},
             {"Tools",
              {"script", "tools"},
              {"script.new", "script.open", "script.save", "-", "script.run", "script.stop", "script.toggle_rerun", "-",
@@ -419,6 +422,7 @@ const std::vector<ImGuiLayer::BuiltinExtension>& ImGuiLayer::Builtins() {
         {"nuka.assets", "Assets", "Importable files to drop into the scene or open.", {"assets"}},
         {"nuka.stats", "Stats", "Frame and physics timings.", {"stats"}},
         {"nuka.debug", "Debug Draw", "Collider and contact overlays.", {"debug"}},
+        {"nuka.solver", "Solver", "Solver residuals, sweep budget alerts and the residual heatmap.", {"solver"}},
         {"nuka.camera", "Camera", "Camera pose, framing and controls.", {"camera"}},
         {"nuka.drive", "Drive", "Joint drive targets and keyboard teleop.", {"drive"}},
         {"nuka.script", "Script", "The Python script editor and the console.", {"script", "console"}},
@@ -431,8 +435,8 @@ void ImGuiLayer::AddBuiltinPanel(const std::string& panel_id) {
     using Builder = void (ImGuiLayer::*)(nui::VStack&);
     const Builder builders[] = {&ImGuiLayer::BuildStage,  &ImGuiLayer::BuildProperties, &ImGuiLayer::BuildFile,
                                 &ImGuiLayer::BuildAssets, &ImGuiLayer::BuildStats,      &ImGuiLayer::BuildDebug,
-                                &ImGuiLayer::BuildCamera, &ImGuiLayer::BuildDrive,      &ImGuiLayer::BuildScript,
-                                &ImGuiLayer::BuildConsole, &ImGuiLayer::BuildInspector};
+                                &ImGuiLayer::BuildSolver, &ImGuiLayer::BuildCamera,     &ImGuiLayer::BuildDrive,
+                                &ImGuiLayer::BuildScript, &ImGuiLayer::BuildConsole,    &ImGuiLayer::BuildInspector};
     const size_t i = static_cast<size_t>(
         std::find_if(std::begin(kPanels), std::end(kPanels), [&](const PanelSpec& p) { return panel_id == p.id; }) -
         std::begin(kPanels));
@@ -541,6 +545,9 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
         {"file.import", icon::kImport},     {"scene.collision_dialog", icon::kHull},  {"scene.set_visible", icon::kEyeSlash},
         {"scene.set_locked", icon::kLock},  {"assets.add_folder", icon::kFolderPlus}, {"assets.rescan", icon::kReset}};
     for (const auto& [id, glyph] : icons) registry.Decorate(id, glyph, false);
+    for (const auto& [id, glyph] : {std::pair{"solver.telemetry", icon::kPlot}, std::pair{"solver.heatmap", icon::kPalette},
+                                    std::pair{"solver.locate", icon::kTarget}})
+        registry.Decorate(id, glyph, false);
     const std::pair<const char*, const char*> script_icons[] = {
         {"script.new", icon::kNew},   {"script.open", icon::kOpen},     {"script.save", icon::kSave},
         {"script.stop", icon::kStop}, {"script.toggle_rerun", icon::kRepeat}, {"script.eval", icon::kTerminal}};
@@ -550,7 +557,8 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
         registry.Decorate(id, "", true);
     for (const char* id : {"edit.apply", "edit.rename", "edit.reparent", "scene.spawn", "scene.select", "sim.play",
                            "sim.pause", "sim.speed", "view.stats", "file.unload", "file.open_recent", "file.forget_recent",
-                           "file.recover", "file.autosave", "app.answer_prompt", "app.check"})
+                           "file.recover", "file.autosave", "app.answer_prompt", "app.check", "solver.status",
+                           "solver.records", "solver.set_iterations"})
         registry.Decorate(id, "", true);
     registry.Rebind("file.open", "Ctrl+O");
     registry.Rebind("file.save", "Ctrl+S");
@@ -1432,7 +1440,13 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
     if (layout_pending_) {
         DockLayout(dockspace);
         layout_pending_ = false;
+        layout_settle_ = 3;
     }
+    // Overflowing tab bars scroll to the selected tab once the docked tabs have their widths.
+    if (layout_settle_ > 0 && --layout_settle_ == 0)
+        for (const ImGuiID id : {dock_left_, dock_right_, dock_bottom_})
+            if (ImGuiDockNode* node = ImGui::DockBuilderGetNode(id); node != nullptr && node->TabBar != nullptr)
+                node->TabBar->NextSelectedTabId = node->TabBar->SelectedTabId;
     ImGui::DockSpaceOverViewport(dockspace, ImGui::GetMainViewport(), ImGuiDockNodeFlags_PassthruCentralNode);
     host_.DrawPanels([this](const nui::Panel& panel) -> ImGuiID {
         const ImGuiID node = panel.dock == "left"     ? dock_left_
@@ -1465,6 +1479,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
                                 {Tr("PERSPECTIVE"), Fmt(Tr("FOV %.0f\xC2\xB0"), camera.fov_degrees),
                                  Tr(ui_state.playing ? "LIVE" : "PAUSED"),
                                  Fmt(Tr("TICK %llu"), static_cast<unsigned long long>(stats.sim_ticks))});
+            DrawSolverHud(vmin, vmax);
         } else if (!ui_state.start.shown) {
             const float s = nui::Scale();
             ImFont* font = GetNukaFont(FontRole::Display);
@@ -1502,18 +1517,26 @@ void ImGuiLayer::DockLayout(ImGuiID dockspace) {
     std::lock_guard<std::recursive_mutex> lock(host_.Mutex());
     for (const PanelSpec& p : kPanels)
         if (nui::Panel* panel = host_.FindPanel(p.id)) panel->open = false;
-    // Focusing a column's first panel selects its tab once the windows have docked; disabled
-    // built-in extensions leave gaps.
+    // Tabs follow the preset's order and a rebuilt node selects its saved tab, here the column's
+    // first panel; disabled built-in extensions leave gaps.
     const auto place = [this](const std::vector<const char*>& ids, ImGuiID node) {
-        nui::Panel* first = nullptr;
+        const char* first = nullptr;
+        short order = 0;
         for (const char* id : ids) {
             nui::Panel* panel = host_.FindPanel(id);
             if (panel == nullptr) continue;
             panel->open = true;
-            if (first == nullptr) first = panel;
-            ImGui::DockBuilderDockWindow((std::string("###") + id).c_str(), node);
+            if (first == nullptr) first = id;
+            const std::string name = std::string("###") + id;
+            ImGui::DockBuilderDockWindow(name.c_str(), node);
+            if (ImGuiWindow* window = ImGui::FindWindowByName(name.c_str()))
+                window->DockOrder = order++;
+            else
+                ImGui::FindWindowSettingsByID(ImHashStr(name.c_str()))->DockOrder = order++;
         }
-        if (first != nullptr) first->focus_request = true;
+        if (first == nullptr) return;
+        const ImGuiID window = ImHashStr((std::string("###") + first).c_str());
+        ImGui::DockBuilderGetNode(node)->SelectedTabId = ImHashStr("#TAB", 0, window);
     };
     place(preset.left, dock_left_);
     place(preset.right, dock_right_);
@@ -1726,13 +1749,23 @@ void ImGuiLayer::DrawToolbar() {
             list->AddText(label_font, label_px, ImVec2(b0.x + 24.0f * s, cy - ts.y * 0.5f), U32(theme::kFg), tag.c_str());
             x = b0.x - 6.0f * s;
         }
-        const auto chip = [&](const std::string& text, const ImVec4& color, const char* glyph, bool dot, bool pulse) {
+        // A chip with a tip is a button; it reports the click.
+        const auto chip = [&](const std::string& text, const ImVec4& color, const char* glyph, bool dot, bool pulse,
+                              const char* tip) {
             const ImVec2 ts = label_font->CalcTextSizeA(label_px, FLT_MAX, 0.0f, text.c_str());
             const float lead = glyph != nullptr || dot ? 16.0f * s : 0.0f;
             const float cw = ts.x + lead + 16.0f * s, ch = 22.0f * s;
-            if (x - cw < limit) return;
+            if (x - cw < limit) return false;
             const ImVec2 c0(x - cw, cy - ch * 0.5f), c1(x, cy + ch * 0.5f);
-            draw::Chamfer(list, c0, c1, 4.0f * s, U32(theme::Alpha(color, 0.10f)), U32(theme::Alpha(color, 0.38f)));
+            bool clicked = false, hovered = false;
+            if (tip != nullptr) {
+                ImGui::SetCursorScreenPos(c0);
+                clicked = ImGui::InvisibleButton(tip, ImVec2(cw, ch));
+                hovered = ImGui::IsItemHovered();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip)) ImGui::SetTooltip("%s", tip);
+            }
+            draw::Chamfer(list, c0, c1, 4.0f * s, U32(theme::Alpha(color, hovered ? 0.22f : 0.10f)),
+                          U32(theme::Alpha(color, hovered ? 0.85f : 0.38f)));
             const ImVec2 mark(c0.x + 14.0f * s, cy);
             if (glyph != nullptr) draw::Glyph(list, mark, glyph, U32(color), false, 13.0f);
             if (pulse) {
@@ -1742,21 +1775,27 @@ void ImGuiLayer::DrawToolbar() {
             if (dot) list->AddCircleFilled(mark, 3.0f * s, U32(color));
             list->AddText(label_font, label_px, ImVec2(c0.x + 8.0f * s + lead, cy - ts.y * 0.5f), U32(color), text.c_str());
             x = c0.x - 6.0f * s;
+            return clicked;
         };
         // A script session names its script; a script that steps the world drives the transport.
         if (ui.script_session)
             chip(std::string(Tr(ui.script_driven ? "SCRIPT DRIVEN" : "SCRIPT")) + "  " + Upper(ui.doc_title), theme::kInfo,
-                 icon::kConsole, false, ui.script_driven);
+                 icon::kConsole, false, ui.script_driven, nullptr);
         chip(Tr(!ui.has_scene ? "NO SCENE" : ui.playing ? "LIVE" : "PAUSED"),
-             !ui.has_scene ? theme::kFgDim : ui.playing ? theme::kOk : theme::kFgMuted, nullptr, true, ui.playing);
+             !ui.has_scene ? theme::kFgDim : ui.playing ? theme::kOk : theme::kFgMuted, nullptr, true, ui.playing, nullptr);
         if (ui.has_scene) {
-            chip(Fmt(Tr("T %llu"), static_cast<unsigned long long>(stats.sim_ticks)), theme::kFgMuted, icon::kTimer, false, false);
+            chip(Fmt(Tr("T %llu"), static_cast<unsigned long long>(stats.sim_ticks)), theme::kFgMuted, icon::kTimer, false, false,
+                 nullptr);
             chip(Tr(stats.zero_copy ? "ZERO-COPY" : "HOST COPY"), stats.zero_copy ? theme::kAccent : theme::kWarn,
-                 stats.zero_copy ? icon::kZeroCopy : icon::kHostCopy, false, false);
+                 stats.zero_copy ? icon::kZeroCopy : icon::kHostCopy, false, false, nullptr);
             if (stats.capped_batches != 0u)
                 chip(Fmt(Tr("CAP \xC3\x97%llu"), static_cast<unsigned long long>(stats.capped_batches)), theme::kWarn, icon::kWarn,
-                     false, false);
-            if (ui.save_dirty) chip(Tr("UNSAVED"), theme::kWarn, icon::kEdit, false, false);
+                     false, false, nullptr);
+            if (ui.solver.recent_caps != 0u &&
+                chip(Fmt(Tr("SOLVER CAP \xC3\x97%u"), ui.solver.recent_caps), theme::kErr, icon::kTarget, false, true,
+                     Tr("Sweep budget spent above the alert residual; click to locate the worst element")))
+                Queue("solver.locate");
+            if (ui.save_dirty) chip(Tr("UNSAVED"), theme::kWarn, icon::kEdit, false, false, nullptr);
         }
     }
     ImGui::End();

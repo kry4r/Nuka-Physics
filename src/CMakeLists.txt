@@ -191,6 +191,16 @@ add_custom_command(
     VERBATIM
 )
 
+# The present path's mesh.vert variant with the per-vertex colour stream.
+set(NUKA_RASTER_MESH_COLOR_VERT_SPV "${CMAKE_CURRENT_BINARY_DIR}/render/raster/shaders/mesh_color.vert.spv")
+add_custom_command(
+    OUTPUT "${NUKA_RASTER_MESH_COLOR_VERT_SPV}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/render/raster/shaders"
+    COMMAND "${GLSLC_EXECUTABLE}" -DNUKA_VERTEX_COLOR "${NUKA_RASTER_MESH_VERT}" -o "${NUKA_RASTER_MESH_COLOR_VERT_SPV}"
+    DEPENDS "${NUKA_RASTER_MESH_VERT}"
+    VERBATIM
+)
+
 set(NUKA_RASTER_MESH_FRAG "${CMAKE_CURRENT_SOURCE_DIR}/render/raster/shaders/mesh_pbr.frag")
 set(NUKA_RASTER_MESH_FRAG_SPV "${CMAKE_CURRENT_BINARY_DIR}/render/raster/shaders/mesh_pbr.frag.spv")
 add_custom_command(
@@ -250,6 +260,7 @@ add_custom_command(
 add_custom_target(nuka_render_shaders DEPENDS
     "${NUKA_DEBUG_DRAW_SPV}"
     "${NUKA_RASTER_MESH_VERT_SPV}"
+    "${NUKA_RASTER_MESH_COLOR_VERT_SPV}"
     "${NUKA_RASTER_MESH_FRAG_SPV}"
     "${NUKA_RASTER_MESH_INSTANCED_VERT_SPV}"
     "${NUKA_RASTER_SHADOW_VERT_SPV}"
@@ -367,7 +378,7 @@ if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)
 
     target_compile_definitions(nuka_present
         PRIVATE
-            NUKA_RASTER_MESH_VERT_SPV="${NUKA_RASTER_MESH_VERT_SPV}"
+            NUKA_RASTER_MESH_VERT_SPV="${NUKA_RASTER_MESH_COLOR_VERT_SPV}"
             NUKA_RASTER_MESH_FRAG_SPV="${NUKA_RASTER_MESH_FRAG_SPV}"
             # M11 INT-F1: the present path's opt-in instanced pipeline reads the
             # per-instance model matrix from the interop SSBO by gl_InstanceIndex.
@@ -395,6 +406,7 @@ if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)
         runtime/app/viewer/imgui_layer.cpp
         runtime/app/viewer/scene_panels.cpp
         runtime/app/viewer/script_tabs.cpp
+        runtime/app/viewer/solver_panel.cpp
         runtime/app/viewer/nui/nui_capi.cpp
         runtime/app/viewer/nui/nui_core.cpp
         runtime/app/viewer/nui/nui_data.cpp

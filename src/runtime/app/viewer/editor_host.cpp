@@ -565,6 +565,45 @@ ActionResult Outcome(const ApplyResult& r) {
     return r.ok ? Ok(Object({{"focus", json::Value::Str(r.focus)}})) : ActionResult::Fail(r.error);
 }
 
+// The Solver view keeps this many of the newest telemetry records.
+constexpr size_t kSolverHistory = 2048u;
+
+// One telemetry record as the solver actions report it.
+json::Value RecordJson(const nuka_telemetry_record_t& r, uint64_t number) {
+    const auto kind = [](uint32_t k) {
+        return json::Value::Str(k == NUKA_TELEMETRY_ELEMENT_PARTICLE ? "particle"
+                                : k == NUKA_TELEMETRY_ELEMENT_ROW    ? "row"
+                                                                     : "none");
+    };
+    json::Value sides = json::Value::Array();
+    for (uint32_t s = 0; s < 2u && r.worst_kind == NUKA_TELEMETRY_ELEMENT_ROW; ++s)
+        sides.PushBack(Object({{"kind", json::Value::Int(r.worst_side_kind[s])},
+                               {"index", json::Value::Int(r.worst_side_index[s])}}));
+    json::Value samples = json::Value::Array();
+    for (uint32_t i = 0; i < std::min<uint32_t>(r.sample_count, NUKA_TELEMETRY_SAMPLES); ++i)
+        samples.PushBack(Object({{"sweep", json::Value::Int(r.sample_sweep[i])},
+                                 {"residual", json::Value::Float(r.sample_residual[i])}}));
+    const bool energy = (r.flags & NUKA_TELEMETRY_ENERGY_VALID) != 0u;
+    return Object({{"record", json::Value::Int(static_cast<int64_t>(number))},
+                   {"substep", json::Value::Int(r.substep)},
+                   {"sweeps", json::Value::Int(r.sweeps)},
+                   {"sweep_budget", json::Value::Int(r.sweep_budget)},
+                   {"capped", json::Value::Bool((r.flags & NUKA_TELEMETRY_CAP) != 0u)},
+                   {"converged", json::Value::Bool((r.flags & NUKA_TELEMETRY_CONVERGED) != 0u)},
+                   {"contacts", json::Value::Int(r.contacts)},
+                   {"vertex_residual", json::Value::Float(r.vertex_residual)},
+                   {"vertex_force", json::Value::Float(r.vertex_force)},
+                   {"contact_residual", json::Value::Float(r.contact_residual)},
+                   {"max_penetration", json::Value::Float(r.max_penetration)},
+                   {"energy", energy ? json::Value::Float(r.energy) : json::Value::Null()},
+                   {"energy_residual", energy ? json::Value::Float(r.energy_residual) : json::Value::Null()},
+                   {"worst_kind", kind(r.worst_kind)},
+                   {"worst_index", json::Value::Int(r.worst_index)},
+                   {"worst_residual", json::Value::Float(r.worst_residual)},
+                   {"sides", std::move(sides)},
+                   {"samples", std::move(samples)}});
+}
+
 double Ms(Clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); }
 
 uint64_t Fnv1a(const std::string& bytes, uint64_t hash = 14695981039346656037ull) {
@@ -625,6 +664,7 @@ struct EditorHost::State : DocumentHost {
     void RegisterAssetActions();
     void RegisterSimActions();
     void RegisterViewActions();
+    void RegisterSolverActions();
     void ConfigureExtensions();
     void Queue(const std::string& id, json::Value args, const std::string& source);
     void RunQueuedActions();
@@ -681,6 +721,8 @@ struct EditorHost::State : DocumentHost {
     void BindWorker(uint64_t tick = 0u, double sim_time = 0.0);
     void DropPublisher();
     void ApplySnapshot(const Snapshot& snap);
+    // Takes the telemetry records the worker read since the last frame into the Solver view.
+    void SyncSolver();
     void TakeWorkerResults();
     void PushTransport();
     void PushEdits();
@@ -807,6 +849,7 @@ struct EditorHost::State : DocumentHost {
     uint64_t sent_static_revision_ = 0u;
     uint64_t transport_seq_ = 0u;
     uint64_t reset_seq_ = 0u;
+    uint64_t solver_seq_ = 0u;  // the last solver command
     bool reset_framing_ = false;
     uint64_t run_script_seq_ = 0u;
     bool frame_pending_ = false;
@@ -1311,6 +1354,7 @@ void EditorHost::State::ApplySnapshot(const Snapshot& snap) {
     shown_ = loaded_ && snap.epoch == bound_epoch_ ? &snap : nullptr;
     if (shown_ == nullptr) return;
     loaded_->sim->ApplyPoses(snap.link_poses, snap.body_poses);
+    if (!snap.particles.empty()) loaded_->sim->ApplyParticles(snap.particles, snap.heat, ui_state_.solver.alert);
     last_telemetry_ = snap.telemetry;
     last_tick_ = snap.tick;
     last_step_healthy_ = snap.healthy;
@@ -1322,6 +1366,38 @@ void EditorHost::State::ApplySnapshot(const Snapshot& snap) {
         reset_framing_ = false;
         FrameWorld(loaded_->sim->GetRenderWorld());
     }
+}
+
+void EditorHost::State::SyncSolver() {
+    SolverView& v = ui_state_.solver;
+    std::vector<nuka_telemetry_record_t> fresh;
+    SolverStats stats = worker_.ReadSolver(v.first + v.history.size(), &fresh);
+    if (stats.session != v.session) {
+        v.history.clear();
+        v.first = 0u;
+        v.session = stats.session;
+        stats = worker_.ReadSolver(0u, &fresh);
+    }
+    // Records the worker's log dropped before this frame read them leave a gap.
+    const uint64_t from = stats.records - fresh.size();
+    if (from != v.first + v.history.size()) {
+        v.history.clear();
+        v.first = from;
+    }
+    v.history.insert(v.history.end(), fresh.begin(), fresh.end());
+    if (v.history.size() > kSolverHistory) {
+        const size_t drop = v.history.size() - kSolverHistory;
+        v.history.erase(v.history.begin(), v.history.begin() + static_cast<std::ptrdiff_t>(drop));
+        v.first += drop;
+    }
+    v.mask = stats.mask;
+    v.alert = stats.alert;
+    v.iterations = stats.iterations;
+    v.records = stats.records;
+    v.caps = stats.caps;
+    v.recent_caps = stats.recent_caps;
+    v.recent_records = static_cast<uint32_t>(std::min<uint64_t>(stats.records, kRecentRecords));
+    v.dropped = stats.dropped;
 }
 
 void EditorHost::State::TakeWorkerResults() {
@@ -1852,6 +1928,7 @@ void EditorHost::State::RegisterActions() {
     RegisterAssetActions();
     RegisterSimActions();
     RegisterViewActions();
+    RegisterSolverActions();
     RegisterScriptActions();
     ui_.RegisterActions(actions_);
 }
@@ -2652,6 +2729,139 @@ void EditorHost::State::RegisterViewActions() {
                   }});
 }
 
+void EditorHost::State::RegisterSolverActions() {
+    const auto has_scene = [this] { return loaded_ != nullptr; };
+    const auto telemetry = [this](uint32_t mask, float alert) {
+        solver_seq_ = worker_.Push(TickCommand::Param(ParamKind::Telemetry, {static_cast<float>(mask), alert}));
+    };
+    // Without a mask the action toggles every channel; the alert defaults to the current one.
+    actions_.Add({"solver.telemetry", "Record Solver Telemetry", "solver", "", ShortcutScope::Global, has_scene,
+                  [this] { return ui_state_.solver.mask != 0u; },
+                  [this, telemetry](const json::Value& args) {
+                      const SolverView& v = ui_state_.solver;
+                      const auto mask = static_cast<uint32_t>(
+                          NumArg(args, "mask", v.mask != 0u ? 0.0 : static_cast<double>(kSolverTelemetryAll)));
+                      const auto alert = static_cast<float>(NumArg(args, "alert", v.alert));
+                      telemetry(mask, alert);
+                      return Ok(Object({{"mask", json::Value::Int(mask)}, {"alert", json::Value::Float(alert)}}));
+                  }});
+    // The heatmap needs the per-vertex channel and turns it on.
+    actions_.Add({"solver.heatmap", "Residual Heatmap", "solver", "", ShortcutScope::Global, has_scene,
+                  [this] { return ui_state_.solver.heatmap; },
+                  [this, telemetry](const json::Value& args) {
+                      SolverView& v = ui_state_.solver;
+                      v.heatmap = BoolArg(args, "on", !v.heatmap);
+                      if (v.heatmap && (v.mask & NUKA_TELEMETRY_VERTICES) == 0u)
+                          telemetry(v.mask != 0u ? v.mask | NUKA_TELEMETRY_VERTICES : kSolverTelemetryAll, v.alert);
+                      solver_seq_ = worker_.Push(TickCommand::Param(ParamKind::Heatmap, {v.heatmap ? 1.0f : 0.0f}));
+                      return Ok(Object({{"on", json::Value::Bool(v.heatmap)}}));
+                  }});
+    actions_.Add({"solver.set_iterations", "Set Sweep Budget", "solver", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      const auto n = static_cast<uint32_t>(NumArg(args, "n", 0.0));
+                      if (n == 0u) return ActionResult::Fail("n: a positive sweep count");
+                      solver_seq_ = worker_.Push(TickCommand::Param(ParamKind::Iterations, {static_cast<float>(n)}));
+                      return Ok(Object({{"n", json::Value::Int(n)}}));
+                  }});
+    actions_.Add({"solver.status", "Solver Status", "solver", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value&) {
+                      const SolverView& v = ui_state_.solver;
+                      json::Value mark = json::Value::Null();
+                      if (v.marked) {
+                          json::Value position = json::Value::Array();
+                          for (const float x : v.mark) position.PushBack(json::Value::Float(x));
+                          mark = Object({{"position", std::move(position)},
+                                         {"label", json::Value::Str(MarkLabel(v, false))}});
+                      }
+                      return Ok(Object(
+                          {{"mask", json::Value::Int(v.mask)},
+                           {"alert", json::Value::Float(v.alert)},
+                           {"iterations", json::Value::Int(v.iterations)},
+                           {"heatmap", json::Value::Bool(v.heatmap)},
+                           {"records", json::Value::Int(static_cast<int64_t>(v.records))},
+                           {"caps", json::Value::Int(static_cast<int64_t>(v.caps))},
+                           {"recent_caps", json::Value::Int(v.recent_caps)},
+                           {"recent_records", json::Value::Int(v.recent_records)},
+                           {"dropped", json::Value::Int(static_cast<int64_t>(v.dropped))},
+                           {"first", json::Value::Int(static_cast<int64_t>(v.first))},
+                           {"next", json::Value::Int(static_cast<int64_t>(v.first + v.history.size()))},
+                           {"applied", json::Value::Bool(shown_ != nullptr && shown_->acked >= solver_seq_)},
+                           {"last", v.history.empty() ? json::Value::Null()
+                                                      : RecordJson(v.history.back(), v.first + v.history.size() - 1u)},
+                           {"marker", std::move(mark)}}));
+                  }});
+    // Pages forward through the kept records: `since` on, at most `limit`, oldest first.
+    actions_.Add({"solver.records", "Solver Records", "solver", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value& args) {
+                      const SolverView& v = ui_state_.solver;
+                      const uint64_t end = v.first + v.history.size();
+                      const auto limit = static_cast<uint64_t>(NumArg(args, "limit", 64.0));
+                      uint64_t n = std::max(static_cast<uint64_t>(NumArg(args, "since", 0.0)), v.first);
+                      json::Value records = json::Value::Array();
+                      const bool capped_only = BoolArg(args, "capped", false);
+                      for (; n < end && records.Size() < limit; ++n) {
+                          const nuka_telemetry_record_t& r = v.history[n - v.first];
+                          if (!capped_only || (r.flags & NUKA_TELEMETRY_CAP) != 0u) records.PushBack(RecordJson(r, n));
+                      }
+                      return Ok(Object({{"records", std::move(records)},
+                                        {"first", json::Value::Int(static_cast<int64_t>(v.first))},
+                                        {"next", json::Value::Int(static_cast<int64_t>(n))}}));
+                  }});
+    // Frames and selects the worst element of a kept record: the given one, else the newest capped
+    // one, else the newest; {"clear": true} drops the marker.
+    actions_.Add({"solver.locate", "Locate Worst Element", "solver", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      SolverView& v = ui_state_.solver;
+                      if (BoolArg(args, "clear", false)) {
+                          v.marked = false;
+                          return Ok();
+                      }
+                      if (v.history.empty()) return ActionResult::Fail("no telemetry records; record and run first");
+                      size_t at = v.history.size() - 1u;
+                      if (const json::Value* record = args.Find("record"); record != nullptr && !record->IsNull()) {
+                          const auto n = static_cast<uint64_t>(record->AsDouble());
+                          if (n < v.first || n >= v.first + v.history.size())
+                              return ActionResult::Fail("record " + std::to_string(n) + " is no longer kept");
+                          at = static_cast<size_t>(n - v.first);
+                      } else {
+                          const auto it = std::find_if(v.history.rbegin(), v.history.rend(), [](const nuka_telemetry_record_t& r) {
+                              return (r.flags & NUKA_TELEMETRY_CAP) != 0u;
+                          });
+                          if (it != v.history.rend()) at = static_cast<size_t>(v.history.rend() - it) - 1u;
+                      }
+                      const nuka_telemetry_record_t record = v.history[at];
+                      LocatedElement e;
+                      bool found = false;
+                      worker_.Exclusive([&] { found = LocateTelemetry(world_, loaded_->Layout(), loaded_->scene, record, &e); });
+                      if (!found) return ActionResult::Fail("the record names no element in the world");
+                      ui_state_.env_index = e.env;
+                      PushTransport();
+                      if (e.entity != scene::kInvalidEntity) {
+                          ui_state_.selected_entity = e.entity;
+                          ui_state_.selection = {e.entity};
+                      }
+                      const math::Vec3 half{0.2f, 0.2f, 0.2f};
+                      camera_.FrameAabb(e.position - half, e.position + half, ui_.Viewport().Aspect());
+                      v.marked = true;
+                      v.mark[0] = e.position.x;
+                      v.mark[1] = e.position.y;
+                      v.mark[2] = e.position.z;
+                      v.mark_kind = e.kind;
+                      v.mark_index = e.index;
+                      v.mark_row = e.row;
+                      v.mark_residual = record.worst_residual;
+                      json::Value position = json::Value::Array();
+                      for (const float x : v.mark) position.PushBack(json::Value::Float(x));
+                      return Ok(Object({{"record", json::Value::Int(static_cast<int64_t>(v.first + at))},
+                                        {"label", json::Value::Str(MarkLabel(v, false))},
+                                        {"env", json::Value::Int(e.env)},
+                                        {"position", std::move(position)},
+                                        {"entity", json::Value::Str(PathOfEntity(e.entity))},
+                                        {"residual", json::Value::Float(record.worst_residual)},
+                                        {"capped", json::Value::Bool((record.flags & NUKA_TELEMETRY_CAP) != 0u)}}));
+                  }});
+}
+
 // FNV-1a of the document saved as NKS: equal documents hash equal.
 uint64_t EditorHost::State::DocumentHash() {
     if (!loaded_) return 0u;
@@ -2733,6 +2943,7 @@ void EditorHost::State::ApplyUnload() {
     entity_drag_.Cancel();
     loaded_.reset();
     hidden_meshes_.clear();
+    ui_state_.solver.marked = false;
     debug_overlay_.Reset();
     ClearModelUi(ui_state_);
     ++ui_state_.scene_version;
@@ -2955,6 +3166,7 @@ void EditorHost::State::Frame(bool step_physics) {
     TakeWorkerResults();
     const auto apply_t0 = Clock::now();
     if (const Snapshot* snap = worker_.AcquireSnapshot()) ApplySnapshot(*snap);
+    if (loaded_) SyncSolver();
     double apply_ms = Ms(Clock::now() - apply_t0);
 
     const render::RenderWorld& render_world = ShownWorld();

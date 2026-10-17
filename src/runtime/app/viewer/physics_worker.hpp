@@ -17,6 +17,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -28,7 +29,9 @@ namespace nuka::runtime::app::viewer {
 using WorkerClock = std::chrono::steady_clock;
 
 enum class CommandKind : uint8_t { EditApply, Teleport, ParamSet, Perturb, Transport, ScriptCall };
-enum class ParamKind : uint8_t { Field, HoldGains, ControllerCommand, DisplayEnv, ScatterRows, Overlay, Registry };
+enum class ParamKind : uint8_t {
+    Field, HoldGains, ControllerCommand, DisplayEnv, ScatterRows, Overlay, Registry, Telemetry, Iterations, Heatmap
+};
 enum class TransportOp : uint8_t { Play, Pause, Step, Speed, Reset };
 
 // A held load on one link (wrench) or free body (force and torque), rewritten before
@@ -49,7 +52,9 @@ struct TickCommand {
     size_t offset = 0u;                   // bytes into the field
     uint32_t index = 0u;                  // Registry parameter
     uint32_t element = 0u;                // Registry element
-    std::vector<float> values;            // field values, gains (kp, kd), command, overlay flags, registry value
+    // Field values, gains (kp, kd), command, overlay flags, registry value, telemetry (mask, alert),
+    // sweep budget or heatmap flag.
+    std::vector<float> values;
     uint32_t env = 0u;                    // DisplayEnv
     std::vector<ScatterRow> rows;         // ScatterRows
     Perturbation perturb;                 // Perturb
@@ -82,6 +87,21 @@ struct WorkerTelemetry {
     double dropped_sim_s = 0.0;
 };
 
+// The newest records of this many count toward SolverStats::recent_caps.
+inline constexpr uint32_t kRecentRecords = 256u;
+
+// What the worker read of the solver telemetry.
+struct SolverStats {
+    uint64_t session = 0u;  // bumped whenever the mask is set
+    uint32_t mask = 0u;  // nuka_telemetry_bits_t
+    float alert = 1.0e-3f;
+    uint32_t iterations = 0u;  // the sweep budget
+    uint64_t records = 0u;     // read since the mask was set
+    uint64_t caps = 0u;
+    uint32_t recent_caps = 0u;
+    uint64_t dropped = 0u;
+};
+
 struct Snapshot {
     uint64_t sequence = 0u;  // gaps between reads are dropped snapshots
     uint64_t epoch = 0u;     // the binding it was taken from
@@ -94,6 +114,8 @@ struct Snapshot {
     bool healthy = true;
     std::vector<math::Transform> link_poses;
     std::vector<math::Transform> body_poses;
+    std::vector<math::Vec3> particles;  // the shown environment's
+    std::vector<float> heat;            // its per-particle residuals while the heatmap reads them
     OverlayData overlay;
     WorkerTelemetry telemetry;
 };
@@ -184,6 +206,9 @@ public:
     std::vector<TickResult> TakeResults();
     const Snapshot* AcquireSnapshot() { return ring_.Acquire(); }
     PoseSlotPool& Slots() { return slots_; }
+    // Copies the kept records numbered `since` on, 0 being the first since the mask was set;
+    // readable from any thread.
+    SolverStats ReadSolver(uint64_t since, std::vector<nuka_telemetry_record_t>* out);
 
 private:
     void Loop();
@@ -193,6 +218,7 @@ private:
     bool Apply(const TickCommand& cmd);
     double Advance();
     void WritePerturbations();
+    void ReadTelemetry();
     void Publish();
     void DispatchTick();
     void Report(uint64_t seq, std::string text, bool error = false);
@@ -238,8 +264,18 @@ private:
     WorkerClock::time_point last_mirror_{};
     std::vector<math::Transform> mirror_links_;
     std::vector<math::Transform> mirror_bodies_;
+    std::vector<math::Vec3> mirror_particles_;
+    std::vector<float> mirror_heat_;
     OverlayData overlay_;
     WorkerTelemetry telemetry_;
+
+    // The telemetry mask, alert and heatmap survive rebinds; the log holds the newest records.
+    bool heatmap_ = false;
+    std::vector<nuka_telemetry_record_t> records_scratch_;
+    std::vector<float> vertex_scratch_;
+    std::mutex solver_mu_;
+    std::deque<nuka_telemetry_record_t> solver_log_;
+    SolverStats solver_;
 };
 
 }  // namespace nuka::runtime::app::viewer

@@ -428,6 +428,7 @@ struct DataView {
     uint32_t* dat_particle_parent = nullptr;  // per:particle arena:scratch owner:data
     uint32_t* dat_body_parent = nullptr;  // per:body arena:scratch owner:data
     uint32_t* dat_artic_parent = nullptr;  // per:articulation arena:scratch owner:data
+    uint32_t* telemetry = nullptr;  // per:scalar arena:scratch owner:data count:telemetry_words flags:[readout]
 };
 
 } // namespace nuka::phi

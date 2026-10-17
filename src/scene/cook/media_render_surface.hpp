@@ -26,6 +26,9 @@ struct MediaRenderSurface {
     // renderer's default media material).
     uint32_t render_material_id = 0xFFFFFFFFu;
 
+    // The scene medium (MediaRecord id) the surface draws.
+    uint32_t medium = 0u;
+
     // Particle media retain a range and sampling radius; zero count means the whole field.
     // Without density reconstruction, the range renders as individual grains.
     float    particle_radius = 0.0f;

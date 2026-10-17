@@ -61,6 +61,9 @@ public:
         kReadoutPhysicsDiagnostics = 1u << 2,
         kReadoutContactAudit = 1u << 3,
         kReadoutVbdSolveAudit = 1u << 4,
+        // The solve's telemetry record each substep, and its residual samples at chosen sweeps.
+        kReadoutTelemetry = 1u << 5,
+        kReadoutTelemetrySweeps = 1u << 6,
     };
 
     // All emitted physics ops are required; unsupported demands leave no runnable calls.
@@ -88,6 +91,7 @@ private:
     std::vector<phi::BlockDescentSolveParams> p_block_descent_substeps_;
     std::vector<phi::AccumulateStepParams> p_accumulate_step_;
     std::vector<phi::ReadoutEnergyLedgerParams> p_energy_;
+    std::vector<phi::RecordTelemetryParams> p_telemetry_substeps_;
     phi::FkLinkVelocitiesParams p_fk_velocity_{};
 
     // The build-time coupling providers (row path + MLS-MPM grid-transfer path).
@@ -132,6 +136,7 @@ private:
     phi::ClothStepParams              p_cloth_step_{};
     phi::MpmParams                    p_mpm_{};
     phi::ReadoutContactWrenchParams   p_readout_{};
+    phi::RecordTelemetryParams        p_telemetry_{};
     // L1-c: p_union_obs_ (the union-only per-env contact-obs readout params)
     // was DELETED with the UnionCsr path / ReadoutUnionContactObs op.
 };

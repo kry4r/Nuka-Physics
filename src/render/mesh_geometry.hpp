@@ -11,6 +11,7 @@ struct MeshGeometry {
     std::vector<float> normals;
     std::vector<float> uvs;
     std::vector<float> corner_uvs;  // 6 per triangle; preferred over per-vertex uvs across seams
+    std::vector<float> colors;      // 3 per vertex, multiplied into the material colour; empty is white
     std::vector<uint32_t> indices;
     std::vector<float> sphere_centers;
     std::vector<float> sphere_radii;

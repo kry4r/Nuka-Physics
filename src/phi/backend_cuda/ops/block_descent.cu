@@ -13,6 +13,8 @@
 
 #include "constraint/coulomb_contact.hpp"
 #include "nk/material/mpm_constitutive.hpp"
+#include "nk/readout/energy_ledger.hpp"
+#include "nk/readout/telemetry.hpp"
 #include "nk/solve/augmented_row.hpp"
 #include "nk/solve/block_row_schedule.hpp"
 #include "nk/solve/chebyshev_iteration.hpp"
@@ -2247,6 +2249,188 @@ __global__ void FinishSweepKernel(BlockDescentSolveParams p, BlockScratch s,
     if (graph) cudaGraphSetConditional(loop, again);
 }
 
+__device__ nk::TelemetryHeader* TelemetryHeaderOf(uint32_t* ring) {
+    return reinterpret_cast<nk::TelemetryHeader*>(ring);
+}
+
+// The record of the running substep; the solve and the substep's RecordTelemetry fill it.
+__device__ nk::TelemetryRecord* OpenTelemetryRecord(uint32_t* ring) {
+    const nk::TelemetryHeader* header = TelemetryHeaderOf(ring);
+    return reinterpret_cast<nk::TelemetryRecord*>(ring + nk::kTelemetryHeaderWords) +
+           header->head % header->capacity;
+}
+
+__device__ float PackedValue(uint64_t packed) { return __uint_as_float(static_cast<uint32_t>(packed >> 32u)); }
+__device__ uint32_t PackedIndex(uint64_t packed) { return ~static_cast<uint32_t>(packed); }
+__device__ uint64_t Larger(uint64_t a, uint64_t b) { return a > b ? a : b; }
+
+// Sample slot of the 1-based sweep n among 1, 2, 3, 4, 6, 8, 12, 16, ...; kTelemetrySamples when unsampled.
+__device__ uint32_t SweepSampleSlot(uint32_t n) {
+    const uint32_t k = 31u - static_cast<uint32_t>(__clz(n));
+    if (n == 1u << k) return k == 0u ? 0u : 2u * k - 1u;
+    if (k > 0u && n == 3u << (k - 1u)) return 2u * k;
+    return nk::kTelemetrySamples;
+}
+
+__global__ void OpenTelemetryKernel(DataView data) {
+    auto* words = reinterpret_cast<uint32_t*>(OpenTelemetryRecord(data.telemetry));
+    for (uint32_t word = threadIdx.x; word < nk::kTelemetryRecordWords; word += blockDim.x) words[word] = 0u;
+    if (threadIdx.x == 0u) TelemetryHeaderOf(data.telemetry)->penetration = 0u;
+}
+
+// The residual after a sampled sweep: the largest vertex Newton correction and contact natural velocity.
+__global__ void SampleVerticesKernel(ModelView model, DataView data, BlockDescentSolveParams p, BlockScratch s) {
+    const uint32_t slot = SweepSampleSlot(s.sweep_state[kSweepCount] + 1u);
+    if (slot >= nk::kTelemetrySamples) return;
+    auto* sample = reinterpret_cast<unsigned int*>(OpenTelemetryRecord(data.telemetry)->sample_residual + slot);
+    const uint32_t lane = threadIdx.x % warpSize;
+    const uint32_t first = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
+    const uint32_t stride = gridDim.x * blockDim.x / warpSize;
+    const VertexBlockView b = Vertices(model, data, p);
+    for (uint32_t item = first; item < b.layout.dynamic_vertices * p.env_count; item += stride) {
+        const uint32_t env = item / b.layout.dynamic_vertices;
+        const uint32_t vertex = b.color_vertices[item % b.layout.dynamic_vertices];
+        Vec3 u, force;
+        SymmetricMat3 hessian, inverse;
+        VertexBlockEquationWarp(b, PointMasses(data), nullptr, env, vertex, lane, u, force, hessian);
+        const bool valid = Finite(force) && nk::vbd::Invert(hessian, 0.0f, &inverse);
+        const Vec3 correction = inverse.Multiply(force) / p.dt;
+        const float value = valid ? fmaxf(fabsf(correction.x), fmaxf(fabsf(correction.y), fabsf(correction.z)))
+                                  : FLT_MAX;
+        if (lane == 0u) atomicMax(sample, __float_as_uint(value));
+    }
+}
+
+__global__ void SampleRowsKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
+    const uint32_t n = s.sweep_state[kSweepCount] + 1u;
+    const uint32_t slot = SweepSampleSlot(n);
+    if (slot >= nk::kTelemetrySamples) return;
+    nk::TelemetryRecord* record = OpenTelemetryRecord(data.telemetry);
+    if (blockIdx.x == 0u && threadIdx.x == 0u) {
+        record->sample_sweep[slot] = n;
+        atomicMax(&record->sample_count, slot + 1u);
+    }
+    auto* sample = reinterpret_cast<unsigned int*>(record->sample_residual + slot);
+    const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
+    for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < *s.active_count;
+         item += gridDim.x * blockDim.x) {
+        const uint32_t row_slot = s.active_rows[item];
+        const NkRow row = rows[row_slot];
+        if (!(row.flags & nk::nk_row_flags::kBlockNormal)) continue;
+        const auto residual = ContactRowResidual(data, p, s, row_slot, row);
+        const float value = residual.valid
+            ? fmaxf(fmaxf(residual.normal_natural_velocity, residual.tangent_natural_velocity), 0.0f) : FLT_MAX;
+        atomicMax(sample, __float_as_uint(value));
+    }
+}
+
+// The solve's part of the substep record: sweeps, acceleration and the deepest active contact row.
+__global__ void TelemetrySolveKernel(DataView data, BlockDescentSolveParams p, BlockScratch s, uint32_t tile,
+                                     uint32_t accelerate) {
+    auto* deepest = reinterpret_cast<unsigned long long*>(&TelemetryHeaderOf(data.telemetry)->penetration);
+    const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
+    for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < *s.active_count;
+         item += gridDim.x * blockDim.x) {
+        const uint32_t row_slot = s.active_rows[item];
+        if (!(rows[row_slot].flags & nk::nk_row_flags::kBlockNormal)) continue;
+        const float depth = data.row_penetration[row_slot];
+        if (depth > 0.0f)
+            atomicMax(deepest, (static_cast<unsigned long long>(__float_as_uint(depth)) << 32u) | ~row_slot);
+    }
+    if (blockIdx.x != 0u || threadIdx.x != 0u) return;
+    nk::TelemetryRecord* record = OpenTelemetryRecord(data.telemetry);
+    record->sweeps = tile != 0u ? p.iterations : s.sweep_state[kSweepCount];
+    record->sweep_budget = p.iterations;
+    if (record->sweeps < p.iterations) record->flags |= nk::kTelemetryConverged;
+    float ratio = 0.0f;
+    for (uint32_t env = 0u; accelerate != 0u && env < p.env_count; ++env)
+        ratio = fmaxf(ratio, s.acceleration_ratio[env]);
+    record->acceleration = ratio;
+}
+
+// Completes the substep record from the measured solve and the energy ledger, then commits it.
+__global__ void RecordTelemetryKernel(DataView data, RecordTelemetryParams p) {
+    using nk::EnergyColumn;
+    __shared__ uint64_t maxima[4][kThreads];
+    __shared__ float sums[2][kThreads];
+    __shared__ uint32_t counts[2][kThreads];
+    uint64_t local[4] = {0u, 0u, 0u, 0u};
+    float energy = 0.0f, residual = 0.0f;
+    uint32_t contacts = 0u, invalid = 0u;
+    const auto column = [](EnergyColumn c) { return static_cast<uint32_t>(c); };
+    for (uint32_t env = threadIdx.x; env < p.env_count; env += blockDim.x) {
+        const uint64_t* metrics = data.contact_solve_metrics + size_t{env} * constraint::kContactSolveMetricCount;
+        local[0] = Larger(local[0], data.vbd_solve_metrics[env * 2u]);
+        local[1] = Larger(local[1], data.vbd_solve_metrics[env * 2u + 1u]);
+        local[2] = Larger(local[2], metrics[0]);
+        local[3] = Larger(local[3], metrics[1]);
+        contacts += data.contact_solve_counts[env * constraint::kContactSolveCountSize];
+        if (p.energy == 0u) continue;
+        const float* ledger = data.energy_ledger + (size_t{env} * p.substeps + p.substep) * nk::kEnergyColumnCount;
+        energy += ledger[column(EnergyColumn::EndKinetic)] + ledger[column(EnergyColumn::EndGravity)] +
+                  ledger[column(EnergyColumn::EndElastic)];
+        residual += ledger[column(EnergyColumn::Residual)];
+        invalid += ledger[column(EnergyColumn::Valid)] == 1.0f ? 0u : 1u;
+    }
+    for (uint32_t k = 0u; k < 4u; ++k) maxima[k][threadIdx.x] = local[k];
+    sums[0][threadIdx.x] = energy;
+    sums[1][threadIdx.x] = residual;
+    counts[0][threadIdx.x] = contacts;
+    counts[1][threadIdx.x] = invalid;
+    __syncthreads();
+    for (uint32_t half = blockDim.x / 2u; half > 0u; half /= 2u) {
+        if (threadIdx.x < half) {
+            const uint32_t other = threadIdx.x + half;
+            for (uint32_t k = 0u; k < 4u; ++k) maxima[k][threadIdx.x] = Larger(maxima[k][threadIdx.x], maxima[k][other]);
+            for (uint32_t k = 0u; k < 2u; ++k) {
+                sums[k][threadIdx.x] += sums[k][other];
+                counts[k][threadIdx.x] += counts[k][other];
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x != 0u) return;
+    nk::TelemetryHeader* header = TelemetryHeaderOf(data.telemetry);
+    nk::TelemetryRecord* record = OpenTelemetryRecord(data.telemetry);
+    const uint64_t vertex = maxima[0][0], contact = Larger(maxima[2][0], maxima[3][0]);
+    record->sequence = header->head;
+    record->substep = p.substep;
+    record->contacts = counts[0][0];
+    record->vertex_residual = vertex != 0u ? PackedValue(vertex) : 0.0f;
+    record->vertex_force = maxima[1][0] != 0u ? PackedValue(maxima[1][0]) : 0.0f;
+    record->contact_residual = contact != 0u ? PackedValue(contact) : 0.0f;
+    record->max_penetration = header->penetration != 0u ? PackedValue(header->penetration) : 0.0f;
+    record->penetration_row = header->penetration != 0u ? PackedIndex(header->penetration) : ~0u;
+    record->energy = sums[0][0];
+    record->energy_residual = sums[1][0];
+    if (p.energy != 0u && counts[1][0] == 0u) record->flags |= nk::kTelemetryEnergyValid;
+    record->worst_kind = nk::kTelemetryElementNone;
+    record->worst_index = ~0u;
+    for (uint32_t side = 0u; side < 2u; ++side) {
+        record->worst_side_kind[side] = ~0u;
+        record->worst_side_index[side] = ~0u;
+    }
+    if (vertex != 0u && vertex >= contact) {
+        record->worst_kind = nk::kTelemetryElementParticle;
+        record->worst_index = PackedIndex(vertex);
+        record->worst_residual = PackedValue(vertex);
+    } else if (contact != 0u) {
+        const NkRow row = reinterpret_cast<const NkRow*>(data.urows)[PackedIndex(contact)];
+        record->worst_kind = nk::kTelemetryElementRow;
+        record->worst_index = PackedIndex(contact);
+        record->worst_residual = PackedValue(contact);
+        record->worst_side_kind[0] = row.a.kind;
+        record->worst_side_index[0] = row.a.index;
+        record->worst_side_kind[1] = row.b.kind;
+        record->worst_side_index[1] = row.b.index;
+    }
+    const float alert = p.velocity_tolerance > 0.0f ? p.velocity_tolerance : header->alert_velocity;
+    if (record->sweeps >= record->sweep_budget && record->worst_residual > alert)
+        record->flags |= nk::kTelemetryCap;
+    __threadfence();
+    header->head += 1u;
+}
+
 template <typename Kernel, typename... Args>
 cudaError_t LaunchWork(Kernel kernel, uint32_t work, uint32_t items_per_block,
                        cudaStream_t stream, Args... args) {
@@ -2362,6 +2546,22 @@ Status MeasureSolve(const ModelView& model, const DataView& data, const BlockDes
     return Status::Ok;
 }
 
+// The measured solve, then its part of the telemetry record when telemetry is on.
+Status MeasureAndRecord(const ModelView& model, const DataView& data, const BlockDescentSolveParams& p,
+                        const BlockScratch& s, bool tile, bool accelerate, cudaStream_t stream) {
+    if (MeasureSolve(model, data, p, s, stream) != Status::Ok) return Status::Failed;
+    if (p.telemetry == 0u) return Status::Ok;
+    return LaunchWork(TelemetrySolveKernel, std::max(s.rows, 1u), kThreads, stream, data, p, s,
+                      uint32_t{tile}, uint32_t{accelerate}) == cudaSuccess ? Status::Ok : Status::Failed;
+}
+
+Status OpRecordTelemetry(const ModelView&, const DataView& data, const void* params, cudaStream_t stream) {
+    const auto* p = static_cast<const RecordTelemetryParams*>(params);
+    if (p == nullptr || data.telemetry == nullptr) return Status::InvalidArgument;
+    LaunchCuda(RecordTelemetryKernel, dim3(1u), dim3(kThreads), 0u, stream, data, *p);
+    return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
+}
+
 Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
                            const void* params, cudaStream_t stream) {
     const auto* p = static_cast<const BlockDescentSolveParams*>(params);
@@ -2423,6 +2623,11 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
     const auto clear = [&](void* ptr, size_t bytes) {
         return bytes == 0u || (ptr != nullptr && cudaMemsetAsync(ptr, 0, bytes, stream) == cudaSuccess);
     };
+    if (p->telemetry != 0u) {
+        if (data.telemetry == nullptr) return Status::InvalidArgument;
+        LaunchCuda(OpenTelemetryKernel, dim3(1u), dim3(kThreads), 0u, stream, data);
+        if (cudaGetLastError() != cudaSuccess) return Status::Failed;
+    }
     if (DenseTileRoute(*p)) {
         if (p->measure_contact_residual != 0u && !clear(s.active_count, sizeof(uint32_t))) return Status::Failed;
         if (!clear(s.tile_next, sizeof(uint32_t))) return Status::Failed;
@@ -2431,7 +2636,7 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
             return LaunchDenseTiles<decltype(width)::value>(articulation_state, data, *p, s, stream);
         });
         if (launched != cudaSuccess) return Status::Failed;
-        return MeasureSolve(model, data, *p, s, stream);
+        return MeasureAndRecord(model, data, *p, s, true, false, stream);
     }
     if (p->measure_vertex_audit != 0u && !clear(data.vbd_solve_audit,
             size_t{p->vertex_blocks.vertices} * p->env_count * nk::kVbdSolveAuditColumnCount * sizeof(float)))
@@ -2651,6 +2856,11 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
              LaunchWork(UnconvergedVerticesKernel, p->vertex_blocks.dynamic_vertices * p->env_count,
                  kThreads / 32u, stream, model, data, *p, s) != cudaSuccess))
             return Status::Failed;
+        if ((p->telemetry & nk::kTelemetrySweeps) != 0u &&
+            (LaunchWork(SampleRowsKernel, std::max(s.rows, 1u), kThreads, stream, data, *p, s) != cudaSuccess ||
+             LaunchWork(SampleVerticesKernel, p->vertex_blocks.dynamic_vertices * p->env_count,
+                 kThreads / 32u, stream, model, data, *p, s) != cudaSuccess))
+            return Status::Failed;
         LaunchCuda(FinishSweepKernel, dim3(1u), dim3(1u), 0u, stream, *p, s, loop, graph);
         return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
     };
@@ -2705,7 +2915,7 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
         data.joint_limit_impulse != nullptr &&
         LaunchWork(WriteBlockJointLimitImpulsesKernel, p->base_link_count * p->env_count,
             kThreads, stream, data, *p) != cudaSuccess) return Status::Failed;
-    return MeasureSolve(model, data, *p, s, stream);
+    return MeasureAndRecord(model, data, *p, s, false, accelerate, stream);
 }
 
 }  // namespace
@@ -2716,6 +2926,7 @@ uint64_t BlockDescentScratchWords(const BlockDescentSolveParams& params) {
 
 void RegisterNkBlockDescentOps() {
     SetCudaOp(NkOp::BlockDescentSolve, &OpBlockDescentSolve);
+    SetCudaOp(NkOp::RecordTelemetry, &OpRecordTelemetry);
 }
 
 }  // namespace nuka::phi

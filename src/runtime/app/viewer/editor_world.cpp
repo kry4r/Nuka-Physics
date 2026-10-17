@@ -2,8 +2,10 @@
 
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
+#include "runtime/app/viewer/imgui_layer.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -31,6 +33,20 @@ bool DownloadPoses(nuka_world_handle world, nuka_state_field_t field, uint32_t r
     return ok;
 }
 
+// The surface drawing a per-environment particle, or null.
+const ParticleSurfaceBinding* SurfaceOf(const WorldLayout& layout, uint32_t particle) {
+    for (const ParticleSurfaceBinding& s : layout.surfaces)
+        if (std::find(s.triangles.begin(), s.triangles.end(), particle) != s.triangles.end()) return &s;
+    return nullptr;
+}
+
+template <class T>
+T DownloadRow(nuka_world_handle world, nuka_state_field_t field, size_t row) {
+    T value{};
+    CheckResult(nuka_world_download_field(world, field, &value, sizeof(T), row * sizeof(T)), "nuka_world_download_field");
+    return value;
+}
+
 }  // namespace
 
 void CheckResult(nuka_result_t result, const char* what) {
@@ -48,12 +64,25 @@ WorldLayout QueryLayout(nuka_world_handle world) {
     layout.contacts_per_env = info.contacts_per_env;
     layout.links_per_env = RowsPerEnv(world, NUKA_FIELD_ARTICULATION_LINK_POSE, layout.env_count);
     layout.contact_slots_per_env = RowsPerEnv(world, NUKA_FIELD_UCONTACT_COUNT, layout.env_count);
+    layout.particles_per_env = info.particles_per_env;
     layout.links.resize(layout.links_per_env);
     for (uint32_t l = 0; l < layout.links_per_env; ++l) {
         CheckResult(nuka_world_get_link_binding(world, l, &layout.links[l]),
                     "nuka_world_get_link_binding");
         layout.articulations_per_env =
             std::max(layout.articulations_per_env, layout.links[l].articulation_index + 1u);
+    }
+    uint32_t surfaces = 0u;
+    CheckResult(nuka_world_get_particle_surface_count(world, &surfaces), "nuka_world_get_particle_surface_count");
+    for (uint32_t s = 0; s < surfaces; ++s) {
+        ParticleSurfaceBinding surface;
+        CheckResult(nuka_world_get_particle_surface(world, s, &surface.info, nullptr, 0u), "nuka_world_get_particle_surface");
+        if (surface.info.triangle_count == 0u) continue;
+        surface.triangles.resize(static_cast<size_t>(surface.info.triangle_count) * 3u);
+        CheckResult(nuka_world_get_particle_surface(world, s, &surface.info, surface.triangles.data(),
+                                                    surface.triangles.size()),
+                    "nuka_world_get_particle_surface");
+        layout.surfaces.push_back(std::move(surface));
     }
     return layout;
 }
@@ -163,6 +192,91 @@ void DownloadEnvPoses(nuka_world_handle world, const WorldLayout& layout, uint32
     DownloadPoses(world, NUKA_FIELD_RIGID_BODY_TRANSFORM, layout.bodies_per_env, env, *bodies);
 }
 
+void DownloadEnvParticles(nuka_world_handle world, const WorldLayout& layout, uint32_t env_index,
+                          std::vector<math::Vec3>* out) {
+    out->resize(layout.particles_per_env);
+    const size_t bytes = out->size() * sizeof(math::Vec3);
+    if (bytes == 0u) return;
+    CheckResult(nuka_world_download_field(world, NUKA_FIELD_PARTICLE_POSITION, out->data(), bytes,
+                                          (env_index % layout.env_count) * bytes),
+                "download particle positions");
+}
+
+bool LocateTelemetry(nuka_world_handle world, const WorldLayout& layout, const scene::SceneIR& scene,
+                     const nuka_telemetry_record_t& record, LocatedElement* out) {
+    const auto particle = [&](uint32_t index) {
+        out->env = index / layout.particles_per_env;
+        const uint32_t local = index % layout.particles_per_env;
+        out->position = DownloadRow<math::Vec3>(world, NUKA_FIELD_PARTICLE_POSITION, index);
+        const ParticleSurfaceBinding* s = SurfaceOf(layout, local);
+        out->entity = s != nullptr ? scene.EntityOfMedia(s->info.medium) : scene::kInvalidEntity;
+        out->kind = "particle %u";
+        out->index = local;
+        return true;
+    };
+    const auto body = [&](uint32_t index) {
+        out->env = index / layout.bodies_per_env;
+        const uint32_t row = index % layout.bodies_per_env;
+        out->position = DownloadRow<math::Transform>(world, NUKA_FIELD_RIGID_BODY_TRANSFORM, index).position;
+        out->entity = scene.EntityOfBody(row);
+        out->kind = "body %u";
+        out->index = row;
+        return true;
+    };
+    // A link side names its articulation; the root link stands for it.
+    const auto articulation = [&](uint32_t index) {
+        out->env = index / layout.articulations_per_env;
+        const uint32_t a = index % layout.articulations_per_env;
+        const auto root = std::find_if(layout.links.begin(), layout.links.end(), [&](const nuka_link_binding_t& l) {
+            return l.articulation_index == a && l.is_root != 0u;
+        });
+        const size_t link = static_cast<size_t>(out->env) * layout.links_per_env +
+                            static_cast<size_t>(root - layout.links.begin());
+        out->position = DownloadRow<math::Transform>(world, NUKA_FIELD_ARTICULATION_LINK_POSE, link).position;
+        out->entity = scene.EntityOfBody(root->body_index);
+        out->kind = "articulation %u";
+        out->index = a;
+        return true;
+    };
+    // A cloth endpoint stands for its heaviest particle in the latest interval's stencil maps.
+    const auto endpoint = [&](uint32_t index) {
+        const auto range = DownloadRow<nuka_point_endpoint_range_t>(world, NUKA_FIELD_POINT_ENDPOINT_RANGES, index);
+        std::vector<nuka_point_endpoint_term_t> terms(range.count);
+        CheckResult(nuka_world_download_field(world, NUKA_FIELD_POINT_ENDPOINT_TERMS, terms.data(),
+                                              terms.size() * sizeof(nuka_point_endpoint_term_t),
+                                              range.first * sizeof(nuka_point_endpoint_term_t)),
+                    "download point endpoint terms");
+        const nuka_point_endpoint_term_t* heaviest = nullptr;
+        float weight = 0.0f;
+        for (const nuka_point_endpoint_term_t& t : terms) {
+            const float w = t.column[0][0] + t.column[1][1] + t.column[2][2];
+            if (t.kind == NUKA_CONTACT_SIDE_PARTICLE && (heaviest == nullptr || w > weight)) {
+                heaviest = &t;
+                weight = w;
+            }
+        }
+        return heaviest != nullptr && particle(heaviest->index);
+    };
+    const auto side = [&](uint32_t kind, uint32_t index) {
+        switch (kind) {
+            case NUKA_CONTACT_SIDE_RIGID: return body(index);
+            case NUKA_CONTACT_SIDE_LINK: return articulation(index);
+            case NUKA_CONTACT_SIDE_PARTICLE: return particle(index);
+            case NUKA_CONTACT_SIDE_POINT_ENDPOINT: return endpoint(index);
+            default: return false;
+        }
+    };
+    if (record.worst_kind == NUKA_TELEMETRY_ELEMENT_PARTICLE) return particle(record.worst_index);
+    if (record.worst_kind != NUKA_TELEMETRY_ELEMENT_ROW) return false;
+    // A particle or endpoint side pins the contact point; a body or link side only names its owner.
+    const uint32_t b = record.worst_side_kind[1];
+    const int a = b == NUKA_CONTACT_SIDE_PARTICLE || b == NUKA_CONTACT_SIDE_POINT_ENDPOINT ? 1 : 0;
+    const bool found = side(record.worst_side_kind[a], record.worst_side_index[a]) ||
+                       side(record.worst_side_kind[1 - a], record.worst_side_index[1 - a]);
+    if (found) out->row = record.worst_index;
+    return found;
+}
+
 std::vector<ScatterRow> BuildScatterRows(const render::RenderWorld& render_world) {
     std::vector<ScatterRow> rows(render_world.instances.size());
     for (size_t i = 0; i < rows.size(); ++i) {
@@ -184,13 +298,49 @@ std::vector<ScatterRow> BuildScatterRows(const render::RenderWorld& render_world
     return rows;
 }
 
-EditorSim::EditorSim(WorldLayout layout, render::RenderWorld render_world)
-    : layout_(std::move(layout)), render_world_(std::move(render_world)) {}
+EditorSim::EditorSim(WorldLayout layout, render::RenderWorld render_world, const scene::SceneIR& scene)
+    : layout_(std::move(layout)), render_world_(std::move(render_world)) {
+    // The heatmap's colours multiply into a white matte.
+    scene::RenderMaterial heat;
+    heat.base_color[0] = heat.base_color[1] = heat.base_color[2] = 1.0f;
+    heat.roughness = 0.85f;
+    heat_material_ = render_world_.MaterialCount();
+    render_world_.materials.push_back(heat);
+    for (const ParticleSurfaceBinding& s : layout_.surfaces) {
+        render::RenderInstance inst;
+        inst.entity = scene.EntityOfMedia(s.info.medium);
+        inst.mesh_id = render_world_.meshes.AppendGeometry({}, render::MeshSource::PrimitiveFallback);
+        inst.render_material_id = s.info.render_material_id < render_world_.default_material_id
+                                      ? s.info.render_material_id
+                                      : render_world_.default_material_id;
+        Surface surface{render_world_.InstanceCount(), inst.mesh_id, inst.render_material_id, {}};
+        surface.topology.triangles = s.triangles;
+        surface.topology.normal_offset = s.info.normal_offset;
+        surface.topology.smooth_iters = s.info.smooth_iters;
+        surface.topology.smooth_lambda = s.info.smooth_lambda;
+        surfaces_.push_back(std::move(surface));
+        render_world_.instances.push_back(inst);
+    }
+}
 
 std::vector<PoseWrite> EditorSim::TakePoseWrites() {
     std::vector<PoseWrite> out;
     out.swap(pose_writes_);
     return out;
+}
+
+void EditorSim::ApplyParticles(const std::vector<math::Vec3>& positions, const std::vector<float>& heat, float alert) {
+    const bool heated = heat.size() == positions.size();
+    for (const Surface& s : surfaces_) {
+        render::MeshGeometry geo;
+        runtime::soft::BuildSurfaceMesh(positions, s.topology, geo);
+        if (heated) {
+            geo.colors.resize(positions.size() * 3u);
+            for (size_t v = 0; v < positions.size(); ++v) HeatColor(heat[v], alert, &geo.colors[v * 3u]);
+        }
+        render_world_.meshes.ReplaceGeometry(s.mesh, std::move(geo));
+        render_world_.instances[s.instance].render_material_id = heated ? heat_material_ : s.material;
+    }
 }
 
 void EditorSim::ApplyPoses(const std::vector<math::Transform>& links,

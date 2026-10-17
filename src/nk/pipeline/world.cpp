@@ -13,6 +13,7 @@
 #include "core/checked_size.hpp"
 #include "phi/articulation_contract.hpp"
 #include "nk/model/contact_capacity.hpp"
+#include "nk/readout/physics_diagnostics.hpp"
 #include "nk/solve/nk_row.hpp"
 
 namespace nuka::nk {
@@ -760,7 +761,7 @@ phi::Status World::SetGravity(const math::Vec3& gravity) {
     config.gravity[1] = gravity.y;
     config.gravity[2] = gravity.z;
     auto candidate = std::make_unique<Pipeline>();
-    last_status_ = candidate->Build(model_, config, device_, readout_demand_, &state_sensors_);
+    last_status_ = candidate->Build(model_, config, device_, Demand(telemetry_mask_), &state_sensors_);
     if (last_status_ != phi::Status::Ok) return last_status_;
     last_status_ = Synchronize();
     if (last_status_ != phi::Status::Ok) return last_status_;
@@ -784,7 +785,7 @@ phi::Status World::SetVelocityIterations(uint32_t iterations) {
     config.vel_iters = static_cast<uint16_t>(iterations);
     config.velocity_iterations_override = true;
     auto candidate = std::make_unique<Pipeline>();
-    last_status_ = candidate->Build(model_, config, device_, readout_demand_, &state_sensors_);
+    last_status_ = candidate->Build(model_, config, device_, Demand(telemetry_mask_), &state_sensors_);
     if (last_status_ != phi::Status::Ok) return last_status_;
     last_status_ = Synchronize();
     if (last_status_ != phi::Status::Ok) return last_status_;
@@ -892,9 +893,45 @@ phi::Status World::DemandReadout(FieldId id) {
         }
         cap.contact_readout = true;
     }
-    auto candidate = std::make_unique<Pipeline>();
-    last_status_ = candidate->Build(model_, cfg_, device_, readout_demand_ | bit, &state_sensors_);
+    std::unique_ptr<Pipeline> candidate;
+    last_status_ = BuildDemanded(Demand(telemetry_mask_) | bit, &candidate);
     if (last_status_ != phi::Status::Ok) return last_status_;
+    for (const phi::OpCall& call : candidate->Calls()) {
+        if (call.op == phi::NkOp::ReadoutContactWrench) {
+            execution_error_ = {};
+            last_status_ = DispatchChecked(backend_, model_view_, data_view_, call, &execution_error_);
+            if (last_status_ != phi::Status::Ok) return last_status_;
+            break;
+        }
+    }
+    InstallPipeline(std::move(candidate));
+    readout_demand_ |= bit;
+    return last_status_ = phi::Status::Ok;
+}
+
+phi::Status World::RebuildPipeline() {
+    auto candidate = std::make_unique<Pipeline>();
+    auto status = candidate->Build(model_, cfg_, device_, Demand(telemetry_mask_), &state_sensors_);
+    if (status != phi::Status::Ok) return last_status_ = status;
+    InstallPipeline(std::move(candidate));
+    return last_status_ = phi::Status::Ok;
+}
+
+uint32_t World::Demand(uint32_t telemetry_mask) const {
+    if (telemetry_mask == 0u) return readout_demand_;
+    uint32_t demand = readout_demand_ | Pipeline::kReadoutTelemetry;
+    if ((telemetry_mask & kTelemetrySweeps) != 0u) demand |= Pipeline::kReadoutTelemetrySweeps;
+    if ((telemetry_mask & kTelemetryEnergy) != 0u) demand |= Pipeline::kReadoutEnergyLedger;
+    if ((telemetry_mask & kTelemetryVertices) != 0u) demand |= Pipeline::kReadoutVbdSolveAudit;
+    return demand;
+}
+
+phi::Status World::BuildDemanded(uint32_t demand, std::unique_ptr<Pipeline>* out) {
+    phi::BufferType* bt = phi::BackendDeviceBufferType(backend_);
+    auto& cap = model_.capacities;
+    auto candidate = std::make_unique<Pipeline>();
+    auto status = candidate->Build(model_, cfg_, device_, demand, &state_sensors_);
+    if (status != phi::Status::Ok) return status;
     // Solve measurements demanded later widen the solver scratch.
     uint64_t solve_words = 0u;
     bool measure_response = false;
@@ -907,28 +944,25 @@ phi::Status World::DemandReadout(FieldId id) {
     if (measure_response && !cap.contact_response) {
         ModelCapacities demanded = cap;
         demanded.contact_response = true;
-        last_status_ = data_.AllocateField(bt, FieldId::RowContactResponse,
+        status = data_.AllocateField(bt, FieldId::RowContactResponse,
             CheckedProduct({demanded.ElementCount(FieldId::RowContactResponse),
                             uint64_t{LayoutOf(FieldId::RowContactResponse).elem_size}}));
-        if (last_status_ != phi::Status::Ok) return last_status_;
+        if (status != phi::Status::Ok) return status;
         cap.contact_response = true;
     }
     if (solve_words > cap.block_descent_scratch_words) {
-        last_status_ = data_.AllocateField(bt, FieldId::BlockDescentScratch, solve_words * sizeof(uint32_t));
-        if (last_status_ != phi::Status::Ok) return last_status_;
+        status = data_.AllocateField(bt, FieldId::BlockDescentScratch, solve_words * sizeof(uint32_t));
+        if (status != phi::Status::Ok) return status;
         cap.block_descent_scratch_words = solve_words;
-        last_status_ = candidate->Build(model_, cfg_, device_, readout_demand_ | bit, &state_sensors_);
-        if (last_status_ != phi::Status::Ok) return last_status_;
+        status = candidate->Build(model_, cfg_, device_, demand, &state_sensors_);
+        if (status != phi::Status::Ok) return status;
     }
     data_.FillView(&data_view_);
-    for (const phi::OpCall& call : candidate->Calls()) {
-        if (call.op == phi::NkOp::ReadoutContactWrench) {
-            execution_error_ = {};
-            last_status_ = DispatchChecked(backend_, model_view_, data_view_, call, &execution_error_);
-            if (last_status_ != phi::Status::Ok) return last_status_;
-            break;
-        }
-    }
+    *out = std::move(candidate);
+    return phi::Status::Ok;
+}
+
+void World::InstallPipeline(std::unique_ptr<Pipeline> candidate) {
     if (plan_ != nullptr && backend_ != nullptr) {
         phi::BackendPlanFree(backend_, plan_);
         plan_ = nullptr;
@@ -936,19 +970,77 @@ phi::Status World::DemandReadout(FieldId id) {
     plan_attempted_ = false;
     graph_error_ = {};
     pipeline_ = std::move(candidate);
-    readout_demand_ |= bit;
-    return last_status_ = phi::Status::Ok;
 }
 
-phi::Status World::RebuildPipeline() {
-    auto candidate = std::make_unique<Pipeline>();
-    auto status = candidate->Build(model_, cfg_, device_, readout_demand_, &state_sensors_);
-    if (status != phi::Status::Ok) return last_status_ = status;
-    if (plan_) { phi::BackendPlanFree(backend_, plan_); plan_ = nullptr; }
-    plan_attempted_ = false;
-    graph_error_ = {};
-    pipeline_ = std::move(candidate);
-    return last_status_ = phi::Status::Ok;
+phi::Status World::SetTelemetry(uint32_t mask, float alert_velocity) {
+    if (!ready_ || !(alert_velocity >= 0.0f)) return last_status_ = phi::Status::InvalidArgument;
+    last_status_ = Synchronize();
+    if (last_status_ != phi::Status::Ok) return last_status_;
+    if (mask != 0u) {
+        const uint64_t words = kTelemetryHeaderWords + uint64_t{kTelemetryRecords} * kTelemetryRecordWords;
+        last_status_ = data_.AllocateField(phi::BackendDeviceBufferType(backend_), FieldId::Telemetry,
+                                           words * sizeof(uint32_t));
+        if (last_status_ != phi::Status::Ok) return last_status_;
+        TelemetryHeader header{};
+        header.capacity = kTelemetryRecords;
+        header.alert_velocity = alert_velocity;
+        last_status_ = data_.UploadFieldStatus(FieldId::Telemetry, &header, sizeof(header), 0u);
+        if (last_status_ != phi::Status::Ok) return last_status_;
+        telemetry_read_ = 0u;
+    }
+    std::unique_ptr<Pipeline> candidate;
+    last_status_ = BuildDemanded(Demand(mask), &candidate);
+    if (last_status_ != phi::Status::Ok) return last_status_;
+    InstallPipeline(std::move(candidate));
+    telemetry_mask_ = mask;
+    return last_status_;
+}
+
+phi::Status World::ReadTelemetry(std::vector<TelemetryRecord>* out, uint32_t capacity, uint32_t* dropped) {
+    out->clear();
+    *dropped = 0u;
+    if (data_view_.telemetry == nullptr) return last_status_ = phi::Status::Unsupported;
+    last_status_ = Synchronize();
+    if (last_status_ != phi::Status::Ok) return last_status_;
+    TelemetryHeader header{};
+    last_status_ = data_.DownloadFieldStatus(FieldId::Telemetry, &header, sizeof(header), 0u);
+    if (last_status_ != phi::Status::Ok) return last_status_;
+    uint32_t first = telemetry_read_;
+    if (header.head - first > header.capacity) {
+        *dropped = header.head - first - header.capacity;
+        first = header.head - header.capacity;
+    }
+    out->resize(std::min(header.head - first, capacity));
+    for (uint32_t done = 0u; done < out->size();) {
+        const uint32_t slot = (first + done) % header.capacity;
+        const uint32_t run = std::min(static_cast<uint32_t>(out->size()) - done, header.capacity - slot);
+        last_status_ = data_.DownloadFieldStatus(FieldId::Telemetry, out->data() + done,
+            uint64_t{run} * sizeof(TelemetryRecord), sizeof(TelemetryHeader) + uint64_t{slot} * sizeof(TelemetryRecord));
+        if (last_status_ != phi::Status::Ok) return last_status_;
+        done += run;
+    }
+    telemetry_read_ = first + static_cast<uint32_t>(out->size());
+    return last_status_;
+}
+
+phi::Status World::ReadTelemetryVertices(std::vector<float>* out) {
+    if ((telemetry_mask_ & kTelemetryVertices) == 0u) return last_status_ = phi::Status::Unsupported;
+    const auto& cap = model_.capacities;
+    const uint64_t slots = cap.ElementCount(FieldId::VbdSolveAudit);
+    std::vector<float> audit(slots * kVbdSolveAuditColumnCount);
+    last_status_ = Synchronize();
+    if (last_status_ != phi::Status::Ok) return last_status_;
+    last_status_ = data_.DownloadFieldStatus(FieldId::VbdSolveAudit, audit.data(), audit.size() * sizeof(float), 0u);
+    if (last_status_ != phi::Status::Ok) return last_status_;
+    out->assign(slots == 0u ? 0u : slots / cap.vbd_vertices_per_env * cap.particles_per_env, 0.0f);
+    const auto x = static_cast<uint32_t>(VbdSolveAuditColumn::NewtonCorrectionX);
+    for (uint64_t slot = 0u; slot < slots; ++slot) {
+        const float* correction = audit.data() + slot * kVbdSolveAuditColumnCount + x;
+        const uint64_t env = slot / cap.vbd_vertices_per_env;
+        const uint64_t particle = env * cap.particles_per_env + cap.vbd_particle_begin + slot % cap.vbd_vertices_per_env;
+        (*out)[particle] = std::max({std::fabs(correction[0]), std::fabs(correction[1]), std::fabs(correction[2])});
+    }
+    return last_status_;
 }
 
 phi::Status World::AttachStateSensor(const sensor::StateSensorDesc& desc, uint32_t* id) {

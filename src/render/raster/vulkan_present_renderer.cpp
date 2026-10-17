@@ -279,8 +279,10 @@ uint64_t MeshSignature(const MeshGeometry& geo) {
     auto mix = [&h](uint64_t v) { h ^= v; h *= 1099511628211ull; };
     mix(geo.positions.size());
     mix(geo.normals.size());
+    mix(geo.colors.size());
     mix(geo.indices.size());
     mix(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(geo.positions.data())));
+    mix(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(geo.colors.data())));
     mix(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(geo.indices.data())));
     auto sample = [&](const std::vector<float>& v, size_t i) {
         if (i < v.size()) { uint32_t b = 0; std::memcpy(&b, &v[i], 4); mix(b); }
@@ -289,6 +291,11 @@ uint64_t MeshSignature(const MeshGeometry& geo) {
         sample(geo.positions, 0);
         sample(geo.positions, geo.positions.size() / 2);
         sample(geo.positions, geo.positions.size() - 1);
+    }
+    if (!geo.colors.empty()) {
+        sample(geo.colors, 0);
+        sample(geo.colors, geo.colors.size() / 2);
+        sample(geo.colors, geo.colors.size() - 1);
     }
     if (!geo.indices.empty()) { mix(geo.indices.front()); mix(geo.indices.back()); }
     return h | 1ull;
@@ -444,7 +451,7 @@ struct PresentRenderer::Impl {
     // so a resize never re-uploads geometry.
     struct MeshCacheEntry {
         uint64_t  signature = 0;  // 0 = unused slot
-        GpuBuffer pos, nrm, idx;
+        GpuBuffer pos, nrm, col, idx;
         uint32_t  index_count = 0;
     };
     std::vector<MeshCacheEntry> mesh_cache;
@@ -1004,16 +1011,20 @@ struct PresentRenderer::Impl {
         stages[1].module = frag_module;
         stages[1].pName = "main";
 
-        std::array<VkVertexInputBindingDescription, 2> bindings{};
+        std::array<VkVertexInputBindingDescription, 3> bindings{};
         bindings[0].binding = 0u; bindings[0].stride = sizeof(float) * 3u;
         bindings[0].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
         bindings[1].binding = 1u; bindings[1].stride = sizeof(float) * 3u;
         bindings[1].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-        std::array<VkVertexInputAttributeDescription, 2> attrs{};
+        bindings[2].binding = 2u; bindings[2].stride = sizeof(float) * 3u;
+        bindings[2].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+        std::array<VkVertexInputAttributeDescription, 3> attrs{};
         attrs[0].location = 0u; attrs[0].binding = 0u;
         attrs[0].format = VK_FORMAT_R32G32B32_SFLOAT; attrs[0].offset = 0u;
         attrs[1].location = 1u; attrs[1].binding = 1u;
         attrs[1].format = VK_FORMAT_R32G32B32_SFLOAT; attrs[1].offset = 0u;
+        attrs[2].location = 2u; attrs[2].binding = 2u;
+        attrs[2].format = VK_FORMAT_R32G32B32_SFLOAT; attrs[2].offset = 0u;
         VkPipelineVertexInputStateCreateInfo vertex_input{};
         vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
         vertex_input.vertexBindingDescriptionCount = static_cast<uint32_t>(bindings.size());
@@ -1105,16 +1116,20 @@ struct PresentRenderer::Impl {
         stages[1].module = frag_module;
         stages[1].pName = "main";
 
-        std::array<VkVertexInputBindingDescription, 2> bindings{};
+        std::array<VkVertexInputBindingDescription, 3> bindings{};
         bindings[0].binding = 0u; bindings[0].stride = sizeof(float) * 3u;
         bindings[0].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
         bindings[1].binding = 1u; bindings[1].stride = sizeof(float) * 3u;
         bindings[1].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-        std::array<VkVertexInputAttributeDescription, 2> attrs{};
+        bindings[2].binding = 2u; bindings[2].stride = sizeof(float) * 3u;
+        bindings[2].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+        std::array<VkVertexInputAttributeDescription, 3> attrs{};
         attrs[0].location = 0u; attrs[0].binding = 0u;
         attrs[0].format = VK_FORMAT_R32G32B32_SFLOAT; attrs[0].offset = 0u;
         attrs[1].location = 1u; attrs[1].binding = 1u;
         attrs[1].format = VK_FORMAT_R32G32B32_SFLOAT; attrs[1].offset = 0u;
+        attrs[2].location = 2u; attrs[2].binding = 2u;
+        attrs[2].format = VK_FORMAT_R32G32B32_SFLOAT; attrs[2].offset = 0u;
         VkPipelineVertexInputStateCreateInfo vertex_input{};
         vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
         vertex_input.vertexBindingDescriptionCount = static_cast<uint32_t>(bindings.size());
@@ -1238,16 +1253,20 @@ struct PresentRenderer::Impl {
         stages[1].module = frag_module;
         stages[1].pName = "main";
 
-        std::array<VkVertexInputBindingDescription, 2> bindings{};
+        std::array<VkVertexInputBindingDescription, 3> bindings{};
         bindings[0].binding = 0u; bindings[0].stride = sizeof(float) * 3u;
         bindings[0].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
         bindings[1].binding = 1u; bindings[1].stride = sizeof(float) * 3u;
         bindings[1].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-        std::array<VkVertexInputAttributeDescription, 2> attrs{};
+        bindings[2].binding = 2u; bindings[2].stride = sizeof(float) * 3u;
+        bindings[2].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+        std::array<VkVertexInputAttributeDescription, 3> attrs{};
         attrs[0].location = 0u; attrs[0].binding = 0u;
         attrs[0].format = VK_FORMAT_R32G32B32_SFLOAT; attrs[0].offset = 0u;
         attrs[1].location = 1u; attrs[1].binding = 1u;
         attrs[1].format = VK_FORMAT_R32G32B32_SFLOAT; attrs[1].offset = 0u;
+        attrs[2].location = 2u; attrs[2].binding = 2u;
+        attrs[2].format = VK_FORMAT_R32G32B32_SFLOAT; attrs[2].offset = 0u;
         VkPipelineVertexInputStateCreateInfo vertex_input{};
         vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
         vertex_input.vertexBindingDescriptionCount = static_cast<uint32_t>(bindings.size());
@@ -1565,19 +1584,20 @@ struct PresentRenderer::Impl {
         vkDeviceWaitIdle(device);
         if (shrink) {
             for (size_t i = mesh_count; i < mesh_cache.size(); ++i) {
-                Destroy(mesh_cache[i].pos); Destroy(mesh_cache[i].nrm); Destroy(mesh_cache[i].idx);
+                Destroy(mesh_cache[i].pos); Destroy(mesh_cache[i].nrm); Destroy(mesh_cache[i].col);
+                Destroy(mesh_cache[i].idx);
             }
         }
         mesh_cache.resize(mesh_count);
         if (rebuild.empty()) return;
 
         std::vector<GpuBuffer> staging;
-        staging.reserve(rebuild.size() * 3u);
+        staging.reserve(rebuild.size() * 4u);
         VkCommandBuffer cmd = BeginOneShot();
         for (size_t k = 0; k < rebuild.size(); ++k) {
             const uint32_t id = rebuild[k];
             MeshCacheEntry& e = mesh_cache[id];
-            Destroy(e.pos); Destroy(e.nrm); Destroy(e.idx);
+            Destroy(e.pos); Destroy(e.nrm); Destroy(e.col); Destroy(e.idx);
             const MeshGeometry& geo = world.meshes.Geometry(id);
             std::vector<float> synth;
             const std::vector<float>* nrm_src = &geo.normals;
@@ -1585,11 +1605,18 @@ struct PresentRenderer::Impl {
                 synth = SynthesizeFlatNormals(geo.positions, geo.indices);
                 nrm_src = &synth;
             }
+            std::vector<float> white;
+            const std::vector<float>* col_src = &geo.colors;
+            if (geo.colors.size() != geo.positions.size()) {
+                white.assign(geo.positions.size(), 1.0f);
+                col_src = &white;
+            }
             const VkDeviceSize pos_bytes = geo.positions.size() * sizeof(float);
             const VkDeviceSize nrm_bytes = nrm_src->size() * sizeof(float);
             const VkDeviceSize idx_bytes = geo.indices.size() * sizeof(uint32_t);
             e.pos = CreateDeviceLocalBuffer(pos_bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
             e.nrm = CreateDeviceLocalBuffer(nrm_bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+            e.col = CreateDeviceLocalBuffer(pos_bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
             e.idx = CreateDeviceLocalBuffer(idx_bytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
             e.index_count = static_cast<uint32_t>(geo.indices.size());
             auto stage_copy = [&](const void* data, VkDeviceSize n, const GpuBuffer& dst) {
@@ -1601,6 +1628,7 @@ struct PresentRenderer::Impl {
             };
             stage_copy(geo.positions.data(), pos_bytes, e.pos);
             stage_copy(nrm_src->data(), nrm_bytes, e.nrm);
+            stage_copy(col_src->data(), pos_bytes, e.col);
             stage_copy(geo.indices.data(), idx_bytes, e.idx);
             e.signature = rebuild_sig[k];
         }
@@ -1610,13 +1638,13 @@ struct PresentRenderer::Impl {
 
     void DestroyMeshCache() {
         for (MeshCacheEntry& e : mesh_cache) {
-            Destroy(e.pos); Destroy(e.nrm); Destroy(e.idx);
+            Destroy(e.pos); Destroy(e.nrm); Destroy(e.col); Destroy(e.idx);
         }
         mesh_cache.clear();
     }
 
     struct InstanceDraw {
-        VkBuffer  pos = VK_NULL_HANDLE, nrm = VK_NULL_HANDLE, idx = VK_NULL_HANDLE;  // cache-owned
+        VkBuffer  pos = VK_NULL_HANDLE, nrm = VK_NULL_HANDLE, col = VK_NULL_HANDLE, idx = VK_NULL_HANDLE;  // cache-owned
         uint32_t  index_count = 0;
         Mat4      model;
         float     base_color[4] = {0.8f, 0.8f, 0.8f, 1.0f};
@@ -1746,6 +1774,7 @@ struct PresentRenderer::Impl {
             draw.model = TransformToMatrix(inst.world_xform);
             draw.pos = cached.pos.buffer;
             draw.nrm = cached.nrm.buffer;
+            draw.col = cached.col.buffer;
             draw.idx = cached.idx.buffer;
             draw.index_count = cached.index_count;
             if (inst.render_material_id != kNoId &&
@@ -1871,9 +1900,9 @@ struct PresentRenderer::Impl {
             vkCmdPushConstants(cmd, active_layout,
                                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0u,
                                sizeof(PushBlock), &push);
-            std::array<VkBuffer, 2> vbuffers{draw.pos, draw.nrm};
-            std::array<VkDeviceSize, 2> offsets{0u, 0u};
-            vkCmdBindVertexBuffers(cmd, 0u, 2u, vbuffers.data(), offsets.data());
+            std::array<VkBuffer, 3> vbuffers{draw.pos, draw.nrm, draw.col};
+            std::array<VkDeviceSize, 3> offsets{0u, 0u, 0u};
+            vkCmdBindVertexBuffers(cmd, 0u, 3u, vbuffers.data(), offsets.data());
             vkCmdBindIndexBuffer(cmd, draw.idx, 0u, VK_INDEX_TYPE_UINT32);
             // INT-F1: on the instanced path, firstInstance == the SSBO row so
             // gl_InstanceIndex picks the right scattered transform (the draw loop
@@ -1912,9 +1941,9 @@ struct PresentRenderer::Impl {
                 vkCmdPushConstants(cmd, pipeline_layout,
                                    VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0u,
                                    sizeof(PushBlock), &push);
-                std::array<VkBuffer, 2> vbuffers{cached.pos.buffer, cached.nrm.buffer};
-                std::array<VkDeviceSize, 2> offsets{0u, 0u};
-                vkCmdBindVertexBuffers(cmd, 0u, 2u, vbuffers.data(), offsets.data());
+                std::array<VkBuffer, 3> vbuffers{cached.pos.buffer, cached.nrm.buffer, cached.col.buffer};
+                std::array<VkDeviceSize, 3> offsets{0u, 0u, 0u};
+                vkCmdBindVertexBuffers(cmd, 0u, 3u, vbuffers.data(), offsets.data());
                 vkCmdBindIndexBuffer(cmd, cached.idx.buffer, 0u, VK_INDEX_TYPE_UINT32);
                 vkCmdDrawIndexed(cmd, cached.index_count, 1u, 0u, 0, 0u);
             }

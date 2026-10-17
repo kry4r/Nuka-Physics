@@ -613,6 +613,17 @@ struct BlockDescentSolveParams {
     float position_max_velocity = 0.0f;
     // Sweeps stop once the vertex equations and contact rows hold to this velocity; zero runs them all.
     float velocity_tolerance = 0.0f;
+    // nk::kTelemetry* bits: the solve opens, samples and fills the ring's current record.
+    uint32_t telemetry = 0u;
+};
+
+// Completes the substep's telemetry record from the measured solve and the energy ledger, then commits it.
+struct RecordTelemetryParams {
+    uint32_t env_count = 0u;
+    uint32_t substep = 0u;
+    uint32_t substeps = 1u;
+    uint32_t energy = 0u;
+    float velocity_tolerance = 0.0f;
 };
 
 // Environments of rigid bodies and articulations without particles or grid nodes, whose articulations fit a

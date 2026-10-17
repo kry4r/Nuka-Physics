@@ -3,6 +3,7 @@
 // the command palette and toasts. It reads and edits plain UI state and queues actions.
 
 #include "math/transform.hpp"
+#include "nuka/nuka.h"
 #include "render/render_world.hpp"
 #include "runtime/app/viewer/editor_actions.hpp"
 #include "runtime/app/viewer/nui/nui.hpp"
@@ -148,6 +149,34 @@ struct StagedEdit {
     float after = 0.0f;
 };
 
+// Solver telemetry as the Solver panel, the heatmap and the toolbar show it; the host fills it.
+struct SolverView {
+    uint32_t mask = 0u;     // nuka_telemetry_bits_t the world records; 0 is off
+    float alert = 1.0e-3f;  // [m/s]
+    uint32_t iterations = 0u;
+    bool heatmap = false;
+    uint64_t session = 0u;
+    uint64_t records = 0u, caps = 0u, dropped = 0u;
+    uint32_t recent_caps = 0u;
+    uint32_t recent_records = 0u;  // the newest records recent_caps counts over
+    std::vector<nuka_telemetry_record_t> history;  // the newest records, oldest first
+    uint64_t first = 0u;                           // the number of the first of them
+    bool marked = false;                           // the last locate's point, drawn in the viewport
+    float mark[3] = {0.0f, 0.0f, 0.0f};
+    const char* mark_kind = "";  // the located element's label format, index and contact row (or -1)
+    uint32_t mark_index = 0u;
+    int64_t mark_row = -1;
+    float mark_residual = 0.0f;  // [m/s]
+};
+
+inline constexpr uint32_t kSolverTelemetryAll =
+    NUKA_TELEMETRY_SOLVE | NUKA_TELEMETRY_SWEEPS | NUKA_TELEMETRY_ENERGY | NUKA_TELEMETRY_VERTICES;
+
+// The heatmap colour of a residual [m/s]: four decades up to ten times the alert, the alert at amber.
+void HeatColor(float residual, float alert, float rgb[3]);
+// The marked element, such as "contact row 12 / particle 147", in the UI language or in English.
+std::string MarkLabel(const SolverView& v, bool translate);
+
 // Transport, selection and panel state. The UI queues actions for anything that changes the
 // world and edits only this plain state in place.
 struct ViewerUiState {
@@ -228,6 +257,7 @@ struct ViewerUiState {
     std::vector<PropertyGroup> properties;
     uint64_t properties_version = 0u;  // bumped with every rebuild of `properties`
     std::vector<StagedEdit> staged;
+    SolverView solver;
 };
 
 // Per-frame physics and render facts the panels show.
@@ -334,6 +364,7 @@ private:
     void BuildFile(nui::VStack& root);
     void BuildStats(nui::VStack& root);
     void BuildDebug(nui::VStack& root);
+    void BuildSolver(nui::VStack& root);
     void BuildCamera(nui::VStack& root);
     void BuildDrive(nui::VStack& root);
     void BuildScript(nui::VStack& root);
@@ -360,6 +391,8 @@ private:
     void DrawPrompt();
     void DrawImportWizard();
     void DrawCollisionDialog();
+    // The heatmap's scale and the located element's marker over the scene viewport.
+    void DrawSolverHud(const ImVec2& vmin, const ImVec2& vmax);
     // While an asset card is dragged, the viewport takes the drop at the ground under the pointer.
     void DrawAssetDrop();
     // The texture of a PPM file, reloaded when the file changes; null without the file.
@@ -375,6 +408,7 @@ private:
 
     std::string layout_ = "authoring";
     bool layout_pending_ = true;
+    int layout_settle_ = 0;  // frames until the new layout's tab bars scroll to their selected tabs
     unsigned int dock_left_ = 0u, dock_right_ = 0u, dock_bottom_ = 0u;
     float ui_scale_ = 1.0f;
     float applied_scale_ = 0.0f;

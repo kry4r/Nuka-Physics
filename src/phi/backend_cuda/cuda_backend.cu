@@ -72,6 +72,7 @@ const char* NkOpName(int op) {
         case NkOp::ReadoutEnergyLedger: return "ReadoutEnergyLedger";
         case NkOp::ReadoutContactAudit: return "ReadoutContactAudit";
         case NkOp::MimicReduce: return "MimicReduce";
+        case NkOp::RecordTelemetry: return "RecordTelemetry";
         default: return "op";
     }
 }

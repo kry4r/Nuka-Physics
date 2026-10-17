@@ -18,6 +18,10 @@ constexpr uint32_t kMaxStepsPerBatch = 64u;
 constexpr std::chrono::milliseconds kMirrorPeriod{33};
 // A long batch publishes at least this often so the view keeps moving during catch-up.
 constexpr std::chrono::milliseconds kBatchPublishPeriod{33};
+// The solver log keeps this many of the newest telemetry records.
+constexpr size_t kSolverLog = 4096u;
+
+bool Capped(const nuka_telemetry_record_t& r) { return (r.flags & NUKA_TELEMETRY_CAP) != 0u; }
 
 double Ms(WorkerClock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); }
 
@@ -192,6 +196,14 @@ uint64_t PhysicsWorker::Bind(WorkerBinding binding) {
     timeline_value_ = 0u;
     last_mirror_ = WorkerClock::time_point{};
     telemetry_ = WorkerTelemetry{};
+    {
+        std::lock_guard<std::mutex> lock(solver_mu_);
+        if (solver_.mask != 0u)
+            CheckResult(nuka_world_set_telemetry_mask(bind_.world, solver_.mask, solver_.alert),
+                        "nuka_world_set_telemetry_mask");
+        CheckResult(nuka_world_get_velocity_iterations(bind_.world, &solver_.iterations),
+                    "nuka_world_get_velocity_iterations");
+    }
     Publish();
     return epoch_;
 }
@@ -238,6 +250,14 @@ std::vector<TickResult> PhysicsWorker::TakeResults() {
     std::lock_guard<std::mutex> lock(mu_);
     out.swap(results_);
     return out;
+}
+
+SolverStats PhysicsWorker::ReadSolver(uint64_t since, std::vector<nuka_telemetry_record_t>* out) {
+    std::lock_guard<std::mutex> lock(solver_mu_);
+    const uint64_t first = solver_.records - solver_log_.size();
+    const uint64_t from = std::min(std::max(since, first), solver_.records);
+    out->assign(solver_log_.begin() + static_cast<std::ptrdiff_t>(from - first), solver_log_.end());
+    return solver_;
 }
 
 void PhysicsWorker::Report(uint64_t seq, std::string text, bool error) {
@@ -356,6 +376,27 @@ bool PhysicsWorker::Apply(const TickCommand& cmd) {
                     Report(std::move(r));
                     return false;
                 }
+                case ParamKind::Telemetry: {
+                    const auto mask = static_cast<uint32_t>(cmd.values[0]);
+                    CheckResult(nuka_world_set_telemetry_mask(bind_.world, mask, cmd.values[1]),
+                                "nuka_world_set_telemetry_mask");
+                    std::lock_guard<std::mutex> lock(solver_mu_);
+                    solver_log_.clear();
+                    solver_ = SolverStats{solver_.session + 1u, mask, cmd.values[1], solver_.iterations};
+                    return true;
+                }
+                case ParamKind::Iterations: {
+                    CheckResult(nuka_world_set_velocity_iterations(bind_.world, static_cast<uint32_t>(cmd.values[0])),
+                                "nuka_world_set_velocity_iterations");
+                    std::lock_guard<std::mutex> lock(solver_mu_);
+                    CheckResult(nuka_world_get_velocity_iterations(bind_.world, &solver_.iterations),
+                                "nuka_world_get_velocity_iterations");
+                    return true;
+                }
+                case ParamKind::Heatmap:
+                    heatmap_ = cmd.values[0] != 0.0f;
+                    last_mirror_ = WorkerClock::time_point{};
+                    return true;
             }
             return false;
         case CommandKind::Perturb: {
@@ -495,6 +536,25 @@ void PhysicsWorker::DispatchTick() {
     Report(0u, std::move(text));
 }
 
+// Appends the records written since the last read; the worker is the log's only writer.
+void PhysicsWorker::ReadTelemetry() {
+    records_scratch_.resize(1024u);
+    uint32_t count = 0u, dropped = 0u;
+    CheckResult(nuka_world_read_telemetry(bind_.world, records_scratch_.data(),
+                                          static_cast<uint32_t>(records_scratch_.size()), &count, &dropped),
+                "nuka_world_read_telemetry");
+    std::lock_guard<std::mutex> lock(solver_mu_);
+    solver_.records += count;
+    solver_.dropped += dropped;
+    for (uint32_t i = 0; i < count; ++i) {
+        solver_.caps += Capped(records_scratch_[i]) ? 1u : 0u;
+        solver_log_.push_back(records_scratch_[i]);
+    }
+    while (solver_log_.size() > kSolverLog) solver_log_.pop_front();
+    const auto recent = static_cast<std::ptrdiff_t>(std::min<size_t>(solver_log_.size(), kRecentRecords));
+    solver_.recent_caps = static_cast<uint32_t>(std::count_if(solver_log_.end() - recent, solver_log_.end(), Capped));
+}
+
 void PhysicsWorker::Publish() {
     const WorkerClock::time_point start = WorkerClock::now();
     Snapshot& s = ring_.Back();
@@ -514,11 +574,26 @@ void PhysicsWorker::Publish() {
     }
     if (bind_.scatter == nullptr || !playing_ || start - last_mirror_ >= kMirrorPeriod) {
         DownloadEnvPoses(bind_.world, bind_.layout, bind_.env, &mirror_links_, &mirror_bodies_);
+        DownloadEnvParticles(bind_.world, bind_.layout, bind_.env, &mirror_particles_);
         ReadOverlayData(bind_.world, bind_.layout, bind_.env, bind_.colliders, bind_.contacts, &overlay_);
+        if (solver_.mask != 0u) ReadTelemetry();
+        mirror_heat_.clear();
+        const size_t particles = bind_.layout.particles_per_env;
+        if (heatmap_ && (solver_.mask & NUKA_TELEMETRY_VERTICES) != 0u && particles != 0u) {
+            vertex_scratch_.resize(particles * bind_.layout.env_count);
+            size_t count = 0u;
+            CheckResult(nuka_world_read_telemetry_vertices(bind_.world, vertex_scratch_.data(), vertex_scratch_.size(),
+                                                           &count),
+                        "nuka_world_read_telemetry_vertices");
+            const auto begin = vertex_scratch_.begin() + static_cast<std::ptrdiff_t>(bind_.env * particles);
+            mirror_heat_.assign(begin, begin + static_cast<std::ptrdiff_t>(particles));
+        }
         last_mirror_ = start;
     }
     s.link_poses = mirror_links_;
     s.body_poses = mirror_bodies_;
+    s.particles = mirror_particles_;
+    s.heat = mirror_heat_;
     s.overlay = overlay_;
     s.published = WorkerClock::now();
     last_publish_ = s.published;

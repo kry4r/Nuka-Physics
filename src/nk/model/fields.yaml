@@ -819,3 +819,5 @@ fields:
   - {name: dat_particle_parent, dtype: u32, per: particle, arena: scratch, owner: data}
   - {name: dat_body_parent, dtype: u32, per: body, arena: scratch, owner: data}
   - {name: dat_artic_parent, dtype: u32, per: articulation, arena: scratch, owner: data}
+  # Solver telemetry ring (nk::TelemetryHeader + records), allocated while a telemetry mask is set.
+  - {name: telemetry, dtype: u32, per: scalar, count: "telemetry_words", arena: scratch, owner: data, flags: [readout]}

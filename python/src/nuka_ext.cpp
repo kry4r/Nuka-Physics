@@ -680,6 +680,72 @@ public:
         return iterations;
     }
 
+    void set_telemetry_mask(uint32_t mask, float alert_velocity) {
+        check(nuka_world_set_telemetry_mask(h_, mask, alert_velocity), "nuka_world_set_telemetry_mask");
+    }
+
+    uint32_t telemetry_mask() const {
+        uint32_t mask = 0u;
+        check(nuka_world_get_telemetry_mask(h_, &mask), "nuka_world_get_telemetry_mask");
+        return mask;
+    }
+
+    nb::dict read_telemetry() {
+        std::vector<nuka_telemetry_record_t> records(1024u);
+        uint32_t count = 0u;
+        uint32_t dropped = 0u;
+        check(nuka_world_read_telemetry(h_, records.data(), static_cast<uint32_t>(records.size()), &count, &dropped),
+              "nuka_world_read_telemetry");
+        nb::list out;
+        for (uint32_t i = 0u; i < count; ++i) {
+            const nuka_telemetry_record_t& r = records[i];
+            nb::dict entry;
+            entry["sequence"] = r.sequence;
+            entry["substep"] = r.substep;
+            entry["sweeps"] = r.sweeps;
+            entry["sweep_budget"] = r.sweep_budget;
+            entry["flags"] = r.flags;
+            entry["cap"] = (r.flags & NUKA_TELEMETRY_CAP) != 0u;
+            entry["converged"] = (r.flags & NUKA_TELEMETRY_CONVERGED) != 0u;
+            entry["contacts"] = r.contacts;
+            entry["vertex_residual"] = r.vertex_residual;
+            entry["vertex_force"] = r.vertex_force;
+            entry["contact_residual"] = r.contact_residual;
+            entry["max_penetration"] = r.max_penetration;
+            entry["penetration_row"] = r.penetration_row;
+            entry["acceleration"] = r.acceleration;
+            nb::object energy = nb::none();
+            if ((r.flags & NUKA_TELEMETRY_ENERGY_VALID) != 0u) energy = nb::cast(r.energy);
+            entry["energy"] = energy;
+            entry["energy_residual"] = r.energy_residual;
+            entry["worst_kind"] = r.worst_kind == NUKA_TELEMETRY_ELEMENT_PARTICLE ? "particle"
+                                  : r.worst_kind == NUKA_TELEMETRY_ELEMENT_ROW    ? "row" : "none";
+            entry["worst_index"] = r.worst_index;
+            entry["worst_residual"] = r.worst_residual;
+            entry["worst_sides"] = nb::make_tuple(nb::make_tuple(r.worst_side_kind[0], r.worst_side_index[0]),
+                                                  nb::make_tuple(r.worst_side_kind[1], r.worst_side_index[1]));
+            nb::list samples;
+            for (uint32_t s = 0u; s < r.sample_count; ++s)
+                samples.append(nb::make_tuple(r.sample_sweep[s], r.sample_residual[s]));
+            entry["samples"] = samples;
+            out.append(entry);
+        }
+        nb::dict result;
+        result["records"] = out;
+        result["dropped"] = dropped;
+        return result;
+    }
+
+    nb::object telemetry_vertices() {
+        size_t count = 0u;
+        check(nuka_world_read_telemetry_vertices(h_, nullptr, 0u, &count), "nuka_world_read_telemetry_vertices");
+        float* out = new float[count == 0u ? 1u : count];
+        nb::capsule owner(out, [](void* p) noexcept { delete[] static_cast<float*>(p); });
+        check(nuka_world_read_telemetry_vertices(h_, out, count, &count), "nuka_world_read_telemetry_vertices");
+        size_t shape[1] = {count};
+        return nb::cast(nb::ndarray<nb::numpy, float>(out, 1, shape, owner));
+    }
+
     nb::list param_infos() const {
         uint32_t count = 0u;
         check(nuka_world_param_count(h_, &count), "nuka_world_param_count");
@@ -2972,6 +3038,17 @@ NB_MODULE(_nuka_ext, m) {
              "timestep and invalidates the execution graph when the value changes.")
         .def("velocity_iterations", &World::velocity_iterations,
              "Block-descent iteration budget of the contact solve.")
+        .def("set_telemetry_mask", &World::set_telemetry_mask, nb::arg("mask"), nb::arg("alert_velocity") = 1.0e-3f,
+             "Record solver telemetry each substep: bit 0 the solve, 1 residual samples per sweep, 2 energy, "
+             "3 per-vertex residuals. 0 removes it; a nonzero mask restarts the ring. A spent sweep budget "
+             "counts as a cap above alert_velocity (m/s), or above the solver tolerance when set.")
+        .def("telemetry_mask", &World::telemetry_mask, "The telemetry mask in effect.")
+        .def("read_telemetry", &World::read_telemetry,
+             "Records since the last read, oldest first, as {'records': [dict], 'dropped': n}. "
+             "'samples' lists (sweep, residual) pairs; residuals are velocities (m/s).")
+        .def("telemetry_vertices", &World::telemetry_vertices,
+             "Per particle (environment-major) largest Newton correction component (m/s) of the last solve, "
+             "0 outside the vertex blocks.")
         .def("param_infos", &World::param_infos,
              "The tunable parameters in index order: key, unit, scene_field, type, tier "
              "('live' applies at the next step, 'rebuild' needs rebuild_from_scene), count, min, max.")

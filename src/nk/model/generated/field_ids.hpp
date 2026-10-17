@@ -400,6 +400,7 @@ enum class FieldId : uint16_t {
     DatParticleParent,  // dat_particle_parent (per:particle arena:scratch owner:data)
     DatBodyParent,  // dat_body_parent (per:body arena:scratch owner:data)
     DatArticParent,  // dat_artic_parent (per:articulation arena:scratch owner:data)
+    Telemetry,  // telemetry (per:scalar arena:scratch owner:data count:telemetry_words flags:[readout])
     Count
 };
 
@@ -795,6 +796,7 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "dat_particle_parent",
     "dat_body_parent",
     "dat_artic_parent",
+    "telemetry",
 };
 inline constexpr const char* FieldName(FieldId id) {
     return static_cast<int>(id) < kFieldCount ? kFieldNames[static_cast<int>(id)] : "unknown";

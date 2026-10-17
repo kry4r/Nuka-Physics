@@ -899,6 +899,59 @@ typedef struct nuka_point_endpoint_term_t {
     float column[3][3];
 } nuka_point_endpoint_term_t;
 
+// Solver telemetry, one record per physical substep. SOLVE records the solve; SWEEPS adds the
+// residual at sweeps 1, 2, 3, 4, 6, 8, 12, ...; ENERGY the ledger totals; VERTICES per-vertex residuals.
+typedef enum nuka_telemetry_bits_t {
+    NUKA_TELEMETRY_SOLVE = 1u << 0,
+    NUKA_TELEMETRY_SWEEPS = 1u << 1,
+    NUKA_TELEMETRY_ENERGY = 1u << 2,
+    NUKA_TELEMETRY_VERTICES = 1u << 3
+} nuka_telemetry_bits_t;
+
+// CAP: the sweep budget ran out above the alert residual. CONVERGED: sweeps stopped at the tolerance.
+typedef enum nuka_telemetry_flags_t {
+    NUKA_TELEMETRY_CAP = 1u << 0,
+    NUKA_TELEMETRY_CONVERGED = 1u << 1,
+    NUKA_TELEMETRY_ENERGY_VALID = 1u << 2
+} nuka_telemetry_flags_t;
+
+typedef enum nuka_telemetry_element_t {
+    NUKA_TELEMETRY_ELEMENT_NONE = 0,
+    NUKA_TELEMETRY_ELEMENT_PARTICLE = 1,  // worst_index is a global particle index
+    NUKA_TELEMETRY_ELEMENT_ROW = 2        // worst_index is a global row slot
+} nuka_telemetry_element_t;
+
+#define NUKA_TELEMETRY_SAMPLES 24
+
+// Residuals are velocities [m/s]: the vertex Newton correction and the contact natural velocity.
+// Maxima run over every environment; a row's sides use nuka_contact_side_kind_t kinds, where a
+// link side carries its articulation index.
+typedef struct nuka_telemetry_record_t {
+    uint32_t sequence;          // records written since the mask was set
+    uint32_t substep;
+    uint32_t sweeps;
+    uint32_t sweep_budget;
+    uint32_t flags;             // nuka_telemetry_flags_t
+    uint32_t contacts;          // evaluated contact blocks
+    float vertex_residual;
+    float vertex_force;         // largest vertex stationarity force [N]
+    float contact_residual;
+    float max_penetration;      // [m]
+    uint32_t penetration_row;   // UINT32_MAX without penetration
+    float acceleration;         // largest Chebyshev ratio, 0 without acceleration
+    float energy;               // end kinetic + gravity + elastic energy [J]
+    float energy_residual;      // ledger balance residual [J]
+    uint32_t worst_kind;        // nuka_telemetry_element_t
+    uint32_t worst_index;
+    float worst_residual;
+    uint32_t worst_side_kind[2];
+    uint32_t worst_side_index[2];
+    uint32_t sample_count;
+    uint32_t sample_sweep[NUKA_TELEMETRY_SAMPLES];
+    float sample_residual[NUKA_TELEMETRY_SAMPLES];
+    uint32_t reserved[2];
+} nuka_telemetry_record_t;
+
 typedef struct nuka_buffer_view_t {
     void* device_ptr;
     size_t element_count;
@@ -929,6 +982,39 @@ nuka_result_t nuka_world_download_field(nuka_world_handle world,
                                         nuka_state_field_t field,
                                         void* bytes, size_t nbytes,
                                         size_t byte_offset);
+
+// Mask 0 removes every telemetry kernel and write; a nonzero mask restarts the 1024-record ring.
+// A spent budget is a cap above alert_velocity [m/s], or above the solver tolerance when it is set.
+nuka_result_t nuka_world_set_telemetry_mask(nuka_world_handle world, uint32_t mask,
+                                            float alert_velocity);
+nuka_result_t nuka_world_get_telemetry_mask(nuka_world_handle world, uint32_t* out_mask);
+// Copies up to `capacity` records written since the last read, oldest first, synchronizing the
+// world stream; *out_dropped counts the records the ring overwrote before they were read.
+nuka_result_t nuka_world_read_telemetry(nuka_world_handle world, nuka_telemetry_record_t* out,
+                                        uint32_t capacity, uint32_t* out_count,
+                                        uint32_t* out_dropped);
+// Per particle, environment-major, the largest Newton correction component [m/s] of the last solve,
+// 0 outside the vertex blocks. Needs NUKA_TELEMETRY_VERTICES; copies up to `capacity` values of *out_count.
+nuka_result_t nuka_world_read_telemetry_vertices(nuka_world_handle world, float* out, size_t capacity,
+                                                 size_t* out_count);
+
+// One cooked render surface of the world's particles; its triangles index the global particle array.
+typedef struct nuka_particle_surface_t {
+    uint32_t triangle_count;
+    uint32_t particle_first;
+    uint32_t particle_count;
+    uint32_t smooth_iters;       // Laplacian passes over the rendered positions
+    float smooth_lambda;
+    float normal_offset;         // outward inflation along the smooth normal [m]
+    uint32_t render_material_id; // a scene render material, or UINT32_MAX
+    uint32_t medium;             // the scene medium it draws
+} nuka_particle_surface_t;
+
+nuka_result_t nuka_world_get_particle_surface_count(nuka_world_handle world, uint32_t* out_count);
+// Describes surface `index` and copies up to `capacity` of its 3 * triangle_count indices.
+nuka_result_t nuka_world_get_particle_surface(nuka_world_handle world, uint32_t index,
+                                              nuka_particle_surface_t* out, uint32_t* triangles,
+                                              size_t capacity);
 
 // Resolve the cooked DOF NAME of articulation-local link `link_index` (0 == the
 // root; 1..base_link_count-1 == the actuated joints in COOKED order). Writes the

@@ -24,7 +24,7 @@ void BindWorld(EditorScene& es) {
                                               es.rest_targets.data(),
                                               es.rest_targets.size() * sizeof(float), 0u),
                     "download drive targets");
-    es.sim = std::make_unique<EditorSim>(std::move(layout), std::move(render_world));
+    es.sim = std::make_unique<EditorSim>(std::move(layout), std::move(render_world), es.scene);
 }
 
 }  // namespace

@@ -5,14 +5,22 @@
 #include "nuka/nuka.h"
 #include "render/render_world.hpp"
 #include "runtime/app/viewer/pose_scatter.hpp"
+#include "runtime/soft/particle_surface.hpp"
 #include "scene/scene_ir.hpp"
 #include "scene/scene_map.hpp"
 #include "scene/terrain/heightfield.hpp"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace nuka::runtime::app::viewer {
+
+// One triangulated particle surface; its triangles index one environment's particles.
+struct ParticleSurfaceBinding {
+    nuka_particle_surface_t info{};
+    std::vector<uint32_t> triangles;
+};
 
 struct WorldLayout {
     uint32_t env_count = 1u;
@@ -22,7 +30,9 @@ struct WorldLayout {
     uint32_t dofs_per_env = 0u;
     uint32_t contacts_per_env = 0u;
     uint32_t contact_slots_per_env = 0u;
+    uint32_t particles_per_env = 0u;
     std::vector<nuka_link_binding_t> links;  // per-environment link order
+    std::vector<ParticleSurfaceBinding> surfaces;
 };
 
 // Throws std::runtime_error when a query fails; `what` names the call.
@@ -62,16 +72,38 @@ void ApplyHoldGains(nuka_world_handle world, const WorldLayout& layout, float kp
 void DownloadEnvPoses(nuka_world_handle world, const WorldLayout& layout, uint32_t env_index,
                       std::vector<math::Transform>* links, std::vector<math::Transform>* bodies);
 
+// One environment's particle positions; empty without particles.
+void DownloadEnvParticles(nuka_world_handle world, const WorldLayout& layout, uint32_t env_index,
+                          std::vector<math::Vec3>* out);
+
+// A solver telemetry element in the world: where it is and the entity drawing it.
+struct LocatedElement {
+    math::Vec3 position = math::Vec3::Zero();
+    scene::EntityId entity = scene::kInvalidEntity;
+    uint32_t env = 0u;
+    const char* kind = "";  // the label format taking index: "particle %u", "body %u" or "articulation %u"
+    uint32_t index = 0u;
+    int64_t row = -1;  // the contact row it sides, or -1
+};
+
+// Resolves a record's worst element, or a contact row's first located side; false when neither is.
+bool LocateTelemetry(nuka_world_handle world, const WorldLayout& layout, const scene::SceneIR& scene,
+                     const nuka_telemetry_record_t& record, LocatedElement* out);
+
 // The zero-copy rows of the render instances, in instance order.
 std::vector<ScatterRow> BuildScatterRows(const render::RenderWorld& render_world);
 
-// The UI thread's binding of one world: the layout and the render world it draws.
+// The UI thread's binding of one world: the layout and the render world it draws, with one
+// deforming instance per particle surface owned by its medium's entity.
 class EditorSim {
 public:
-    EditorSim(WorldLayout layout, render::RenderWorld render_world);
+    EditorSim(WorldLayout layout, render::RenderWorld render_world, const scene::SceneIR& scene);
 
     // Re-poses instances, cameras and lights from one environment's poses.
     void ApplyPoses(const std::vector<math::Transform>& links, const std::vector<math::Transform>& bodies);
+    // Rebuilds the particle surfaces from one environment's particles; per-particle residuals
+    // colour them as a heatmap, an empty `heat` draws their materials.
+    void ApplyParticles(const std::vector<math::Vec3>& positions, const std::vector<float>& heat, float alert);
 
     // Edits queue live teleports; the frame hands them to the physics thread.
     void QueuePoseWrite(const PoseWrite& write) { pose_writes_.push_back(write); }
@@ -85,8 +117,17 @@ public:
     const WorldLayout& Layout() const { return layout_; }
 
 private:
+    struct Surface {
+        uint32_t instance;
+        uint32_t mesh;
+        uint32_t material;
+        runtime::soft::SurfaceTopology topology;
+    };
+
     WorldLayout layout_;
     render::RenderWorld render_world_;
+    std::vector<Surface> surfaces_;
+    uint32_t heat_material_ = render::kNoId;
     std::vector<PoseWrite> pose_writes_;
     uint64_t static_revision_ = 0u;
 };

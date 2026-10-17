@@ -16,6 +16,7 @@
 #include "constraint/contact_manifold.hpp"  // ContactManifold::kMaxPoints
 #include "nk/model/contact_capacity.hpp"
 #include "nk/model/model.hpp"
+#include "nk/readout/telemetry.hpp"
 #include "nk/solve/nk_row.hpp"
 #include "nk/solve/point_endpoint.hpp"
 #include "sensor/state_bank.hpp"
@@ -54,6 +55,7 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
     p_accumulate_step_.clear();
     p_energy_.clear();
     p_block_descent_substeps_.clear();
+    p_telemetry_substeps_.clear();
     const auto& cap = model.capacities;
     const bool articulated = cap.dofs_per_env > 0u || cap.links_per_env > 0u;
     const bool tile = phi::BlockDescentTileRoute(cap.particles_per_env * cap.env_count,
@@ -87,6 +89,7 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
         return phi::Status::InvalidArgument;
     const auto status = BuildInterval(model, interval, device, readout_demand);
     if (status != phi::Status::Ok) return status;
+    p_telemetry_.substeps = substeps;
     if (sensors && (!sensors->Before().empty() || !sensors->After().empty())) {
         const auto physics = std::move(calls_);
         calls_.clear();
@@ -109,6 +112,7 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
     calls_.reserve(static_cast<size_t>(call_count));
     p_accumulate_step_.resize(static_cast<size_t>(substeps) * 2u);
     p_block_descent_substeps_.resize(substeps);
+    p_telemetry_substeps_.resize(substeps);
     for (uint32_t step = 0u; step < substeps; ++step) {
         auto& capture = p_accumulate_step_[static_cast<size_t>(step) * 2u];
         capture.env_count = cap.env_count;
@@ -144,6 +148,11 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
                 solve.clear_failure_diagnostics = step == 0u ? 1u : 0u;
                 solve.substep_index = step;
                 AddOp(call.op, &solve, device);
+            } else if (call.op == phi::NkOp::RecordTelemetry) {
+                auto& record = p_telemetry_substeps_[step];
+                record = *static_cast<const phi::RecordTelemetryParams*>(call.params);
+                record.substep = step;
+                AddOp(call.op, &record, device);
             } else AddOp(call.op, call.params, device);
             if (mpm_reaction && call.op == phi::NkOp::MpmCommit)
                 AddOp(phi::NkOp::AccumulateStep, &capture, device);
@@ -453,9 +462,13 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         uint64_t{cap.mpm_stress_cells_per_env} * kMpmCellStencilNodes;
     const char* diagnostics = std::getenv("NUKA_CONTACT_SOLVER_DIAGNOSTICS");
     p_block_descent_.measure_vertex_audit = (readout_demand & kReadoutVbdSolveAudit) != 0u;
+    const bool telemetry = (readout_demand & kReadoutTelemetry) != 0u;
+    p_block_descent_.telemetry = telemetry ? kTelemetrySolve |
+        ((readout_demand & kReadoutTelemetrySweeps) != 0u ? kTelemetrySweeps : 0u) : 0u;
     p_block_descent_.measure_contact_residual = cfg.measure_contact_residual ||
         p_block_descent_.measure_vertex_audit != 0u ||
         p_block_descent_.velocity_tolerance > 0.0f ||
+        telemetry ||
         (readout_demand & kReadoutPhysicsDiagnostics) != 0u ||
         (diagnostics != nullptr && diagnostics[0] == '1');
     // The build-time coupling context: the row provider's PreCouple/PostCouple
@@ -927,6 +940,14 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_readout_.contact_rows_per_env = contact_rows_per_env;
         p_readout_.workspace_bytes = cap.contact_index_scratch_bytes;
         add(phi::NkOp::ReadoutContactWrench, &p_readout_);
+    }
+
+    // The substep's telemetry record closes after every stage it summarizes.
+    if ((readout_demand & kReadoutTelemetry) != 0u) {
+        p_telemetry_.env_count = env_count;
+        p_telemetry_.energy = (readout_demand & kReadoutEnergyLedger) != 0u ? 1u : 0u;
+        p_telemetry_.velocity_tolerance = p_block_descent_.velocity_tolerance;
+        add(phi::NkOp::RecordTelemetry, &p_telemetry_);
     }
 
     if (!missing_ops_.empty()) {

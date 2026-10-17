@@ -323,6 +323,7 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::ContactSolveMetrics: v.contact_solve_metrics = static_cast<uint64_t*>(p); break;
         case FieldId::ContactSolveWorstTerms: v.contact_solve_worst_terms = static_cast<float*>(p); break;
         case FieldId::ContactSolveCounts: v.contact_solve_counts = static_cast<uint32_t*>(p); break;
+        case FieldId::Telemetry: v.telemetry = static_cast<uint32_t*>(p); break;
         case FieldId::PairSortScratch:     v.pair_sort_scratch = static_cast<uint8_t*>(p); break;
         case FieldId::RngState:            v.rng_state = static_cast<uint64_t*>(p); break;
         case FieldId::EnvStatus:           v.env_status = static_cast<uint32_t*>(p); break;

@@ -292,6 +292,7 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         if (id == FieldId::ContactIndexScratch) return contact_index_scratch_bytes;
         if (id == FieldId::PairSampleChunks) return pair_sample_chunk_words;
         if (id == FieldId::BlockDescentScratch) return block_descent_scratch_words;
+        if (id == FieldId::Telemetry) return 0u;  // owned by the world while a mask is set
         // MLS-MPM background grid node fields: per-env nodes x env_count (the keys
         // are env-offset, so each env owns a private node span). 0 for a non-MPM world.
         // grid_body_dp/grid_body_owner share the per-node extent (the body-BC handoff).

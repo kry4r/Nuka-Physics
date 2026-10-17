@@ -13,6 +13,7 @@
 #include "nk/pipeline/pipeline.hpp"
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/model/generated/views.hpp"
+#include "nk/readout/telemetry.hpp"
 #include "sensor/state_bank.hpp"
 
 namespace nuka::nk {
@@ -71,6 +72,15 @@ public:
     uint32_t VelocityIterations() const {
         return pipeline_ ? pipeline_->VelocityIterations() : cfg_.vel_iters;
     }
+
+    // A nonzero kTelemetry* mask allocates and restarts the telemetry ring; zero removes its operators.
+    phi::Status SetTelemetry(uint32_t mask, float alert_velocity);
+    uint32_t TelemetryMask() const { return telemetry_mask_; }
+    // Up to `capacity` records written since the last read, oldest first; *dropped counts those the
+    // ring overwrote unread.
+    phi::Status ReadTelemetry(std::vector<TelemetryRecord>* out, uint32_t capacity, uint32_t* dropped);
+    // The largest Newton correction component [m/s] of each VBD vertex in the last solve, env-major.
+    phi::Status ReadTelemetryVertices(std::vector<float>* out);
 
     // Write one template link's value of a per-link parameter field (width floats) in every
     // environment and in the model template, without reallocating.
@@ -137,6 +147,11 @@ private:
     // now on (rebuild pipeline, drop the plan) + backfill it from the last solve.
     phi::Status DemandReadout(FieldId id);
     phi::Status RebuildPipeline();
+    // The readout demand together with what a telemetry mask adds.
+    uint32_t Demand(uint32_t telemetry_mask) const;
+    // Builds the pipeline for a demand, widening the solver scratch and measurement buffers it needs.
+    phi::Status BuildDemanded(uint32_t demand, std::unique_ptr<Pipeline>* out);
+    void InstallPipeline(std::unique_ptr<Pipeline> candidate);
 
     Model           model_;
     sensor::StateSensorBank state_sensors_;
@@ -145,6 +160,8 @@ private:
     Pipeline::SolverConfig cfg_{};
     phi::Device*    device_ = nullptr;
     uint32_t        readout_demand_ = 0;
+    uint32_t        telemetry_mask_ = 0u;
+    uint32_t        telemetry_read_ = 0u;  // sequence of the next unread telemetry record
     phi::Backend*   backend_ = nullptr;
     phi::ModelView  model_view_{};
     phi::DataView   data_view_{};

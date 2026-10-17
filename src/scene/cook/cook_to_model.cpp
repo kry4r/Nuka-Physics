@@ -2382,8 +2382,12 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
     if (media.empty()) return surfaces;
     // MPM media concatenate before vertex-block media; each medium retains its own surface definition.
     uint32_t base = 0u;
+    const auto tag = [&](size_t first, const MediaRecord& m) {
+        for (size_t i = first; i < surfaces.size(); ++i) surfaces[i].medium = m.id;
+    };
     for (const MediaRecord& m : media) {
         if (m.method != MediaRecord::Method::MlsMpm) continue;
+        const size_t first = surfaces.size();
         if (!m.mpm_fills.empty()) {
             base += AppendMpmFillSurfaces(surfaces, m, base);
         } else {
@@ -2404,6 +2408,7 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
             }
             base += n_mpm;
         }
+        tag(first, m);
     }
     // The soft slice holds vertex-block media in media order; track the running particle
     // base exactly as CookSceneMedia appends them (fluid/MPM skipped).
@@ -2452,8 +2457,12 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
         }
         base += verts;
     };
-    for (const MediaRecord& m : media)
-        if (IsVertexBlockMedium(m)) append_soft(m);
+    for (const MediaRecord& m : media) {
+        if (!IsVertexBlockMedium(m)) continue;
+        const size_t first = surfaces.size();
+        append_soft(m);
+        tag(first, m);
+    }
     return surfaces;
 }
 
