@@ -42,19 +42,32 @@ float* FieldPtr(nuka_world_handle world, nuka_state_field_t field) {
 bool Go2PolicyController::Init(const std::string& policy_path, uint32_t links_per_env,
                               uint32_t articulations_per_env,
                               const ::nuka::terrain::HeightField& terrain,
-                              const Config& cfg) {
+                              const Config& cfg, std::string* error) {
     cfg_ = cfg;
     terrain_ = terrain;
     ready_ = false;
     gains_applied_ = false;
     step_ = 0;
-    if (!policy_.Load(policy_path)) return false;
+    if (!policy_.Load(policy_path)) {
+        *error = "cannot load the policy '" + policy_path + "'";
+        return false;
+    }
+    if (policy_.ActDim() != kJoints) {
+        *error = "the policy has " + std::to_string(policy_.ActDim()) +
+                 " actions; the contract drives " + std::to_string(kJoints) + " joints";
+        return false;
+    }
 
+    if (articulations_per_env == 0u) {
+        *error = "the scene has no robot";
+        return false;
+    }
     links_per_env_ = links_per_env;
-    num_dogs_ = articulations_per_env > 0u ? articulations_per_env : 1u;
-    links_per_dog_ = num_dogs_ > 0u ? links_per_env / num_dogs_ : links_per_env;
+    num_dogs_ = articulations_per_env;
+    links_per_dog_ = links_per_env / num_dogs_;
     if (links_per_dog_ < kBlc) {
-        std::fprintf(stderr, "[go2_policy] links_per_dog %u < %u\n", links_per_dog_, kBlc);
+        *error = "a robot has " + std::to_string(links_per_dog_) + " links; the contract needs " +
+                 std::to_string(kBlc) + " (a root and " + std::to_string(kJoints) + " joints)";
         return false;
     }
     scan_nx_ = static_cast<uint32_t>(
@@ -63,8 +76,8 @@ bool Go2PolicyController::Init(const std::string& policy_path, uint32_t links_pe
                    std::lround((cfg_.scan_y_max - cfg_.scan_y_min) / cfg_.scan_res)) + 1u;
     scan_n_ = scan_nx_ * scan_ny_;
     if (kProprio + scan_n_ != policy_.ObsDim()) {
-        std::fprintf(stderr, "[go2_policy] obs width %u != policy %u\n",
-                     kProprio + scan_n_, policy_.ObsDim());
+        *error = "the policy observes " + std::to_string(policy_.ObsDim()) +
+                 " values; the contract builds " + std::to_string(kProprio + scan_n_);
         return false;
     }
 

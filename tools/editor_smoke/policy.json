@@ -1,0 +1,53 @@
+{
+  "name": "policy",
+  "launch": [],
+  "steps": [
+    {"action": "file.open", "args": {"path": "${scenario_dir}/../../examples/assets/nuka_lab/stage.nks"}},
+    {"frames": 20},
+    {"python": "import builtins, struct, time, numpy as np, nuka\ndef frames(n):\n    for _ in range(n):\n        app.update(True)\ndef run_for(seconds):\n    t = time.monotonic()\n    while time.monotonic() - t < seconds:\n        app.update(True)\ndef tick():\n    return app.actions.run('timeline.status')['tick']\ndef until_tick(n):\n    deadline = time.monotonic() + 60.0\n    while tick() < n:\n        assert time.monotonic() < deadline, tick()\n        app.update(True)\ndef step(n):\n    t = tick()\n    app.actions.run('sim.step', steps=n)\n    until_tick(t + n)\n    frames(3)\ndef targets():\n    return np.asarray(app.world.download_field(nuka.Field.DRIVE_TARGET), dtype=np.float32).reshape(app.world.env_count, -1)[0].copy()\ndef fails(action, text, **args):\n    from nuka.editor.app import ActionError\n    try:\n        app.actions.run(action, **args)\n    except ActionError as e:\n        assert text in str(e), (action, args, str(e))\n    else:\n        raise AssertionError((action, args))\ndef nkml(path, obs, act, seed):\n    rng = np.random.default_rng(seed)\n    dims = [obs, 32, act]\n    with open(path, 'wb') as f:\n        f.write(struct.pack('<IIIff', 0x4E4B4D4C, 1, obs, 5.0, 1.0))\n        f.write(np.zeros(obs, np.float32).tobytes() + np.ones(obs, np.float32).tobytes())\n        f.write(struct.pack('<I', 2))\n        for l in range(2):\n            f.write(struct.pack('<III', dims[l], dims[l + 1], 1 - l))\n            f.write((rng.standard_normal((dims[l + 1], dims[l])) / np.sqrt(dims[l])).astype(np.float32).tobytes())\n            f.write((0.3 * rng.standard_normal(dims[l + 1])).astype(np.float32).tobytes())\nnkml('${out}/rand.bin', 235, 12, 1)\nnkml('${out}/obs100.bin', 100, 12, 2)\nnkml('${out}/act6.bin', 235, 6, 3)\nwith open('${out}/junk.bin', 'wb') as f:\n    f.write(b'nope')\nbuiltins.pl_frames, builtins.pl_run_for, builtins.pl_tick, builtins.pl_until_tick = frames, run_for, tick, until_tick\nbuiltins.pl_step, builtins.pl_targets, builtins.pl_fails = step, targets, fails"},
+    {"action": "policy.status", "expect_value": {"loaded": false, "on": true, "path": "", "error": ""}},
+    {"python": "import builtins\nbuiltins.pl_fails('policy.load', 'the scene has no robot', path='${out}/rand.bin')"},
+
+    {"action": "file.import", "args": {"path": "${scenario_dir}/../../examples/scenes/go2_float.usda", "mode": "add",
+     "name": "go2", "pose": {"pos": [0.0, 0.0, 0.6], "quat": [1.0, 0.0, 0.0, 0.0]}}, "bind": "go2"},
+    {"frames": 10},
+    {"action": "window.layout_robot"},
+    {"action": "view.frame_all"},
+    {"action": "robot.fix_base", "args": {"on": true}},
+    {"frames": 10},
+    {"action": "robot.drive", "args": {"kp": 20.0}},
+    {"frames": 10},
+    {"python": "import builtins\nf = builtins.pl_fails\nf('policy.load', \"cannot load the policy\", path='${out}/missing.bin')\nf('policy.load', \"cannot load the policy\", path='${out}/junk.bin')\nf('policy.load', 'the policy observes 100 values; the contract builds 235', path='${out}/obs100.bin')\nf('policy.load', 'the policy has 6 actions; the contract drives 12 joints', path='${out}/act6.bin')\nf('policy.unload', '')\nf('policy.enable', '', on=True)\ns = app.policy.status()\nassert not s['loaded'] and 'has 6 actions' in s['error'] and 'joints' not in s, s"},
+
+    {"action": "policy.load", "args": {"path": "${out}/rand.bin"}, "bind": "p0"},
+    {"python": "import builtins, numpy as np\ns = ${p0}\nprint('POLICY', {k: v for k, v in s.items() if k != 'joints'})\nprint('POLICY_JOINTS', [(j['name'], j['link']) for j in s['joints']])\nassert s['loaded'] and s['on'] and s['device'] == 'gpu' and s['error'] == '' and s['path'].endswith('rand.bin'), s\nassert s['robots'] == 1 and s['obs_dim'] == 235 and s['act_dim'] == 12 and s['decimation'] == 4 and s['rate_hz'] > 0.0, s\nassert abs(s['action_scale'] - 0.25) < 1e-6, s\nd = [0.1, 0.8, -1.5, -0.1, 0.8, -1.5, 0.1, 1.0, -1.5, -0.1, 1.0, -1.5]\nassert np.allclose([j['default'] for j in s['joints']], d), s['joints']\nfor u, j in enumerate(s['joints']):\n    assert j['name'].lower() == ('fl', 'fr', 'rl', 'rr')[u // 3] + '_' + ('hip', 'thigh', 'calf')[u % 3] + '_joint', (u, j)\nbuiltins.pl_frames(5)\ns = app.policy.status()\nt = app.teleop.status()\nassert np.allclose(s['command'], [0.0, 0.0, 0.0]) and t['controller'] and not t['on'], (s['command'], t)\nbuiltins.pl_joints = s['joints']"},
+    {"python": "import builtins, numpy as np\napp.actions.run('sim.play')\nbuiltins.pl_until_tick(builtins.pl_tick() + 200)\napp.actions.run('sim.pause')\nbuiltins.pl_frames(5)\ntg = builtins.pl_targets()\ndev = np.array([tg[j['link']] - j['default'] for j in builtins.pl_joints])\ns = app.policy.status()\nprint('POLICY_RUN', np.round(dev, 4).tolist(), s['action_norm'])\nassert np.all(np.abs(dev) <= 0.25 + 1e-5) and np.max(np.abs(dev)) > 1e-3, dev\nassert 0.0 < s['action_norm'] <= np.sqrt(12.0) + 1e-4, s['action_norm']"},
+
+    {"action": "teleop.pad", "args": {"attach": "Policy Pad"}, "bind": "pad"},
+    {"frames": 4},
+    {"action": "teleop.use", "args": {"on": true, "device": "${pad.id}", "mode": "command"}},
+    {"action": "teleop.pad", "args": {"id": "${pad.id}", "axes": {"lefty": -0.6, "rightx": 0.5}}},
+    {"frames": 6},
+    {"python": "import numpy as np\ns = app.policy.status()\nt = app.teleop.status()\ne, w = (0.6 - 0.1) / 0.9, -(0.5 - 0.1) / 0.9\nprint('POLICY_CMD', s['command'], t['command'])\nassert t['controller'] and np.allclose(t['command'], [e, 0.0, w], atol=1e-3), t\nassert np.allclose(s['command'], t['command'], atol=1e-6), (s['command'], t['command'])"},
+    {"action": "window.maximize"},
+    {"action": "window.focus", "args": {"panel": "policy"}},
+    {"python": "import builtins\napp.actions.run('sim.play')\nbuiltins.pl_run_for(9.0)\napp.actions.run('sim.pause')\nbuiltins.pl_frames(10)\ns = app.policy.status()\nassert s['action_norm'] > 0.0, s"},
+    {"screenshot": "00_policy"},
+
+    {"python": "import builtins, numpy as np\ndef zeroed():\n    app.actions.run('robot.set_targets', targets={j['name']: 0.0 for j in builtins.pl_joints})\n    builtins.pl_step(40)\n    tg = builtins.pl_targets()\n    return np.array([tg[j['link']] for j in builtins.pl_joints])\ndef policy_deviation():\n    tg = builtins.pl_targets()\n    return np.array([tg[j['link']] - j['default'] for j in builtins.pl_joints])\nbuiltins.pl_zeroed, builtins.pl_deviation = zeroed, policy_deviation\ns = app.policy.enable(False)\nassert s['loaded'] and not s['on'], s\nbuiltins.pl_frames(3)\nassert not app.teleop.status()['controller']\nassert np.allclose(zeroed(), 0.0), 'a stopped policy wrote the targets'\ns = app.policy.enable()\nassert s['on'], s\nbuiltins.pl_frames(3)\nassert app.teleop.status()['controller']\nbuiltins.pl_step(40)\ndev = policy_deviation()\nprint('POLICY_RESUMED', np.round(dev, 4).tolist())\nassert np.all(np.abs(dev) <= 0.25 + 1e-5), dev"},
+    {"python": "import builtins, numpy as np\ns = app.policy.unload()\nassert not s['loaded'] and s['path'] == '' and 'joints' not in s, s\nbuiltins.pl_frames(3)\nassert not app.teleop.status()['controller']\nassert np.allclose(builtins.pl_zeroed(), 0.0), 'an unloaded policy wrote the targets'"},
+
+    {"action": "policy.load", "args": {"path": "${out}/rand.bin", "host": true}, "expect_value": {"loaded": true, "on": true, "device": "host"}},
+    {"python": "import builtins, numpy as np\nbuiltins.pl_step(40)\ndev = builtins.pl_deviation()\nprint('POLICY_HOST', np.round(dev, 4).tolist())\nassert np.all(np.abs(dev) <= 0.25 + 1e-5) and np.max(np.abs(dev)) > 1e-3, dev"},
+    {"action": "robot.fix_base", "args": {"on": false}},
+    {"frames": 10},
+    {"action": "policy.status", "expect_value": {"loaded": true, "on": true, "device": "host", "error": ""}},
+    {"action": "policy.unload", "expect_value": {"loaded": false}},
+    {"action": "teleop.use", "args": {"on": false}},
+    {"action": "teleop.pad", "args": {"id": "${pad.id}", "detach": true}},
+    {"action": "window.restore"},
+    {"action": "file.close", "args": {"discard": true}},
+    {"frames": 4},
+    {"expect": {"loaded": false}}
+  ]
+}

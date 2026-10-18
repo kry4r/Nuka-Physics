@@ -905,6 +905,7 @@ struct EditorHost::State : DocumentHost {
     void RegisterIkActions();
     void RegisterOverlayActions();
     void RegisterTeleopActions();
+    void RegisterPolicyActions();
     json::Value TimelineStatus();
     // What a recording must match to load: the document, the world's counts and step, and the
     // names of the link and body rows its poses fill.
@@ -1061,6 +1062,14 @@ struct EditorHost::State : DocumentHost {
     // The ik mode's link: the one teleop.use named, else the selected link below a root; -1 when none.
     int TeleopLink() const;
     json::Value TeleopStatus() const;
+    // A policy over the loaded robots, or null with `error` saying why it does not fit them.
+    std::unique_ptr<inference::Go2PolicyController> MakeController(const std::string& path, bool host,
+                                                                   std::string* error) const;
+    // The Policy panel's copy of the loaded policy's contract; the command and the norms follow it.
+    void SyncPolicyView();
+    // The shown robots' action norm at a new tick, read back from the drive targets the policy wrote.
+    void RecordPolicyNorm(const Snapshot& snap);
+    json::Value PolicyStatus();
     void TakeWorkerResults();
     void PushTransport();
     void PushPoseWrites();
@@ -1089,6 +1098,8 @@ struct EditorHost::State : DocumentHost {
     SceneCache cache_;
     render::RenderWorld empty_world_;
     std::unique_ptr<inference::Go2PolicyController> policy_ctrl_;
+    bool policy_on_ = true;      // a loaded policy steps; off, its drive targets hold
+    uint64_t policy_tick_ = 0u;  // the tick RecordPolicyNorm last read
     std::unique_ptr<EditorScene> loaded_;
     bool attach_pending_ = false;
     EntityDrag entity_drag_;
@@ -1839,7 +1850,7 @@ void EditorHost::State::BindWorker(uint64_t tick, double sim_time) {
     binding.world = world_;
     binding.layout = layout;
     binding.rest_targets = loaded_->rest_targets;
-    binding.controller = policy_ctrl_.get();
+    binding.controller = policy_on_ ? policy_ctrl_.get() : nullptr;
     binding.scatter = scatter_.get();
     EnvView& envs = ui_state_.envs;
     envs.count = layout.env_count;
@@ -1886,6 +1897,7 @@ void EditorHost::State::ApplySnapshot(const Snapshot& snap) {
     for (const PoseSample& e : snap.envs) loaded_->sim->AddEnv(e.env, e.links, e.bodies, EnvOffset(e.env, snap.env));
     if (!snap.particles.empty()) loaded_->sim->ApplyParticles(snap.particles, snap.heat, ui_state_.solver.alert);
     ui_state_.robot.live = snap.joints;
+    RecordPolicyNorm(snap);
     ui_state_.robot.link_poses = snap.link_poses;
     // A spring draws as a band to its target, a plain force as an arrow along it.
     for (const Perturbation& p : snap.perturbs) {
@@ -2147,13 +2159,15 @@ bool EditorHost::State::StepTeleop(double dt) {
     t.error.clear();
 
     // A command consumer gets the command every frame, and one zero once the mode stops.
-    const bool cmd_ctrl = loaded_ && policy_ctrl_ && policy_ctrl_->AcceptsCommand();
+    const bool cmd_ctrl = loaded_ && policy_ctrl_ && policy_on_ && policy_ctrl_->AcceptsCommand();
     t.controller = cmd_ctrl;
     const bool command = live && t.mode == "command";
     const float drive[3] = {q("vx"), q("vy"), q("wyaw")};
     for (int k = 0; k < 3; ++k) t.command[k] = command ? t.command_base[k] + drive[k] : 0.0f;
-    if (cmd_ctrl && (command || teleop_command_prev_))
+    if (cmd_ctrl && (command || teleop_command_prev_)) {
         worker_.Push(TickCommand::Param(ParamKind::ControllerCommand, {t.command[0], t.command[1], t.command[2]}));
+        std::copy(t.command, t.command + 3, ui_state_.policy.command);
+    }
     teleop_command_prev_ = command;
     // PD hold's rising edge makes the drive targets act without a policy.
     const bool hold = live && t.hold && !(command && cmd_ctrl);
@@ -2898,6 +2912,7 @@ void EditorHost::State::OnLoaded(const std::string& path) {
     if (opt_.teleop_cmd_on && cmd_ctrl) {
         // The CLI command is the baseline the every-frame producer re-sends.
         policy_ctrl_->SetCommandVector(opt_.teleop_cmd, 3);
+        std::copy(opt_.teleop_cmd, opt_.teleop_cmd + 3, ui_state_.policy.command);
         teleop.on = true;
         teleop.mode = "command";
         for (int k = 0; k < 3; ++k) teleop.command_base[k] = opt_.teleop_cmd[k];
@@ -3282,6 +3297,7 @@ void EditorHost::State::RegisterRobotActions() {
     RegisterIkActions();
     RegisterOverlayActions();
     RegisterTeleopActions();
+    RegisterPolicyActions();
 }
 
 void EditorHost::State::RegisterIkActions() {
@@ -3551,6 +3567,65 @@ void EditorHost::State::RegisterTeleopActions() {
     // The active device's reading, the mode's quantities and what they drove last frame.
     actions_.Add({"teleop.status", "Teleop Status", "robot", "", ShortcutScope::Global, {}, {},
                   [this](const json::Value&) { return Ok(TeleopStatus()); }});
+}
+
+void EditorHost::State::RegisterPolicyActions() {
+    const auto has_policy = [this] { return policy_ctrl_ != nullptr; };
+    // Attaches an NKML locomotion policy to the loaded robots in place of the one before, and
+    // sends it teleop's command; the dialog asks without `path`, `host` runs the host MLP.
+    actions_.Add({"policy.load", "Load Policy...", "robot", "", ShortcutScope::Global, [this] { return loaded_ != nullptr; },
+                  {},
+                  [this](const json::Value& args) {
+                      if (loaded_ == nullptr) return ActionResult::Fail("no scene is loaded");
+                      std::string path = StrArg(args, "path");
+                      if (path.empty()) path = OpenFileDialog(nui::Tr("Load Policy"), nui::Tr("NKML policies"), "*.bin;*.nkml");
+                      if (path.empty()) return ActionResult::Fail("no policy file chosen");
+                      const bool host = BoolArg(args, "host", false);
+                      std::string error;
+                      std::unique_ptr<inference::Go2PolicyController> pc = MakeController(path, host, &error);
+                      if (pc == nullptr) {
+                          ui_state_.policy.error = error;
+                          return ActionResult::Fail(error);
+                      }
+                      opt_.policy_path = path;
+                      opt_.force_host_policy = host;
+                      policy_on_ = true;
+                      worker_.Exclusive([&] {
+                          policy_ctrl_ = std::move(pc);
+                          worker_.SetController(policy_ctrl_.get());
+                          SyncPolicyView();
+                      });
+                      ui_state_.policy.error.clear();
+                      teleop_command_prev_ = true;  // the next frame sends teleop's command, zero while it is off
+                      Emit(stdout, Format("[nuka_editor] policy attached: %s  path=%s\n", path.c_str(),
+                                          policy_ctrl_->UsingGpu() ? "GPU" : "host"));
+                      return Ok(PolicyStatus());
+                  }});
+    actions_.Add({"policy.unload", "Unload Policy", "robot", "", ShortcutScope::Global, has_policy, {},
+                  [this](const json::Value&) {
+                      if (policy_ctrl_ == nullptr) return ActionResult::Fail("no policy is loaded");
+                      worker_.Exclusive([&] {
+                          worker_.SetController(nullptr);
+                          policy_ctrl_.reset();
+                      });
+                      opt_.policy_path.clear();
+                      SyncPolicyView();
+                      return Ok(PolicyStatus());
+                  }});
+    // Runs or stops the loaded policy; stopped, the drive targets hold where it left them. Bare, it toggles.
+    actions_.Add({"policy.enable", "Run Policy", "robot", "", ShortcutScope::Global, has_policy,
+                  [this] { return policy_ctrl_ != nullptr && policy_on_; },
+                  [this](const json::Value& args) {
+                      if (policy_ctrl_ == nullptr) return ActionResult::Fail("no policy is loaded");
+                      policy_on_ = BoolArg(args, "on", args.Items().empty() ? !policy_on_ : policy_on_);
+                      worker_.Exclusive([&] { worker_.SetController(policy_on_ ? policy_ctrl_.get() : nullptr); });
+                      ui_state_.policy.on = policy_on_;
+                      teleop_command_prev_ = true;
+                      return Ok(PolicyStatus());
+                  }});
+    // The loaded policy, its contract, the joints it drives and the command it reads.
+    actions_.Add({"policy.status", "Policy Status", "robot", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value&) { return Ok(PolicyStatus()); }});
 }
 
 void EditorHost::State::RegisterOverlayActions() {
@@ -5857,20 +5932,125 @@ json::Value EditorHost::State::DocumentState() {
     return v;
 }
 
+std::unique_ptr<inference::Go2PolicyController> EditorHost::State::MakeController(const std::string& path, bool host,
+                                                                                  std::string* error) const {
+    // Without a heightfield the height scan reads the z = 0 ground plane.
+    static const terrain::HeightField kPlane = [] {
+        terrain::HeightField plane;
+        plane.values.assign(4u, 0.0f);
+        plane.nrow = plane.ncol = 2u;
+        plane.cell_x = plane.cell_y = 1.0f;
+        return plane;
+    }();
+    const WorldLayout& layout = loaded_->Layout();
+    auto pc = std::make_unique<inference::Go2PolicyController>();
+    if (!pc->Init(path, layout.links_per_env, layout.articulations_per_env,
+                  terrain::IsValid(loaded_->terrain) ? loaded_->terrain : kPlane, error))
+        return nullptr;
+    if (host) pc->SetUseGpu(false);
+    return pc;
+}
+
+// The --policy or policy.load policy, attached again at every load and rebuild.
 void EditorHost::State::AttachController() {
     policy_ctrl_.reset();
-    const WorldLayout& layout = loaded_->Layout();
-    if (!opt_.policy_path.empty() && terrain::IsValid(loaded_->terrain)) {
-        auto pc = std::make_unique<inference::Go2PolicyController>();
-        if (pc->Init(opt_.policy_path, layout.links_per_env, layout.articulations_per_env, loaded_->terrain)) {
-            if (opt_.force_host_policy) pc->SetUseGpu(false);
-            policy_ctrl_ = std::move(pc);
+    ui_state_.policy.error.clear();
+    if (!opt_.policy_path.empty()) {
+        policy_ctrl_ = MakeController(opt_.policy_path, opt_.force_host_policy, &ui_state_.policy.error);
+        if (policy_ctrl_ != nullptr)
             Emit(stdout, Format("[nuka_editor] policy attached: %s  play=%s  path=%s\n", opt_.policy_path.c_str(),
                                 opt_.want_play ? "yes" : "no", policy_ctrl_->UsingGpu() ? "GPU" : "host"));
-        } else {
-            Emit(stderr, "[nuka_editor] policy Init failed: " + opt_.policy_path + "\n");
-        }
+        else
+            Emit(stderr, "[nuka_editor] policy Init failed: " + opt_.policy_path + ": " + ui_state_.policy.error + "\n");
     }
+    SyncPolicyView();
+}
+
+void EditorHost::State::SyncPolicyView() {
+    PolicyView& p = ui_state_.policy;
+    p.loaded = policy_ctrl_ != nullptr;
+    p.on = policy_on_;
+    p.path = opt_.policy_path;
+    p.links.clear();
+    p.defaults.clear();
+    p.norm = 0.0f;
+    p.norm_time.clear();
+    p.norm_value.clear();
+    if (policy_ctrl_ == nullptr) return;
+    const inference::Go2PolicyController::Config& c = policy_ctrl_->Contract();
+    p.gpu = policy_ctrl_->UsingGpu();
+    p.robots = policy_ctrl_->Robots();
+    p.obs_dim = policy_ctrl_->ObsDim();
+    p.act_dim = policy_ctrl_->ActDim();
+    p.decimation = c.decimation;
+    p.rate_hz = 1.0f / (opt_.dt * static_cast<float>(c.decimation));
+    p.action_scale = c.action_scale;
+    for (uint32_t k = 0; k < p.robots; ++k)
+        for (size_t u = 0; u < c.default_angles.size(); ++u) {
+            p.links.push_back(k * policy_ctrl_->LinksPerRobot() + 1u + c.slot_of_urdf[u]);
+            p.defaults.push_back(c.default_angles[u]);
+        }
+    std::copy(c.command.begin(), c.command.end(), p.command);
+    std::snprintf(p.path_edit, sizeof(p.path_edit), "%s", opt_.policy_path.c_str());
+}
+
+void EditorHost::State::RecordPolicyNorm(const Snapshot& snap) {
+    constexpr size_t kNorms = 2000u;
+    PolicyView& p = ui_state_.policy;
+    const std::vector<float>& targets = snap.joints.target;
+    if (policy_ctrl_ == nullptr || !policy_on_ || !snap.playing || snap.tick == policy_tick_ || targets.empty()) return;
+    policy_tick_ = snap.tick;
+    // An action is (target - default) / scale, which the targets keep between decisions.
+    const size_t per = p.links.size() / p.robots;
+    float sum = 0.0f;
+    for (uint32_t k = 0; k < p.robots; ++k) {
+        float squares = 0.0f;
+        for (size_t i = k * per; i < (k + 1u) * per; ++i) {
+            const float a = (targets[p.links[i]] - p.defaults[i]) / p.action_scale;
+            squares += a * a;
+        }
+        sum += std::sqrt(squares);
+    }
+    p.norm = sum / static_cast<float>(p.robots);
+    p.norm_time.push_back(static_cast<float>(snap.sim_time));
+    p.norm_value.push_back(p.norm);
+    if (p.norm_time.size() > kNorms) {
+        p.norm_time.erase(p.norm_time.begin());
+        p.norm_value.erase(p.norm_value.begin());
+    }
+}
+
+json::Value EditorHost::State::PolicyStatus() {
+    const PolicyView& p = ui_state_.policy;
+    json::Value v = Object({{"loaded", json::Value::Bool(p.loaded)},
+                            {"on", json::Value::Bool(policy_on_)},
+                            {"path", json::Value::Str(opt_.policy_path)},
+                            {"error", json::Value::Str(p.error)}});
+    if (policy_ctrl_ == nullptr) return v;
+    // The command the policy reads now, which the stepping thread writes.
+    std::array<float, 3> command{};
+    worker_.Exclusive([&] { command = policy_ctrl_->Contract().command; });
+    const std::vector<RobotJoint>& rj = ui_state_.robot.joints;
+    const size_t per = p.links.size() / p.robots;
+    json::Value joints = json::Value::Array();
+    for (size_t i = 0; i < p.links.size(); ++i) {
+        const auto j = std::find_if(rj.begin(), rj.end(), [&](const RobotJoint& r) { return r.link == p.links[i]; });
+        joints.PushBack(Object({{"robot", json::Value::Int(static_cast<int64_t>(i / per))},
+                                {"name", j != rj.end() ? json::Value::Str(j->name) : json::Value()},
+                                {"link", json::Value::Int(p.links[i])},
+                                {"default", json::Value::Float(p.defaults[i])}}));
+    }
+    v.Set("device", json::Value::Str(p.gpu ? "gpu" : "host"));
+    v.Set("robots", json::Value::Int(p.robots));
+    v.Set("obs_dim", json::Value::Int(p.obs_dim));
+    v.Set("act_dim", json::Value::Int(p.act_dim));
+    v.Set("decimation", json::Value::Int(p.decimation));
+    v.Set("rate_hz", json::Value::Float(p.rate_hz));
+    v.Set("action_scale", json::Value::Float(p.action_scale));
+    v.Set("joints", std::move(joints));
+    v.Set("command", Vec3Json(math::Vec3{command[0], command[1], command[2]}));
+    v.Set("action_norm", json::Value::Float(p.norm));
+    return v;
 }
 
 // Drops the scene binding; the world stays until the editor is destroyed.
@@ -5882,6 +6062,7 @@ void EditorHost::State::ApplyUnload() {
     bound_epoch_ = 0u;
     reset_framing_ = false;
     policy_ctrl_.reset();
+    SyncPolicyView();
     entity_drag_.Cancel();
     loaded_.reset();
     hidden_meshes_.clear();

@@ -1,6 +1,6 @@
 // The Joints panel: each moving joint's limits, value, drive target and effort, the selected
 // joint's curves, drive conversion, the fixed base, the gizmo's IK and teleop; the
-// Poses panel and the Gain Tuner.
+// Poses panel, the Policy panel and the Gain Tuner.
 
 #include "runtime/app/viewer/imgui_layer.hpp"
 
@@ -623,6 +623,93 @@ void ImGuiLayer::BuildPoses(nui::VStack& root) {
             ImGui::PopID();
         }
     });
+}
+
+void ImGuiLayer::BuildPolicy(nui::VStack& root) {
+    const auto pol = [this]() -> PolicyView& { return frame_.ui->policy; };
+
+    auto& head = root.Add<nui::HStack>();
+    head.wrap = true;
+    head.Add<nui::ToggleButton>("Run").Action("policy.enable");
+    auto& state = head.Add<nui::Badge>();
+    state.text_fn = [pol] { return std::string(Tr(!pol().loaded ? "no policy" : pol().on ? "running" : "stopped")); };
+    state.tone_fn = [pol] { return !pol().loaded ? Tone::Dim : pol().on ? Tone::Accent : Tone::Warn; };
+    auto& device = head.Add<nui::Badge>();
+    device.text_fn = [pol] { return std::string(pol().gpu ? "GPU" : Tr("HOST")); };
+    device.tone_fn = [] { return Tone::Info; };
+    device.visible_if = [pol] { return pol().loaded; };
+
+    // The file and where its MLP runs; Load replaces the policy before it.
+    root.Add<nui::Custom>([this] {
+        PolicyView& p = frame_.ui->policy;
+        ImGui::TextDisabled("%s", Tr("Policy file"));
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputTextWithHint("##policy_path", Tr("NKML policy; empty browses"), p.path_edit, sizeof(p.path_edit));
+        if (p.path_edit[0] != '\0' && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) ImGui::SetTooltip("%s", p.path_edit);
+        ImGui::Checkbox(Tr("Host MLP"), &p.host);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort))
+            ImGui::SetTooltip("%s", Tr("Run the MLP on the CPU instead of the GPU."));
+        if (ImGui::Button(Iconed(icon::kOpen, Tr("Load")).c_str())) {
+            json::Value args = Args({{"host", json::Value::Bool(p.host)}});
+            if (p.path_edit[0] != '\0') args.Set("path", json::Value::Str(p.path_edit));
+            Queue("policy.load", std::move(args));
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!p.loaded);
+        if (ImGui::Button(Iconed(icon::kUnload, Tr("Unload")).c_str())) Queue("policy.unload", json::Value::Object());
+        ImGui::EndDisabled();
+        if (!p.error.empty()) {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextColored(theme::kWarn, "%s", p.error.c_str());
+            ImGui::PopTextWrapPos();
+        }
+    });
+
+    // The contract it runs under, the command it reads and its action norm over simulated time.
+    auto& info = root.Add<nui::Custom>([this] {
+        const PolicyView& p = frame_.ui->policy;
+        const float s = nui::Scale();
+        if (ImGui::BeginTable("##policy_info", 2, ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed);
+            ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
+            const auto row = [](const char* label, const std::string& value) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextColored(theme::kFgMuted, "%s", Tr(label));
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextUnformatted(value.c_str());
+            };
+            row("Robots", Fmt("%u", p.robots));
+            row("Observations", Fmt("%u", p.obs_dim));
+            row("Actions", Fmt(Tr("%u per robot"), p.act_dim));
+            row("Decisions", Fmt(Tr("%.0f Hz (%u steps)"), static_cast<double>(p.rate_hz), p.decimation));
+            row("Action norm", Fmt("%.3f", static_cast<double>(p.norm)));
+            ImGui::EndTable();
+        }
+        ImGui::PushTextWrapPos(0.0f);
+        nui::PushTextStyle(TextStyle::Mono);
+        ImGui::TextColored(theme::kAccent, "\xE2\x86\x92 vx %+.2f  vy %+.2f  wyaw %+.2f", static_cast<double>(p.command[0]),
+                           static_cast<double>(p.command[1]), static_cast<double>(p.command[2]));
+        nui::PopTextStyle();
+        ImGui::TextDisabled("%s", Tr("Teleop's velocity command mode steers it."));
+        ImGui::PopTextWrapPos();
+        nui::draw::SectionHeader(Tr("Action norm"));
+        if (p.norm_time.empty()) {
+            ImGui::TextDisabled("%s", Tr("Play to record its actions."));
+            return;
+        }
+        ImPlot::PushStyleVar(ImPlotStyleVar_PlotPadding, ImVec2(theme::kSpace * s, theme::kSpace * s));
+        ImPlot::PushStyleVar(ImPlotStyleVar_FitPadding, ImVec2(0.0f, 0.1f));
+        if (ImPlot::BeginPlot("##policy_norm", ImVec2(-FLT_MIN, 150.0f * s),
+                              ImPlotFlags_NoMenus | ImPlotFlags_NoBoxSelect | ImPlotFlags_NoFrame | ImPlotFlags_NoLegend)) {
+            ImPlot::SetupAxes(Tr("s"), "|a|", ImPlotAxisFlags_AutoFit, ImPlotAxisFlags_AutoFit);
+            ImPlot::PlotLine("##norm", p.norm_time.data(), p.norm_value.data(), static_cast<int>(p.norm_time.size()),
+                             Line(theme::kAccent, 1.5f));
+            ImPlot::EndPlot();
+        }
+        ImPlot::PopStyleVar(2);
+    });
+    info.visible_if = [pol] { return pol().loaded; };
 }
 
 void ImGuiLayer::DrawGainTuner() {

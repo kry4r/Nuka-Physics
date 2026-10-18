@@ -7,6 +7,7 @@
 #include "render/render_world.hpp"
 #include "runtime/app/viewer/editor_actions.hpp"
 #include "runtime/app/viewer/nui/nui.hpp"
+#include "runtime/app/viewer/policy_view.hpp"
 #include "runtime/app/viewer/property_schema.hpp"
 #include "runtime/app/viewer/robot_view.hpp"
 #include "runtime/app/viewer/scene_viewport.hpp"
@@ -295,6 +296,7 @@ struct ViewerUiState {
     std::vector<uint8_t> drive_dirty;
     RobotView robot;
     TeleopView teleop;
+    PolicyView policy;
 
     // Queued for the next frame top, so recording the UI never changes the world.
     std::vector<ActionCall> actions;
@@ -467,6 +469,7 @@ private:
     void BuildCamera(nui::VStack& root);
     void BuildJoints(nui::VStack& root);
     void BuildPoses(nui::VStack& root);
+    void BuildPolicy(nui::VStack& root);
     void BuildScript(nui::VStack& root);
     void BuildConsole(nui::VStack& root);
     // The script tab bar with its keys, completions, disk-change bar and close prompt.

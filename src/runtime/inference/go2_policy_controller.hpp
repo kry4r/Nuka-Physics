@@ -49,17 +49,26 @@ public:
     };
 
     // Load the policy + bind the cooked env layout (links_per_env, K articulations) +
-    // the retained terrain. False on load failure or obs-width mismatch (48+scan).
+    // the retained terrain. False, with `error` saying why, on a load failure or a
+    // contract mismatch (12 actions, a root + 12 joints per robot, 48 + scan obs).
     bool Init(const std::string& policy_path, uint32_t links_per_env,
               uint32_t articulations_per_env,
-              const ::nuka::terrain::HeightField& terrain, const Config& cfg);
+              const ::nuka::terrain::HeightField& terrain, const Config& cfg,
+              std::string* error);
     // Convenience overload using the default Go2 contract.
     bool Init(const std::string& policy_path, uint32_t links_per_env,
               uint32_t articulations_per_env,
-              const ::nuka::terrain::HeightField& terrain) {
-        return Init(policy_path, links_per_env, articulations_per_env, terrain, Config{});
+              const ::nuka::terrain::HeightField& terrain, std::string* error) {
+        return Init(policy_path, links_per_env, articulations_per_env, terrain, Config{},
+                    error);
     }
     bool Ready() const { return ready_; }
+    // Only `command` changes after Init, on the thread that steps the world.
+    const Config& Contract() const { return cfg_; }
+    uint32_t Robots() const { return num_dogs_; }
+    uint32_t LinksPerRobot() const { return links_per_dog_; }
+    uint32_t ObsDim() const { return policy_.ObsDim(); }
+    uint32_t ActDim() const { return policy_.ActDim(); }
     void SetCommand(float vx, float vy, float wyaw) {
         cfg_.command = {vx, vy, wyaw};
         gpu_.SetCommand(vx, vy, wyaw);

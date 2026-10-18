@@ -272,6 +272,28 @@ class Teleop:
         return self._app.actions.run("teleop.status")
 
 
+class Policy:
+    """A locomotion policy through the ``policy.*`` actions; teleop's command mode steers it."""
+
+    def __init__(self, app: "EditorApp"):
+        self._app = weakref.proxy(app)
+
+    def load(self, path: str, host: bool = False) -> dict:
+        """Attach the NKML policy at ``path`` to the loaded robots; ``host`` runs the host MLP."""
+        return self._app.actions.run("policy.load", path=path, host=host)
+
+    def unload(self) -> dict:
+        return self._app.actions.run("policy.unload")
+
+    def enable(self, on: Optional[bool] = None) -> dict:
+        """Run or stop the loaded policy; without ``on`` it toggles."""
+        return self._app.actions.run("policy.enable", **({} if on is None else {"on": on}))
+
+    def status(self) -> dict:
+        """The loaded policy, its contract, the joints it drives and the command it reads."""
+        return self._app.actions.run("policy.status")
+
+
 class EditorApp:
     """The editor over a world: a window, or a display-less surface with ``--offscreen``.
 
@@ -299,6 +321,7 @@ class EditorApp:
             raise EditorStartupError(str(error)) from None
         self.actions = Actions(self)
         self.teleop = Teleop(self)
+        self.policy = Policy(self)
         self.ui = UI(weakref.proxy(self))
         atexit.register(self.close)
 

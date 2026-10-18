@@ -318,6 +318,8 @@ public:
     // returns its epoch.
     uint64_t Bind(WorkerBinding binding);
     void Unbind();
+    // Exclusive sections only. The controller run before each step from now on; null runs none.
+    void SetController(inference::WorldController* controller) { bind_.controller = controller; }
     // Exclusive sections only. Writes the current branch's line of history to `path` after
     // `manifest`, which comes back with the history's own fields; keyframes pass through `scratch`.
     scene::json::Value SaveHistory(const std::string& path, scene::json::Value manifest, const std::string& scratch);

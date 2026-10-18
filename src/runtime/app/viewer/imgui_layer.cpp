@@ -89,6 +89,7 @@ const PanelSpec kPanels[] = {{"stage", "Stage", icon::kStage},       {"property"
                              {"camera", "Camera", icon::kCamera},
                              {"joints", "Joints", icon::kJoint},
                              {"poses", "Poses", icon::kRobot},
+                             {"policy", "Policy", icon::kBrain},
                              {"script", "Script", icon::kScript},    {"console", "Console", icon::kConsole},
                              {"nui", "UI Inspector", icon::kInspector}};
 
@@ -102,9 +103,9 @@ const LayoutPreset kLayouts[] = {
     {"authoring", "Authoring", {"stage", "file"}, {"property", "camera"},
      {"assets", "console", "script", "stats", "timeline"}},
     {"debug", "Debug", {"stage"}, {"solver", "debug", "stats", "property"}, {"console", "timeline", "script", "assets"}},
-    {"robot", "Robot", {"stage"}, {"joints", "poses", "property"}, {"console", "timeline", "stats", "assets"}},
+    {"robot", "Robot", {"stage"}, {"joints", "poses", "policy", "property"}, {"console", "timeline", "stats", "assets"}},
     {"data", "Data", {"file", "stage"}, {"stats", "camera", "property"}, {"assets", "console", "script", "timeline"}},
-    {"training", "Training", {"stats", "stage"}, {"joints", "camera"}, {"console", "script", "assets", "timeline"}},
+    {"training", "Training", {"stats", "stage"}, {"policy", "joints", "camera"}, {"console", "script", "assets", "timeline"}},
 };
 
 const LayoutPreset* FindLayout(std::string_view name) {
@@ -428,6 +429,7 @@ const std::vector<ImGuiLayer::BuiltinExtension>& ImGuiLayer::Builtins() {
         {"nuka.camera", "Camera", "Camera pose, framing and controls.", {"camera"}},
         {"nuka.joints", "Joints", "Joint states, drive targets and gains, the fixed base and teleop.", {"joints"}},
         {"nuka.poses", "Poses", "Named joint poses: blend to one, start from it, import and export.", {"poses"}},
+        {"nuka.policy", "Policy", "Load a locomotion policy, run or stop it and watch its actions.", {"policy"}},
         {"nuka.script", "Script", "The Python script editor and the console.", {"script", "console"}},
         {"nuka.ui_inspector", "UI Inspector", "The nui component tree, for extension authors.", {"nui"}},
     };
@@ -439,8 +441,8 @@ void ImGuiLayer::AddBuiltinPanel(const std::string& panel_id) {
     const Builder builders[] = {&ImGuiLayer::BuildStage,  &ImGuiLayer::BuildProperties, &ImGuiLayer::BuildFile,
                                 &ImGuiLayer::BuildAssets, &ImGuiLayer::BuildStats,      &ImGuiLayer::BuildDebug,
                                 &ImGuiLayer::BuildSolver, &ImGuiLayer::BuildTimeline,   &ImGuiLayer::BuildCamera,
-                                &ImGuiLayer::BuildJoints, &ImGuiLayer::BuildPoses,      &ImGuiLayer::BuildScript,
-                                &ImGuiLayer::BuildConsole, &ImGuiLayer::BuildInspector};
+                                &ImGuiLayer::BuildJoints, &ImGuiLayer::BuildPoses,      &ImGuiLayer::BuildPolicy,
+                                &ImGuiLayer::BuildScript, &ImGuiLayer::BuildConsole,    &ImGuiLayer::BuildInspector};
     const size_t i = static_cast<size_t>(
         std::find_if(std::begin(kPanels), std::end(kPanels), [&](const PanelSpec& p) { return panel_id == p.id; }) -
         std::begin(kPanels));
