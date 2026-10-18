@@ -1278,6 +1278,7 @@ if(CMAKE_CUDA_COMPILER)
             runtime/app/viewer/editor_extensions.cpp
             runtime/app/viewer/editor_profile.cpp
             runtime/app/viewer/editor_instance.cpp
+            runtime/app/viewer/teleop_devices.cpp
         )
         add_dependencies(nuka_editor nuka_render_shaders)
         set_target_properties(nuka_editor PROPERTIES

@@ -394,11 +394,12 @@ nuka_ik_target_t IkGoal(uint32_t link, const math::Transform& goal, bool orient,
     return t;
 }
 
-// An IK solve of `targets` below link `root` (-1 for each target's articulation root) with the
-// core's iteration settings; it writes what the transport does with a drag.
-TickCommand IkCommand(std::vector<nuka_ik_target_t> targets, int root, float rotation_weight) {
+// An IK solve of `targets` in environment `env` below link `root` (-1 for each target's
+// articulation root) with the core's iteration settings; it writes what the transport does with a drag.
+TickCommand IkCommand(std::vector<nuka_ik_target_t> targets, int root, float rotation_weight, uint32_t env) {
     TickCommand cmd;
     cmd.kind = CommandKind::IkSolve;
+    cmd.env = env;
     cmd.ik.root = root < 0 ? ~uint32_t{0} : static_cast<uint32_t>(root);
     cmd.ik.iterations = 200u;
     cmd.ik.rotation_weight = rotation_weight;
@@ -903,6 +904,7 @@ struct EditorHost::State : DocumentHost {
     void RegisterAssemblyActions();
     void RegisterIkActions();
     void RegisterOverlayActions();
+    void RegisterTeleopActions();
     json::Value TimelineStatus();
     // What a recording must match to load: the document, the world's counts and step, and the
     // names of the link and body rows its poses fill.
@@ -1051,6 +1053,14 @@ struct EditorHost::State : DocumentHost {
     // The gizmo on IK link `link`: a press holds the pins and the link's pose under the gizmo at
     // `live`; each move makes the next solve toward `gizmo`.
     void DragIk(int link, const math::Transform& live, const math::Transform& gizmo, bool changed, bool using_now);
+    // The devices teleop can read: the keyboard, the virtual device, the SDL pads and the extensions'.
+    void ListTeleopDevices();
+    // The active device's reading through the mode's mapping into a controller command, a joint's
+    // target, the IK goal or an extension's targets; true while the keyboard device owns W A S D.
+    bool StepTeleop(double dt);
+    // The ik mode's link: the one teleop.use named, else the selected link below a root; -1 when none.
+    int TeleopLink() const;
+    json::Value TeleopStatus() const;
     void TakeWorkerResults();
     void PushTransport();
     void PushPoseWrites();
@@ -1257,8 +1267,17 @@ struct EditorHost::State : DocumentHost {
     SampleWindow frame_ms_, ui_ms_, apply_ms_, draw_ms_, sleep_ms_, age_ms_, step_ms_;
     bool ctrl_down_ = false;
     bool surface_suspended_ = false;
+    TeleopPads pads_;
+    // The virtual device teleop.input sets, in the pad layout.
+    std::vector<float> virtual_axes_ = std::vector<float>(kPadAxes.size(), 0.0f);
+    std::vector<uint8_t> virtual_buttons_ = std::vector<uint8_t>(kPadButtons.size(), 0u);
     bool teleop_hold_prev_ = false;
-    bool teleop_prev_enabled_ = false;
+    bool teleop_command_prev_ = false;      // the command mode drove the controller last frame
+    float teleop_press_[2] = {0.0f, 0.0f};  // last frame's next and prev, so a press steps once
+    // The ik mode's link, its pose when teleop took it and the pinned links' poses then.
+    int teleop_ik_link_ = -1;
+    math::Transform teleop_ik_start_;
+    std::vector<std::pair<uint32_t, math::Transform>> teleop_ik_pins_;
     float last_mouse_x_ = 0.0f;
     float last_mouse_y_ = 0.0f;
     bool script_ran_ = false;
@@ -1291,6 +1310,7 @@ struct EditorHost::State : DocumentHost {
 EditorHost::State::State(const std::vector<std::string>& args, nuka_world_handle world, float dt)
     : world_(world), borrowed_(world != nullptr) {
     ui_thread_ = std::this_thread::get_id();
+    ui_state_.teleop.maps = DefaultTeleopMaps();
     if (dt > 0.0f) {
         opt_.dt = dt;
         opt_.dt_set = true;
@@ -2064,7 +2084,7 @@ void EditorHost::State::DragIk(int link, const math::Transform& live, const math
         std::vector<nuka_ik_target_t> targets = {IkGoal(l, aim, turn, 1.0f)};
         if (!turn && ik.lock_orientation) targets.push_back(IkGoal(l, aim, true, kIkLockWeight));
         for (const auto& [p, pose] : ik_pins_) targets.push_back(IkGoal(p, pose, true, 1.0f));
-        ik_next_ = IkCommand(std::move(targets), FindLink(ik.root), ik.rotation_weight);
+        ik_next_ = IkCommand(std::move(targets), FindLink(ik.root), ik.rotation_weight, shown_->env);
         const float t[3] = {aim.position.x, aim.position.y, aim.position.z};
         std::copy(t, t + 3, ik.target);
     }
@@ -2072,6 +2092,199 @@ void EditorHost::State::DragIk(int link, const math::Transform& live, const math
     ik_drag_ = false;
     ik.link = -1;
     ik.missed = false;
+}
+
+void EditorHost::State::ListTeleopDevices() {
+    TeleopView& t = ui_state_.teleop;
+    t.devices.clear();
+    t.devices.push_back({"keyboard", "Keyboard", "keyboard", "", kPadAxes, kPadButtons});
+    t.devices.push_back({"virtual", "Virtual device", "virtual", "", kPadAxes, kPadButtons});
+    pads_.Update(&t.devices);
+    extensions_.TeleopEntries(&t.devices, &t.retargets);
+}
+
+int EditorHost::State::TeleopLink() const {
+    const TeleopView& t = ui_state_.teleop;
+    const int link = FindLink(t.link.empty() ? PathOfEntity(ui_state_.selected_entity) : t.link);
+    return link >= 0 && ui_state_.robot.links[static_cast<size_t>(link)].parent >= 0 ? link : -1;
+}
+
+bool EditorHost::State::StepTeleop(double dt) {
+    TeleopView& t = ui_state_.teleop;
+    const ImGuiIO& io = ImGui::GetIO();
+    ListTeleopDevices();
+    const auto found =
+        std::find_if(t.devices.begin(), t.devices.end(), [&](const TeleopDeviceInfo& d) { return d.id == t.device; });
+    t.connected = found != t.devices.end();
+    const TeleopDeviceInfo device = t.connected ? *found : TeleopDeviceInfo{t.device, t.device, "", "", {}, {}};
+    t.axes.assign(device.axes.size(), 0.0f);
+    t.buttons.assign(device.buttons.size(), 0u);
+    // Ctrl chords belong to shortcuts (Ctrl+S, Ctrl+=), so they never drive the robot.
+    const bool keys = t.on && t.device == "keyboard" && !io.WantCaptureKeyboard && !io.KeyCtrl && !io.WantTextInput &&
+                      ui_.OwnsScenePointer() && ui_state_.window_focused;
+    if (t.device == "keyboard") {
+        const auto key = [&](ImGuiKey k) { return keys && ImGui::IsKeyDown(k) ? 1.0f : 0.0f; };
+        t.axes[kLeftX] = key(ImGuiKey_D) - key(ImGuiKey_A);
+        t.axes[kLeftY] = key(ImGuiKey_S) - key(ImGuiKey_W);
+        t.axes[kRightX] = key(ImGuiKey_E) - key(ImGuiKey_Q);
+        t.axes[kRightY] = key(ImGuiKey_PageDown) - key(ImGuiKey_PageUp);
+        t.buttons[kLeftShoulder] = static_cast<uint8_t>(key(ImGuiKey_Minus) != 0.0f);
+        t.buttons[kRightShoulder] = static_cast<uint8_t>(key(ImGuiKey_Equal) != 0.0f);
+    } else if (t.device == "virtual") {
+        t.axes = virtual_axes_;
+        t.buttons = virtual_buttons_;
+    } else if (t.connected) {
+        t.connected = device.owner.empty() ? pads_.Read(t.device, &t.axes, &t.buttons)
+                                           : extensions_.ReadTeleopDevice(t.device, &t.axes, &t.buttons);
+    }
+    t.quantities = TeleopQuantities(device, t.axes, t.buttons, t.maps[t.mode], ModeQuantities(t.mode), t.deadzone);
+    const auto q = [&](const char* name) {
+        const auto it = t.quantities.find(name);
+        return it != t.quantities.end() ? it->second : 0.0f;
+    };
+    const bool live = t.on && loaded_ != nullptr;
+    const float step = static_cast<float>(dt);
+    t.error.clear();
+
+    // A command consumer gets the command every frame, and one zero once the mode stops.
+    const bool cmd_ctrl = loaded_ && policy_ctrl_ && policy_ctrl_->AcceptsCommand();
+    t.controller = cmd_ctrl;
+    const bool command = live && t.mode == "command";
+    const float drive[3] = {q("vx"), q("vy"), q("wyaw")};
+    for (int k = 0; k < 3; ++k) t.command[k] = command ? t.command_base[k] + drive[k] : 0.0f;
+    if (cmd_ctrl && (command || teleop_command_prev_))
+        worker_.Push(TickCommand::Param(ParamKind::ControllerCommand, {t.command[0], t.command[1], t.command[2]}));
+    teleop_command_prev_ = command;
+    // PD hold's rising edge makes the drive targets act without a policy.
+    const bool hold = live && t.hold && !(command && cmd_ctrl);
+    if (hold && !teleop_hold_prev_) worker_.Push(TickCommand::Param(ParamKind::HoldGains, {t.kp, t.kd}));
+    teleop_hold_prev_ = hold;
+
+    const std::vector<RobotJoint>& joints = ui_state_.robot.joints;
+    const bool editable = !joints.empty() && ui_state_.drive_targets.size() == ui_state_.drive_dirty.size();
+    const float next = q("next"), prev = q("prev");
+    if (live && t.mode == "joint" && editable) {
+        const int n = static_cast<int>(joints.size());
+        if (next > 0.5f && teleop_press_[0] <= 0.5f) ++t.joint;
+        if (prev > 0.5f && teleop_press_[1] <= 0.5f) --t.joint;
+        t.joint = (t.joint % n + n) % n;
+        const RobotJoint& j = joints[static_cast<size_t>(t.joint)];
+        if (const float rate = q("rate"); rate != 0.0f) {
+            const bool limited = j.limited && j.upper > j.lower;
+            float& target = ui_state_.drive_targets[j.link];
+            target = std::clamp(target + rate * step, limited ? j.lower : -FLT_MAX, limited ? j.upper : FLT_MAX);
+            ui_state_.drive_dirty[j.link] = 1u;
+        }
+    }
+    teleop_press_[0] = next;
+    teleop_press_[1] = prev;
+
+    // The ik mode moves the goal at the mapped velocity and solves toward it while it moves.
+    const int link = live && t.mode == "ik" && shown_ != nullptr ? TeleopLink() : -1;
+    if (live && t.mode == "ik" && link < 0) t.error = "select a robot link below its root";
+    if (link < 0) t.goal_set = false;
+    if (link >= 0) {
+        const std::vector<math::Transform>& poses = shown_->link_poses;
+        const IkState& ik = ui_state_.robot.ik;
+        if (!t.goal_set || link != teleop_ik_link_) {
+            teleop_ik_link_ = link;
+            teleop_ik_start_ = poses[static_cast<size_t>(link)];
+            const math::Vec3 at = teleop_ik_start_.position;
+            const float g[3] = {at.x, at.y, at.z};
+            std::copy(g, g + 3, t.goal);
+            t.goal_set = true;
+            teleop_ik_pins_.clear();
+            for (const std::string& pin : ik.pins)
+                if (const int p = FindLink(pin); p >= 0 && p != link)
+                    teleop_ik_pins_.emplace_back(static_cast<uint32_t>(p), poses[static_cast<size_t>(p)]);
+        }
+        const float v[3] = {q("x"), q("y"), q("z")};
+        if (v[0] != 0.0f || v[1] != 0.0f || v[2] != 0.0f) {
+            for (int k = 0; k < 3; ++k) t.goal[k] += v[k] * step;
+            math::Transform aim = teleop_ik_start_;
+            aim.position = math::Vec3{t.goal[0], t.goal[1], t.goal[2]};
+            const auto l = static_cast<uint32_t>(link);
+            std::vector<nuka_ik_target_t> targets = {IkGoal(l, aim, false, 1.0f)};
+            if (ik.lock_orientation) targets.push_back(IkGoal(l, aim, true, kIkLockWeight));
+            for (const auto& [p, pose] : teleop_ik_pins_) targets.push_back(IkGoal(p, pose, true, 1.0f));
+            ik_next_ = IkCommand(std::move(targets), FindLink(ik.root), ik.rotation_weight, shown_->env);
+        }
+    }
+
+    // An extension's mode maps the device and the joints to joint targets.
+    const bool builtin = std::find(kTeleopModes.begin(), kTeleopModes.end(), t.mode) != kTeleopModes.end();
+    if (live && !builtin && editable) {
+        json::Value axes = json::Value::Object(), buttons = json::Value::Object(), quantities = json::Value::Object();
+        for (size_t i = 0; i < device.axes.size(); ++i) axes.Set(device.axes[i], json::Value::Float(t.axes[i]));
+        for (size_t i = 0; i < device.buttons.size(); ++i) buttons.Set(device.buttons[i], json::Value::Bool(t.buttons[i] != 0u));
+        for (const auto& [name, value] : t.quantities) quantities.Set(name, json::Value::Float(value));
+        const std::vector<float>& qs = ui_state_.robot.live.q;
+        json::Value list = json::Value::Array();
+        for (const RobotJoint& j : joints)
+            list.PushBack(Object({{"name", json::Value::Str(j.name)},
+                                  {"q", json::Value::Float(j.link < qs.size() ? qs[j.link] : 0.0f)},
+                                  {"target", json::Value::Float(ui_state_.drive_targets[j.link])}}));
+        const json::Value state =
+            Object({{"device", Object({{"id", json::Value::Str(t.device)}, {"axes", axes}, {"buttons", buttons}})},
+                    {"quantities", quantities},
+                    {"joints", list},
+                    {"dt", json::Value::Float(dt)}});
+        std::string out;
+        if (!extensions_.Retarget(t.mode, state.Dump(0), &out)) {
+            t.error = out;
+        } else {
+            try {
+                const json::Value targets = json::Value::Parse(out);
+                for (const auto& [name, value] : targets.Items()) {
+                    const auto j = std::find_if(joints.begin(), joints.end(), [&](const RobotJoint& r) { return r.name == name; });
+                    if (j == joints.end()) {
+                        t.error = "teleop mode '" + t.mode + "' set no joint '" + name + "'";
+                        continue;
+                    }
+                    ui_state_.drive_targets[j->link] = value.AsFloat();
+                    ui_state_.drive_dirty[j->link] = 1u;
+                }
+            } catch (const std::exception& e) {
+                t.error = "teleop mode '" + t.mode + "': " + e.what();
+            }
+        }
+    }
+    return keys;
+}
+
+json::Value EditorHost::State::TeleopStatus() const {
+    const TeleopView& t = ui_state_.teleop;
+    const auto found =
+        std::find_if(t.devices.begin(), t.devices.end(), [&](const TeleopDeviceInfo& d) { return d.id == t.device; });
+    json::Value axes = json::Value::Object(), buttons = json::Value::Object(), quantities = json::Value::Object();
+    if (found != t.devices.end()) {
+        for (size_t i = 0; i < std::min(found->axes.size(), t.axes.size()); ++i)
+            axes.Set(found->axes[i], json::Value::Float(t.axes[i]));
+        for (size_t i = 0; i < std::min(found->buttons.size(), t.buttons.size()); ++i)
+            buttons.Set(found->buttons[i], json::Value::Bool(t.buttons[i] != 0u));
+    }
+    for (const auto& [name, value] : t.quantities) quantities.Set(name, json::Value::Float(value));
+    const std::vector<RobotJoint>& joints = ui_state_.robot.joints;
+    const int link = TeleopLink();
+    const int n = static_cast<int>(joints.size());
+    return Object({{"on", json::Value::Bool(t.on)},
+                   {"device", json::Value::Str(t.device)},
+                   {"connected", json::Value::Bool(t.connected)},
+                   {"mode", json::Value::Str(t.mode)},
+                   {"axes", std::move(axes)},
+                   {"buttons", std::move(buttons)},
+                   {"quantities", std::move(quantities)},
+                   {"command", Vec3Json(math::Vec3{t.command[0], t.command[1], t.command[2]})},
+                   {"command_base", Vec3Json(math::Vec3{t.command_base[0], t.command_base[1], t.command_base[2]})},
+                   {"controller", json::Value::Bool(t.controller)},
+                   {"joint", n == 0 ? json::Value() : json::Value::Str(joints[static_cast<size_t>(std::clamp(t.joint, 0, n - 1))].name)},
+                   {"link", link < 0 ? json::Value() : json::Value::Str(ui_state_.robot.links[static_cast<size_t>(link)].path)},
+                   {"goal", t.goal_set ? Vec3Json(math::Vec3{t.goal[0], t.goal[1], t.goal[2]}) : json::Value()},
+                   {"hold", json::Value::Bool(t.hold)},
+                   {"kp", json::Value::Float(t.kp)},
+                   {"kd", json::Value::Float(t.kd)},
+                   {"deadzone", json::Value::Float(t.deadzone)},
+                   {"error", json::Value::Str(t.error)}});
 }
 
 void EditorHost::State::TakeWorkerResults() {
@@ -2669,24 +2882,25 @@ void EditorHost::State::OnLoaded(const std::string& path) {
 
     // Headless teleop: PD-hold and nudge one drive target, or feed a command.
     const bool cmd_ctrl = policy_ctrl_ && policy_ctrl_->AcceptsCommand();
+    TeleopView& teleop = ui_state_.teleop;
     if (opt_.teleop_nudge_on && !cmd_ctrl && opt_.teleop_nudge_dof >= 0 &&
         static_cast<size_t>(opt_.teleop_nudge_dof) < ui_state_.drive_targets.size()) {
-        ApplyHoldGains(world_, loaded_->Layout(), ui_state_.teleop_kp, ui_state_.teleop_kd);
-        ui_state_.teleop_enabled = true;
-        ui_state_.teleop_hold = true;
-        ui_state_.teleop_dof = opt_.teleop_nudge_dof;
+        ApplyHoldGains(world_, loaded_->Layout(), teleop.kp, teleop.kd);
+        teleop.on = true;
+        teleop.hold = true;
         const size_t dof = static_cast<size_t>(opt_.teleop_nudge_dof);
         ui_state_.drive_targets[dof] += opt_.teleop_nudge_delta;
         ui_state_.drive_dirty[dof] = 1u;
         Emit(stdout, Format("[nuka_editor] teleop nudge: dof %d += %g (PD-hold kp=%g kd=%g)\n", opt_.teleop_nudge_dof,
-                            static_cast<double>(opt_.teleop_nudge_delta), static_cast<double>(ui_state_.teleop_kp),
-                            static_cast<double>(ui_state_.teleop_kd)));
+                            static_cast<double>(opt_.teleop_nudge_delta), static_cast<double>(teleop.kp),
+                            static_cast<double>(teleop.kd)));
     }
     if (opt_.teleop_cmd_on && cmd_ctrl) {
         // The CLI command is the baseline the every-frame producer re-sends.
         policy_ctrl_->SetCommandVector(opt_.teleop_cmd, 3);
-        ui_state_.teleop_enabled = true;
-        for (int k = 0; k < 3; ++k) ui_state_.teleop_cmd_base[k] = opt_.teleop_cmd[k];
+        teleop.on = true;
+        teleop.mode = "command";
+        for (int k = 0; k < 3; ++k) teleop.command_base[k] = opt_.teleop_cmd[k];
         Emit(stdout, Format("[nuka_editor] teleop cmd: vx=%g vy=%g wyaw=%g\n", static_cast<double>(opt_.teleop_cmd[0]),
                             static_cast<double>(opt_.teleop_cmd[1]), static_cast<double>(opt_.teleop_cmd[2])));
     }
@@ -3067,6 +3281,7 @@ void EditorHost::State::RegisterRobotActions() {
     RegisterAssemblyActions();
     RegisterIkActions();
     RegisterOverlayActions();
+    RegisterTeleopActions();
 }
 
 void EditorHost::State::RegisterIkActions() {
@@ -3103,7 +3318,8 @@ void EditorHost::State::RegisterIkActions() {
                       const int root = FindLink(root_name);
                       if (!root_name.empty() && root < 0) return ActionResult::Fail("no link '" + root_name + "'");
                       TickCommand cmd = IkCommand(std::move(targets), root,
-                                                  static_cast<float>(NumArg(args, "rotation_weight", ik.rotation_weight)));
+                                                  static_cast<float>(NumArg(args, "rotation_weight", ik.rotation_weight)),
+                                                  shown_->env);
                       const bool apply = BoolArg(args, "apply", true);
                       IkReport report;
                       if (apply) {
@@ -3112,7 +3328,6 @@ void EditorHost::State::RegisterIkActions() {
                           worker_.TakeIk(&report);
                           TakeIkReport(report);
                       } else {
-                          cmd.env = shown_->env;
                           worker_.Exclusive([&] { report = RunIk(world_, loaded_->Layout().links_per_env, cmd); });
                       }
                       if (!report.error.empty()) return ActionResult::Fail(report.error);
@@ -3156,6 +3371,186 @@ void EditorHost::State::RegisterIkActions() {
                       ik.on = BoolArg(args, "on", !ik.on);
                       return Ok(Object({{"on", json::Value::Bool(ik.on)}}));
                   }});
+}
+
+void EditorHost::State::RegisterTeleopActions() {
+    const auto mode_known = [this](const std::string& mode) {
+        const std::vector<TeleopRetarget>& r = ui_state_.teleop.retargets;
+        return std::find(kTeleopModes.begin(), kTeleopModes.end(), mode) != kTeleopModes.end() ||
+               std::any_of(r.begin(), r.end(), [&](const TeleopRetarget& t) { return t.id == mode; });
+    };
+    // A button reads true, false or a number (nonzero is down).
+    const auto pressed = [](const json::Value& v) {
+        return v.type() == json::Value::Type::Bool ? v.AsBool() : v.AsDouble() != 0.0;
+    };
+    // The devices teleop reads and the modes it maps them through, with the active ones.
+    actions_.Add({"teleop.devices", "Teleop Devices", "robot", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value&) {
+                      ListTeleopDevices();
+                      const TeleopView& t = ui_state_.teleop;
+                      json::Value devices = json::Value::Array();
+                      for (const TeleopDeviceInfo& d : t.devices)
+                          devices.PushBack(Object({{"id", json::Value::Str(d.id)},
+                                                   {"label", json::Value::Str(d.label)},
+                                                   {"kind", json::Value::Str(d.kind)},
+                                                   {"owner", json::Value::Str(d.owner)},
+                                                   {"axes", StrList(d.axes)},
+                                                   {"buttons", StrList(d.buttons)}}));
+                      json::Value modes = json::Value::Array();
+                      for (const std::string& m : kTeleopModes)
+                          modes.PushBack(Object({{"id", json::Value::Str(m)},
+                                                 {"label", json::Value::Str(m)},
+                                                 {"owner", json::Value::Str(std::string())},
+                                                 {"quantities", StrList(ModeQuantities(m))}}));
+                      for (const TeleopRetarget& r : t.retargets)
+                          modes.PushBack(Object({{"id", json::Value::Str(r.id)},
+                                                 {"label", json::Value::Str(r.label)},
+                                                 {"owner", json::Value::Str(r.owner)},
+                                                 {"quantities", json::Value::Array()}}));
+                      return Ok(Object({{"devices", std::move(devices)},
+                                        {"modes", std::move(modes)},
+                                        {"device", json::Value::Str(t.device)},
+                                        {"mode", json::Value::Str(t.mode)}}));
+                  }});
+    // Switches teleop on or off and picks the device, the mode, the joint mode's joint, the ik
+    // mode's link ("" follows the selection), PD hold and the command baseline; bare, it toggles.
+    actions_.Add({"teleop.use", "Teleop", "robot", "", ShortcutScope::Global, {}, [this] { return ui_state_.teleop.on; },
+                  [this, mode_known](const json::Value& args) {
+                      ListTeleopDevices();
+                      TeleopView& t = ui_state_.teleop;
+                      const std::string device = StrArg(args, "device", t.device);
+                      const std::string mode = StrArg(args, "mode", t.mode);
+                      // Only a change is checked, so teleop still switches off after its device is gone.
+                      if (device != t.device &&
+                          std::none_of(t.devices.begin(), t.devices.end(), [&](const TeleopDeviceInfo& d) { return d.id == device; }))
+                          return ActionResult::Fail("no teleop device '" + device + "'");
+                      if (mode != t.mode && !mode_known(mode)) return ActionResult::Fail("no teleop mode '" + mode + "'");
+                      int joint = t.joint;
+                      if (const json::Value* j = args.Find("joint"); j != nullptr && !j->IsNull()) {
+                          const std::vector<RobotJoint>& joints = ui_state_.robot.joints;
+                          const auto it = std::find_if(joints.begin(), joints.end(),
+                                                       [&](const RobotJoint& r) { return r.name == j->AsString(); });
+                          if (it == joints.end()) return ActionResult::Fail("no joint '" + j->AsString() + "'");
+                          joint = static_cast<int>(it - joints.begin());
+                      }
+                      std::string link = StrArg(args, "link", t.link);
+                      if (!link.empty()) {
+                          const int l = FindLink(link);
+                          if (l < 0 || ui_state_.robot.links[static_cast<size_t>(l)].parent < 0)
+                              return ActionResult::Fail("no link '" + link + "' below a root");
+                          link = ui_state_.robot.links[static_cast<size_t>(l)].path;
+                      }
+                      const float kp = static_cast<float>(NumArg(args, "kp", t.kp));
+                      const float kd = static_cast<float>(NumArg(args, "kd", t.kd));
+                      if (kp < 0.0f || kd < 0.0f) return ActionResult::Fail("kp and kd must not be negative");
+                      math::Vec3 base{t.command_base[0], t.command_base[1], t.command_base[2]};
+                      Vec3Arg(args, "command_base", &base);
+                      if (device != t.device || mode != t.mode || link != t.link) t.goal_set = false;
+                      t.on = BoolArg(args, "on", args.Items().empty() ? !t.on : t.on);
+                      t.device = device;
+                      t.mode = mode;
+                      t.joint = joint;
+                      t.link = link;
+                      t.hold = BoolArg(args, "hold", t.hold);
+                      t.kp = kp;
+                      t.kd = kd;
+                      const float b[3] = {base.x, base.y, base.z};
+                      std::copy(b, b + 3, t.command_base);
+                      return Ok(TeleopStatus());
+                  }});
+    // Sets the virtual device's axes ([-1, 1]) and buttons by name; the others keep their values.
+    actions_.Add({"teleop.input", "Teleop Input", "robot", "", ShortcutScope::Global, {}, {},
+                  [this, pressed](const json::Value& args) {
+                      std::vector<std::pair<size_t, float>> axes;
+                      std::vector<std::pair<size_t, uint8_t>> buttons;
+                      if (const json::Value* a = args.Find("axes"))
+                          for (const auto& [name, v] : a->Items()) {
+                              const size_t i = static_cast<size_t>(std::find(kPadAxes.begin(), kPadAxes.end(), name) - kPadAxes.begin());
+                              if (i == kPadAxes.size()) return ActionResult::Fail("no axis '" + name + "'");
+                              axes.emplace_back(i, std::clamp(v.AsFloat(), -1.0f, 1.0f));
+                          }
+                      if (const json::Value* b = args.Find("buttons"))
+                          for (const auto& [name, v] : b->Items()) {
+                              const size_t i =
+                                  static_cast<size_t>(std::find(kPadButtons.begin(), kPadButtons.end(), name) - kPadButtons.begin());
+                              if (i == kPadButtons.size()) return ActionResult::Fail("no button '" + name + "'");
+                              buttons.emplace_back(i, static_cast<uint8_t>(pressed(v)));
+                          }
+                      for (const auto& [i, v] : axes) virtual_axes_[i] = v;
+                      for (const auto& [i, v] : buttons) virtual_buttons_[i] = v;
+                      json::Value out_axes = json::Value::Object(), out_buttons = json::Value::Object();
+                      for (size_t i = 0; i < kPadAxes.size(); ++i) out_axes.Set(kPadAxes[i], json::Value::Float(virtual_axes_[i]));
+                      for (size_t i = 0; i < kPadButtons.size(); ++i)
+                          out_buttons.Set(kPadButtons[i], json::Value::Bool(virtual_buttons_[i] != 0u));
+                      return Ok(Object({{"axes", std::move(out_axes)}, {"buttons", std::move(out_buttons)}}));
+                  }});
+    // A mode's bindings [{input, quantity, gain, invert}]: given ones replace them and `reset`
+    // restores the defaults; `deadzone` in [0, 1) is shared by every axis.
+    actions_.Add({"teleop.map", "Teleop Mapping", "robot", "", ShortcutScope::Global, {}, {},
+                  [this, mode_known](const json::Value& args) {
+                      TeleopView& t = ui_state_.teleop;
+                      const std::string mode = StrArg(args, "mode", t.mode);
+                      if (!mode_known(mode)) return ActionResult::Fail("no teleop mode '" + mode + "'");
+                      const float deadzone = static_cast<float>(NumArg(args, "deadzone", t.deadzone));
+                      if (deadzone < 0.0f || deadzone >= 1.0f) return ActionResult::Fail("deadzone wants [0, 1)");
+                      const std::vector<std::string>& names = ModeQuantities(mode);
+                      std::vector<TeleopBinding> bindings = t.maps[mode];
+                      if (BoolArg(args, "reset", false)) {
+                          const auto defaults = DefaultTeleopMaps();
+                          const auto it = defaults.find(mode);
+                          bindings = it != defaults.end() ? it->second : std::vector<TeleopBinding>();
+                      }
+                      if (const json::Value* list = args.Find("bindings"); list != nullptr && !list->IsNull()) {
+                          bindings.clear();
+                          for (const json::Value& b : list->Elements()) {
+                              TeleopBinding binding{StrArg(b, "input"), StrArg(b, "quantity"),
+                                                    static_cast<float>(NumArg(b, "gain", 1.0)), BoolArg(b, "invert", false)};
+                              if (binding.input.empty() || binding.quantity.empty())
+                                  return ActionResult::Fail("a binding wants an input and a quantity");
+                              if (!names.empty() && std::find(names.begin(), names.end(), binding.quantity) == names.end())
+                                  return ActionResult::Fail("mode '" + mode + "' has no quantity '" + binding.quantity + "'");
+                              bindings.push_back(std::move(binding));
+                          }
+                      }
+                      t.maps[mode] = bindings;
+                      t.deadzone = deadzone;
+                      json::Value list = json::Value::Array();
+                      for (const TeleopBinding& b : bindings)
+                          list.PushBack(Object({{"input", json::Value::Str(b.input)},
+                                                {"quantity", json::Value::Str(b.quantity)},
+                                                {"gain", json::Value::Float(b.gain)},
+                                                {"invert", json::Value::Bool(b.invert)}}));
+                      return Ok(Object({{"mode", json::Value::Str(mode)},
+                                        {"bindings", std::move(list)},
+                                        {"quantities", StrList(names)},
+                                        {"deadzone", json::Value::Float(t.deadzone)}}));
+                  }});
+    // A virtual gamepad on SDL's joystick path: `attach` names a new one; `id` with `axes` and
+    // `buttons` sets its inputs, and with `detach` removes it.
+    actions_.Add({"teleop.pad", "Virtual Gamepad", "robot", "", ShortcutScope::Global, {}, {},
+                  [this, pressed](const json::Value& args) {
+                      std::string error;
+                      if (const json::Value* name = args.Find("attach"); name != nullptr && !name->IsNull()) {
+                          const std::string id = pads_.Attach(name->AsString(), &error);
+                          if (id.empty()) return ActionResult::Fail(error);
+                          return Ok(Object({{"id", json::Value::Str(id)}}));
+                      }
+                      const std::string id = StrArg(args, "id");
+                      if (BoolArg(args, "detach", false)) {
+                          if (!pads_.Detach(id)) return ActionResult::Fail("'" + id + "' is not a virtual gamepad");
+                          return Ok(Object({{"id", json::Value::Str(id)}, {"detached", json::Value::Bool(true)}}));
+                      }
+                      std::map<std::string, float> axes, buttons;
+                      if (const json::Value* a = args.Find("axes"))
+                          for (const auto& [axis, v] : a->Items()) axes[axis] = v.AsFloat();
+                      if (const json::Value* b = args.Find("buttons"))
+                          for (const auto& [button, v] : b->Items()) buttons[button] = pressed(v) ? 1.0f : 0.0f;
+                      if (!pads_.Set(id, axes, buttons, &error)) return ActionResult::Fail(error);
+                      return Ok(Object({{"id", json::Value::Str(id)}}));
+                  }});
+    // The active device's reading, the mode's quantities and what they drove last frame.
+    actions_.Add({"teleop.status", "Teleop Status", "robot", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value&) { return Ok(TeleopStatus()); }});
 }
 
 void EditorHost::State::RegisterOverlayActions() {
@@ -6023,44 +6418,8 @@ void EditorHost::State::Frame(bool step_physics) {
 
     ApplyInspectorEdits();
 
-    // Teleop sends its command every frame; gating zeroes the keys, so a walking
-    // robot stops instead of latching.
-    bool teleop_owns_wasd = false;
-    {
-        const bool cmd_ctrl = loaded_ && policy_ctrl_ && policy_ctrl_->AcceptsCommand();
-        // Ctrl chords belong to shortcuts (Ctrl+S, Ctrl+=), so they never drive the robot.
-        const bool active = loaded_ && ui_state_.teleop_enabled && !io.WantCaptureKeyboard && !io.KeyCtrl &&
-                            !io.WantTextInput && ui_.OwnsScenePointer() && ui_state_.window_focused;
-        TeleopKeys tk;
-        if (active) {
-            tk.dof_minus = ImGui::IsKeyPressed(ImGuiKey_LeftBracket, false) || ImGui::IsKeyPressed(ImGuiKey_Comma, false);
-            tk.dof_plus  = ImGui::IsKeyPressed(ImGuiKey_RightBracket, false) || ImGui::IsKeyPressed(ImGuiKey_Period, false);
-            tk.dof_prev  = ImGui::IsKeyPressed(ImGuiKey_Minus, false);
-            tk.dof_next  = ImGui::IsKeyPressed(ImGuiKey_Equal, false);
-            tk.fwd = ImGui::IsKeyDown(ImGuiKey_W); tk.back = ImGui::IsKeyDown(ImGuiKey_S);
-            tk.strafe_l = ImGui::IsKeyDown(ImGuiKey_A); tk.strafe_r = ImGui::IsKeyDown(ImGuiKey_D);
-            tk.yaw_l = ImGui::IsKeyDown(ImGuiKey_Q); tk.yaw_r = ImGui::IsKeyDown(ImGuiKey_E);
-        }
-        // PD-hold rising edge makes drive targets effective for direct control.
-        const bool hold_now = active && ui_state_.teleop_hold && !cmd_ctrl;
-        if (hold_now && !teleop_hold_prev_)
-            worker_.Push(TickCommand::Param(ParamKind::HoldGains, {ui_state_.teleop_kp, ui_state_.teleop_kd}));
-        teleop_hold_prev_ = hold_now;
-
-        const uint32_t dof_count = static_cast<uint32_t>(ui_state_.drive_targets.size());
-        const TeleopResult tr = ApplyTeleop(active, tk, ui_state_, dof_count);
-        if (cmd_ctrl) {
-            if (ui_state_.teleop_enabled) {
-                worker_.Push(TickCommand::Param(ParamKind::ControllerCommand,
-                                                {tr.command[0], tr.command[1], tr.command[2]}));
-            } else if (teleop_prev_enabled_) {
-                // Toggle-off edge: one zero stops the robot, then scripts may own the command.
-                worker_.Push(TickCommand::Param(ParamKind::ControllerCommand, {0.0f, 0.0f, 0.0f}));
-            }
-            teleop_owns_wasd = active;
-        }
-        teleop_prev_enabled_ = ui_state_.teleop_enabled;
-    }
+    // Teleop maps the active device every frame, so a released stick or key stops the robot.
+    const bool teleop_owns_wasd = StepTeleop(frame_dt);
 
     // Shortcuts queue their actions; viewport ones need the pointer over a free viewport.
     const bool viewport_keys = !io.WantCaptureKeyboard && !io.WantTextInput && !io.AppFocusLost &&

@@ -62,6 +62,34 @@ typedef struct nuka_editor_overlay_desc_t {
     void (*release)(void* user);
 } nuka_editor_overlay_desc_t;
 
+// A teleop input device (a SpaceMouse, an XR controller, ...): while it is the active device,
+// read fills axes[axis_count] in [-1, 1] and buttons[button_count] (0 or 1) once a frame and
+// returns 0 when it failed. The Teleop mapping binds its inputs by name.
+typedef struct nuka_editor_teleop_device_desc_t {
+    uint32_t struct_size;
+    const char* id;    // unique across the editor, e.g. "spacemouse"
+    const char* label;
+    const char* kind;  // what it is, e.g. "spacemouse"; NULL is "extension"
+    uint32_t axis_count;
+    const char* const* axis_names;
+    uint32_t button_count;
+    const char* const* button_names;
+    int32_t (*read)(void* user, float* axes, uint8_t* buttons);
+    void* user;
+    void (*release)(void* user);
+} nuka_editor_teleop_device_desc_t;
+
+// A teleop mode: map gets {"device": {"id", "axes", "buttons"}, "quantities", "joints": [{"name",
+// "q", "target"}], "dt"} and returns 1 with *out_json {joint name: target}, or 0 with the reason.
+typedef struct nuka_editor_teleop_retarget_desc_t {
+    uint32_t struct_size;
+    const char* id;  // the mode's name, unique across the editor
+    const char* label;
+    int32_t (*map)(void* user, const char* state_json, const char** out_json);
+    void* user;
+    void (*release)(void* user);
+} nuka_editor_teleop_retarget_desc_t;
+
 // The Dear ImGui build a plugin compiled against; see nuka_editor_plugin_imgui.
 typedef struct nuka_editor_imgui_check_t {
     uint32_t struct_size;
@@ -99,6 +127,8 @@ typedef struct nuka_editor_host_api_t {
     // A panel whose content the plugin draws with Dear ImGui; needs the fields above.
     nuka_result_t (*register_imgui_panel)(void* host, const char* id, const char* title, const char* dock,
                                           void (*draw)(void* user), void* user, void (*release)(void* user));
+    nuka_result_t (*register_teleop_device)(void* host, const nuka_editor_teleop_device_desc_t* desc);
+    nuka_result_t (*register_teleop_retarget)(void* host, const nuka_editor_teleop_retarget_desc_t* desc);
 } nuka_editor_host_api_t;
 
 typedef uint32_t (*nuka_editor_plugin_abi_fn)(void);

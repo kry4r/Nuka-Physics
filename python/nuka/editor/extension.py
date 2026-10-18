@@ -25,6 +25,9 @@ registers belongs to the extension and goes away with it::
         def draw(self, frame):
             frame.line((0, 0, 0), (1, 0, 0), 0xFF5050FF)
 
+``ctx.teleop`` adds input devices (a SpaceMouse, an XR controller, ...) and teleop modes that
+turn a device's reading into joint targets; the Teleop panel and the ``teleop.*`` actions pick them.
+
 Callbacks run on the thread that runs ``update()``. An action or overlay that raises logs its
 traceback to the extension's log; three failures in a row disable the extension.
 """
@@ -93,6 +96,41 @@ class _Overlays:
         ctx._host.register_overlay(overlay_id, draw)
 
 
+class _Teleop:
+    def __init__(self, ctx: "Context"):
+        self._ctx = ctx
+
+    def register_device(self, device_id: str, label: str, read: Callable, *, axes=(), buttons=(),
+                        kind: str = "extension") -> None:
+        """A teleop device: read() returns (axes, buttons) in the order named here, axes in
+        [-1, 1] and buttons true or false. It is read once a frame while it is the active device."""
+        ctx = self._ctx
+
+        def poll():
+            try:
+                a, b = read()
+                return [float(x) for x in a], [1.0 if x else 0.0 for x in b]
+            except Exception:
+                ctx.log(traceback.format_exc(), "error")
+                raise
+
+        ctx._host.register_teleop_device(device_id, label, kind, list(axes), list(buttons), poll)
+
+    def register_retarget(self, retarget_id: str, label: str, fn: Callable) -> None:
+        """A teleop mode: fn(state) gets {"device": {"id", "axes", "buttons"}, "quantities",
+        "joints": [{"name", "q", "target"}], "dt"} each frame and returns {joint name: target}."""
+        ctx = self._ctx
+
+        def run(state_json: str):
+            try:
+                return True, json.dumps(fn(json.loads(state_json)))
+            except Exception as error:
+                ctx.log(traceback.format_exc(), "error")
+                return False, f"{type(error).__name__}: {error}"
+
+        ctx._host.register_teleop_retarget(retarget_id, label, run)
+
+
 class Context:
     """What an enabled extension reaches the editor through."""
 
@@ -105,6 +143,7 @@ class Context:
         self.ui = UI(app, native=host)
         self.actions = _Actions(self)
         self.overlays = _Overlays(self)
+        self.teleop = _Teleop(self)
 
     def log(self, text, level: str = "info") -> None:
         """To the extension's log and the editor console; level: info, ok, warn or error."""

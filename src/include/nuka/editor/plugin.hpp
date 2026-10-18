@@ -79,6 +79,8 @@ struct ActionInfo {
 using ActionFn = std::function<Reply(const std::string& args_json)>;
 using OverlayFn = std::function<bool(const Overlay& overlay)>;
 using EventFn = std::function<void(uint32_t node, const std::string& event_json)>;
+// Fills one frame of a teleop device's axes and buttons in the order it named them.
+using TeleopReadFn = std::function<bool(float* axes, uint8_t* buttons)>;
 
 // The editor as this extension sees it. What it registers goes away with the extension.
 class Host {
@@ -118,6 +120,39 @@ public:
         desc.user = new OverlayFn(std::move(fn));
         desc.release = [](void* user) { delete static_cast<OverlayFn*>(user); };
         return api_->register_overlay(api_->host, &desc) == NUKA_RESULT_OK;
+    }
+
+    // A teleop input device, active once the Teleop panel or teleop.use picks it by `id`.
+    bool AddTeleopDevice(const char* id, const char* label, const char* kind, const std::vector<const char*>& axes,
+                         const std::vector<const char*>& buttons, TeleopReadFn read) {
+        nuka_editor_teleop_device_desc_t desc{};
+        desc.struct_size = static_cast<uint32_t>(sizeof(desc));
+        desc.id = id;
+        desc.label = label;
+        desc.kind = kind;
+        desc.axis_count = static_cast<uint32_t>(axes.size());
+        desc.axis_names = axes.data();
+        desc.button_count = static_cast<uint32_t>(buttons.size());
+        desc.button_names = buttons.data();
+        desc.read = [](void* user, float* a, uint8_t* b) -> int32_t {
+            return (*static_cast<TeleopReadFn*>(user))(a, b) ? 1 : 0;
+        };
+        desc.user = new TeleopReadFn(std::move(read));
+        desc.release = [](void* user) { delete static_cast<TeleopReadFn*>(user); };
+        return api_->register_teleop_device(api_->host, &desc) == NUKA_RESULT_OK;
+    }
+
+    // A teleop mode: `map` gets the state JSON (see nuka_editor_teleop_retarget_desc_t) and
+    // replies {joint name: target}.
+    bool AddTeleopMode(const char* id, const char* label, ActionFn map) {
+        nuka_editor_teleop_retarget_desc_t desc{};
+        desc.struct_size = static_cast<uint32_t>(sizeof(desc));
+        desc.id = id;
+        desc.label = label;
+        desc.map = &RunAction;
+        desc.user = new ActionSlot{std::move(map), std::string()};
+        desc.release = [](void* user) { delete static_cast<ActionSlot*>(user); };
+        return api_->register_teleop_retarget(api_->host, &desc) == NUKA_RESULT_OK;
     }
 
 #ifdef NUKA_EDITOR_PLUGIN_IMGUI

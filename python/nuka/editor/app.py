@@ -240,6 +240,38 @@ class Actions:
         return json.loads(self._app._native.action_log(since))
 
 
+class Teleop:
+    """Teleoperation through the ``teleop.*`` actions. Extensions add devices and modes with
+    ``ctx.teleop``; ``input`` drives the built-in virtual device and ``pad`` a virtual SDL gamepad."""
+
+    def __init__(self, app: "EditorApp"):
+        self._app = weakref.proxy(app)
+
+    def devices(self) -> dict:
+        """The devices, the modes and the active ones."""
+        return self._app.actions.run("teleop.devices")
+
+    def use(self, **args) -> dict:
+        """Switch teleop on or off and pick the device, mode, joint, IK link and PD hold."""
+        return self._app.actions.run("teleop.use", **args)
+
+    def input(self, axes: Optional[dict] = None, buttons: Optional[dict] = None) -> dict:
+        """Set the virtual device's axes and buttons by name; the rest keep their values."""
+        return self._app.actions.run("teleop.input", axes=axes or {}, buttons=buttons or {})
+
+    def map(self, **args) -> dict:
+        """A mode's bindings [{input, quantity, gain, invert}] and the deadzone."""
+        return self._app.actions.run("teleop.map", **args)
+
+    def pad(self, **args) -> dict:
+        """Attach, set or detach a virtual gamepad on SDL's joystick path."""
+        return self._app.actions.run("teleop.pad", **args)
+
+    def status(self) -> dict:
+        """The active device's reading, the mode's quantities and what they drove."""
+        return self._app.actions.run("teleop.status")
+
+
 class EditorApp:
     """The editor over a world: a window, or a display-less surface with ``--offscreen``.
 
@@ -266,6 +298,7 @@ class EditorApp:
         except RuntimeError as error:
             raise EditorStartupError(str(error)) from None
         self.actions = Actions(self)
+        self.teleop = Teleop(self)
         self.ui = UI(weakref.proxy(self))
         atexit.register(self.close)
 

@@ -194,5 +194,6 @@ inline constexpr const char kViewQuad[] = "\xEE\x91\xA4";    // squares-four
 inline constexpr const char kMaximize[] = "\xEE\x87\x90";    // corners-out
 inline constexpr const char kRuler[] = "\xEE\x9A\xB8";
 inline constexpr const char kOverlays[] = "\xEE\xB1\xBC";    // cube-transparent
+inline constexpr const char kGamepad[] = "\xEE\x89\xAE";     // game-controller
 
 }  // namespace nuka::render::imgui::icon

@@ -4,6 +4,7 @@
 
 #include "nuka/nuka_editor.h"
 #include "runtime/app/viewer/editor_actions.hpp"
+#include "runtime/app/viewer/teleop_view.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -48,6 +49,12 @@ public:
     // An extension's action ran; a callback that keeps failing disables its extension.
     void Report(const std::string& owner, const std::string& callback, bool ok);
     const nuka_editor_host_api_t* HostApi(const std::string& id) const;
+    // The teleop devices (appended to `devices`) and modes the enabled extensions registered.
+    void TeleopEntries(std::vector<TeleopDeviceInfo>* devices, std::vector<TeleopRetarget>* retargets) const;
+    // One frame of extension device `id`; false when it failed or is gone.
+    bool ReadTeleopDevice(const std::string& id, std::vector<float>* axes, std::vector<uint8_t>* buttons);
+    // Runs extension mode `id` on the state JSON: true with *out its targets, false with the reason.
+    bool Retarget(const std::string& id, const std::string& state_json, std::string* out);
 
     struct Impl;
 

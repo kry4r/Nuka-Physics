@@ -426,7 +426,7 @@ const std::vector<ImGuiLayer::BuiltinExtension>& ImGuiLayer::Builtins() {
         {"nuka.solver", "Solver", "Solver residuals, sweep budget alerts and the residual heatmap.", {"solver"}},
         {"nuka.timeline", "Timeline", "Seek, replay and fork the run, and compare branches with a ghost.", {"timeline"}},
         {"nuka.camera", "Camera", "Camera pose, framing and controls.", {"camera"}},
-        {"nuka.joints", "Joints", "Joint states, drive targets and gains, the fixed base and keyboard teleop.", {"joints"}},
+        {"nuka.joints", "Joints", "Joint states, drive targets and gains, the fixed base and teleop.", {"joints"}},
         {"nuka.poses", "Poses", "Named joint poses: blend to one, start from it, import and export.", {"poses"}},
         {"nuka.script", "Script", "The Python script editor and the console.", {"script", "console"}},
         {"nuka.ui_inspector", "UI Inspector", "The nui component tree, for extension authors.", {"nui"}},

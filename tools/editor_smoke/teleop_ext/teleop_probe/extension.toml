@@ -1,0 +1,8 @@
+[package]
+id = "teleop_probe"
+version = "1.0.0"
+title = "Teleop Probe"
+description = "A six-axis teleop device and a mode that maps one quantity onto two joints."
+
+[python]
+module = "teleop_probe"

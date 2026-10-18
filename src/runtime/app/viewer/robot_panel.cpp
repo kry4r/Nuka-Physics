@@ -1,5 +1,5 @@
 // The Joints panel: each moving joint's limits, value, drive target and effort, the selected
-// joint's curves, drive conversion, the fixed base, the gizmo's IK and keyboard teleop; the
+// joint's curves, drive conversion, the fixed base, the gizmo's IK and teleop; the
 // Poses panel and the Gain Tuner.
 
 #include "runtime/app/viewer/imgui_layer.hpp"
@@ -12,6 +12,7 @@
 #include "render/imgui/nuka_theme.hpp"
 #include "runtime/app/viewer/robot_tools.hpp"
 #include "runtime/app/viewer/shell_util.hpp"
+#include "runtime/app/viewer/teleop.hpp"
 
 #include <algorithm>
 #include <cfloat>
@@ -103,6 +104,27 @@ json::Value Floats(const float* v) {
 }
 
 constexpr const char* kAttachJoints[] = {"fixed", "revolute", "prismatic"};
+
+// The built-in teleop modes' names, in kTeleopModes' order.
+constexpr const char* kTeleopModeLabels[] = {"Velocity command", "Joint rate", "IK goal"};
+
+std::string Leaf(const std::string& path) { return path.substr(path.rfind('/') + 1u); }
+
+// An axis in [-1, 1] as a fill from the middle of [a, b].
+void AxisBar(float value, ImVec2 a, ImVec2 b) {
+    const float s = nui::Scale(), mid = (a.x + b.x) * 0.5f;
+    const float at = mid + std::clamp(value, -1.0f, 1.0f) * (b.x - a.x) * 0.5f;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(a, b, U32(theme::kBg3), 2.0f * s);
+    dl->AddRectFilled(ImVec2(std::min(mid, at), a.y), ImVec2(std::max(mid, at), b.y), U32(theme::Alpha(theme::kAccent, 0.6f)),
+                      2.0f * s);
+    dl->AddLine(ImVec2(mid, a.y - s), ImVec2(mid, b.y + s), U32(theme::kLineHi), s);
+}
+
+const TeleopDeviceInfo* ActiveDevice(const TeleopView& t) {
+    const auto it = std::find_if(t.devices.begin(), t.devices.end(), [&](const TeleopDeviceInfo& d) { return d.id == t.device; });
+    return it != t.devices.end() ? &*it : nullptr;
+}
 
 }  // namespace
 
@@ -332,22 +354,217 @@ void ImGuiLayer::BuildJoints(nui::VStack& root) {
         ImGui::EndDisabled();
     });
 
-    const size_t n = ui.drive_targets.size();
-    auto& teleop = root.Add<nui::Collapsible>("Teleop", false, icon::kKeyboard);
-    auto& tgrid = teleop.Add<nui::PropertyGrid>();
-    tgrid.Add<nui::BoolField>("Keyboard", nui::Ref(&ui.teleop_enabled));
-    tgrid.Add<nui::IntField>("DOF", nui::Ref(&ui.teleop_dof), 0, std::max(static_cast<int>(n) - 1, 0));
-    tgrid.Add<nui::FloatField>("Step size", nui::Ref(&ui.teleop_step), 0.005f);
-    tgrid.Add<nui::BoolField>("PD hold", nui::Ref(&ui.teleop_hold));
-    tgrid.Add<nui::FloatField>("kp", nui::Ref(&ui.teleop_kp), 0.5f);
-    tgrid.Add<nui::FloatField>("kd", nui::Ref(&ui.teleop_kd), 0.05f);
-    teleop.Add<nui::Label>("[ / ] nudge the DOF and - / = pick it. With a policy, W A S D move and Q / E turn.", Tone::Dim)
-        .wrap = true;
-    auto& cmd = teleop.Add<nui::Label>(std::string(), Tone::Accent, TextStyle::Mono);
-    cmd.text_fn = [this] {
-        const float* c = frame_.ui->teleop_cmd;
-        return Fmt("cmd  vx %.2f  vy %.2f  wyaw %.2f", c[0], c[1], c[2]);
+    // Which device drives which mode, the device's live reading, the mode's mapping and PD hold.
+    const auto tele = [this]() -> TeleopView& { return frame_.ui->teleop; };
+    auto& teleop = root.Add<nui::Collapsible>("Teleop", true, icon::kGamepad);
+    auto& thead = teleop.Add<nui::HStack>();
+    thead.wrap = true;
+    thead.Add<nui::ToggleButton>("Enabled").Action("teleop.use");
+    auto& link_state = thead.Add<nui::Badge>();
+    link_state.text_fn = [tele] { return std::string(Tr(!tele().connected ? "disconnected" : tele().on ? "driving" : "idle")); };
+    link_state.tone_fn = [tele] { return !tele().connected ? Tone::Warn : tele().on ? Tone::Accent : Tone::Dim; };
+    teleop.Add<nui::Custom>([this] {
+        const TeleopView& t = frame_.ui->teleop;
+        const RobotView& v = frame_.ui->robot;
+        const auto use = [this](const char* key, json::Value value) { Queue("teleop.use", Args({{key, std::move(value)}})); };
+        const TeleopDeviceInfo* device = ActiveDevice(t);
+        ImGui::TextDisabled("%s", Tr("Device"));
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        const std::string current = device != nullptr ? std::string(Tr(device->label.c_str())) : Fmt(Tr("%s (gone)"), t.device.c_str());
+        if (ImGui::BeginCombo("##teleop_device", current.c_str())) {
+            for (const TeleopDeviceInfo& d : t.devices) {
+                ImGui::PushID(d.id.c_str());
+                if (ImGui::Selectable(Tr(d.label.c_str()), d.id == t.device)) use("device", json::Value::Str(d.id));
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort))
+                    ImGui::SetTooltip("%s  \xC2\xB7  %s%s%s", d.id.c_str(), d.kind.c_str(), d.owner.empty() ? "" : "  \xC2\xB7  ",
+                                      d.owner.c_str());
+                ImGui::PopID();
+            }
+            ImGui::EndCombo();
+        }
+        const auto mode_label = [&](const std::string& id) -> std::string {
+            const auto m = std::find(kTeleopModes.begin(), kTeleopModes.end(), id);
+            if (m != kTeleopModes.end()) return Tr(kTeleopModeLabels[m - kTeleopModes.begin()]);
+            const auto r = std::find_if(t.retargets.begin(), t.retargets.end(), [&](const TeleopRetarget& x) { return x.id == id; });
+            return r != t.retargets.end() ? r->label : id;
+        };
+        ImGui::TextDisabled("%s", Tr("Mode"));
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::BeginCombo("##teleop_mode", mode_label(t.mode).c_str())) {
+            std::vector<std::string> modes = kTeleopModes;
+            for (const TeleopRetarget& r : t.retargets) modes.push_back(r.id);
+            for (const std::string& m : modes) {
+                ImGui::PushID(m.c_str());
+                if (ImGui::Selectable(mode_label(m).c_str(), m == t.mode)) use("mode", json::Value::Str(m));
+                ImGui::PopID();
+            }
+            ImGui::EndCombo();
+        }
+        if (t.mode == "joint" && !v.joints.empty()) {
+            const int j = std::clamp(t.joint, 0, static_cast<int>(v.joints.size()) - 1);
+            ImGui::TextDisabled("%s", Tr("Joint"));
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::BeginCombo("##teleop_joint", v.joints[static_cast<size_t>(j)].name.c_str())) {
+                for (size_t i = 0; i < v.joints.size(); ++i) {
+                    ImGui::PushID(static_cast<int>(i));
+                    if (ImGui::Selectable(v.joints[i].name.c_str(), static_cast<int>(i) == j))
+                        use("joint", json::Value::Str(v.joints[i].name));
+                    ImGui::PopID();
+                }
+                ImGui::EndCombo();
+            }
+        }
+        if (t.mode == "ik") {
+            ImGui::TextDisabled("%s", Tr("Link"));
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            const std::string link = t.link.empty() ? std::string(Tr("Selected link")) : Leaf(t.link);
+            if (ImGui::BeginCombo("##teleop_link", link.c_str())) {
+                if (ImGui::Selectable(Tr("Selected link"), t.link.empty())) use("link", json::Value::Str(std::string()));
+                for (size_t i = 0; i < v.links.size(); ++i) {
+                    if (v.links[i].parent < 0) continue;
+                    ImGui::PushID(static_cast<int>(i));
+                    if (ImGui::Selectable(Leaf(v.links[i].path).c_str(), v.links[i].path == t.link))
+                        use("link", json::Value::Str(v.links[i].path));
+                    ImGui::PopID();
+                }
+                ImGui::EndCombo();
+            }
+        }
+        if (!t.error.empty()) {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextColored(theme::kWarn, "%s", t.error.c_str());
+            ImGui::PopTextWrapPos();
+        }
+    });
+    auto& out = teleop.Add<nui::Label>(std::string(), Tone::Accent, TextStyle::Mono);
+    out.wrap = true;
+    out.text_fn = [tele] {
+        const TeleopView& t = tele();
+        std::string line;
+        for (const auto& [name, value] : t.quantities) line += Fmt("%s %+.2f  ", name.c_str(), static_cast<double>(value));
+        if (t.mode == "command")
+            line += Fmt("\n\xE2\x86\x92 vx %+.2f  vy %+.2f  wyaw %+.2f", static_cast<double>(t.command[0]),
+                        static_cast<double>(t.command[1]), static_cast<double>(t.command[2]));
+        if (t.mode == "ik" && t.goal_set)
+            line += Fmt("\n\xE2\x86\x92 %.3f %.3f %.3f m", static_cast<double>(t.goal[0]), static_cast<double>(t.goal[1]),
+                        static_cast<double>(t.goal[2]));
+        return line;
     };
+    auto& no_policy = teleop.Add<nui::Label>("No policy takes the command; load one, or pick the joint or IK mode.", Tone::Warn);
+    no_policy.wrap = true;
+    no_policy.visible_if = [tele] { return tele().on && tele().mode == "command" && !tele().controller; };
+
+    // The active device's axes as bars from the middle, and its buttons as chips lit while down.
+    teleop.Add<nui::Custom>([this] {
+        const TeleopView& t = frame_.ui->teleop;
+        const TeleopDeviceInfo* d = ActiveDevice(t);
+        if (d == nullptr || !t.connected) {
+            ImGui::TextDisabled("%s", Tr("The device is not connected."));
+            return;
+        }
+        const float s = nui::Scale(), line = ImGui::GetTextLineHeight(), pad = theme::kSpace * s;
+        float name_w = 0.0f;
+        for (const std::string& a : d->axes) name_w = std::max(name_w, ImGui::CalcTextSize(a.c_str()).x);
+        const float value_w = ImGui::CalcTextSize("+0.00").x;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        for (size_t i = 0; i < std::min(d->axes.size(), t.axes.size()); ++i) {
+            const ImVec2 p = ImGui::GetCursorScreenPos();
+            const float w = ImGui::GetContentRegionAvail().x;
+            ImGui::Dummy(ImVec2(w, line));
+            dl->AddText(p, U32(theme::kFgMuted), d->axes[i].c_str());
+            const std::string value = Fmt("%+.2f", static_cast<double>(t.axes[i]));
+            dl->AddText(ImVec2(p.x + w - value_w, p.y), U32(theme::kFg), value.c_str());
+            AxisBar(t.axes[i], ImVec2(p.x + name_w + pad, p.y + line * 0.3f), ImVec2(p.x + w - value_w - pad, p.y + line * 0.7f));
+        }
+        const float right = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
+        for (size_t i = 0; i < std::min(d->buttons.size(), t.buttons.size()); ++i) {
+            const ImVec2 chip(ImGui::CalcTextSize(d->buttons[i].c_str()).x + 2.0f * pad, line + pad);
+            if (i > 0) {
+                ImGui::SameLine(0.0f, 0.5f * pad);
+                if (ImGui::GetCursorScreenPos().x + chip.x > right) ImGui::NewLine();
+            }
+            const ImVec2 p = ImGui::GetCursorScreenPos();
+            ImGui::Dummy(chip);
+            const bool down = t.buttons[i] != 0u;
+            dl->AddRectFilled(p, ImVec2(p.x + chip.x, p.y + chip.y), U32(down ? theme::Alpha(theme::kAccent, 0.55f) : theme::kBg3),
+                              3.0f * s);
+            dl->AddText(ImVec2(p.x + pad, p.y + 0.5f * pad), U32(down ? theme::kFg : theme::kFgDim), d->buttons[i].c_str());
+        }
+    });
+
+    // The mode's bindings, each one input scaled into a quantity; edits act from the next frame.
+    teleop.Add<nui::Custom>([this] {
+        TeleopView& t = frame_.ui->teleop;
+        std::vector<TeleopBinding>& bindings = t.maps[t.mode];
+        std::vector<std::string> inputs;
+        if (const TeleopDeviceInfo* d = ActiveDevice(t)) {
+            inputs = d->axes;
+            inputs.insert(inputs.end(), d->buttons.begin(), d->buttons.end());
+        }
+        const std::vector<std::string>& names = ModeQuantities(t.mode);
+        const float s = nui::Scale();
+        nui::draw::SectionHeader(Tr("Mapping"));
+        int remove = -1;
+        // The input and its quantity stack in one cell, which keeps both names readable in a narrow panel.
+        if (ImGui::BeginTable("##teleop_map", 4, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg)) {
+            const std::string pair = std::string(Tr("Input")) + " \xE2\x86\x92 " + Tr("Quantity");
+            ImGui::TableSetupColumn(pair.c_str(), ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            ImGui::TableSetupColumn(Tr("Gain"), ImGuiTableColumnFlags_WidthFixed, 40.0f * s);
+            ImGui::TableSetupColumn("\xC2\xB1", ImGuiTableColumnFlags_WidthFixed);
+            ImGui::TableSetupColumn("##remove", ImGuiTableColumnFlags_WidthFixed);
+            ImGui::TableHeadersRow();
+            for (size_t i = 0; i < bindings.size(); ++i) {
+                TeleopBinding& b = bindings[i];
+                ImGui::PushID(static_cast<int>(i));
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::BeginCombo("##input", b.input.c_str(), ImGuiComboFlags_NoArrowButton)) {
+                    for (const std::string& in : inputs)
+                        if (ImGui::Selectable(in.c_str(), in == b.input)) b.input = in;
+                    ImGui::EndCombo();
+                }
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                // An extension's mode names its own quantities, so they are typed.
+                if (names.empty()) {
+                    char text[64];
+                    std::snprintf(text, sizeof(text), "%s", b.quantity.c_str());
+                    if (ImGui::InputText("##quantity", text, sizeof(text))) b.quantity = text;
+                } else if (ImGui::BeginCombo("##quantity", ("\xE2\x86\x92 " + b.quantity).c_str(), ImGuiComboFlags_NoArrowButton)) {
+                    for (const std::string& q : names)
+                        if (ImGui::Selectable(q.c_str(), q == b.quantity)) b.quantity = q;
+                    ImGui::EndCombo();
+                }
+                ImGui::TableSetColumnIndex(1);
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                ImGui::DragFloat("##gain", &b.gain, 0.01f, 0.0f, 0.0f, "%.2f");
+                ImGui::TableSetColumnIndex(2);
+                ImGui::Checkbox("##invert", &b.invert);
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) ImGui::SetTooltip("%s", Tr("Invert"));
+                ImGui::TableSetColumnIndex(3);
+                if (nui::draw::IconButton("##remove", icon::kTrash, false, Tr("Remove"))) remove = static_cast<int>(i);
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        if (remove >= 0) bindings.erase(bindings.begin() + static_cast<std::ptrdiff_t>(remove));
+        if (ImGui::Button(Iconed(icon::kAdd, Tr("Add Binding")).c_str()))
+            bindings.push_back({inputs.empty() ? kPadAxes.front() : inputs.front(), names.empty() ? std::string() : names.front()});
+        ImGui::SameLine();
+        if (nui::draw::IconButton("##reset_map", icon::kReset, false, Tr("Reset Mapping")))
+            Queue("teleop.map", Args({{"mode", json::Value::Str(t.mode)}, {"reset", json::Value::Bool(true)}}));
+    });
+    auto& tgrid = teleop.Add<nui::PropertyGrid>();
+    auto& deadzone = tgrid.Add<nui::FloatField>("Deadzone", nui::Ref(&ui.teleop.deadzone), 0.005f, 0.0f, 0.95f);
+    deadzone.format = "%.2f";
+    tgrid.Add<nui::BoolField>("PD hold", nui::Ref(&ui.teleop.hold));
+    tgrid.Add<nui::FloatField>("kp", nui::Ref(&ui.teleop.kp), 0.5f, 0.0f, 100000.0f);
+    tgrid.Add<nui::FloatField>("kd", nui::Ref(&ui.teleop.kd), 0.05f, 0.0f, 10000.0f);
+    auto& keys = teleop.Add<nui::Label>("W S and A D are the left stick, Q E the right stick across and Page Up / Page Down "
+                                        "along it; - and = are the shoulders. Gamepads appear when plugged in.",
+                                        Tone::Dim);
+    keys.wrap = true;
+    keys.visible_if = [tele] { return tele().device == "keyboard"; };
 }
 
 void ImGuiLayer::BuildPoses(nui::VStack& root) {

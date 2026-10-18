@@ -1,85 +1,96 @@
 #pragma once
-// ---------------------------------------------------------------------------
-// nuka::runtime::app::viewer -- interactive keyboard teleop mapping.
-//
-// A general live-input -> drive-command producer, the interactive sibling of the
-// Drive sliders and the --policy controller. Per-DOF nudges write the SAME
-// drive_targets / drive_dirty seam the Drive panel uses; WASD/QE produce a
-// [vx,vy,wyaw] command for a command-consuming WorldController. Decoupled from ImGui
-// (the viewer reads key state into TeleopKeys) so the mapping is unit-testable with
-// synthetic intents. Host-only, no deps beyond ViewerUiState.
-// ---------------------------------------------------------------------------
+// Teleop devices and their mapping. The built-in devices all report SDL's gamepad layout, so
+// one mapping drives the keyboard, a gamepad or the virtual device; SDL gamepads live here too.
 
-#include "runtime/app/viewer/imgui_layer.hpp"
+#include "runtime/app/viewer/teleop_view.hpp"
 
-#include <cstddef>
-#include <cstdint>
+#include <algorithm>
+#include <cmath>
+#include <map>
+#include <memory>
+#include <string>
+#include <vector>
 
 namespace nuka::runtime::app::viewer {
 
-// The per-frame keyboard state teleop maps. The dof_* fields are pressed-this-frame
-// (one-shot edges); the move/yaw fields are held-down-now (continuous). The viewer
-// fills these from ImGui; a test fills them synthetically.
-struct TeleopKeys {
-    bool dof_minus = false;   // '[' or ','  : nudge the selected DOF target down
-    bool dof_plus  = false;   // ']' or '.'  : nudge it up
-    bool dof_prev  = false;   // '-'         : select the previous DOF
-    bool dof_next  = false;   // '='         : select the next DOF
-    bool fwd = false, back = false;          // W / S : +vx / -vx
-    bool strafe_l = false, strafe_r = false; // A / D : +vy / -vy
-    bool yaw_l = false, yaw_r = false;       // Q / E : +wyaw / -wyaw
-};
+// SDL's standard gamepad axes and buttons, by its names and in its order.
+inline const std::vector<std::string> kPadAxes = {"leftx", "lefty", "rightx", "righty", "lefttrigger", "righttrigger"};
+inline const std::vector<std::string> kPadButtons = {"a",          "b",          "x",           "y",
+                                                     "back",       "guide",      "start",       "leftstick",
+                                                     "rightstick", "leftshoulder", "rightshoulder", "dpup",
+                                                     "dpdown",     "dpleft",     "dpright"};
+enum PadAxis : uint32_t { kLeftX, kLeftY, kRightX, kRightY };
+enum PadButton : uint32_t { kLeftShoulder = 9u, kRightShoulder = 10u };
 
-// One teleop tick's locomotion command, handed to a command-consuming controller.
-// The producer sends it EVERY frame; a gated tick is all-zero (stops the robot).
-struct TeleopResult {
-    bool  command_active = false;
-    float command[3]     = {0.0f, 0.0f, 0.0f};  // vx, vy, wyaw
-};
+inline const std::vector<std::string> kTeleopModes = {"command", "joint", "ik"};
 
-// One teleop tick. Gated (`enabled` false) => ui untouched + the ZERO command (still
-// sent every frame, so a gate/release stops the robot); enabled => base + held keys.
-inline TeleopResult ApplyTeleop(bool enabled, const TeleopKeys& keys,
-                                ViewerUiState& ui, uint32_t dof_count) {
-    TeleopResult out;
-    if (!enabled) return out;
+// What a built-in mode reads: vx, vy [m/s] and wyaw [rad/s]; the joint's rate and presses that
+// pick the next or previous joint; the IK goal's world velocity [m/s].
+inline const std::vector<std::string>& ModeQuantities(const std::string& mode) {
+    static const std::map<std::string, std::vector<std::string>> quantities = {
+        {"command", {"vx", "vy", "wyaw"}}, {"joint", {"rate", "next", "prev"}}, {"ik", {"x", "y", "z"}}};
+    static const std::vector<std::string> none;
+    const auto it = quantities.find(mode);
+    return it != quantities.end() ? it->second : none;
+}
 
-    // Per-DOF: select (clamped into range) + nudge the active DOF's drive target.
-    if (dof_count > 0u) {
-        if (keys.dof_next) ui.teleop_dof += 1;
-        if (keys.dof_prev) ui.teleop_dof -= 1;
-        if (ui.teleop_dof < 0) ui.teleop_dof = 0;
-        if (ui.teleop_dof >= static_cast<int>(dof_count))
-            ui.teleop_dof = static_cast<int>(dof_count) - 1;
-        if (ui.drive_targets.size() == dof_count && ui.drive_dirty.size() == dof_count) {
-            float delta = 0.0f;
-            if (keys.dof_plus)  delta += ui.teleop_step;
-            if (keys.dof_minus) delta -= ui.teleop_step;
-            if (delta != 0.0f) {
-                const size_t d = static_cast<size_t>(ui.teleop_dof);
-                ui.drive_targets[d] += delta;
-                ui.drive_dirty[d] = 1u;
-            }
-        }
+// Stick forward and left are +x and +y, so SDL's down- and right-positive axes are inverted.
+inline std::map<std::string, std::vector<TeleopBinding>> DefaultTeleopMaps() {
+    return {{"command", {{"lefty", "vx", 1.0f, true}, {"leftx", "vy", 1.0f, true}, {"rightx", "wyaw", 1.0f, true}}},
+            {"joint",
+             {{"lefty", "rate", 1.0f, true}, {"rightshoulder", "next", 1.0f, false}, {"leftshoulder", "prev", 1.0f, false}}},
+            {"ik", {{"lefty", "x", 0.2f, true}, {"leftx", "y", 0.2f, true}, {"righty", "z", 0.2f, true}}}};
+}
+
+// An input's value: an axis past the deadzone rescaled to [-1, 1], a button's 0 or 1, and 0 for
+// a name the device lacks.
+inline float InputValue(const TeleopDeviceInfo& device, const std::vector<float>& axes,
+                        const std::vector<uint8_t>& buttons, const std::string& input, float deadzone) {
+    const auto axis = std::find(device.axes.begin(), device.axes.end(), input);
+    if (axis != device.axes.end()) {
+        const float v = axes[static_cast<size_t>(axis - device.axes.begin())];
+        return std::copysign(std::min(std::max(std::fabs(v) - deadzone, 0.0f) / (1.0f - deadzone), 1.0f), v);
     }
+    const auto button = std::find(device.buttons.begin(), device.buttons.end(), input);
+    return button != device.buttons.end() && buttons[static_cast<size_t>(button - device.buttons.begin())] != 0u ? 1.0f
+                                                                                                                 : 0.0f;
+}
 
-    // Locomotion command: the persistent baseline plus the held keys (all keys
-    // released -> back to the baseline, which is zero unless a CLI/script set it).
-    float vx = ui.teleop_cmd_base[0], vy = ui.teleop_cmd_base[1], wz = ui.teleop_cmd_base[2];
-    if (keys.fwd)      vx += ui.teleop_lin;
-    if (keys.back)     vx -= ui.teleop_lin;
-    if (keys.strafe_l) vy += ui.teleop_lin;
-    if (keys.strafe_r) vy -= ui.teleop_lin;
-    if (keys.yaw_l)    wz += ui.teleop_yaw;
-    if (keys.yaw_r)    wz -= ui.teleop_yaw;
-    out.command[0] = vx;
-    out.command[1] = vy;
-    out.command[2] = wz;
-    out.command_active = (vx != 0.0f || vy != 0.0f || wz != 0.0f);
-    ui.teleop_cmd[0] = vx;
-    ui.teleop_cmd[1] = vy;
-    ui.teleop_cmd[2] = wz;
+// Each of `names`, and each quantity a binding reaches, as the sum of its scaled inputs.
+inline std::map<std::string, float> TeleopQuantities(const TeleopDeviceInfo& device, const std::vector<float>& axes,
+                                                     const std::vector<uint8_t>& buttons,
+                                                     const std::vector<TeleopBinding>& bindings,
+                                                     const std::vector<std::string>& names, float deadzone) {
+    std::map<std::string, float> out;
+    for (const std::string& name : names) out[name] = 0.0f;
+    for (const TeleopBinding& b : bindings)
+        out[b.quantity] += (b.invert ? -b.gain : b.gain) * InputValue(device, axes, buttons, b.input, deadzone);
     return out;
 }
+
+// SDL gamepads, virtual ones included, as devices "gamepad:<SDL id>" in the pad layout. It starts
+// SDL's gamepad subsystem itself, so pads work without a window and while it is in the background.
+class TeleopPads {
+public:
+    TeleopPads();
+    ~TeleopPads();
+    TeleopPads(const TeleopPads&) = delete;
+    TeleopPads& operator=(const TeleopPads&) = delete;
+
+    // Opens what was plugged in, closes what was pulled, and lists the pads into `out`.
+    void Update(std::vector<TeleopDeviceInfo>* out);
+    // The pad's axes and buttons; false when it is gone.
+    bool Read(const std::string& id, std::vector<float>* axes, std::vector<uint8_t>* buttons) const;
+    // A virtual gamepad on SDL's joystick path; its device id, or empty with *error.
+    std::string Attach(const std::string& name, std::string* error);
+    // Sets a virtual pad's axes and buttons (nonzero is down) by name; false with *error.
+    bool Set(const std::string& id, const std::map<std::string, float>& axes,
+             const std::map<std::string, float>& buttons, std::string* error);
+    bool Detach(const std::string& id);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 
 }  // namespace nuka::runtime::app::viewer

@@ -8,6 +8,7 @@
 
 #include "nuka/nuka_editor.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <stdexcept>
@@ -71,6 +72,17 @@ struct Callback {
     }
 };
 
+// A Python teleop device: fn() returns (axes, buttons) in the order it named them.
+struct Device {
+    nb::object fn;
+    size_t axes;
+    size_t buttons;
+    static void Release(void* self) {
+        nb::gil_scoped_acquire acquire;
+        delete static_cast<Device*>(self);
+    }
+};
+
 // The editor as one extension sees it (nuka_editor_host_api_t): what it builds or registers
 // here goes away when the extension is disabled, and the table with it.
 class ExtHost {
@@ -131,6 +143,40 @@ public:
         desc.release = &Callback::Release;
         Check(Api().register_overlay(Api().host, &desc), "register_overlay");
     }
+    // fn() returns (axes, buttons): numbers in the order of `axes` and `buttons`.
+    void register_teleop_device(const std::string& device_id, const std::string& label, const std::string& kind,
+                                const std::vector<std::string>& axes, const std::vector<std::string>& buttons,
+                                nb::object fn) {
+        std::vector<const char*> axis_names, button_names;
+        for (const std::string& a : axes) axis_names.push_back(a.c_str());
+        for (const std::string& b : buttons) button_names.push_back(b.c_str());
+        nuka_editor_teleop_device_desc_t desc{};
+        desc.struct_size = static_cast<uint32_t>(sizeof(desc));
+        desc.id = device_id.c_str();
+        desc.label = label.c_str();
+        desc.kind = kind.c_str();
+        desc.axis_count = static_cast<uint32_t>(axes.size());
+        desc.axis_names = axis_names.data();
+        desc.button_count = static_cast<uint32_t>(buttons.size());
+        desc.button_names = button_names.data();
+        desc.read = &ReadDevice;
+        desc.user = new Device{std::move(fn), axes.size(), buttons.size()};
+        desc.release = &Device::Release;
+        if (Api().register_teleop_device(Api().host, &desc) != NUKA_RESULT_OK)
+            throw std::runtime_error("cannot register teleop device '" + device_id + "'; see the extension log");
+    }
+    // fn(state_json) returns (ok, targets_json or reason).
+    void register_teleop_retarget(const std::string& retarget_id, const std::string& label, nb::object fn) {
+        nuka_editor_teleop_retarget_desc_t desc{};
+        desc.struct_size = static_cast<uint32_t>(sizeof(desc));
+        desc.id = retarget_id.c_str();
+        desc.label = label.c_str();
+        desc.map = &RunAction;
+        desc.user = new Callback{std::move(fn), std::string()};
+        desc.release = &Callback::Release;
+        if (Api().register_teleop_retarget(Api().host, &desc) != NUKA_RESULT_OK)
+            throw std::runtime_error("cannot register teleop mode '" + retarget_id + "'; see the extension log");
+    }
     void log(int level, const std::string& text) {
         Api().log(Api().host, static_cast<nuka_nui_level_t>(level), text.c_str());
     }
@@ -190,6 +236,22 @@ private:
         }
         nb::cast<OverlayFrame&>(view).Drop();
         return ok ? 1 : 0;
+    }
+    static int32_t ReadDevice(void* user, float* axes, uint8_t* buttons) {
+        Device& device = *static_cast<Device*>(user);
+        nb::gil_scoped_acquire acquire;
+        try {
+            nb::tuple reply = nb::cast<nb::tuple>(device.fn());
+            const std::vector<float> a = nb::cast<std::vector<float>>(reply[0]);
+            const std::vector<float> b = nb::cast<std::vector<float>>(reply[1]);
+            std::copy_n(a.begin(), std::min(a.size(), device.axes), axes);
+            for (size_t i = 0; i < std::min(b.size(), device.buttons); ++i) buttons[i] = static_cast<uint8_t>(b[i] != 0.0f);
+            return 1;
+        } catch (nb::python_error& error) {
+            error.discard_as_unraisable("nuka.editor teleop device");
+        } catch (const std::exception&) {
+        }
+        return 0;
     }
 
     const nuka_editor_host_api_t* api_;
@@ -478,6 +540,10 @@ NB_MODULE(_editor_ext, m) {
         .def("register_action", &ExtHost::register_action, nb::arg("id"), nb::arg("label"), nb::arg("category"),
              nb::arg("shortcut"), nb::arg("icon"), nb::arg("hidden"), nb::arg("fn"))
         .def("register_overlay", &ExtHost::register_overlay, nb::arg("id"), nb::arg("fn"))
+        .def("register_teleop_device", &ExtHost::register_teleop_device, nb::arg("id"), nb::arg("label"),
+             nb::arg("kind"), nb::arg("axes"), nb::arg("buttons"), nb::arg("fn"))
+        .def("register_teleop_retarget", &ExtHost::register_teleop_retarget, nb::arg("id"), nb::arg("label"),
+             nb::arg("fn"))
         .def("log", &ExtHost::log, nb::arg("level"), nb::arg("text"))
         .def("close", &ExtHost::close);
 

@@ -11,6 +11,7 @@
 #include "runtime/app/viewer/robot_view.hpp"
 #include "runtime/app/viewer/scene_viewport.hpp"
 #include "runtime/app/viewer/script_tabs.hpp"
+#include "runtime/app/viewer/teleop_view.hpp"
 #include "runtime/app/viewer/timeline_view.hpp"
 #include "scene/ecs/entity.hpp"
 
@@ -293,18 +294,7 @@ struct ViewerUiState {
     std::vector<float> drive_targets;
     std::vector<uint8_t> drive_dirty;
     RobotView robot;
-
-    // Keyboard teleop: [ / ] nudge a DOF, WASD/QE feed a command-consuming controller.
-    bool teleop_enabled = false;
-    int teleop_dof = 0;
-    float teleop_step = 0.05f;
-    float teleop_lin = 1.0f;
-    float teleop_yaw = 1.0f;
-    float teleop_cmd[3] = {0.0f, 0.0f, 0.0f};       // host-set live command
-    float teleop_cmd_base[3] = {0.0f, 0.0f, 0.0f};  // keys add on top of this baseline
-    bool teleop_hold = false;  // PD-hold makes drive targets effective without a policy
-    float teleop_kp = 20.0f;
-    float teleop_kd = 0.5f;
+    TeleopView teleop;
 
     // Queued for the next frame top, so recording the UI never changes the world.
     std::vector<ActionCall> actions;

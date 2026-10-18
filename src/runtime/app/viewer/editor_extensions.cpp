@@ -281,6 +281,18 @@ struct Overlay {
     std::shared_ptr<void> user;
 };
 
+struct TeleopDeviceSlot {
+    TeleopDeviceInfo info;
+    int32_t (*read)(void* user, float* axes, uint8_t* buttons);
+    std::shared_ptr<void> user;
+};
+
+struct RetargetSlot {
+    TeleopRetarget info;
+    int32_t (*map)(void* user, const char* state_json, const char** out_json);
+    std::shared_ptr<void> user;
+};
+
 struct Record;
 
 // What one enabled extension registered, and the host table it registered it through.
@@ -292,6 +304,8 @@ struct Scope {
     nuka_nui_api_t nui{};
     std::vector<std::string> panels;
     std::vector<Overlay> overlays;
+    std::vector<TeleopDeviceSlot> devices;
+    std::vector<RetargetSlot> retargets;
     std::string reply;
     void* library = nullptr;
     fs::path shadow;
@@ -343,6 +357,18 @@ struct ExtensionManager::Impl {
         for (const auto& r : records)
             if (r->id == id) return r.get();
         return nullptr;
+    }
+
+    // Whether a teleop device or mode of an enabled extension already has `id`.
+    bool TeleopTaken(const std::string& id) const {
+        for (const auto& r : records) {
+            if (!r->scope) continue;
+            for (const auto& d : r->scope->devices)
+                if (d.info.id == id) return true;
+            for (const auto& t : r->scope->retargets)
+                if (t.info.id == id) return true;
+        }
+        return false;
     }
 
     // Lines may come from any thread; the UI thread files them at the next frame top.
@@ -440,6 +466,35 @@ nuka_result_t ApiRegisterOverlay(void* host, const nuka_editor_overlay_desc_t* d
     return NUKA_RESULT_OK;
 }
 
+// The built-in devices and modes keep their names.
+bool TeleopIdFree(Scope& s, const std::string& id) {
+    const bool builtin = id == "keyboard" || id == "virtual" || id.rfind("gamepad:", 0) == 0 || id == "command" ||
+                         id == "joint" || id == "ik";
+    if (!builtin && !s.impl->TeleopTaken(id)) return true;
+    s.impl->Log(*s.record, NUKA_NUI_ERROR, "teleop id '" + id + "' is taken");
+    return false;
+}
+
+nuka_result_t ApiRegisterTeleopDevice(void* host, const nuka_editor_teleop_device_desc_t* desc) {
+    Scope& s = S(host);
+    std::shared_ptr<void> user = Owned(desc->user, desc->release);
+    if (!TeleopIdFree(s, desc->id)) return NUKA_RESULT_INVALID_ARG;
+    TeleopDeviceSlot slot{{desc->id, desc->label, desc->kind != nullptr ? desc->kind : "extension", s.record->id, {}, {}},
+                          desc->read, std::move(user)};
+    slot.info.axes.assign(desc->axis_names, desc->axis_names + desc->axis_count);
+    slot.info.buttons.assign(desc->button_names, desc->button_names + desc->button_count);
+    s.devices.push_back(std::move(slot));
+    return NUKA_RESULT_OK;
+}
+
+nuka_result_t ApiRegisterTeleopRetarget(void* host, const nuka_editor_teleop_retarget_desc_t* desc) {
+    Scope& s = S(host);
+    std::shared_ptr<void> user = Owned(desc->user, desc->release);
+    if (!TeleopIdFree(s, desc->id)) return NUKA_RESULT_INVALID_ARG;
+    s.retargets.push_back(RetargetSlot{{desc->id, desc->label, s.record->id}, desc->map, std::move(user)});
+    return NUKA_RESULT_OK;
+}
+
 nuka_result_t ApiRunAction(void* host, const char* id, const char* args_json, const char** out_json) {
     Scope& s = S(host);
     ActionResult result;
@@ -515,6 +570,8 @@ void FillApi(Scope& s) {
     a.run_action = &ApiRunAction;
     a.log = &ApiLog;
     a.register_imgui_panel = &ApiImGuiPanel;
+    a.register_teleop_device = &ApiRegisterTeleopDevice;
+    a.register_teleop_retarget = &ApiRegisterTeleopRetarget;
     nuka_nui_api_t& n = s.nui;
     n.struct_size = static_cast<uint32_t>(sizeof(nuka_nui_api_t));
     n.version = NUKA_NUI_API_VERSION;
@@ -777,6 +834,8 @@ void Impl::Teardown(Record& r) {
         s.unload = nullptr;
     }
     s.overlays.clear();
+    s.devices.clear();
+    s.retargets.clear();
     services.actions->RemoveOwned(r.id);
     for (const std::string& pid : s.panels) {
         if (r.builtin != nullptr) services.ui->RemoveBuiltinPanel(pid);
@@ -835,12 +894,18 @@ json::Value Impl::Describe(const Record& r) const {
     v.Set("actions", std::move(actions));
     json::Value panels = json::Value::Array();
     json::Value overlays = json::Value::Array();
+    json::Value devices = json::Value::Array();
+    json::Value retargets = json::Value::Array();
     if (r.scope) {
         for (const std::string& pid : r.scope->panels) panels.PushBack(json::Value::Str(pid));
         for (const Overlay& o : r.scope->overlays) overlays.PushBack(json::Value::Str(o.id));
+        for (const TeleopDeviceSlot& d : r.scope->devices) devices.PushBack(json::Value::Str(d.info.id));
+        for (const RetargetSlot& t : r.scope->retargets) retargets.PushBack(json::Value::Str(t.info.id));
     }
     v.Set("panels", std::move(panels));
     v.Set("overlays", std::move(overlays));
+    v.Set("teleop_devices", std::move(devices));
+    v.Set("teleop_modes", std::move(retargets));
     return v;
 }
 
@@ -1157,6 +1222,46 @@ const nuka_editor_host_api_t* ExtensionManager::HostApi(const std::string& id) c
     for (const auto& r : impl_->records)
         if (r->id == id && r->scope) return &r->scope->api;
     return nullptr;
+}
+
+void ExtensionManager::TeleopEntries(std::vector<TeleopDeviceInfo>* devices, std::vector<TeleopRetarget>* retargets) const {
+    retargets->clear();
+    for (const auto& r : impl_->records) {
+        if (!r->scope) continue;
+        for (const TeleopDeviceSlot& d : r->scope->devices) devices->push_back(d.info);
+        for (const RetargetSlot& t : r->scope->retargets) retargets->push_back(t.info);
+    }
+}
+
+bool ExtensionManager::ReadTeleopDevice(const std::string& id, std::vector<float>* axes, std::vector<uint8_t>* buttons) {
+    for (const auto& r : impl_->records) {
+        if (!r->scope) continue;
+        for (const TeleopDeviceSlot& d : r->scope->devices) {
+            if (d.info.id != id) continue;
+            axes->assign(d.info.axes.size(), 0.0f);
+            buttons->assign(d.info.buttons.size(), 0u);
+            const bool ok = d.read(d.user.get(), axes->data(), buttons->data()) != 0;
+            Report(r->id, "teleop device " + id, ok);
+            return ok;
+        }
+    }
+    return false;
+}
+
+bool ExtensionManager::Retarget(const std::string& id, const std::string& state_json, std::string* out) {
+    for (const auto& r : impl_->records) {
+        if (!r->scope) continue;
+        for (const RetargetSlot& t : r->scope->retargets) {
+            if (t.info.id != id) continue;
+            const char* text = nullptr;
+            const bool ok = t.map(t.user.get(), state_json.c_str(), &text) != 0;
+            *out = text != nullptr ? text : ok ? "{}" : "failed";
+            Report(r->id, "teleop mode " + id, ok);
+            return ok;
+        }
+    }
+    *out = "no teleop mode '" + id + "'";
+    return false;
 }
 
 }  // namespace nuka::runtime::app::viewer
