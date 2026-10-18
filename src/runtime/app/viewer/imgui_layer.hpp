@@ -5,6 +5,7 @@
 #include "math/transform.hpp"
 #include "nuka/nuka.h"
 #include "render/render_world.hpp"
+#include "runtime/app/viewer/demo_view.hpp"
 #include "runtime/app/viewer/editor_actions.hpp"
 #include "runtime/app/viewer/nui/nui.hpp"
 #include "runtime/app/viewer/policy_view.hpp"
@@ -297,6 +298,7 @@ struct ViewerUiState {
     RobotView robot;
     TeleopView teleop;
     PolicyView policy;
+    DemoView demos;
 
     // Queued for the next frame top, so recording the UI never changes the world.
     std::vector<ActionCall> actions;
@@ -470,6 +472,7 @@ private:
     void BuildJoints(nui::VStack& root);
     void BuildPoses(nui::VStack& root);
     void BuildPolicy(nui::VStack& root);
+    void BuildDemos(nui::VStack& root);
     void BuildScript(nui::VStack& root);
     void BuildConsole(nui::VStack& root);
     // The script tab bar with its keys, completions, disk-change bar and close prompt.

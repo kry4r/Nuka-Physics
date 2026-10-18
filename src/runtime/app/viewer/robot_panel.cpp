@@ -712,6 +712,132 @@ void ImGuiLayer::BuildPolicy(nui::VStack& root) {
     info.visible_if = [pol] { return pol().loaded; };
 }
 
+void ImGuiLayer::BuildDemos(nui::VStack& root) {
+    const auto demo = [this]() -> DemoView& { return frame_.ui->demos; };
+
+    auto& head = root.Add<nui::HStack>();
+    head.wrap = true;
+    head.Add<nui::ToggleButton>("Record").Action("demo.record");
+    auto& state = head.Add<nui::Badge>();
+    state.text_fn = [demo] {
+        const DemoView& d = demo();
+        if (d.recording) return Fmt(Tr("REC %llu"), static_cast<unsigned long long>(d.samples));
+        return std::string(Tr(d.playing >= 0 ? "replaying" : "idle"));
+    };
+    state.tone_fn = [demo] { return demo().recording ? Tone::Err : demo().playing >= 0 ? Tone::Accent : Tone::Dim; };
+    auto& count = head.Add<nui::Badge>();
+    count.text_fn = [demo] { return Fmt(Tr("%zu episodes"), demo().episodes.size()); };
+    count.tone_fn = [] { return Tone::Info; };
+
+    // Who the recording covers, the episodes, and the replay of the selected one.
+    root.Add<nui::Custom>([this] {
+        DemoView& d = frame_.ui->demos;
+        const float s = nui::Scale();
+        ImGui::BeginDisabled(d.recording);
+        ImGui::Checkbox(Tr("All shown environments"), &d.all);
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort | ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("%s", Tr("Record every displayed environment, each as its own episode."));
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextDisabled("%s", Tr("Each step at the head records the joints, drive targets, base, command and device axes."));
+        ImGui::PopTextWrapPos();
+
+        nui::draw::SectionHeader(Tr("Episodes"));
+        const int n = static_cast<int>(d.episodes.size());
+        if (n == 0) {
+            ImGui::TextDisabled("%s", Tr("No episodes"));
+        } else {
+            const float rows = static_cast<float>(std::min(n, 8) + 1);
+            const float row = ImGui::GetTextLineHeight() + 2.0f * ImGui::GetStyle().CellPadding.y;
+            const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
+                                          ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_ScrollY;
+            if (ImGui::BeginTable("##demo_episodes", 4, flags, ImVec2(0.0f, rows * row + 2.0f * s))) {
+                ImGui::TableSetupScrollFreeze(0, 1);
+                ImGui::TableSetupColumn("#");
+                ImGui::TableSetupColumn(Tr("env"));
+                ImGui::TableSetupColumn(Tr("steps"));
+                ImGui::TableSetupColumn(Tr("seconds"));
+                ImGui::TableHeadersRow();
+                for (int k = 0; k < n; ++k) {
+                    const DemoView::Episode& e = d.episodes[static_cast<size_t>(k)];
+                    const json::Value episode = Args({{"episode", json::Value::Int(k)}});
+                    ImGui::PushID(k);
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    const std::string name = Iconed(k == d.playing ? icon::kPlay : icon::kRecord, Fmt("%d", k).c_str());
+                    ImGui::PushStyleColor(ImGuiCol_Text, k == d.playing ? theme::kAccent : theme::kFg);
+                    if (ImGui::Selectable(name.c_str(), k == d.selected, ImGuiSelectableFlags_SpanAllColumns)) d.selected = k;
+                    ImGui::PopStyleColor();
+                    if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) Queue("demo.play", episode);
+                    if (ImGui::BeginPopupContextItem("##episode_menu")) {
+                        if (ImGui::MenuItemEx(Tr("Replay"), icon::kPlay)) Queue("demo.play", episode);
+                        if (ImGui::MenuItemEx(Tr("Discard"), icon::kTrash)) Queue("demo.discard", episode);
+                        ImGui::EndPopup();
+                    }
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%u", e.env);
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%zu", e.steps);
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%.2f", e.seconds);
+                    ImGui::PopID();
+                }
+                ImGui::EndTable();
+            }
+        }
+        // Buttons go on the line while they fit the panel.
+        const auto beside = [](const std::string& label) {
+            const float w = ImGui::CalcTextSize(label.c_str()).x + 2.0f * ImGui::GetStyle().FramePadding.x;
+            ImGui::SameLine();
+            if (ImGui::GetContentRegionAvail().x < w) ImGui::NewLine();
+        };
+        const bool picked = d.selected >= 0 && d.selected < n;
+        const std::string replay = Iconed(icon::kPlay, Tr("Replay")), discard = Iconed(icon::kTrash, Tr("Discard")),
+                          stop = Iconed(icon::kStop, Tr("Stop"));
+        ImGui::BeginDisabled(!picked);
+        if (ImGui::Button(replay.c_str())) Queue("demo.play", Args({{"episode", json::Value::Int(d.selected)}}));
+        beside(discard);
+        if (ImGui::Button(discard.c_str())) Queue("demo.discard", Args({{"episode", json::Value::Int(d.selected)}}));
+        ImGui::EndDisabled();
+        beside(stop);
+        ImGui::BeginDisabled(d.playing < 0);
+        if (ImGui::Button(stop.c_str())) Queue("demo.stop", json::Value::Object());
+        ImGui::EndDisabled();
+        if (d.playing >= 0) {
+            const size_t steps = d.episodes[static_cast<size_t>(d.playing)].steps;
+            const float done = 1.0f - static_cast<float>(d.left) / static_cast<float>(std::max<size_t>(steps, 1u));
+            const std::string over = Fmt(Tr("episode %d: %u steps left"), d.playing, d.left);
+            ImGui::ProgressBar(done, ImVec2(-FLT_MIN, 0.0f), over.c_str());
+        }
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextDisabled("%s", Tr("A replay drives the targets from the state now; reset first to replay from its start."));
+        ImGui::PopTextWrapPos();
+
+        // The HDF5 file, in robomimic's layout.
+        nui::draw::SectionHeader(Tr("File"));
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputTextWithHint("##demo_path", Tr("HDF5 file; empty browses"), d.path_edit, sizeof(d.path_edit));
+        if (d.path_edit[0] != '\0' && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) ImGui::SetTooltip("%s", d.path_edit);
+        const auto path_args = [&d] {
+            json::Value args = json::Value::Object();
+            if (d.path_edit[0] != '\0') args.Set("path", json::Value::Str(d.path_edit));
+            return args;
+        };
+        ImGui::BeginDisabled(n == 0);
+        if (ImGui::Button(Iconed(icon::kSave, Tr("Save")).c_str())) Queue("demo.save", path_args());
+        ImGui::EndDisabled();
+        ImGui::SameLine(0.0f, theme::kSpace * s);
+        ImGui::BeginDisabled(d.recording);
+        if (ImGui::Button(Iconed(icon::kOpen, Tr("Load")).c_str())) Queue("demo.load", path_args());
+        ImGui::EndDisabled();
+        if (!d.error.empty()) {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextColored(theme::kWarn, "%s", d.error.c_str());
+            ImGui::PopTextWrapPos();
+        }
+    });
+}
+
 void ImGuiLayer::DrawGainTuner() {
     RobotView& v = frame_.ui->robot;
     GainTuner& g = v.tuner;

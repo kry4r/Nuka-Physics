@@ -173,7 +173,8 @@ bool PhysicsWorker::Recorded(const TickCommand& cmd) {
         case CommandKind::ParamSet:
             return cmd.param == ParamKind::Field || cmd.param == ParamKind::HoldGains ||
                    cmd.param == ParamKind::ControllerCommand || cmd.param == ParamKind::Registry ||
-                   cmd.param == ParamKind::Iterations || cmd.param == ParamKind::TargetRamp;
+                   cmd.param == ParamKind::Iterations || cmd.param == ParamKind::TargetRamp ||
+                   cmd.param == ParamKind::TargetTrack;
         default:
             return false;
     }
@@ -284,6 +285,8 @@ void PhysicsWorker::Restore(const Keyframe& key) {
     cursor_ = key.log_pos;
     last_mirror_ = WorkerClock::time_point{};
     ResumeRamp();
+    ResumeTrack();
+    ResumeCommand();
     ApplyLogged();
 }
 
@@ -295,6 +298,29 @@ void PhysicsWorker::ResumeRamp() {
         const TickCommand& c = log[i].cmd;
         if (c.kind != CommandKind::ParamSet || c.param != ParamKind::TargetRamp) continue;
         if (log[i].tick + c.index > tick_) ramp_ = TargetRamp{log[i].tick, c.index, c.env, c.values};
+        return;
+    }
+}
+
+// The newest track the log applied before the playhead, when it still has rows to write.
+void PhysicsWorker::ResumeTrack() {
+    track_ = TargetTrack{};
+    const std::vector<LoggedInput>& log = Current().log;
+    for (size_t i = cursor_; i-- > 0u;) {
+        const TickCommand& c = log[i].cmd;
+        if (c.kind != CommandKind::ParamSet || c.param != ParamKind::TargetTrack) continue;
+        if (log[i].tick + c.index > tick_) track_ = TargetTrack{log[i].tick, c.index, c.element, c.env, c.values};
+        return;
+    }
+}
+
+// The newest controller command the log applied before the playhead; with none the current one stays.
+void PhysicsWorker::ResumeCommand() {
+    const std::vector<LoggedInput>& log = Current().log;
+    for (size_t i = cursor_; i-- > 0u;) {
+        const TickCommand& c = log[i].cmd;
+        if (c.kind != CommandKind::ParamSet || c.param != ParamKind::ControllerCommand) continue;
+        Apply(c);
         return;
     }
 }

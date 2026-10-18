@@ -90,6 +90,7 @@ const PanelSpec kPanels[] = {{"stage", "Stage", icon::kStage},       {"property"
                              {"joints", "Joints", icon::kJoint},
                              {"poses", "Poses", icon::kRobot},
                              {"policy", "Policy", icon::kBrain},
+                             {"demos", "Demos", icon::kRecord},
                              {"script", "Script", icon::kScript},    {"console", "Console", icon::kConsole},
                              {"nui", "UI Inspector", icon::kInspector}};
 
@@ -103,9 +104,11 @@ const LayoutPreset kLayouts[] = {
     {"authoring", "Authoring", {"stage", "file"}, {"property", "camera"},
      {"assets", "console", "script", "stats", "timeline"}},
     {"debug", "Debug", {"stage"}, {"solver", "debug", "stats", "property"}, {"console", "timeline", "script", "assets"}},
-    {"robot", "Robot", {"stage"}, {"joints", "poses", "policy", "property"}, {"console", "timeline", "stats", "assets"}},
+    {"robot", "Robot", {"stage"}, {"joints", "poses", "policy", "demos", "property"},
+     {"console", "timeline", "stats", "assets"}},
     {"data", "Data", {"file", "stage"}, {"stats", "camera", "property"}, {"assets", "console", "script", "timeline"}},
-    {"training", "Training", {"stats", "stage"}, {"policy", "joints", "camera"}, {"console", "script", "assets", "timeline"}},
+    {"training", "Training", {"stats", "stage"}, {"policy", "demos", "joints", "camera"},
+     {"console", "script", "assets", "timeline"}},
 };
 
 const LayoutPreset* FindLayout(std::string_view name) {
@@ -430,6 +433,7 @@ const std::vector<ImGuiLayer::BuiltinExtension>& ImGuiLayer::Builtins() {
         {"nuka.joints", "Joints", "Joint states, drive targets and gains, the fixed base and teleop.", {"joints"}},
         {"nuka.poses", "Poses", "Named joint poses: blend to one, start from it, import and export.", {"poses"}},
         {"nuka.policy", "Policy", "Load a locomotion policy, run or stop it and watch its actions.", {"policy"}},
+        {"nuka.demos", "Demos", "Record teleoperated demonstrations, replay them and save them as HDF5.", {"demos"}},
         {"nuka.script", "Script", "The Python script editor and the console.", {"script", "console"}},
         {"nuka.ui_inspector", "UI Inspector", "The nui component tree, for extension authors.", {"nui"}},
     };
@@ -442,6 +446,7 @@ void ImGuiLayer::AddBuiltinPanel(const std::string& panel_id) {
                                 &ImGuiLayer::BuildAssets, &ImGuiLayer::BuildStats,      &ImGuiLayer::BuildDebug,
                                 &ImGuiLayer::BuildSolver, &ImGuiLayer::BuildTimeline,   &ImGuiLayer::BuildCamera,
                                 &ImGuiLayer::BuildJoints, &ImGuiLayer::BuildPoses,      &ImGuiLayer::BuildPolicy,
+                                &ImGuiLayer::BuildDemos,
                                 &ImGuiLayer::BuildScript, &ImGuiLayer::BuildConsole,    &ImGuiLayer::BuildInspector};
     const size_t i = static_cast<size_t>(
         std::find_if(std::begin(kPanels), std::end(kPanels), [&](const PanelSpec& p) { return panel_id == p.id; }) -
@@ -587,6 +592,10 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
                                     std::pair{"robot.gain_clear", icon::kTrash}, std::pair{"robot.assembler", icon::kPlug},
                                     std::pair{"robot.reset_targets", icon::kReset}})
         registry.Decorate(id, glyph, false);
+    for (const auto& [id, glyph] : {std::pair{"demo.record", icon::kRecord}, std::pair{"demo.play", icon::kPlay},
+                                    std::pair{"demo.stop", icon::kStop}, std::pair{"demo.save", icon::kSave},
+                                    std::pair{"demo.load", icon::kOpen}, std::pair{"demo.discard", icon::kTrash}})
+        registry.Decorate(id, glyph, false);
     const std::pair<const char*, const char*> script_icons[] = {
         {"script.new", icon::kNew},   {"script.open", icon::kOpen},     {"script.save", icon::kSave},
         {"script.stop", icon::kStop}, {"script.toggle_rerun", icon::kRepeat}, {"script.eval", icon::kTerminal}};
@@ -603,7 +612,8 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
                            "view.views", "robot.joints", "robot.set_targets", "robot.samples", "robot.poses",
                            "robot.pose_apply", "robot.pose_initial", "robot.pose_rename", "robot.pose_remove",
                            "robot.gain_status", "robot.gain_runs", "robot.links", "robot.asset_links", "robot.attach",
-                           "robot.attach_asset", "robot.ik", "robot.ik_settings", "view.robot_overlays"})
+                           "robot.attach_asset", "robot.ik", "robot.ik_settings", "view.robot_overlays",
+                           "demo.episodes"})
         registry.Decorate(id, "", true);
     registry.Rebind("file.open", "Ctrl+O");
     registry.Rebind("file.save", "Ctrl+S");

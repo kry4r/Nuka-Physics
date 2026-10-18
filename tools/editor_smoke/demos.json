@@ -1,0 +1,51 @@
+{
+  "name": "demos",
+  "launch": [],
+  "steps": [
+    {"action": "file.open", "args": {"path": "${scenario_dir}/../../examples/assets/nuka_lab/stage.nks"}},
+    {"frames": 20},
+    {"python": "import builtins, struct, time, numpy as np\ndef frames(n):\n    for _ in range(n):\n        app.update(True)\ndef tick():\n    return app.actions.run('timeline.status')['tick']\ndef until_tick(n):\n    deadline = time.monotonic() + 60.0\n    while tick() != n:\n        assert time.monotonic() < deadline, (tick(), n)\n        app.update(True)\n    frames(3)\ndef step(n):\n    t = tick()\n    app.actions.run('sim.step', steps=n)\n    until_tick(t + n)\ndef reset():\n    app.actions.run('sim.reset')\n    until_tick(0)\ndef fails(action, text, **args):\n    from nuka.editor.app import ActionError\n    try:\n        app.actions.run(action, **args)\n    except ActionError as e:\n        assert text in str(e), (action, args, str(e))\n    else:\n        raise AssertionError((action, args))\nrng = np.random.default_rng(1)\ndims = [235, 32, 12]\nwith open('${out}/rand.bin', 'wb') as f:\n    f.write(struct.pack('<IIIff', 0x4E4B4D4C, 1, 235, 5.0, 1.0))\n    f.write(np.zeros(235, np.float32).tobytes() + np.ones(235, np.float32).tobytes())\n    f.write(struct.pack('<I', 2))\n    for l in range(2):\n        f.write(struct.pack('<III', dims[l], dims[l + 1], 1 - l))\n        f.write((rng.standard_normal((dims[l + 1], dims[l])) / np.sqrt(dims[l])).astype(np.float32).tobytes())\n        f.write((0.3 * rng.standard_normal(dims[l + 1])).astype(np.float32).tobytes())\nbuiltins.dm_frames, builtins.dm_tick, builtins.dm_until_tick = frames, tick, until_tick\nbuiltins.dm_step, builtins.dm_reset, builtins.dm_fails = step, reset, fails\ns = app.demos.episodes()\nassert not s['recording'] and s['playing'] == -1 and s['episodes'] == [], s\nfails('demo.record', '')\nfails('demo.play', '', episode=0)"},
+
+    {"action": "file.import", "args": {"path": "${scenario_dir}/../../examples/scenes/go2_float.usda", "mode": "add",
+     "name": "go2", "pose": {"pos": [0.0, 0.0, 0.6], "quat": [1.0, 0.0, 0.0, 0.0]}}, "bind": "go2"},
+    {"frames": 10},
+    {"action": "window.layout_robot"},
+    {"action": "view.frame_all"},
+    {"action": "robot.drive", "args": {"kp": 20.0}},
+    {"frames": 10},
+    {"action": "policy.load", "args": {"path": "${out}/rand.bin"}, "expect_value": {"loaded": true, "on": true}},
+    {"action": "teleop.pad", "args": {"attach": "Demo Pad"}, "bind": "pad"},
+    {"frames": 4},
+    {"action": "teleop.use", "args": {"on": true, "device": "${pad.id}", "mode": "command"}},
+    {"action": "teleop.pad", "args": {"id": "${pad.id}", "axes": {"lefty": -0.6, "rightx": 0.5}}},
+    {"frames": 6},
+
+    {"python": "import builtins\nf = builtins.dm_fails\nf('demo.play', '', episode=0)\nbuiltins.dm_reset()\ns = app.demos.record(True)\nassert s['recording'] and s['samples'] == 0 and s['episodes'] == [], s\nf('demo.load', 'stop the recording first', path='${out}/none.hdf5')\nbuiltins.dm_frames(4)\nbuiltins.dm_step(150)\nassert app.demos.episodes()['samples'] == 150\nbuiltins.dm_step(150)\ns = app.demos.record(False)\nprint('DEMO_EP0', s)\nassert not s['recording'] and s['samples'] == 0 and len(s['episodes']) == 1, s\ne = s['episodes'][0]\nassert e['env'] == 0 and e['start'] == 0 and e['steps'] == 300 and abs(e['seconds'] - 300 * app.world.dt) < 1e-6, e\nassert len(s['joints']) == 12 and 'lefty' in s['axes'] and 'rightx' in s['axes'], s\nf('demo.play', 'episode: 0 to 0', episode=5)\nf('demo.play', 'episode: 0 to 0', episode=-1)"},
+
+    {"python": "import builtins\nbuiltins.dm_reset()\napp.demos.record(True)\nbuiltins.dm_frames(4)\np = app.demos.play(0, play=False)\nassert p == {'episode': 0, 'env': 0, 'steps': 300}, p\nbuiltins.dm_frames(3)\ns = app.demos.episodes()\nassert s['playing'] == 0 and s['left'] == 300, s\nbuiltins.dm_step(150)\ns = app.demos.episodes()\nassert s['playing'] == 0 and s['left'] == 150, s\nbuiltins.dm_step(150)\ns = app.demos.record(False)\nprint('DEMO_EP1', s['playing'], s['left'], s['episodes'])\nassert s['playing'] == -1 and s['left'] == 0 and len(s['episodes']) == 2, s\nassert s['episodes'][1] == s['episodes'][0], s['episodes']"},
+
+    {"python": "import builtins\napp.actions.run('timeline.seek', tick=100)\nbuiltins.dm_until_tick(100)\ns = app.demos.episodes()\nprint('DEMO_SEEK', s['playing'], s['left'])\nassert s['left'] == 200, s\nst = app.actions.run('timeline.status')\nassert st['head'] == 300 and len(st['branches']) == 1, {k: v for k, v in st.items() if k != 'keys'}\napp.actions.run('timeline.seek', to='head')\nbuiltins.dm_until_tick(300)\nassert app.demos.episodes()['left'] == 0"},
+
+    {"action": "demo.save", "args": {"path": "${out}/demos.hdf5"}, "expect_value": {"episodes": 2, "steps": 600}},
+    {"python": "import json, h5py, numpy as np\nfrom nuka.editor import demos\nwith h5py.File('${out}/demos.hdf5', 'r') as f:\n    g = f['data']\n    assert int(g.attrs['total']) == 600 and sorted(g) == ['demo_0', 'demo_1'], list(g)\n    args = json.loads(g.attrs['env_args'])\n    d = g['demo_0']\n    assert int(d.attrs['num_samples']) == 300 and int(d.attrs['env']) == 0 and int(d.attrs['start_tick']) == 0, dict(d.attrs)\n    shapes = {k: d['obs'][k].shape for k in d['obs']}\n    print('DEMO_H5', args['scene'], args['dt'], args['joints'][:3], args['axes'], shapes, d['actions'].shape)\n    n = len(args['axes'])\n    assert d['actions'].shape == (300, 12), d['actions'].shape\n    assert shapes == {'q': (300, 12), 'qd': (300, 12), 'root_pose': (300, 1, 7), 'root_vel': (300, 1, 6),\n                      'command': (300, 3), 'axes': (300, n), 'time': (300,)}, shapes\n    assert len(args['joints']) == len(args['links']) == 12 and abs(args['dt'] - app.world.dt) < 1e-9, args\nr = demos.read('${out}/demos.hdf5')\na, b = r['demos']\nassert np.array_equal(a['actions'], b['actions']), np.abs(a['actions'] - b['actions']).max()\ndp = np.abs(a['obs']['root_pose'] - b['obs']['root_pose']).max()\ndq = np.abs(a['obs']['q'] - b['obs']['q']).max()\nmoved = np.linalg.norm(a['obs']['root_pose'][-1, 0, :3] - a['obs']['root_pose'][0, 0, :3])\nprint('DEMO_REPLAY', dp, dq, moved, a['obs']['root_pose'][-1, 0].tolist())\nassert dp < 1e-5 and dq < 1e-5 and moved > 1e-3, (dp, dq, moved)\nassert np.allclose(np.linalg.norm(a['obs']['root_pose'][:, 0, 3:], axis=1), 1.0, atol=1e-4)\nassert np.all(np.isfinite(a['obs']['root_vel'])) and np.abs(a['obs']['qd']).max() > 1e-3\ne, w = (0.6 - 0.1) / 0.9, -(0.5 - 0.1) / 0.9\nassert np.allclose(a['obs']['command'], [e, 0.0, w], atol=1e-3), a['obs']['command'][0]\nly, rx = r['axes'].index('lefty'), r['axes'].index('rightx')\nassert np.allclose(a['obs']['axes'][:, ly], -0.6, atol=1e-4) and np.allclose(a['obs']['axes'][:, rx], 0.5, atol=1e-4), a['obs']['axes'][0]\nassert np.allclose(a['obs']['time'], (np.arange(300) + 1) * app.world.dt, atol=1e-9), a['obs']['time'][:3]"},
+
+    {"python": "import builtins, json, shutil, h5py, numpy as np\nfrom nuka.editor import demos\nf = builtins.dm_fails\nf('demo.load', 'missing.hdf5', path='${out}/missing.hdf5')\nshutil.copy('${out}/demos.hdf5', '${out}/bad.hdf5')\nwith h5py.File('${out}/bad.hdf5', 'r+') as h5:\n    a = json.loads(h5['data'].attrs['env_args'])\n    a['joints'][0] = 'bogus_joint'\n    h5['data'].attrs['env_args'] = json.dumps(a)\nf('demo.load', 'drives joints the scene lacks: bogus_joint', path='${out}/bad.hdf5')\nassert len(app.demos.episodes()['episodes']) == 2\nassert len(app.demos.discard(1)['episodes']) == 1\nassert app.demos.discard()['episodes'] == []\nf('demo.save', '', path='${out}/none.hdf5')\ns = app.demos.load('${out}/demos.hdf5')\nassert len(s['episodes']) == 2 and s['path'].endswith('demos.hdf5') and s['episodes'][1]['steps'] == 300, s\napp.demos.save('${out}/demos2.hdf5')\na, b = demos.read('${out}/demos.hdf5'), demos.read('${out}/demos2.hdf5')\nassert {k: a[k] for k in ('scene', 'dt', 'joints', 'links', 'axes')} == {k: b[k] for k in ('scene', 'dt', 'joints', 'links', 'axes')}\nfor x, y in zip(a['demos'], b['demos']):\n    assert np.array_equal(x['actions'], y['actions']) and all(np.array_equal(x['obs'][k], y['obs'][k]) for k in x['obs'])"},
+
+    {"python": "import builtins\nbuiltins.dm_reset()\napp.demos.play(1, play=False)\nbuiltins.dm_step(120)\ns = app.demos.episodes()\nassert s['playing'] == 1 and s['left'] == 180, s"},
+    {"action": "window.maximize"},
+    {"action": "window.focus", "args": {"panel": "demos"}},
+    {"frames": 10},
+    {"screenshot": "00_demos"},
+    {"action": "demo.stop", "expect_value": {"playing": -1, "left": 0}},
+    {"python": "import builtins\nbuiltins.dm_step(10)\nassert app.demos.episodes()['left'] == 0"},
+
+    {"action": "policy.unload", "expect_value": {"loaded": false}},
+    {"action": "teleop.use", "args": {"on": false}},
+    {"action": "teleop.pad", "args": {"id": "${pad.id}", "detach": true}},
+    {"action": "window.restore"},
+    {"action": "file.close", "args": {"discard": true}},
+    {"frames": 4},
+    {"expect": {"loaded": false}},
+    {"action": "demo.episodes", "expect_value": {"recording": false, "playing": -1, "left": 0}}
+  ]
+}

@@ -196,5 +196,6 @@ inline constexpr const char kRuler[] = "\xEE\x9A\xB8";
 inline constexpr const char kOverlays[] = "\xEE\xB1\xBC";    // cube-transparent
 inline constexpr const char kGamepad[] = "\xEE\x89\xAE";     // game-controller
 inline constexpr const char kBrain[] = "\xEE\x9D\x8E";
+inline constexpr const char kRecord[] = "\xEE\x8F\xAE";
 
 }  // namespace nuka::render::imgui::icon

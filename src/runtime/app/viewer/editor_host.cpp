@@ -906,6 +906,7 @@ struct EditorHost::State : DocumentHost {
     void RegisterOverlayActions();
     void RegisterTeleopActions();
     void RegisterPolicyActions();
+    void RegisterDemoActions();
     json::Value TimelineStatus();
     // What a recording must match to load: the document, the world's counts and step, and the
     // names of the link and body rows its poses fill.
@@ -1070,6 +1071,15 @@ struct EditorHost::State : DocumentHost {
     // The shown robots' action norm at a new tick, read back from the drive targets the policy wrote.
     void RecordPolicyNorm(const Snapshot& snap);
     json::Value PolicyStatus();
+    // Ends the demonstration recording; each environment's consecutive steps become an episode.
+    void StopDemo();
+    // Ends a replay; the drive targets keep its last row.
+    void StopReplay();
+    void SyncDemoView();
+    json::Value DemoStatus() const;
+    // Runs nuka.editor.demos.`fn` between the HDF5 file at `path` and the exchange files in the
+    // cache; returns why it failed, empty when it ran.
+    std::string RunDemoExchange(const char* fn, const std::string& path);
     void TakeWorkerResults();
     void PushTransport();
     void PushPoseWrites();
@@ -1100,6 +1110,10 @@ struct EditorHost::State : DocumentHost {
     std::unique_ptr<inference::Go2PolicyController> policy_ctrl_;
     bool policy_on_ = true;      // a loaded policy steps; off, its drive targets hold
     uint64_t policy_tick_ = 0u;  // the tick RecordPolicyNorm last read
+    DemoSet demos_;              // the demonstrations recorded or loaded
+    bool demo_recording_ = false;
+    std::vector<float> demo_axes_;  // the teleop axes last sent while recording, by the set's names
+    uint64_t demo_play_seq_ = 0u;   // the replay's track command
     std::unique_ptr<EditorScene> loaded_;
     bool attach_pending_ = false;
     EntityDrag entity_drag_;
@@ -1283,7 +1297,8 @@ struct EditorHost::State : DocumentHost {
     std::vector<float> virtual_axes_ = std::vector<float>(kPadAxes.size(), 0.0f);
     std::vector<uint8_t> virtual_buttons_ = std::vector<uint8_t>(kPadButtons.size(), 0u);
     bool teleop_hold_prev_ = false;
-    bool teleop_command_prev_ = false;      // the command mode drove the controller last frame
+    // The command last sent to the controller; none makes the next frame send it.
+    std::optional<std::array<float, 3>> teleop_command_sent_;
     float teleop_press_[2] = {0.0f, 0.0f};  // last frame's next and prev, so a press steps once
     // The ik mode's link, its pose when teleop took it and the pinned links' poses then.
     int teleop_ik_link_ = -1;
@@ -1873,6 +1888,15 @@ void EditorHost::State::BindWorker(uint64_t tick, double sim_time) {
     sent_colliders_ = binding.colliders;
     sent_contacts_ = binding.contacts;
     sent_static_revision_ = loaded_->sim->StaticRevision();
+    // A rebuild ends a demonstration recording and replay; what it recorded stays.
+    if (demo_recording_) {
+        CutEpisodes(worker_.TakeDemo(), &demos_);
+        demo_recording_ = false;
+        SyncDemoView();
+    }
+    ui_state_.demos.playing = -1;
+    ui_state_.demos.left = 0u;
+    teleop_command_sent_.reset();
     bound_epoch_ = worker_.Bind(std::move(binding));
     ui_state_.robot.ik.pending = 0u;
     ui_state_.robot.ik.link = -1;
@@ -1898,6 +1922,12 @@ void EditorHost::State::ApplySnapshot(const Snapshot& snap) {
     if (!snap.particles.empty()) loaded_->sim->ApplyParticles(snap.particles, snap.heat, ui_state_.solver.alert);
     ui_state_.robot.live = snap.joints;
     RecordPolicyNorm(snap);
+    DemoView& demo = ui_state_.demos;
+    demo.samples = worker_.DemoCount();
+    if (snap.acked >= demo_play_seq_) {
+        demo.left = snap.track_left;
+        if (demo.left == 0u) demo.playing = -1;
+    }
     ui_state_.robot.link_poses = snap.link_poses;
     // A spring draws as a band to its target, a plain force as an arrow along it.
     for (const Perturbation& p : snap.perturbs) {
@@ -2158,17 +2188,28 @@ bool EditorHost::State::StepTeleop(double dt) {
     const float step = static_cast<float>(dt);
     t.error.clear();
 
-    // A command consumer gets the command every frame, and one zero once the mode stops.
+    // A command consumer gets the command when it changes, so an unchanged one logs nothing; off, it is zero.
     const bool cmd_ctrl = loaded_ && policy_ctrl_ && policy_on_ && policy_ctrl_->AcceptsCommand();
     t.controller = cmd_ctrl;
     const bool command = live && t.mode == "command";
     const float drive[3] = {q("vx"), q("vy"), q("wyaw")};
     for (int k = 0; k < 3; ++k) t.command[k] = command ? t.command_base[k] + drive[k] : 0.0f;
-    if (cmd_ctrl && (command || teleop_command_prev_)) {
+    const std::array<float, 3> sent = {t.command[0], t.command[1], t.command[2]};
+    if (cmd_ctrl && teleop_command_sent_ != sent) {
         worker_.Push(TickCommand::Param(ParamKind::ControllerCommand, {t.command[0], t.command[1], t.command[2]}));
         std::copy(t.command, t.command + 3, ui_state_.policy.command);
+        teleop_command_sent_ = sent;
     }
-    teleop_command_prev_ = command;
+    // A demonstration records the device's axes under the names its set keeps.
+    if (demo_recording_) {
+        std::vector<float> axes(demos_.axes.size(), 0.0f);
+        for (size_t a = 0; a < axes.size(); ++a) {
+            const auto at = std::find(device.axes.begin(), device.axes.end(), demos_.axes[a]);
+            if (at != device.axes.end()) axes[a] = t.axes[static_cast<size_t>(at - device.axes.begin())];
+        }
+        if (axes != demo_axes_) worker_.Push(TickCommand::Param(ParamKind::TeleopAxes, axes));
+        demo_axes_ = std::move(axes);
+    }
     // PD hold's rising edge makes the drive targets act without a policy.
     const bool hold = live && t.hold && !(command && cmd_ctrl);
     if (hold && !teleop_hold_prev_) worker_.Push(TickCommand::Param(ParamKind::HoldGains, {t.kp, t.kd}));
@@ -3298,6 +3339,7 @@ void EditorHost::State::RegisterRobotActions() {
     RegisterOverlayActions();
     RegisterTeleopActions();
     RegisterPolicyActions();
+    RegisterDemoActions();
 }
 
 void EditorHost::State::RegisterIkActions() {
@@ -3596,7 +3638,7 @@ void EditorHost::State::RegisterPolicyActions() {
                           SyncPolicyView();
                       });
                       ui_state_.policy.error.clear();
-                      teleop_command_prev_ = true;  // the next frame sends teleop's command, zero while it is off
+                      teleop_command_sent_.reset();  // the next frame sends teleop's command, zero while it is off
                       Emit(stdout, Format("[nuka_editor] policy attached: %s  path=%s\n", path.c_str(),
                                           policy_ctrl_->UsingGpu() ? "GPU" : "host"));
                       return Ok(PolicyStatus());
@@ -3620,12 +3662,164 @@ void EditorHost::State::RegisterPolicyActions() {
                       policy_on_ = BoolArg(args, "on", args.Items().empty() ? !policy_on_ : policy_on_);
                       worker_.Exclusive([&] { worker_.SetController(policy_on_ ? policy_ctrl_.get() : nullptr); });
                       ui_state_.policy.on = policy_on_;
-                      teleop_command_prev_ = true;
+                      teleop_command_sent_.reset();
                       return Ok(PolicyStatus());
                   }});
     // The loaded policy, its contract, the joints it drives and the command it reads.
     actions_.Add({"policy.status", "Policy Status", "robot", "", ShortcutScope::Global, {}, {},
                   [this](const json::Value&) { return Ok(PolicyStatus()); }});
+}
+
+void EditorHost::State::RegisterDemoActions() {
+    const auto has_robot = [this] { return loaded_ != nullptr && !ui_state_.robot.joints.empty(); };
+    const auto has_demos = [this] { return !demos_.episodes.empty(); };
+    const auto episode_arg = [this](const json::Value& args, size_t* k) {
+        const double i = NumArg(args, "episode", static_cast<double>(ui_state_.demos.selected));
+        if (i < 0.0 || i >= static_cast<double>(demos_.episodes.size())) return false;
+        *k = static_cast<size_t>(i);
+        return true;
+    };
+    // Records the shown environment, with `all` every displayed one, each step at the head; the
+    // stop cuts each environment's consecutive steps into an episode. Bare, it toggles.
+    actions_.Add({"demo.record", "Record Demonstration", "robot", "", ShortcutScope::Global, has_robot,
+                  [this] { return demo_recording_; },
+                  [this](const json::Value& args) {
+                      const bool on = BoolArg(args, "on", !demo_recording_);
+                      if (on == demo_recording_) return Ok(DemoStatus());
+                      if (!on) {
+                          StopDemo();
+                          return Ok(DemoStatus());
+                      }
+                      if (loaded_ == nullptr || ui_state_.robot.joints.empty())
+                          return ActionResult::Fail("the scene has no robot joints to record");
+                      DemoView& d = ui_state_.demos;
+                      d.all = BoolArg(args, "all", d.all);
+                      const uint32_t env = ui_state_.env_index % loaded_->Layout().env_count;
+                      std::vector<uint32_t> envs = {env};
+                      if (d.all)
+                          for (const uint32_t e : OtherShownEnvs(env)) envs.push_back(e);
+                      // A new set takes the scene's joints and the device's axes; later episodes keep them.
+                      if (demos_.episodes.empty()) {
+                          const TeleopView& t = ui_state_.teleop;
+                          const auto device = std::find_if(t.devices.begin(), t.devices.end(),
+                                                           [&](const TeleopDeviceInfo& i) { return i.id == t.device; });
+                          demos_ = DemoSet{};
+                          demos_.scene = doc_path_;
+                          demos_.dt = opt_.dt;
+                          for (const RobotJoint& j : ui_state_.robot.joints) {
+                              demos_.joints.push_back(j.name);
+                              demos_.links.push_back(j.link);
+                          }
+                          demos_.axes = device != t.devices.end() ? device->axes : kPadAxes;
+                      }
+                      demo_axes_.clear();
+                      worker_.Exclusive([&] { worker_.RecordDemo(std::move(envs)); });
+                      demo_recording_ = true;
+                      SyncDemoView();
+                      return Ok(DemoStatus());
+                  }});
+    // The episodes, the recording and the replay in progress.
+    actions_.Add({"demo.episodes", "Demonstrations", "robot", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value&) { return Ok(DemoStatus()); }});
+    // Writes an episode's recorded drive targets into its environment a row a step from the state
+    // now, the controller waiting meanwhile; `play` (the default) starts the transport.
+    actions_.Add({"demo.play", "Replay Demonstration", "robot", "", ShortcutScope::Global, has_demos, {},
+                  [this, episode_arg](const json::Value& args) {
+                      size_t k = 0u;
+                      if (!episode_arg(args, &k))
+                          return ActionResult::Fail(Format("episode: 0 to %zu", demos_.episodes.size() - 1u));
+                      const DemoEpisode& e = demos_.episodes[k];
+                      if (e.env >= loaded_->Layout().env_count)
+                          return ActionResult::Fail(Format("episode %zu drove environment %u; the scene has %u", k, e.env,
+                                                           loaded_->Layout().env_count));
+                      std::vector<float> values;
+                      for (const uint32_t link : demos_.links) values.push_back(static_cast<float>(link));
+                      values.insert(values.end(), e.action.begin(), e.action.end());
+                      TickCommand cmd = TickCommand::Param(ParamKind::TargetTrack, std::move(values));
+                      cmd.index = static_cast<uint32_t>(e.Steps());
+                      cmd.element = static_cast<uint32_t>(demos_.links.size());
+                      cmd.env = e.env;
+                      demo_play_seq_ = worker_.Push(std::move(cmd));
+                      ui_state_.demos.playing = static_cast<int>(k);
+                      ui_state_.demos.left = static_cast<uint32_t>(e.Steps());
+                      if (BoolArg(args, "play", true)) ui_state_.playing = true;
+                      return Ok(Object({{"episode", json::Value::Int(static_cast<int64_t>(k))},
+                                        {"env", json::Value::Int(e.env)},
+                                        {"steps", json::Value::Int(static_cast<int64_t>(e.Steps()))}}));
+                  }});
+    actions_.Add({"demo.stop", "Stop Replay", "robot", "", ShortcutScope::Global,
+                  [this] { return ui_state_.demos.playing >= 0; }, {},
+                  [this](const json::Value&) {
+                      StopReplay();
+                      return Ok(DemoStatus());
+                  }});
+    // The episodes as robomimic-style HDF5 through nuka.editor.demos; the dialog asks without `path`.
+    actions_.Add({"demo.save", "Save Demonstrations...", "robot", "", ShortcutScope::Global, has_demos, {},
+                  [this](const json::Value& args) {
+                      if (demos_.episodes.empty()) return ActionResult::Fail("no demonstrations are recorded");
+                      std::string path = StrArg(args, "path");
+                      if (path.empty())
+                          path = SaveFileDialog(nui::Tr("Save Demonstrations"), nui::Tr("HDF5 demonstrations"), "*.hdf5;*.h5",
+                                                "demos.hdf5");
+                      if (path.empty()) return ActionResult::Fail("no demonstration file chosen");
+                      WriteDemoExchange(demos_, cache_.File("demos.json"), cache_.File("demos.bin"));
+                      ui_state_.demos.error = RunDemoExchange("_save", path);
+                      if (!ui_state_.demos.error.empty()) return ActionResult::Fail(ui_state_.demos.error);
+                      size_t steps = 0u;
+                      for (const DemoEpisode& e : demos_.episodes) steps += e.Steps();
+                      ui_.Nui().Toast(nui::Level::Ok, std::string(nui::Tr("Demonstrations saved")) + " " + FileName(path));
+                      return Ok(Object({{"path", json::Value::Str(path)},
+                                        {"episodes", json::Value::Int(static_cast<int64_t>(demos_.episodes.size()))},
+                                        {"steps", json::Value::Int(static_cast<int64_t>(steps))}}));
+                  }});
+    // Replaces the episodes with a file's, its joints matched by name to the scene's.
+    actions_.Add({"demo.load", "Load Demonstrations...", "robot", "", ShortcutScope::Global, has_robot, {},
+                  [this](const json::Value& args) {
+                      if (demo_recording_) return ActionResult::Fail("stop the recording first");
+                      std::string path = StrArg(args, "path");
+                      if (path.empty())
+                          path = OpenFileDialog(nui::Tr("Load Demonstrations"), nui::Tr("HDF5 demonstrations"), "*.hdf5;*.h5");
+                      if (path.empty()) return ActionResult::Fail("no demonstration file chosen");
+                      DemoView& d = ui_state_.demos;
+                      d.error = RunDemoExchange("_load", path);
+                      if (!d.error.empty()) return ActionResult::Fail(d.error);
+                      DemoSet set = ReadDemoExchange(cache_.File("demos.json"), cache_.File("demos.bin"));
+                      std::string missing;
+                      for (size_t i = 0; i < set.joints.size(); ++i) {
+                          const int j = FindJoint(ui_state_.robot.joints, set.joints[i]);
+                          if (j >= 0)
+                              set.links[i] = ui_state_.robot.joints[static_cast<size_t>(j)].link;
+                          else
+                              missing += (missing.empty() ? "" : ", ") + set.joints[i];
+                      }
+                      if (!missing.empty()) {
+                          d.error = "'" + FileName(path) + "' drives joints the scene lacks: " + missing;
+                          return ActionResult::Fail(d.error);
+                      }
+                      demos_ = std::move(set);
+                      if (d.playing >= 0) StopReplay();
+                      d.selected = demos_.episodes.empty() ? -1 : 0;
+                      SyncDemoView();
+                      ui_.Nui().Toast(nui::Level::Ok, std::string(nui::Tr("Demonstrations loaded")) + " " + FileName(path));
+                      json::Value v = DemoStatus();
+                      v.Set("path", json::Value::Str(path));
+                      return Ok(std::move(v));
+                  }});
+    // Drops episode `episode`, without it all of them.
+    actions_.Add({"demo.discard", "Discard Demonstrations", "robot", "", ShortcutScope::Global, has_demos, {},
+                  [this, episode_arg](const json::Value& args) {
+                      size_t k = 0u;
+                      if (args.Find("episode") == nullptr) {
+                          demos_.episodes.clear();
+                      } else if (episode_arg(args, &k)) {
+                          demos_.episodes.erase(demos_.episodes.begin() + static_cast<std::ptrdiff_t>(k));
+                      } else {
+                          return ActionResult::Fail(Format("episode: 0 to %zu", demos_.episodes.size() - 1u));
+                      }
+                      if (ui_state_.demos.playing >= 0) StopReplay();
+                      SyncDemoView();
+                      return Ok(DemoStatus());
+                  }});
 }
 
 void EditorHost::State::RegisterOverlayActions() {
@@ -4901,6 +5095,8 @@ void EditorHost::State::RegisterSimActions() {
                       }
                       reset_seq_ = transport_seq_ = worker_.Push(TickCommand::Transport(TransportOp::Reset));
                       reset_framing_ = true;
+                      // The new history logs the command from its first tick.
+                      teleop_command_sent_.reset();
                       ui_state_.playing = sent_playing_ = false;
                       return Ok();
                   }});
@@ -6053,6 +6249,69 @@ json::Value EditorHost::State::PolicyStatus() {
     return v;
 }
 
+void EditorHost::State::StopDemo() {
+    std::vector<DemoSample> samples;
+    worker_.Exclusive([&] {
+        worker_.RecordDemo({});
+        samples = worker_.TakeDemo();
+    });
+    CutEpisodes(samples, &demos_);
+    demo_recording_ = false;
+    ui_state_.demos.selected = static_cast<int>(demos_.episodes.size()) - 1;
+    SyncDemoView();
+}
+
+void EditorHost::State::StopReplay() {
+    demo_play_seq_ = worker_.Push(TickCommand::Param(ParamKind::TargetTrack, {}));
+    ui_state_.demos.playing = -1;
+    ui_state_.demos.left = 0u;
+}
+
+void EditorHost::State::SyncDemoView() {
+    DemoView& d = ui_state_.demos;
+    d.recording = demo_recording_;
+    d.episodes.clear();
+    for (const DemoEpisode& e : demos_.episodes)
+        d.episodes.push_back(DemoView::Episode{e.env, e.Steps(), static_cast<double>(e.Steps()) * demos_.dt});
+    d.selected = std::min(d.selected, static_cast<int>(d.episodes.size()) - 1);
+}
+
+json::Value EditorHost::State::DemoStatus() const {
+    const DemoView& d = ui_state_.demos;
+    json::Value episodes = json::Value::Array();
+    for (const DemoEpisode& e : demos_.episodes)
+        episodes.PushBack(Object({{"env", json::Value::Int(e.env)},
+                                  {"start", json::Value::Int(static_cast<int64_t>(e.start))},
+                                  {"steps", json::Value::Int(static_cast<int64_t>(e.Steps()))},
+                                  {"seconds", json::Value::Float(static_cast<double>(e.Steps()) * demos_.dt)}}));
+    json::Value joints = json::Value::Array(), axes = json::Value::Array();
+    for (const std::string& j : demos_.joints) joints.PushBack(json::Value::Str(j));
+    for (const std::string& a : demos_.axes) axes.PushBack(json::Value::Str(a));
+    return Object({{"recording", json::Value::Bool(demo_recording_)},
+                   {"samples", json::Value::Int(static_cast<int64_t>(worker_.DemoCount()))},
+                   {"playing", json::Value::Int(d.playing)},
+                   {"left", json::Value::Int(d.left)},
+                   {"joints", std::move(joints)},
+                   {"axes", std::move(axes)},
+                   {"episodes", std::move(episodes)}});
+}
+
+std::string EditorHost::State::RunDemoExchange(const char* fn, const std::string& path) {
+    if (!script_host_.Valid()) return "demonstration files need the editor's Python";
+    const auto literal = [](const std::string& s) { return json::Value::Str(s).Dump(0); };
+    const std::string code = std::string("import nuka.editor.demos\nnuka.editor.demos.") + fn + "(" + literal(path) +
+                             ", " + literal(cache_.File("demos.json")) + ", " + literal(cache_.File("demos.bin")) + ")\n";
+    bool failed = false;
+    const std::string text = script_host_.RunString(code, "<demos>", false, &failed);
+    if (!failed) return std::string();
+    // A traceback ends with the exception.
+    const size_t end = text.find_last_not_of("\r\n");
+    if (end == std::string::npos) return "nuka.editor.demos failed";
+    const size_t nl = text.find_last_of('\n', end);
+    const size_t begin = nl == std::string::npos ? 0u : nl + 1u;
+    return text.substr(begin, end + 1u - begin);
+}
+
 // Drops the scene binding; the world stays until the editor is destroyed.
 void EditorHost::State::ApplyUnload() {
     present_->WaitIdle();
@@ -6063,6 +6322,10 @@ void EditorHost::State::ApplyUnload() {
     reset_framing_ = false;
     policy_ctrl_.reset();
     SyncPolicyView();
+    demos_ = DemoSet{};
+    demo_recording_ = false;
+    worker_.TakeDemo();
+    SyncDemoView();
     entity_drag_.Cancel();
     loaded_.reset();
     hidden_meshes_.clear();

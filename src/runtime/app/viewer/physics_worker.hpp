@@ -7,6 +7,7 @@
 #include "nuka/nuka.h"
 #include "render/render_world.hpp"
 #include "runtime/app/viewer/debug_overlay.hpp"
+#include "runtime/app/viewer/demos.hpp"
 #include "runtime/app/viewer/editor_world.hpp"
 #include "runtime/app/viewer/pose_scatter.hpp"
 #include "runtime/app/viewer/robot_view.hpp"
@@ -39,7 +40,7 @@ enum class CommandKind : uint8_t {
 };
 enum class ParamKind : uint8_t {
     Field, HoldGains, ControllerCommand, DisplayEnv, ScatterRows, Overlay, Registry, Telemetry, Iterations, Heatmap,
-    JointWatch, TargetRamp
+    JointWatch, TargetRamp, TargetTrack, TeleopAxes
 };
 enum class TransportOp : uint8_t { Play, Pause, Step, Speed, Reset };
 enum class TimelineOp : uint8_t { Seek, Fork, Branch, Rename, Ghost, Configure, Clear };
@@ -74,14 +75,16 @@ struct TickCommand {
     ParamKind param = ParamKind::Field;   // ParamSet
     nuka_state_field_t field = NUKA_FIELD_DRIVE_TARGET;
     size_t offset = 0u;                   // bytes into the field
-    uint32_t index = 0u;                  // Registry parameter; TargetRamp: its length in steps; GainTest: the link
-    uint32_t element = 0u;                // Registry element
+    // Registry parameter; TargetRamp: its length in steps; TargetTrack: its rows; GainTest: the link.
+    uint32_t index = 0u;
+    uint32_t element = 0u;                // Registry element; TargetTrack: the links of a row
     // Field values, gains (kp, kd), command, overlay flags, registry value, telemetry (mask, alert),
     // sweep budget, heatmap or joint watch flag, ghost flag, the keyframe interval and budget [MB],
-    // a target ramp's (link, from, to) triples, the worker stamping `from`, or a gain test's
-    // (sine, amplitude, frequency, duration).
+    // a target ramp's (link, from, to) triples, the worker stamping `from`, a target track's links
+    // then its rows, the teleop axes, or a gain test's (sine, amplitude, frequency, duration).
     std::vector<float> values;
-    uint32_t env = 0u;                    // DisplayEnv; the worker stamps pose writes with the shown one
+    // DisplayEnv, TargetTrack; the worker stamps pose writes with the shown one.
+    uint32_t env = 0u;
     std::vector<ScatterRow> rows;         // ScatterRows
     Perturbation perturb;                 // Perturb
     TransportOp op = TransportOp::Pause;  // Transport
@@ -231,6 +234,7 @@ struct Snapshot {
     std::vector<Perturbation> perturbs;  // the loads held on it
     OverlayData overlay;
     WorkerTelemetry telemetry;
+    uint32_t track_left = 0u;  // the steps the target track still drives
     uint32_t branch = 0u;  // the history branch the playhead is on
     uint64_t head = 0u;    // its newest recorded tick
     // The ghost branch's poses at this tick; empty while it matches or has none.
@@ -320,6 +324,12 @@ public:
     void Unbind();
     // Exclusive sections only. The controller run before each step from now on; null runs none.
     void SetController(inference::WorldController* controller) { bind_.controller = controller; }
+    // Exclusive sections only. Each step at the head from now on records environments `envs`
+    // for a demonstration; empty stops. TakeDemo moves out what was recorded.
+    void RecordDemo(std::vector<uint32_t> envs);
+    std::vector<DemoSample> TakeDemo();
+    // The samples waiting for TakeDemo; readable from any thread.
+    uint64_t DemoCount() const { return demo_count_.load(std::memory_order_relaxed); }
     // Exclusive sections only. Writes the current branch's line of history to `path` after
     // `manifest`, which comes back with the history's own fields; keyframes pass through `scratch`.
     scene::json::Value SaveHistory(const std::string& path, scene::json::Value manifest, const std::string& scratch);
@@ -364,6 +374,8 @@ private:
     void StampRamp(TickCommand& cmd);
     void StartRamp(const TickCommand& cmd, uint64_t start);
     void WriteRamp();
+    void WriteTrack();
+    void SampleDemo();
     void RunGainTest(const TickCommand& cmd);
     void SolveIk(const TickCommand& cmd);
     void SampleJoints();
@@ -387,6 +399,8 @@ private:
     void SeekTo(uint64_t target);
     void Restore(const Keyframe& key);
     void ResumeRamp();
+    void ResumeTrack();
+    void ResumeCommand();
     void ApplyLogged(size_t limit = ~size_t(0));
     bool Matches(nuka_checkpoint_handle state);
     void ApplyTimeline(const TickCommand& cmd);
@@ -439,6 +453,24 @@ private:
         std::vector<float> values;
     };
     TargetRamp ramp_;
+    // Rows of environment `env`'s drive targets, one per step from tick `start`, written in place
+    // of the controller; empty `values` is none.
+    struct TargetTrack {
+        uint64_t start = 0u;
+        uint32_t rows = 0u;
+        uint32_t columns = 0u;  // the links of a row, the first `columns` values
+        uint32_t env = 0u;
+        std::vector<float> values;
+    };
+    TargetTrack track_;
+    std::vector<float> track_scratch_;
+    // The controller command and teleop axes in force, which demonstrations record.
+    std::array<float, 3> command_{};
+    std::vector<float> axes_;
+    std::vector<uint32_t> demo_envs_;
+    std::vector<uint32_t> demo_roots_;
+    std::vector<DemoSample> demo_;
+    std::atomic<uint64_t> demo_count_{0u};
     uint64_t timeline_value_ = 0u;
     uint64_t sequence_ = 0u;
     WorkerClock::time_point last_publish_{};

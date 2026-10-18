@@ -294,6 +294,41 @@ class Policy:
         return self._app.actions.run("policy.status")
 
 
+class Demos:
+    """Teleoperated demonstrations through the ``demo.*`` actions; files are robomimic-style HDF5,
+    which ``nuka.editor.demos.read`` opens outside the editor."""
+
+    def __init__(self, app: "EditorApp"):
+        self._app = weakref.proxy(app)
+
+    def record(self, on: Optional[bool] = None, all: Optional[bool] = None) -> dict:
+        """Start or stop recording; ``all`` records every displayed environment. Bare, it toggles."""
+        args = {k: v for k, v in (("on", on), ("all", all)) if v is not None}
+        return self._app.actions.run("demo.record", **args)
+
+    def episodes(self) -> dict:
+        """The recording, the replay in progress and the episodes."""
+        return self._app.actions.run("demo.episodes")
+
+    def play(self, episode: int, play: bool = True) -> dict:
+        """Replay an episode's drive targets from the state now; ``play`` starts the transport."""
+        return self._app.actions.run("demo.play", episode=episode, play=play)
+
+    def stop(self) -> dict:
+        return self._app.actions.run("demo.stop")
+
+    def save(self, path: str) -> dict:
+        return self._app.actions.run("demo.save", path=path)
+
+    def load(self, path: str) -> dict:
+        """Replace the episodes with the file's; its joints must exist in the scene."""
+        return self._app.actions.run("demo.load", path=path)
+
+    def discard(self, episode: Optional[int] = None) -> dict:
+        """Drop one episode, without ``episode`` all of them."""
+        return self._app.actions.run("demo.discard", **({} if episode is None else {"episode": episode}))
+
+
 class EditorApp:
     """The editor over a world: a window, or a display-less surface with ``--offscreen``.
 
@@ -322,6 +357,7 @@ class EditorApp:
         self.actions = Actions(self)
         self.teleop = Teleop(self)
         self.policy = Policy(self)
+        self.demos = Demos(self)
         self.ui = UI(weakref.proxy(self))
         atexit.register(self.close)
 

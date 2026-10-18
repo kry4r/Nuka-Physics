@@ -207,6 +207,10 @@ uint64_t PhysicsWorker::Bind(WorkerBinding binding) {
     clock_reset_ = true;
     perturbs_.clear();
     ramp_ = TargetRamp{};
+    track_ = TargetTrack{};
+    command_ = {};
+    axes_.clear();
+    demo_envs_.clear();
     timeline_value_ = 0u;
     last_mirror_ = WorkerClock::time_point{};
     telemetry_ = WorkerTelemetry{};
@@ -238,6 +242,8 @@ void PhysicsWorker::Unbind() {
     step_budget_ = 0u;
     perturbs_.clear();
     ramp_ = TargetRamp{};
+    track_ = TargetTrack{};
+    demo_envs_.clear();
     branches_.clear();
 }
 
@@ -416,6 +422,7 @@ bool PhysicsWorker::Apply(const TickCommand& cmd) {
                     ApplyHoldGains(bind_.world, bind_.layout, cmd.values[0], cmd.values[1]);
                     return false;
                 case ParamKind::ControllerCommand:
+                    std::copy_n(cmd.values.begin(), std::min(cmd.values.size(), command_.size()), command_.begin());
                     if (bind_.controller != nullptr)
                         bind_.controller->SetCommandVector(cmd.values.data(), static_cast<uint32_t>(cmd.values.size()));
                     return false;
@@ -481,6 +488,14 @@ bool PhysicsWorker::Apply(const TickCommand& cmd) {
                 case ParamKind::TargetRamp:
                     StartRamp(cmd, tick_);
                     return true;
+                case ParamKind::TargetTrack:
+                    // A track of no rows stops the one driving.
+                    track_ = cmd.index == 0u ? TargetTrack{}
+                                             : TargetTrack{tick_, cmd.index, cmd.element, cmd.env, cmd.values};
+                    return true;
+                case ParamKind::TeleopAxes:
+                    axes_ = cmd.values;
+                    return false;
             }
             return false;
         case CommandKind::Perturb:
@@ -520,6 +535,7 @@ bool PhysicsWorker::Apply(const TickCommand& cmd) {
                     step_budget_ = 0u;
                     perturbs_.clear();
                     ramp_ = TargetRamp{};
+                    track_ = TargetTrack{};
                     last_mirror_ = WorkerClock::time_point{};
                     Report(cmd.seq, scripts_->DispatchReset());
                     ResetHistory();
@@ -638,13 +654,17 @@ bool PhysicsWorker::StepOnce() {
     }
     WritePerturbations();
     if (!ramp_.values.empty()) WriteRamp();
-    if (bind_.controller != nullptr) bind_.controller->OnStep(bind_.world, bind_.env);
+    // A target track drives in place of the controller.
+    const bool tracking = !track_.values.empty();
+    if (tracking) WriteTrack();
+    if (bind_.controller != nullptr && !tracking) bind_.controller->OnStep(bind_.world, bind_.env);
     const bool healthy = nuka_world_step(bind_.world) == NUKA_RESULT_OK;
     SetTick(tick_ + 1u);
     sim_time_ += static_cast<double>(bind_.dt);
     if (watch_ && bind_.layout.links_per_env != 0u) SampleJoints();
     HistoryBranch& b = Current();
     if (recording) {
+        if (!demo_envs_.empty()) SampleDemo();
         b.head = tick_;
         return healthy;
     }
@@ -756,6 +776,49 @@ void PhysicsWorker::WriteRamp() {
                     "upload drive target");
     }
     if (alpha >= 1.0f) ramp_ = TargetRamp{};
+}
+
+// The track's row for the step from the current tick; the last row ends the track.
+void PhysicsWorker::WriteTrack() {
+    const uint64_t row = tick_ - track_.start;
+    const size_t links = bind_.layout.links_per_env, offset = static_cast<size_t>(track_.env) * links * sizeof(float);
+    track_scratch_.resize(links);
+    CheckResult(nuka_world_download_field(bind_.world, NUKA_FIELD_DRIVE_TARGET, track_scratch_.data(),
+                                          links * sizeof(float), offset),
+                "nuka_world_download_field");
+    const float* values = track_.values.data() + track_.columns * (row + 1u);
+    for (uint32_t c = 0; c < track_.columns; ++c) track_scratch_[static_cast<size_t>(track_.values[c])] = values[c];
+    CheckResult(nuka_world_upload_field(bind_.world, NUKA_FIELD_DRIVE_TARGET, track_scratch_.data(), links * sizeof(float),
+                                        offset),
+                "upload drive target");
+    if (row + 1u >= track_.rows) track_ = TargetTrack{};
+}
+
+void PhysicsWorker::RecordDemo(std::vector<uint32_t> envs) {
+    demo_envs_ = std::move(envs);
+    axes_.clear();
+    demo_roots_.clear();
+    for (uint32_t i = 0; i < bind_.layout.links_per_env; ++i)
+        if (bind_.layout.links[i].is_root != 0u) demo_roots_.push_back(i);
+}
+
+std::vector<DemoSample> PhysicsWorker::TakeDemo() {
+    std::vector<DemoSample> out;
+    out.swap(demo_);
+    demo_count_.store(0u, std::memory_order_relaxed);
+    return out;
+}
+
+void PhysicsWorker::SampleDemo() {
+    for (const uint32_t env : demo_envs_) {
+        DemoSample& s = demo_.emplace_back();
+        s.tick = tick_;
+        s.time = sim_time_;
+        DownloadDemoSample(bind_.world, bind_.layout, env, demo_roots_, &s);
+        s.command = command_;
+        s.axes = axes_;
+    }
+    demo_count_.store(demo_.size(), std::memory_order_relaxed);
 }
 
 // Steps the drive alone, without loads, ramp or policy, writing one link's target each step,
@@ -924,6 +987,7 @@ void PhysicsWorker::Publish() {
     for (const Perturbation& p : perturbs_)
         if (p.env == bind_.env) s.perturbs.push_back(p);
     s.overlay = overlay_;
+    s.track_left = track_.values.empty() ? 0u : static_cast<uint32_t>(track_.start + track_.rows - tick_);
     s.published = WorkerClock::now();
     last_publish_ = s.published;
     telemetry_.publish_ms = Ms(s.published - start);

@@ -1260,6 +1260,7 @@ if(CMAKE_CUDA_COMPILER)
             runtime/app/viewer/editor_assets.cpp
             runtime/app/viewer/property_schema.cpp
             runtime/app/viewer/debug_overlay.cpp
+            runtime/app/viewer/demos.cpp
             runtime/app/viewer/physics_worker.cpp
             runtime/app/viewer/physics_history.cpp
             runtime/app/viewer/robot_tools.cpp
