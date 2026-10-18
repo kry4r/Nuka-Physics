@@ -861,6 +861,7 @@ struct EditorHost::State : DocumentHost {
     void RegisterRobotActions();
     void RegisterPoseActions();
     void RegisterGainActions();
+    void RegisterAssemblyActions();
     json::Value TimelineStatus();
     // What a recording must match to load: the document, the world's counts and step, and the
     // names of the link and body rows its poses fill.
@@ -980,6 +981,8 @@ struct EditorHost::State : DocumentHost {
     void SyncJoints();
     // Adds a finished gain test to the tuner's runs with what it measured.
     void SyncGainTest();
+    // The selection and the scene body's offset from its parent link the Robot Assembler shows.
+    void SyncAssembler();
     void TakeWorkerResults();
     void PushTransport();
     void PushPoseWrites();
@@ -1580,6 +1583,7 @@ void EditorHost::State::SeedDriveTargets() {
     RobotView& robot = ui_state_.robot;
     const auto path_of = [this](scene::EntityId e) { return PathOfEntity(e); };
     robot.joints = RobotJoints(loaded_->scene, layout, path_of);
+    robot.links = RobotLinks(loaded_->scene, layout, path_of);
     robot.roots = RobotRoots(loaded_->scene, layout, path_of);
     robot.floating = std::any_of(layout.links.begin(), layout.links.end(),
                                  [](const nuka_link_binding_t& l) { return l.is_floating != 0u; });
@@ -1758,6 +1762,7 @@ void EditorHost::State::SyncJoints() {
     if (doc_.Revision() != joints_revision_) {
         joints_revision_ = doc_.Revision();
         v.joints = RobotJoints(loaded_->scene, loaded_->Layout(), [this](scene::EntityId e) { return PathOfEntity(e); });
+        v.links = RobotLinks(loaded_->scene, loaded_->Layout(), [this](scene::EntityId e) { return PathOfEntity(e); });
     }
     std::vector<JointSample> fresh;
     uint64_t session = 0u;
@@ -1796,6 +1801,26 @@ void EditorHost::State::SyncGainTest() {
     g.runs.push_back(std::move(run));
     while (g.runs.size() > kGainRuns) g.runs.pop_front();
     g.running = 0u;
+}
+
+void EditorHost::State::SyncAssembler() {
+    Assembler& a = ui_state_.robot.assembler;
+    if (!a.open) return;
+    a.selected = ui_state_.selected_entity == scene::kInvalidEntity ? std::string() : PathOfEntity(ui_state_.selected_entity);
+    const auto body = [this](const std::string& path) {
+        const auto node = loaded_->scene.Tree().NodeOf(path);
+        const auto& bodies = doc_.Records().body;
+        const auto it = node ? bodies.find(node->entity) : bodies.end();
+        return it == bodies.end() ? scene::kInvalidBody : it->second;
+    };
+    const scene::BodyId child = body(a.child), parent = body(a.parent);
+    a.posed = !a.from_asset && child != scene::kInvalidBody && parent != scene::kInvalidBody;
+    if (!a.posed) return;
+    const math::Transform offset = BodyWorld(loaded_->scene, parent).Inverse() * BodyWorld(loaded_->scene, child);
+    const math::Vec3 rot = EulerDegFromQuat(offset.rotation);
+    const float values[6] = {offset.position.x, offset.position.y, offset.position.z, rot.x, rot.y, rot.z};
+    std::copy(values, values + 3, a.offset_pos);
+    std::copy(values + 3, values + 6, a.offset_rot);
 }
 
 void EditorHost::State::TakeWorkerResults() {
@@ -2749,6 +2774,7 @@ void EditorHost::State::RegisterRobotActions() {
                   }});
     RegisterPoseActions();
     RegisterGainActions();
+    RegisterAssemblyActions();
 }
 
 void EditorHost::State::RegisterGainActions() {
@@ -2824,6 +2850,114 @@ void EditorHost::State::RegisterGainActions() {
                       GainTuner& g = ui_state_.robot.tuner;
                       g.open = BoolArg(args, "on", !g.open);
                       return Ok(Object({{"on", json::Value::Bool(g.open)}}));
+                  }});
+}
+
+void EditorHost::State::RegisterAssemblyActions() {
+    const auto has_scene = [this] { return loaded_ != nullptr; };
+    // The shown environment's links in link order, each with its parent link and incoming joint.
+    actions_.Add({"robot.links", "Robot Links", "robot", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value&) {
+                      const RobotView& v = ui_state_.robot;
+                      json::Value links = json::Value::Array();
+                      for (const RobotLink& l : v.links) links.PushBack(LinkJson(l, v.links));
+                      return Ok(Object({{"links", std::move(links)}}));
+                  }});
+    // An asset's links, its roots first, which the Assembler offers as mounts; without `path` it asks.
+    actions_.Add({"robot.asset_links", "Choose Asset to Attach...", "robot", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      Assembler& a = ui_state_.robot.assembler;
+                      std::string path = StrArg(args, "path");
+                      if (path.empty())
+                          path = OpenFileDialog(nui::Tr("Attach Asset"), nui::Tr("Assets"),
+                                                "*.urdf;*.xml;*.usd;*.usda;*.stl;*.obj;*.nks");
+                      if (path.empty()) return ActionResult::Fail("no asset chosen");
+                      const ImportAnalysis analysis = AnalyzeImport(path, StrArg(args, "profile", a.profile));
+                      a.path = path;
+                      a.profile = analysis.profile.empty() ? a.profile : analysis.profile;
+                      a.mount.clear();
+                      a.asset_links.clear();
+                      a.asset_error = Importable(analysis) ? std::string() : ImportError(analysis);
+                      if (!a.asset_error.empty()) return ActionResult::Fail(a.asset_error);
+                      const scene::SceneIR& s = *analysis.scene;
+                      std::vector<uint8_t> jointed(s.RigidBodyCount(), 0u);
+                      for (const scene::JointRecord& j : s.Joints()) jointed[j.child_body] = 1u;
+                      std::vector<std::string> roots, rest;
+                      for (scene::BodyId b = 0; b < s.RigidBodyCount(); ++b)
+                          (jointed[b] != 0u ? rest : roots).push_back(s.GetBody(b).name);
+                      a.asset_links = roots;
+                      a.asset_links.insert(a.asset_links.end(), rest.begin(), rest.end());
+                      return Ok(Object({{"path", json::Value::Str(path)},
+                                        {"links", StrList(a.asset_links)},
+                                        {"roots", StrList(roots)}}));
+                  }});
+    // The attach op's fields from an action's arguments: `frame` takes `pos` with a `quat` (w, x, y, z)
+    // or XYZ degrees `rot`, and `joint_name` names the new joint.
+    const auto attach_op = [](const json::Value& args) {
+        json::Value after = Object({{"parent", json::Value::Str(StrArg(args, "parent"))},
+                                    {"joint", json::Value::Str(StrArg(args, "joint", "fixed"))}});
+        if (const json::Value* axis = args.Find("axis"); axis != nullptr && !axis->IsNull()) after.Set("axis", *axis);
+        if (const json::Value* frame = args.Find("frame"); frame != nullptr && !frame->IsNull()) {
+            float p[3] = {0.0f, 0.0f, 0.0f}, r[3] = {0.0f, 0.0f, 0.0f};
+            for (const auto& [key, out] : {std::pair{"pos", p}, std::pair{"rot", r}})
+                if (const json::Value* v = frame->Find(key))
+                    for (size_t i = 0; i < 3u; ++i) out[i] = v->Elements()[i].AsFloat();
+            math::Transform t;
+            t.position = math::Vec3{p[0], p[1], p[2]};
+            t.rotation = QuatFromEulerDeg(math::Vec3{r[0], r[1], r[2]});
+            if (const json::Value* q = frame->Find("quat")) {
+                const auto& e = q->Elements();
+                t.rotation = math::Quat(e[0].AsFloat(), e[1].AsFloat(), e[2].AsFloat(), e[3].AsFloat()).Normalized();
+            }
+            after.Set("frame", TransformToJson(t));
+        }
+        if (const std::string mount = StrArg(args, "mount"); !mount.empty()) after.Set("mount", json::Value::Str(mount));
+        if (const std::string name = StrArg(args, "joint_name"); !name.empty()) after.Set("name", json::Value::Str(name));
+        return after;
+    };
+    // Names the joint the attached root now hangs off and closes the Assembler.
+    const auto attached = [this](ActionResult r) {
+        if (!r.ok) return r;
+        const std::string focus = r.value.At("focus").AsString();
+        for (const scene::JointRecord& j : loaded_->scene.Joints())
+            if (PathOfEntity(loaded_->scene.EntityOfBody(j.child_body)) == focus) r.value.Set("joint", json::Value::Str(j.name));
+        ui_state_.robot.assembler.open = false;
+        return r;
+    };
+    // Hangs the body `child` and what its joints carry off the link `parent` through a new joint; `frame`
+    // puts `mount` (default the child) in the parent's frame, else it stays where it is.
+    actions_.Add({"robot.attach", "Attach to Robot", "robot", "", ShortcutScope::Global, has_scene, {},
+                  [this, attach_op, attached](const json::Value& args) {
+                      const std::string child = StrArg(args, "child");
+                      const std::string label = "Attach " + child.substr(child.rfind('/') + 1u);
+                      return attached(SubmitTxn(EditTxn{label, {EditOp{child, "attach", json::Value(), attach_op(args)}}}));
+                  }});
+    // Adds the asset at `path` and hangs its link `mount` (default its root) off `parent` in one edit;
+    // without `frame` the mount takes the parent's frame.
+    actions_.Add({"robot.attach_asset", "Attach Asset to Robot", "robot", "", ShortcutScope::Global, has_scene, {},
+                  [this, attach_op, attached](const json::Value& args) {
+                      const std::string path = StrArg(args, "path");
+                      if (!fs::exists(Utf8Path(path))) return ActionResult::Fail("no file at " + path);
+                      const std::string name = StrArg(args, "name", PathText(Utf8Path(path).stem()));
+                      json::Value after = attach_op(args);
+                      if (after.Find("frame") == nullptr) after.Set("frame", TransformToJson(math::Transform::Identity()));
+                      after.Set("asset", Object({{"path", json::Value::Str(path)},
+                                                 {"profile", json::Value::Str(StrArg(args, "profile", "strict"))},
+                                                 {"name", json::Value::Str(name)}}));
+                      return attached(SubmitTxn(EditTxn{"Attach " + name, {EditOp{"", "attach", json::Value(), std::move(after)}}}));
+                  }});
+    // Opening it on a selected link makes that link the parent.
+    actions_.Add({"robot.assembler", "Robot Assembler", "robot", "", ShortcutScope::Global, has_scene,
+                  [this] { return ui_state_.robot.assembler.open; },
+                  [this](const json::Value& args) {
+                      Assembler& a = ui_state_.robot.assembler;
+                      a.open = BoolArg(args, "on", !a.open);
+                      const std::string selected = ui_state_.selected_entity == scene::kInvalidEntity
+                                                       ? std::string()
+                                                       : PathOfEntity(ui_state_.selected_entity);
+                      for (const RobotLink& link : ui_state_.robot.links)
+                          if (a.open && link.path == selected) a.parent = selected;
+                      return Ok(Object({{"on", json::Value::Bool(a.open)}}));
                   }});
 }
 
@@ -5026,6 +5160,7 @@ void EditorHost::State::Frame(bool step_physics) {
     if (loaded_) SyncSolver();
     if (loaded_) SyncJoints();
     SyncGainTest();
+    if (loaded_) SyncAssembler();
     if (loaded_) worker_.ReadTimeline(&ui_state_.timeline);
     double apply_ms = Ms(Clock::now() - apply_t0);
 

@@ -162,8 +162,8 @@ const std::vector<MenuSpec>& Menus() {
               "tool.perturb", "tool.pin", "-", "solver.telemetry", "solver.heatmap", "solver.locate"}},
             {"Robot",
              {"robot"},
-             {"robot.fix_base", "robot.drive", "robot.watch", "robot.gain_tuner", "-", "robot.pose_capture", "robot.poses_save",
-              "robot.poses_load"}},
+             {"robot.fix_base", "robot.drive", "robot.watch", "robot.gain_tuner", "robot.assembler", "-", "robot.pose_capture",
+              "robot.poses_save", "robot.poses_load"}},
             {"Tools",
              {"script", "tools"},
              {"script.new", "script.open", "script.save", "-", "script.run", "script.stop", "script.toggle_rerun", "-",
@@ -561,7 +561,7 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
                                     std::pair{"robot.watch", icon::kPlot}, std::pair{"robot.pose_capture", icon::kAdd},
                                     std::pair{"robot.poses_save", icon::kSave}, std::pair{"robot.poses_load", icon::kOpen},
                                     std::pair{"robot.gain_tuner", icon::kWaves}, std::pair{"robot.gain_test", icon::kRun},
-                                    std::pair{"robot.gain_clear", icon::kTrash}})
+                                    std::pair{"robot.gain_clear", icon::kTrash}, std::pair{"robot.assembler", icon::kPlug}})
         registry.Decorate(id, glyph, false);
     const std::pair<const char*, const char*> script_icons[] = {
         {"script.new", icon::kNew},   {"script.open", icon::kOpen},     {"script.save", icon::kSave},
@@ -578,7 +578,8 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
                            "sim.perturb", "sim.grab_particle", "sim.release", "sim.loads", "view.layout", "view.view",
                            "view.views", "robot.joints", "robot.set_targets", "robot.samples", "robot.poses",
                            "robot.pose_apply", "robot.pose_initial", "robot.pose_rename", "robot.pose_remove",
-                           "robot.gain_status", "robot.gain_runs"})
+                           "robot.gain_status", "robot.gain_runs", "robot.links", "robot.asset_links", "robot.attach",
+                           "robot.attach_asset"})
         registry.Decorate(id, "", true);
     registry.Rebind("file.open", "Ctrl+O");
     registry.Rebind("file.save", "Ctrl+S");
@@ -1475,6 +1476,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
     DrawImportWizard();
     DrawCollisionDialog();
     DrawGainTuner();
+    DrawAssembler();
     DrawPrompt();
 }
 

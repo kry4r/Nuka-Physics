@@ -484,6 +484,8 @@ private:
     void DrawCollisionDialog();
     // The floating Gain Tuner while it is open.
     void DrawGainTuner();
+    // The floating Robot Assembler while it is open.
+    void DrawAssembler();
     // The heatmap's scale and the located element's marker over the scene viewport.
     void DrawSolverHud(const ImVec2& vmin, const ImVec2& vmax);
     // Each held load's pull from its grab point toward its target.

@@ -515,6 +515,26 @@ ShapeId SceneIR::InsertCollisionShape(CollisionShapeRecord record) {
     return id;
 }
 
+JointId SceneIR::InsertJoint(JointRecord record) {
+    // A reload adds the joints body by body, each on its child body's node.
+    size_t pos = joints_.size();
+    while (pos > 0u && joints_[pos - 1u].child_body > record.child_body) --pos;
+    const auto id = static_cast<JointId>(pos);
+    const auto shift = [id](JointId& j) {
+        if (j != kInvalidJoint && j >= id) ++j;
+    };
+    shift(record.mimic_source);
+    for (JointRecord& j : joints_) shift(j.mimic_source);
+    for (ActuatorRecord& a : actuators_) shift(a.joint_id);
+    for (SensorDesc& s : sensors_) shift(s.joint_id);
+    joints_.insert(joints_.begin() + static_cast<std::ptrdiff_t>(pos), std::move(record));
+    for (size_t i = 0; i < joints_.size(); ++i) {
+        joints_[i].id = static_cast<JointId>(i);
+    }
+    RebuildFacade();
+    return id;
+}
+
 size_t SceneIR::RigidBodyCount() const { return bodies_.size(); }
 size_t SceneIR::JointCount() const { return joints_.size(); }
 size_t SceneIR::ShapeCount() const { return shapes_.size(); }

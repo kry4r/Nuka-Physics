@@ -8,8 +8,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <optional>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace nuka::runtime::app::viewer {
 namespace {
@@ -21,7 +23,7 @@ constexpr uint32_t kNoParam = ~0u;
 bool IsStructural(const std::string& field) {
     return field == "spawn" || field == "delete" || field == "reparent" || field == "script" || field == "import" ||
            field == "collision" || field == "static" || field == "pin" || field == "drive" ||
-           field == "initial_position";
+           field == "initial_position" || field == "attach";
 }
 
 json::Value Floats(const float* v, size_t n) {
@@ -62,6 +64,28 @@ void MaterialFromJson(const json::Value& v, scene::RenderMaterial* m) {
 std::string Leaf(const std::string& path) {
     const size_t slash = path.rfind('/');
     return slash == std::string::npos ? path : path.substr(slash + 1u);
+}
+
+// The first of `roots` whose joints lead to the body named `mount` (a path or a leaf), else the first root
+// when `mount` is empty; false when none does.
+bool FindMount(const scene::SceneIR& scene, const std::vector<scene::BodyId>& roots, const std::string& mount,
+               scene::BodyId* root, scene::BodyId* at) {
+    for (const scene::BodyId r : roots) {
+        for (const scene::BodyId b : JointSubtree(scene, r)) {
+            const std::string& name = scene.GetBody(b).name;
+            if (!mount.empty() && name != mount && Leaf(name) != mount) continue;
+            *root = r;
+            *at = mount.empty() ? r : b;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool HasParentJoint(const scene::SceneIR& scene, scene::BodyId body) {
+    for (const scene::JointRecord& j : scene.Joints())
+        if (j.child_body == body) return true;
+    return false;
 }
 
 }  // namespace
@@ -352,6 +376,86 @@ bool EditorDocument::ApplyOp(const EditOp& op, EditOp* done, EditOp* inverse, Op
         scene::JointRecord& j = es_->scene.GetJointMut(joint);
         done->before = json::Value::Float(j.initial_position);
         j.initial_position = op.after.AsFloat();
+        out->rebuild = true;
+    } else if (op.field == "attach") {
+        // The target body, or the root of the asset `after.asset` adds, hangs off the body `after.parent`.
+        const std::string parent_path = op.after.At("parent").AsString();
+        const auto parent = records_.body.find(EntityAt(parent_path));
+        if (parent == records_.body.end()) {
+            *error = "no body at '" + parent_path + "'";
+            return false;
+        }
+        scene::JointType type = scene::JointType::Fixed;
+        const json::Value* joint = op.after.Find("joint");
+        if (joint != nullptr && (!ParseJointType(joint->AsString(), &type) ||
+                                 (type != scene::JointType::Fixed && type != scene::JointType::Revolute &&
+                                  type != scene::JointType::Prismatic))) {
+            *error = "the joint is fixed, revolute or prismatic";
+            return false;
+        }
+        float axis[3] = {0.0f, 0.0f, 1.0f};
+        if (const json::Value* a = op.after.Find("axis")) ReadFloats(*a, axis, 3u);
+        if (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2] < 1e-12f) {
+            *error = "the joint axis is zero";
+            return false;
+        }
+        const json::Value* mount_name = op.after.Find("mount");
+        const std::string mount_path = mount_name != nullptr ? mount_name->AsString() : std::string();
+        const json::Value* asset = op.after.Find("asset");
+        std::optional<ImportAnalysis> analysis;
+        const scene::SceneIR* source = &es_->scene;
+        std::vector<scene::BodyId> roots;
+        if (asset != nullptr) {
+            const json::Value* profile = asset->Find("profile");
+            analysis = AnalyzeImport(asset->At("path").AsString(), profile != nullptr ? profile->AsString() : std::string());
+            if (!Importable(*analysis)) {
+                *error = ImportError(*analysis);
+                return false;
+            }
+            source = &*analysis->scene;
+            for (scene::BodyId b = 0; b < source->RigidBodyCount(); ++b)
+                if (!HasParentJoint(*source, b)) roots.push_back(b);
+        } else if (const auto it = records_.body.find(e); it != records_.body.end()) {
+            roots.push_back(it->second);
+        } else {
+            *error = "'" + op.target + "' is not a body";
+            return false;
+        }
+        scene::BodyId child = scene::kInvalidBody, mount = scene::kInvalidBody;
+        if (!FindMount(*source, roots, mount_path, &child, &mount)) {
+            *error = "no link '" + mount_path + "' in what is attached";
+            return false;
+        }
+        if (asset == nullptr && HasParentJoint(es_->scene, child)) {
+            *error = "'" + op.target + "' already hangs off a joint";
+            return false;
+        }
+        if (asset == nullptr) {
+            const std::vector<scene::BodyId> moved = JointSubtree(es_->scene, child);
+            if (std::find(moved.begin(), moved.end(), parent->second) != moved.end()) {
+                *error = "'" + parent_path + "' moves with '" + op.target + "'";
+                return false;
+            }
+        }
+        if (mount != child && type != scene::JointType::Fixed) {
+            *error = "only a fixed joint mounts a link other than the attached root";
+            return false;
+        }
+        if (asset != nullptr) {
+            const scene::BodyId first = static_cast<scene::BodyId>(es_->scene.RigidBodyCount());
+            ComposeAsset(es_->scene, *source, analysis->kind, asset->At("name").AsString(), math::Transform::Identity(),
+                         false);
+            child += first;
+            mount += first;
+        }
+        std::optional<math::Transform> frame;
+        if (const json::Value* f = op.after.Find("frame")) frame = TransformFromJson(*f);
+        const json::Value* name = op.after.Find("name");
+        const std::string made =
+            AttachBody(es_->scene, child, parent->second, mount, type, math::Vec3{axis[0], axis[1], axis[2]},
+                       frame ? &*frame : nullptr, name != nullptr ? name->AsString() : std::string());
+        done->after.Set("name", json::Value::Str(made));
+        out->focus = es_->scene.Tree().PathOf(es_->scene.Ecs().NodeOf(es_->scene.EntityOfBody(child)));
         out->rebuild = true;
     } else if (op.field == "pin") {
         const auto it = records_.media.find(e);

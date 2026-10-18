@@ -18,7 +18,9 @@
 #include "scene/ecs/components.hpp"
 #include "scene/ecs/entity.hpp"
 
+#include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace nuka::runtime::app::viewer {
 
@@ -127,5 +129,13 @@ std::string DeleteSubtree(EditorScene& es, const std::string& path);
 // ("" -> root), pose preserved. "" when declined (non-body / cycle / bad parent).
 std::string ReparentNode(EditorScene& es, const std::string& path,
                          const std::string& new_parent_path);
+
+// `root` and every body its joints lead to, `root` first.
+std::vector<scene::BodyId> JointSubtree(const scene::SceneIR& scene, scene::BodyId root);
+
+// Hangs the jointless body `child`, with what its joints carry, off `parent` through a new joint whose
+// frame puts `mount` at `frame` in the parent's frame, else where it is. Returns the joint's name.
+std::string AttachBody(scene::SceneIR& scene, scene::BodyId child, scene::BodyId parent, scene::BodyId mount,
+                       scene::JointType type, const math::Vec3& axis, const math::Transform* frame, std::string name);
 
 }  // namespace nuka::runtime::app::viewer

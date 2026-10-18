@@ -6,10 +6,12 @@
 
 #include "runtime/app/viewer/editor_edits.hpp"
 
+#include "runtime/app/viewer/editor_import.hpp"
 #include "scene/graph/scene_graph.hpp"
 #include "scene/scene_ir.hpp"
 
 #include <cmath>
+#include <string>
 #include <vector>
 
 namespace nuka::runtime::app::viewer {
@@ -418,6 +420,46 @@ std::string ReparentNode(EditorScene& es, const std::string& path,
     rec.name = group_prefix.empty() ? leaf : group_prefix + "/" + leaf;
     rec.local_transform = parent_world.Inverse() * b_world;
     return PathOfEntity(es.scene, es.scene.EntityOfBody(b));
+}
+
+std::vector<scene::BodyId> JointSubtree(const scene::SceneIR& scene, scene::BodyId root) {
+    std::vector<scene::BodyId> bodies{root};
+    for (size_t i = 0; i < bodies.size(); ++i)
+        for (const scene::JointRecord& j : scene.Joints())
+            if (j.parent_body == bodies[i]) bodies.push_back(j.child_body);
+    return bodies;
+}
+
+std::string AttachBody(scene::SceneIR& scene, scene::BodyId child, scene::BodyId parent, scene::BodyId mount,
+                       scene::JointType type, const math::Vec3& axis, const math::Transform* frame, std::string name) {
+    const math::Transform at = BodyWorld(scene, mount);
+    const math::Transform in_child = BodyWorld(scene, child).Inverse() * at;
+    const math::Transform place = frame != nullptr ? *frame : BodyWorld(scene, parent).Inverse() * at;
+    if (name.empty()) {
+        const std::string& n = scene.GetBody(child).name;
+        name = n.substr(n.rfind('/') + 1u) + "_mount";
+    }
+    const auto taken = [&](const std::string& n) {
+        for (const scene::JointRecord& j : scene.Joints())
+            if (j.name == n) return true;
+        return false;
+    };
+    const std::string base = name;
+    for (int i = 2; taken(name); ++i) name = base + "_" + std::to_string(i);
+    scene::JointRecord joint;
+    joint.name = name;
+    joint.parent_body = parent;
+    joint.child_body = child;
+    joint.type = type;
+    joint.axis = axis.Normalized();
+    joint.parent_frame = place * in_child.Inverse();
+    scene.InsertJoint(std::move(joint));
+    // A link's pose is its joint's frame, as an imported robot's links have it.
+    scene::RigidBodyRecord& body = scene.GetBodyMut(child);
+    body.parent_id = scene::kInvalidBody;
+    body.local_transform = math::Transform::Identity();
+    body.is_static = false;
+    return name;
 }
 
 // -- euler<->quat (intrinsic XYZ, degrees) ----------------------------------

@@ -18,6 +18,11 @@ constexpr std::pair<scene::ActuatorType, const char*> kActuatorTypes[] = {
     {scene::ActuatorType::Velocity, "velocity"},
     {scene::ActuatorType::Force, "force"}};
 
+constexpr std::pair<scene::JointType, const char*> kJointTypes[] = {
+    {scene::JointType::Fixed, "fixed"},         {scene::JointType::Revolute, "revolute"},
+    {scene::JointType::Prismatic, "prismatic"}, {scene::JointType::Spherical, "spherical"},
+    {scene::JointType::Free, "free"}};
+
 const scene::JointRecord* IncomingJoint(const scene::SceneIR& scene, scene::BodyId body) {
     for (const scene::JointRecord& j : scene.Joints())
         if (j.child_body == body) return &j;
@@ -124,6 +129,22 @@ bool ParseActuatorType(const std::string& name, scene::ActuatorType* out) {
     return false;
 }
 
+const char* JointTypeName(scene::JointType type) {
+    for (const auto& [t, name] : kJointTypes)
+        if (t == type) return name;
+    return "";
+}
+
+bool ParseJointType(const std::string& name, scene::JointType* out) {
+    for (const auto& [t, n] : kJointTypes) {
+        if (name == n) {
+            *out = t;
+            return true;
+        }
+    }
+    return false;
+}
+
 std::vector<RobotJoint> RobotJoints(const scene::SceneIR& scene, const WorldLayout& layout,
                                     const std::function<std::string(scene::EntityId)>& path_of) {
     std::vector<RobotJoint> joints;
@@ -157,6 +178,35 @@ std::vector<std::string> RobotRoots(const scene::SceneIR& scene, const WorldLayo
     for (uint32_t l = 0; l < layout.links_per_env; ++l)
         if (layout.links[l].is_root != 0u) roots.push_back(path_of(scene.EntityOfBody(layout.links[l].body_index)));
     return roots;
+}
+
+std::vector<RobotLink> RobotLinks(const scene::SceneIR& scene, const WorldLayout& layout,
+                                  const std::function<std::string(scene::EntityId)>& path_of) {
+    std::vector<RobotLink> links(layout.links_per_env);
+    for (uint32_t l = 0; l < layout.links_per_env; ++l) {
+        const nuka_link_binding_t& link = layout.links[l];
+        RobotLink& r = links[l];
+        r.path = path_of(scene.EntityOfBody(link.body_index));
+        r.mass = scene.GetBody(link.body_index).mass;
+        r.type = "root";
+        const scene::JointRecord* j = link.is_root != 0u ? nullptr : IncomingJoint(scene, link.body_index);
+        if (j == nullptr) continue;
+        r.joint = j->name;
+        r.type = JointTypeName(j->type);
+        for (uint32_t p = 0; p < layout.links_per_env; ++p)
+            if (layout.links[p].body_index == j->parent_body) r.parent = static_cast<int>(p);
+    }
+    return links;
+}
+
+json::Value LinkJson(const RobotLink& link, const std::vector<RobotLink>& links) {
+    json::Value v = json::Value::Object();
+    v.Set("path", json::Value::Str(link.path));
+    v.Set("parent", json::Value::Str(link.parent < 0 ? std::string() : links[static_cast<size_t>(link.parent)].path));
+    v.Set("joint", json::Value::Str(link.joint));
+    v.Set("type", json::Value::Str(link.type));
+    v.Set("mass", json::Value::Float(link.mass));
+    return v;
 }
 
 int FindJoint(const std::vector<RobotJoint>& joints, const std::string& name) {

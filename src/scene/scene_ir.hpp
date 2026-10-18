@@ -593,6 +593,9 @@ public:
     // Add a shape after its body's last one, the id a reload gives it; later shapes and
     // the <pair> overrides naming them shift up by one.
     ShapeId InsertCollisionShape(CollisionShapeRecord record);
+    // Add a joint after those of lower child bodies, the id a reload gives it; the
+    // later joints and every mimic, actuator and sensor reference to them shift up by one.
+    JointId InsertJoint(JointRecord record);
 
     // -- counts -------------------------------------------------------------
     size_t RigidBodyCount() const;

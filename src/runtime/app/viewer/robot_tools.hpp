@@ -18,6 +18,9 @@ namespace nuka::runtime::app::viewer {
 const char* ActuatorTypeName(scene::ActuatorType type);
 // False for a name other than position, motor, velocity or force.
 bool ParseActuatorType(const std::string& name, scene::ActuatorType* out);
+const char* JointTypeName(scene::JointType type);
+// False for a name other than fixed, revolute, prismatic, spherical or free.
+bool ParseJointType(const std::string& name, scene::JointType* out);
 
 // The revolute and prismatic joints of one environment's links, in link order.
 std::vector<RobotJoint> RobotJoints(const scene::SceneIR& scene, const WorldLayout& layout,
@@ -25,6 +28,10 @@ std::vector<RobotJoint> RobotJoints(const scene::SceneIR& scene, const WorldLayo
 // The nodes of one environment's articulation roots.
 std::vector<std::string> RobotRoots(const scene::SceneIR& scene, const WorldLayout& layout,
                                     const std::function<std::string(scene::EntityId)>& path_of);
+// One environment's articulation links, in link order.
+std::vector<RobotLink> RobotLinks(const scene::SceneIR& scene, const WorldLayout& layout,
+                                  const std::function<std::string(scene::EntityId)>& path_of);
+scene::json::Value LinkJson(const RobotLink& link, const std::vector<RobotLink>& links);
 // The joint named `name`, or -1.
 int FindJoint(const std::vector<RobotJoint>& joints, const std::string& name);
 

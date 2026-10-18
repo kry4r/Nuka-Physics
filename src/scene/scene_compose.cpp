@@ -108,6 +108,7 @@ SceneIR Compose(const SceneIR& base, const SceneIR& addon,
         rec.name = PrefixName(addon_name_prefix, rec.name);
         rec.parent_body = RemapId(rec.parent_body, body_off);
         rec.child_body = RemapId(rec.child_body, body_off);
+        rec.mimic_source = RemapId(rec.mimic_source, joint_off);
         out.AddJoint(std::move(rec));
     }
 

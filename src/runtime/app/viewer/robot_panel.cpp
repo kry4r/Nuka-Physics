@@ -104,6 +104,14 @@ void TunerLabel(const char* label) {
     ImGui::SetNextItemWidth(-FLT_MIN);
 }
 
+json::Value Floats(const float* v) {
+    json::Value a = json::Value::Array();
+    for (int i = 0; i < 3; ++i) a.PushBack(json::Value::Float(v[i]));
+    return a;
+}
+
+constexpr const char* kAttachJoints[] = {"fixed", "revolute", "prismatic"};
+
 }  // namespace
 
 void ImGuiLayer::BuildJoints(nui::VStack& root) {
@@ -119,6 +127,8 @@ void ImGuiLayer::BuildJoints(nui::VStack& root) {
     hero.Add<nui::Spacer>();
     auto& tuner = hero.Add<nui::IconButton>(icon::kWaves, "Gain Tuner").Action("robot.gain_tuner");
     tuner.checked_fn = [robot] { return robot().tuner.open; };
+    auto& assembler = hero.Add<nui::IconButton>(icon::kPlug, "Robot Assembler").Action("robot.assembler");
+    assembler.checked_fn = [robot] { return robot().assembler.open; };
     auto& watch = hero.Add<nui::IconButton>(icon::kPlot, "Watch Joints").Action("robot.watch");
     watch.checked_fn = [robot] { return robot().watch; };
     hero.visible_if = [robot] { return !robot().joints.empty(); };
@@ -503,6 +513,130 @@ void ImGuiLayer::DrawGainTuner() {
     }
     ImGui::End();
     if (!open) Queue("robot.gain_tuner", Args({{"on", json::Value::Bool(false)}}));
+}
+
+void ImGuiLayer::DrawAssembler() {
+    RobotView& v = frame_.ui->robot;
+    Assembler& a = v.assembler;
+    if (!a.open || !frame_.ui->has_scene) return;
+    const float s = nui::Scale();
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetWorkCenter(), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
+    bool open = true;
+    const std::string title = std::string(Tr("Robot Assembler")) + "###robot_assembler";
+    if (ImGui::Begin(title.c_str(), &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
+        const std::string pick = Iconed(icon::kTarget, Tr("Use Selection"));
+        const ImGuiStyle& style = ImGui::GetStyle();
+        const float pick_w = ImGui::CalcTextSize(pick.c_str()).x + style.FramePadding.x * 2.0f + style.ItemSpacing.x;
+        const auto use_selection = [&](const char* id, std::string* out) {
+            ImGui::SameLine();
+            ImGui::BeginDisabled(a.selected.empty());
+            if (ImGui::SmallButton(Fmt("%s##%s", pick.c_str(), id).c_str())) *out = a.selected;
+            ImGui::EndDisabled();
+        };
+        const auto node = [](const std::string& path) { return path.empty() ? std::string(Tr("none")) : path; };
+        if (ImGui::BeginTable("##assembler", 2, ImGuiTableFlags_SizingStretchProp, ImVec2(440.0f * s, 0.0f))) {
+            ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed, 110.0f * s);
+            ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
+            TunerLabel("Attach");
+            if (ImGui::RadioButton(Tr("Asset file"), a.from_asset)) a.from_asset = true;
+            ImGui::SameLine();
+            if (ImGui::RadioButton(Tr("Scene body"), !a.from_asset)) a.from_asset = false;
+            if (a.from_asset) {
+                TunerLabel("Asset");
+                if (ImGui::SmallButton(Iconed(icon::kOpen, Tr("Browse...")).c_str()))
+                    Queue("robot.asset_links", Args({{"profile", json::Value::Str(a.profile)}}));
+                ImGui::SameLine();
+                const std::string file = a.path.substr(a.path.find_last_of("/\\") + 1u);
+                ImGui::TextUnformatted(a.path.empty() ? Tr("none") : file.c_str());
+                if (!a.path.empty() && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", a.path.c_str());
+                TunerLabel("Profile");
+                for (const char* profile : {"strict", "legacy"}) {
+                    if (profile[0] == 'l') ImGui::SameLine();
+                    if (!ImGui::RadioButton(Tr(profile[0] == 'l' ? "Legacy" : "Strict"), a.profile == profile) ||
+                        a.profile == profile)
+                        continue;
+                    a.profile = profile;
+                    if (!a.path.empty())
+                        Queue("robot.asset_links", Args({{"path", json::Value::Str(a.path)}, {"profile", json::Value::Str(profile)}}));
+                }
+                TunerLabel("Mount");
+                const std::string shown = a.mount.empty() ? std::string(Tr("its root")) : a.mount;
+                if (ImGui::BeginCombo("##mount", shown.c_str())) {
+                    if (ImGui::Selectable(Tr("its root"), a.mount.empty())) a.mount.clear();
+                    for (const std::string& link : a.asset_links)
+                        if (ImGui::Selectable(link.c_str(), a.mount == link)) a.mount = link;
+                    ImGui::EndCombo();
+                }
+            } else {
+                TunerLabel("Body");
+                ImGui::TextUnformatted(node(a.child).c_str());
+                use_selection("child", &a.child);
+            }
+            TunerLabel("Parent link");
+            ImGui::SetNextItemWidth(-pick_w);
+            if (ImGui::BeginCombo("##parent", node(a.parent).c_str())) {
+                for (const RobotLink& link : v.links)
+                    if (ImGui::Selectable(link.path.c_str(), a.parent == link.path)) a.parent = link.path;
+                ImGui::EndCombo();
+            }
+            use_selection("parent", &a.parent);
+            TunerLabel("Joint");
+            ImGui::Combo("##joint", &a.joint, [](void*, int i) { return Tr(kAttachJoints[i]); }, nullptr, 3);
+            if (a.joint != 0) {
+                TunerLabel("Axis");
+                ImGui::DragFloat3("##axis", a.axis, 0.01f, -1.0f, 1.0f, "%.2f");
+            }
+            if (!a.from_asset) {
+                TunerLabel("Placement");
+                if (ImGui::RadioButton(Tr("Keep where it is"), a.keep_pose)) a.keep_pose = true;
+                ImGui::SameLine();
+                if (ImGui::RadioButton(Tr("Offset"), !a.keep_pose)) a.keep_pose = false;
+            }
+            if (a.from_asset || !a.keep_pose) {
+                TunerLabel("Position");
+                ImGui::DragFloat3("##pos", a.pos, 0.001f, 0.0f, 0.0f, "%.3f m");
+                TunerLabel("Rotation");
+                ImGui::DragFloat3("##rot", a.rot, 0.5f, -360.0f, 360.0f, "%.1f\xC2\xB0");
+            } else if (a.posed) {
+                TunerLabel("Offset");
+                ImGui::TextColored(theme::kFgMuted, "%s",
+                                   Fmt("%.3f %.3f %.3f m  %.1f %.1f %.1f\xC2\xB0", static_cast<double>(a.offset_pos[0]),
+                                       static_cast<double>(a.offset_pos[1]), static_cast<double>(a.offset_pos[2]),
+                                       static_cast<double>(a.offset_rot[0]), static_cast<double>(a.offset_rot[1]),
+                                       static_cast<double>(a.offset_rot[2]))
+                                       .c_str());
+            }
+            ImGui::EndTable();
+        }
+        if (!a.asset_error.empty() && a.from_asset) ImGui::TextColored(theme::kWarn, "%s", a.asset_error.c_str());
+        const bool mounted = a.from_asset && !a.mount.empty() && (a.asset_links.empty() || a.mount != a.asset_links[0]);
+        if (mounted && a.joint != 0)
+            ImGui::TextColored(theme::kWarn, "%s", Tr("Only a fixed joint mounts a link other than the root."));
+        ImGui::TextDisabled("%s", Tr(a.from_asset ? "The mount takes the offset in the parent link's frame."
+                                                  : "The body and what its joints carry move with the parent link."));
+        const bool ready = !a.parent.empty() && (a.from_asset ? !a.path.empty() && a.asset_error.empty() : !a.child.empty());
+        ImGui::BeginDisabled(!ready);
+        if (ImGui::Button(Iconed(icon::kJoint, Tr("Attach")).c_str())) {
+            json::Value args = Args({{"parent", json::Value::Str(a.parent)}, {"joint", json::Value::Str(kAttachJoints[a.joint])}});
+            args.Set("axis", Floats(a.axis));
+            if (a.from_asset || !a.keep_pose)
+                args.Set("frame", Args({{"pos", Floats(a.pos)}, {"rot", Floats(a.rot)}}));
+            if (!a.mount.empty() && a.from_asset) args.Set("mount", json::Value::Str(a.mount));
+            if (a.from_asset) {
+                args.Set("path", json::Value::Str(a.path));
+                args.Set("profile", json::Value::Str(a.profile));
+                Queue("robot.attach_asset", std::move(args));
+            } else {
+                args.Set("child", json::Value::Str(a.child));
+                Queue("robot.attach", std::move(args));
+            }
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button(Tr("Cancel"))) open = false;
+    }
+    ImGui::End();
+    if (!open) Queue("robot.assembler", Args({{"on", json::Value::Bool(false)}}));
 }
 
 }  // namespace nuka::runtime::app::viewer

@@ -44,6 +44,15 @@ struct RobotJoint {
     float damping = 0.0f;      // the joint's own
 };
 
+// A link of the shown environment's articulations.
+struct RobotLink {
+    std::string path;
+    int parent = -1;    // the parent link, by index into the links; -1 at a root
+    std::string joint;  // the incoming joint, empty at a root
+    std::string type;   // the incoming joint's type, "root" at a root
+    float mass = 0.0f;
+};
+
 // Named joint positions in rad or m; applying one moves only the joints it names.
 struct JointPose {
     std::string name;
@@ -104,8 +113,31 @@ struct GainTuner {
     std::deque<GainRun> runs;  // the newest last
 };
 
+// The Robot Assembler's choices: an asset's link or a scene body, the link it hangs off and the joint.
+struct Assembler {
+    bool open = false;
+    bool from_asset = true;
+    std::string path;  // the asset
+    std::string profile = "strict";
+    std::vector<std::string> asset_links;  // the asset's links, its roots first
+    std::string asset_error;
+    std::string child;   // the scene body
+    std::string parent;  // the link it hangs off
+    std::string mount;   // the attached link the joint frame places; empty is the root
+    int joint = 0;       // fixed, revolute or prismatic
+    float axis[3] = {0.0f, 0.0f, 1.0f};
+    bool keep_pose = true;  // a scene body stays where it is, else the mount goes to `pos`/`rot` in the parent
+    float pos[3] = {0.0f, 0.0f, 0.0f};
+    float rot[3] = {0.0f, 0.0f, 0.0f};  // XYZ degrees, as the inspector shows rotations
+    std::string selected;  // the selected node, for Use Selection
+    bool posed = false;    // the scene body's offset from the parent below is known
+    float offset_pos[3] = {0.0f, 0.0f, 0.0f};
+    float offset_rot[3] = {0.0f, 0.0f, 0.0f};
+};
+
 struct RobotView {
     std::vector<RobotJoint> joints;  // in link order
+    std::vector<RobotLink> links;    // in link order
     std::vector<std::string> roots;  // the articulation roots' nodes
     bool floating = false;           // some root is a free base
     JointFrame live;
@@ -120,6 +152,7 @@ struct RobotView {
     std::vector<JointPose> poses;  // the document's pose library
     float pose_blend = 0.5f;       // the simulated seconds a click on a pose blends over
     GainTuner tuner;
+    Assembler assembler;
 };
 
 }  // namespace nuka::runtime::app::viewer
