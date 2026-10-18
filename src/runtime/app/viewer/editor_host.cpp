@@ -112,6 +112,11 @@ constexpr float kForceArrow = 0.3f;
 constexpr uint32_t kMaxEnvs = 4096u;
 // The RT preview renders the viewport scaled down to this many pixels on its long side.
 constexpr float kRtMaxSide = 1920.0f;
+// The Sensors panel reads its sensor at most this often, and plots the last seconds of a state sensor.
+constexpr std::chrono::milliseconds kSensorPeriod{33};
+constexpr float kSensorHistorySeconds = 10.0f;
+// sensor.read returns the values themselves up to this many.
+constexpr size_t kInlineValues = 4096u;
 // A gizmo move's locked orientation weighs this much against its position, so a short chain
 // still reaches the point.
 constexpr float kIkLockWeight = 0.1f;
@@ -1102,6 +1107,8 @@ struct EditorHost::State : DocumentHost {
     void SyncJoints();
     // The sensor list follows the document, and the sensors' world poses the shown snapshot.
     void SyncSensors();
+    // Takes the worker's newest reading into the Sensors panel and asks for the next one.
+    void StepSensorPreview();
     // Adds a finished gain test to the tuner's runs with what it measured.
     void SyncGainTest();
     // The selection and the scene body's offset from its parent link the Robot Assembler shows.
@@ -1307,6 +1314,11 @@ struct EditorHost::State : DocumentHost {
     std::optional<TickCommand> ik_next_;
     int sensor_drag_ = -1;  // the sensor a gizmo drag holds, and its offset while held
     math::Transform sensor_held_;
+    // The Sensors panel's reading in flight, and what was last asked: sensor, plane, environment,
+    // tick and document revision.
+    uint64_t sensor_inflight_ = 0u;
+    std::array<uint64_t, 5> sensor_asked_{~0ull};
+    WorkerClock::time_point sensor_asked_at_{};
     // The Perturb tool's load while its drag lasts; the target slides on the view plane through the anchor.
     std::optional<Perturbation> grab_;
     math::Vec3 grab_anchor_ = math::Vec3::Zero();
@@ -2162,6 +2174,7 @@ void EditorHost::State::SyncSensors() {
         ++v.version;
     }
     if (v.selected >= static_cast<int>(v.items.size())) v.selected = -1;
+    if (v.preview.sensor >= static_cast<int>(v.items.size())) v.preview.sensor = -1;
     // A link rides the shown links, a free body the shown bodies, a static body its authored pose.
     const std::vector<nuka_link_binding_t>& links = loaded_->Layout().links;
     for (size_t i = 0; i < v.items.size(); ++i) {
@@ -2190,6 +2203,59 @@ void EditorHost::State::SyncSensors() {
         }
         item.pose = mount * (static_cast<int>(i) == sensor_drag_ ? sensor_held_ : s.local_offset);
     }
+}
+
+void EditorHost::State::StepSensorPreview() {
+    SensorPreview& p = ui_state_.sensors.preview;
+    // An unbound worker drops what it is asked.
+    if (!loaded_) sensor_inflight_ = 0u;
+    SensorReading r;
+    if (worker_.TakeSensorReading(&r) && r.request == sensor_inflight_) {
+        sensor_inflight_ = 0u;
+        p.error = r.error;
+        const int read = static_cast<int>(sensor_asked_[0]);
+        if (r.error.empty() && r.plane == kStatePlane) {
+            // Another sensor, or time running back, starts the series again.
+            if (read != p.read || p.series.size() != r.width || (!p.times.empty() && r.sim_time < p.times.back())) {
+                p.times.clear();
+                p.series.assign(r.width, {});
+            }
+            p.times.push_back(static_cast<float>(r.sim_time));
+            for (size_t k = 0; k < r.width; ++k) p.series[k].push_back(r.values[k]);
+            const auto kept = std::find_if(p.times.begin(), p.times.end(),
+                                           [&](float t) { return t >= p.times.back() - kSensorHistorySeconds; });
+            const std::ptrdiff_t drop = kept - p.times.begin();
+            p.times.erase(p.times.begin(), kept);
+            for (std::vector<float>& s : p.series) s.erase(s.begin(), s.begin() + drop);
+        }
+        if (r.error.empty()) {
+            p.read = read;
+            p.plane = r.plane;
+            p.tick = r.tick;
+            p.width = r.width;
+            p.height = r.height;
+            p.channels = r.channels;
+            p.values = std::move(r.values);
+            p.instances = std::move(r.instances);
+            ++p.version;
+        }
+    }
+    if (!p.on || !loaded_ || shown_ == nullptr || p.sensor < 0 || sensor_inflight_ != 0u) return;
+    const std::vector<scene::SensorDesc>& sensors = loaded_->scene.Sensors();
+    const scene::SensorType type = sensors[static_cast<size_t>(p.sensor)].type;
+    const uint32_t plane = LidarSensor(type) ? kRangeChannel : RenderSensor(type) ? p.channel : kStatePlane;
+    const std::array<uint64_t, 5> ask = {static_cast<uint64_t>(p.sensor), plane, shown_->env, shown_->tick,
+                                         doc_.Revision()};
+    const WorkerClock::time_point now = WorkerClock::now();
+    if (ask == sensor_asked_ || now - sensor_asked_at_ < kSensorPeriod) return;
+    TickCommand cmd;
+    cmd.kind = CommandKind::SensorRead;
+    cmd.index = SensorSlot(sensors, static_cast<size_t>(p.sensor));
+    cmd.element = plane;
+    cmd.env = shown_->env;
+    sensor_asked_ = ask;
+    sensor_asked_at_ = now;
+    sensor_inflight_ = worker_.Push(std::move(cmd));
 }
 
 void EditorHost::State::SyncGainTest() {
@@ -4617,6 +4683,114 @@ void EditorHost::State::RegisterSensorActions() {
                       if (picked < 0 && !(index != nullptr && index->AsInt() == -1)) return ActionResult::Fail("no such sensor");
                       select(picked);
                       return Ok(json::Value::Int(picked));
+                  },
+                  "", true});
+    // A plane by its kSensorChannels name; -1 for none.
+    const auto channel = [](const std::string& name) {
+        const auto it = std::find_if(std::begin(kSensorChannels), std::end(kSensorChannels),
+                                     [&](const char* c) { return name == c; });
+        return it == std::end(kSensorChannels) ? -1 : static_cast<int>(it - std::begin(kSensorChannels));
+    };
+    // The Sensors panel's reading: `on`, the sensor (`index` or `sensor`, else the selected one) and
+    // the camera `channel` it shows. The result holds them, the newest reading's tick and its error.
+    actions_.Add({"sensor.preview", "Preview Sensor", "sensor", "", ShortcutScope::Global, has_scene, {},
+                  [this, pick, channel](const json::Value& args) {
+                      SensorPreview& p = ui_state_.sensors.preview;
+                      if (args.Find("index") != nullptr || args.Find("sensor") != nullptr) {
+                          p.sensor = pick(args);
+                          if (p.sensor < 0) return ActionResult::Fail("no such sensor");
+                      }
+                      if (const json::Value* c = args.Find("channel")) {
+                          const int plane = channel(c->AsString());
+                          if (plane < 0 || plane == static_cast<int>(kRangeChannel))
+                              return ActionResult::Fail("a camera shows color, depth, normal, albedo or instance");
+                          p.channel = static_cast<uint32_t>(plane);
+                      }
+                      p.on = BoolArg(args, "on", p.on);
+                      if (p.on && p.sensor < 0) p.sensor = ui_state_.sensors.selected;
+                      sensor_asked_[4] = ~0ull;
+                      return Ok(Object({{"on", json::Value::Bool(p.on)},
+                                        {"index", json::Value::Int(p.sensor)},
+                                        {"channel", json::Value::Str(kSensorChannels[p.channel])},
+                                        {"read", json::Value::Int(p.read)},
+                                        {"tick", json::Value::Int(static_cast<int64_t>(p.tick))},
+                                        {"error", json::Value::Str(p.error)}}));
+                  },
+                  "", true});
+    // Renders and reads a sensor of environment `env` (the shown one by default) now: a camera's
+    // `channel` plane (color by default), a lidar's ranges or a state sensor's values. The result
+    // has their shape and statistics, the values up to 4096 of them, and with `path` a .npy of all.
+    actions_.Add({"sensor.read", "Read Sensor", "sensor", "", ShortcutScope::Global, has_scene, {},
+                  [this, pick, channel](const json::Value& args) {
+                      const int index = pick(args);
+                      if (index < 0) return ActionResult::Fail("no such sensor");
+                      const std::vector<scene::SensorDesc>& sensors = loaded_->scene.Sensors();
+                      const scene::SensorType type = sensors[static_cast<size_t>(index)].type;
+                      const int plane = LidarSensor(type)   ? static_cast<int>(kRangeChannel)
+                                        : RenderSensor(type) ? channel(StrArg(args, "channel", "color"))
+                                                             : static_cast<int>(kStatePlane);
+                      if (plane < 0 || (!LidarSensor(type) && plane == static_cast<int>(kRangeChannel)))
+                          return ActionResult::Fail("a camera reads color, depth, normal, albedo or instance");
+                      const auto env = static_cast<uint32_t>(
+                          NumArg(args, "env", shown_ != nullptr ? static_cast<double>(shown_->env) : 0.0));
+                      SensorReading r;
+                      worker_.Exclusive([&] {
+                          r = ReadSensor(world_, SensorSlot(sensors, static_cast<size_t>(index)),
+                                         static_cast<uint32_t>(plane), env);
+                          r.tick = worker_.Tick();
+                          r.sim_time = worker_.SimTime();
+                      });
+                      if (!r.error.empty()) return ActionResult::Fail(r.error);
+                      const bool ids = plane == NUKA_SENSOR_CHANNEL_PRIM;
+                      std::vector<uint32_t> shape = {r.height, r.width};
+                      if (plane == static_cast<int>(kStatePlane)) shape = {r.width};
+                      if (LidarSensor(type)) shape = {r.width, r.height};
+                      if (r.channels > 1u) shape.push_back(r.channels);
+                      const auto value = [&](size_t i) {
+                          uint32_t bits = 0u;
+                          std::memcpy(&bits, &r.values[i], sizeof(bits));
+                          return ids ? static_cast<double>(bits) : static_cast<double>(r.values[i]);
+                      };
+                      double lo = std::numeric_limits<double>::infinity(), hi = -lo, sum = 0.0;
+                      for (size_t i = 0; i < r.values.size(); ++i) {
+                          lo = std::min(lo, value(i));
+                          hi = std::max(hi, value(i));
+                          sum += value(i);
+                      }
+                      json::Value dims = json::Value::Array();
+                      for (const uint32_t n : shape) dims.PushBack(json::Value::Int(n));
+                      json::Value out = Object({{"index", json::Value::Int(index)},
+                                                {"name", json::Value::Str(sensors[static_cast<size_t>(index)].name)},
+                                                {"channel", json::Value::Str(plane == static_cast<int>(kStatePlane)
+                                                                                 ? "state"
+                                                                                 : kSensorChannels[plane])},
+                                                {"env", json::Value::Int(env)},
+                                                {"tick", json::Value::Int(static_cast<int64_t>(r.tick))},
+                                                {"sim_time", json::Value::Float(r.sim_time)},
+                                                {"shape", std::move(dims)},
+                                                {"dtype", json::Value::Str(ids ? "uint32" : "float32")},
+                                                {"min", json::Value::Float(lo)},
+                                                {"max", json::Value::Float(hi)},
+                                                {"mean", json::Value::Float(sum / static_cast<double>(r.values.size()))}});
+                      if (r.values.size() <= kInlineValues) {
+                          json::Value values = json::Value::Array();
+                          for (size_t i = 0; i < r.values.size(); ++i)
+                              values.PushBack(ids ? json::Value::Int(static_cast<int64_t>(value(i)))
+                                                  : json::Value::Float(value(i)));
+                          out.Set("values", std::move(values));
+                      }
+                      if (ids) {
+                          json::Value paths = json::Value::Array();
+                          for (const std::string& path : r.instances) paths.PushBack(json::Value::Str(path));
+                          out.Set("instances", std::move(paths));
+                      }
+                      if (args.Find("path") != nullptr) {
+                          const std::string path = StrArg(args, "path");
+                          if (!WriteNpy(path, shape, ids, r.values))
+                              return ActionResult::Fail("cannot write '" + path + "'");
+                          out.Set("path", json::Value::Str(path));
+                      }
+                      return Ok(std::move(out));
                   },
                   "", true});
     // Each switch given sets it; the result holds them all.
@@ -7368,6 +7542,7 @@ void EditorHost::State::Frame(bool step_physics) {
     if (loaded_) SyncSolver();
     if (loaded_) SyncJoints();
     SyncSensors();
+    StepSensorPreview();
     SyncGainTest();
     if (loaded_) SyncAssembler();
     if (loaded_) worker_.ReadTimeline(&ui_state_.timeline);

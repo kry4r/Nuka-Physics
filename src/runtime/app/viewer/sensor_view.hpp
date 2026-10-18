@@ -38,12 +38,40 @@ struct SensorOverlays {
     bool labels = true;
 };
 
+// The planes a sensor reads, by nuka_sensor_channel_t: a camera's five and a lidar's ranges.
+inline constexpr const char* kSensorChannels[] = {"color", "depth", "normal", "albedo", "instance", "range"};
+inline constexpr uint32_t kRangeChannel = 5u;
+// The plane past those: a state sensor's values.
+inline constexpr uint32_t kStatePlane = 6u;
+
+// The Sensors panel's live reading of one sensor in the shown environment, taken again at most
+// 30 times a second while `on` and the tick, the sensor or its plane changes.
+struct SensorPreview {
+    bool on = false;
+    int sensor = -1;        // by index into `items`
+    uint32_t channel = 0u;  // the camera plane shown; lidars show ranges, state sensors values
+    std::string error;
+    // The newest reading: the sensor it is of, a camera plane (height x width x channels), a
+    // lidar's ranges by azimuth (width) then elevation (height), or a state sensor's values.
+    uint64_t version = 0u;  // bumped with every reading
+    int read = -1;
+    uint32_t plane = 0u;
+    uint64_t tick = 0u;
+    uint32_t width = 0u, height = 0u, channels = 0u;
+    std::vector<float> values;           // instance planes hold uint32 bit patterns
+    std::vector<std::string> instances;  // the node path of each instance an instance plane names
+    // A state sensor's readings over the last seconds of sim time, one series per value.
+    std::vector<float> times;
+    std::vector<std::vector<float>> series;
+};
+
 struct SensorView {
     std::vector<SensorItem> items;  // in the scene's sensor order
     std::vector<std::string> bodies;  // every body's node path, the mounts a sensor can take
     uint64_t version = 0u;          // bumped whenever `items` is rebuilt
     int selected = -1;              // by index into `items`
     SensorOverlays overlays;
+    SensorPreview preview;
 };
 
 // A sensor type the editor offers: its record name, menu label and icon.

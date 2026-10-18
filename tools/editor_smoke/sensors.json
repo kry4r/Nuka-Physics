@@ -34,6 +34,35 @@
 
     {"action": "file.close", "args": {"discard": true}},
     {"frames": 4},
+    {"expect": {"loaded": false}},
+
+    {"action": "file.new", "args": {"template": "ground"}},
+    {"frames": 10},
+    {"python": "import builtins\nrun = app.actions.run\nbox = run('scene.spawn', kind='box', pose={'pos': [2.0, 0.0, 0.25], 'quat': [1.0, 0.0, 0.0, 0.0]})['focus']\nc = run('sensor.add', type='camera', mount='', position=[0.0, 0.0, 0.25])\nassert c['index'] == 0 and c['frame'] == 'world', c\nl = run('sensor.add', type='lidar', mount='', position=[0.0, 0.0, 0.25])\nassert l['index'] == 1 and l['frame'] == 'world', l\ni = run('sensor.add', type='imu', mount=box)\nassert i['index'] == 2 and i['mount'] == box, i\nbuiltins.sn_lidar = l['lidar']"},
+    {"tick": 60},
+    {"python": "import builtins\nimport numpy as np\nrun, out = app.actions.run, r'${out}'\nd = run('sensor.read', index=0, channel='depth', path=out + '/depth.npy')\nD = np.load(out + '/depth.npy')\nprint('SENSOR_DEPTH', {k: d[k] for k in ('shape', 'dtype', 'min', 'max', 'tick')}, D[58:62, 78:82].tolist())\nassert D.shape == (120, 160) and d['shape'] == [120, 160] and d['dtype'] == 'float32' and 'values' not in d, (D.shape, d)\nassert abs(float(D[59:61, 79:81].mean()) - 1.75) < 0.02, D[59:61, 79:81]\nk = run('sensor.read', index=0)\nassert k['channel'] == 'color' and k['shape'][:2] == [120, 160] and len(k['shape']) == 3, k['shape']\ns = builtins.sn_lidar\nr = run('sensor.read', index=1, path=out + '/lidar.npy')\nL = np.load(out + '/lidar.npy')\nna, ne = s['az_count'], s['el_count']\nassert L.shape == (na, ne) and r['shape'] == [na, ne] and r['channel'] == 'range', (L.shape, r['shape'])\naz = s['az_min'] + (np.arange(na) + 0.5) * (s['az_max'] - s['az_min']) / na\nel = s['el_min'] + (np.arange(ne) + 0.5) * (s['el_max'] - s['el_min']) / ne\nA, E = np.meshgrid(az, el, indexing='ij')\np = np.array([0.0, 0.0, 0.25]) + L[..., None] * np.stack([np.cos(E) * np.cos(A), np.cos(E) * np.sin(A), np.sin(E)], -1)\nhit = L < s['max_range'] - 1e-3\non_box = hit & (np.abs(np.max(np.abs(p - [2.0, 0.0, 0.25]) - 0.25, axis=-1)) < 0.02)\non_ground = hit & (np.abs(p[..., 2]) < 0.02)\nprint('SENSOR_LIDAR', int(hit.sum()), int(on_box.sum()), int(on_ground.sum()))\nassert on_box.sum() >= 8 and (on_box | on_ground)[hit].all(), (hit.sum(), on_box.sum(), on_ground.sum())\nm = run('sensor.read', index=2)\nprint('SENSOR_IMU', m)\nf, w = m['values'][:3], m['values'][3:]\nassert m['shape'] == [6] and m['channel'] == 'state' and m['dtype'] == 'float32', m\nassert abs(f[2] - 9.81) < 0.5 and abs(f[0]) < 0.5 and abs(f[1]) < 0.5 and max(abs(x) for x in w) < 0.05, m\nassert run('sensor.read', index=0, channel='instance')['dtype'] == 'uint32'"},
+    {"action": "window.focus", "args": {"panel": "sensors"}},
+    {"action": "view.frame_all"},
+    {"action": "sensor.preview", "args": {"index": 0, "channel": "depth", "on": true},
+     "expect_value": {"on": true, "index": 0, "channel": "depth"}},
+    {"wait": "sensor.preview", "until": {"read": 0, "error": ""}},
+    {"python": "import time\nend = time.monotonic() + 8.5\nwhile time.monotonic() < end:\n    app.update(True)"},
+    {"screenshot": "01_sensor_depth"},
+    {"action": "sensor.select", "args": {"index": 1}},
+    {"action": "sensor.preview", "args": {"index": 1}},
+    {"wait": "sensor.preview", "until": {"read": 1, "error": ""}},
+    {"frames": 10},
+    {"screenshot": "02_sensor_lidar"},
+    {"action": "sensor.preview", "args": {"index": 2}},
+    {"wait": "sensor.preview", "until": {"read": 2, "error": ""}},
+    {"tick": 240},
+    {"frames": 10},
+    {"screenshot": "03_sensor_imu"},
+    {"action": "sensor.preview", "args": {"on": false}, "expect_value": {"on": false}},
+    {"python": "import builtins\nbuiltins.sn_fails('sensor.read', 'a camera reads', index=0, channel='range')\nbuiltins.sn_fails('sensor.preview', 'a camera shows', channel='range')"},
+
+    {"action": "file.close", "args": {"discard": true}},
+    {"frames": 4},
     {"expect": {"loaded": false}}
   ]
 }

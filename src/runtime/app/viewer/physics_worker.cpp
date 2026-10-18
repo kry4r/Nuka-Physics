@@ -1,5 +1,6 @@
 #include "runtime/app/viewer/physics_worker.hpp"
 
+#include "nuka/nuka_state_sensor.h"
 #include "runtime/app/viewer/editor_scene.hpp"
 #include "runtime/app/viewer/robot_tools.hpp"
 
@@ -45,6 +46,52 @@ bool Superseded(const std::vector<TickCommand>& cmds, size_t i) {
 }
 
 }  // namespace
+
+SensorReading ReadSensor(nuka_world_handle world, uint32_t index, uint32_t plane, uint32_t env) {
+    SensorReading out;
+    out.plane = plane;
+    nuka_result_t r = NUKA_RESULT_OK;
+    if (plane == kStatePlane) {
+        uint32_t envs = 0u;
+        r = nuka_world_get_state_sensor_dims(world, index, &envs, &out.width);
+        out.height = out.channels = 1u;
+        out.values.resize(out.width);
+        if (r == NUKA_RESULT_OK)
+            r = nuka_world_download_state_sensor(world, index, out.values.data(), out.values.size() * sizeof(float),
+                                                 size_t{env} * out.values.size() * sizeof(float));
+    } else {
+        r = nuka_world_render_sensors(world);
+        if (r == NUKA_RESULT_OK && plane == NUKA_SENSOR_CHANNEL_RANGE) {
+            r = nuka_world_get_lidar_dims(world, nullptr, nullptr, &out.width, &out.height);
+            out.channels = 1u;
+        } else if (r == NUKA_RESULT_OK) {
+            r = nuka_world_get_sensor_dims(world, nullptr, nullptr, &out.height, &out.width, &out.channels);
+            if (plane == NUKA_SENSOR_CHANNEL_DEPTH || plane == NUKA_SENSOR_CHANNEL_PRIM) out.channels = 1u;
+        }
+        uint64_t count = 0u;
+        const auto channel = static_cast<nuka_sensor_channel_t>(plane);
+        if (r == NUKA_RESULT_OK) r = nuka_world_download_sensor(world, channel, env, index, nullptr, 0u, &count);
+        out.values.resize(count);
+        if (r == NUKA_RESULT_OK)
+            r = nuka_world_download_sensor(world, channel, env, index, out.values.data(), count, &count);
+        size_t len = 0u;
+        if (r == NUKA_RESULT_OK && plane == NUKA_SENSOR_CHANNEL_PRIM &&
+            nuka_world_get_sensor_instances(world, nullptr, 0u, &len) == NUKA_RESULT_OK) {
+            std::string paths(len, '\0');
+            nuka_world_get_sensor_instances(world, paths.data(), paths.size() + 1u, &len);
+            for (size_t at = 0u; at < paths.size();) {
+                const size_t end = paths.find('\n', at);
+                out.instances.push_back(paths.substr(at, end - at));
+                at = end + 1u;
+            }
+        }
+    }
+    if (r != NUKA_RESULT_OK) {
+        out.values.clear();
+        out.error = nuka_result_message(r);
+    }
+    return out;
+}
 
 // An iteration that throws reports the error and pauses the transport.
 template <class Fn>
@@ -314,6 +361,14 @@ bool PhysicsWorker::TakeIk(IkReport* out) {
     return true;
 }
 
+bool PhysicsWorker::TakeSensorReading(SensorReading* out) {
+    std::lock_guard<std::mutex> lock(sensor_mu_);
+    if (!sensor_ready_) return false;
+    *out = std::move(sensor_);
+    sensor_ready_ = false;
+    return true;
+}
+
 uint64_t PhysicsWorker::ReadJoints(uint64_t since, std::vector<JointSample>* out, uint64_t* session) {
     std::lock_guard<std::mutex> lock(joints_mu_);
     const uint64_t first = joint_count_ - joint_log_.size();
@@ -580,6 +635,17 @@ bool PhysicsWorker::Apply(const TickCommand& cmd) {
         case CommandKind::IkSolve:
             SolveIk(cmd);
             return true;
+        case CommandKind::SensorRead: {
+            // Reads the live world at this boundary; physics waits, nothing is published.
+            SensorReading reading = ReadSensor(bind_.world, cmd.index, cmd.element, cmd.env);
+            reading.request = cmd.seq;
+            reading.tick = tick_;
+            reading.sim_time = sim_time_;
+            std::lock_guard<std::mutex> lock(sensor_mu_);
+            sensor_ = std::move(reading);
+            sensor_ready_ = true;
+            return false;
+        }
     }
     return false;
 }

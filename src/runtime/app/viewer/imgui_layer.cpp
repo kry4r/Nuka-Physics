@@ -91,6 +91,7 @@ const PanelSpec kPanels[] = {{"stage", "Stage", icon::kStage},       {"property"
                              {"poses", "Poses", icon::kRobot},
                              {"policy", "Policy", icon::kBrain},
                              {"demos", "Demos", icon::kRecord},
+                             {"sensors", "Sensors", icon::kLive},
                              {"script", "Script", icon::kScript},    {"console", "Console", icon::kConsole},
                              {"nui", "UI Inspector", icon::kInspector}};
 
@@ -102,11 +103,12 @@ struct LayoutPreset {
 };
 const LayoutPreset kLayouts[] = {
     {"authoring", "Authoring", {"stage", "file"}, {"property", "camera"},
-     {"assets", "console", "script", "stats", "timeline"}},
+     {"assets", "console", "script", "stats", "timeline", "sensors"}},
     {"debug", "Debug", {"stage"}, {"solver", "debug", "stats", "property"}, {"console", "timeline", "script", "assets"}},
     {"robot", "Robot", {"stage"}, {"joints", "poses", "policy", "demos", "property"},
-     {"console", "timeline", "stats", "assets"}},
-    {"data", "Data", {"file", "stage"}, {"stats", "camera", "property"}, {"assets", "console", "script", "timeline"}},
+     {"console", "timeline", "stats", "assets", "sensors"}},
+    {"data", "Data", {"file", "stage"}, {"sensors", "stats", "camera", "property"},
+     {"assets", "console", "script", "timeline"}},
     {"training", "Training", {"stats", "stage"}, {"policy", "demos", "joints", "camera"},
      {"console", "script", "assets", "timeline"}},
 };
@@ -454,6 +456,7 @@ const std::vector<ImGuiLayer::BuiltinExtension>& ImGuiLayer::Builtins() {
         {"nuka.poses", "Poses", "Named joint poses: blend to one, start from it, import and export.", {"poses"}},
         {"nuka.policy", "Policy", "Load a locomotion policy, run or stop it and watch its actions.", {"policy"}},
         {"nuka.demos", "Demos", "Record teleoperated demonstrations, replay them and save them as HDF5.", {"demos"}},
+        {"nuka.sensors", "Sensors", "Preview each sensor's images, ranges and readings as the simulation runs.", {"sensors"}},
         {"nuka.script", "Script", "The Python script editor and the console.", {"script", "console"}},
         {"nuka.ui_inspector", "UI Inspector", "The nui component tree, for extension authors.", {"nui"}},
     };
@@ -467,6 +470,7 @@ void ImGuiLayer::AddBuiltinPanel(const std::string& panel_id) {
                                 &ImGuiLayer::BuildSolver, &ImGuiLayer::BuildTimeline,   &ImGuiLayer::BuildCamera,
                                 &ImGuiLayer::BuildJoints, &ImGuiLayer::BuildPoses,      &ImGuiLayer::BuildPolicy,
                                 &ImGuiLayer::BuildDemos,
+                                &ImGuiLayer::BuildSensors,
                                 &ImGuiLayer::BuildScript, &ImGuiLayer::BuildConsole,    &ImGuiLayer::BuildInspector};
     const size_t i = static_cast<size_t>(
         std::find_if(std::begin(kPanels), std::end(kPanels), [&](const PanelSpec& p) { return panel_id == p.id; }) -

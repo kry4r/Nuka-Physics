@@ -12,6 +12,7 @@
 #include "runtime/app/viewer/pose_scatter.hpp"
 #include "runtime/app/viewer/robot_view.hpp"
 #include "runtime/app/viewer/script_host.hpp"
+#include "runtime/app/viewer/sensor_view.hpp"
 #include "runtime/app/viewer/timeline_view.hpp"
 #include "runtime/inference/world_controller.hpp"
 #include "scene/format/json.hpp"
@@ -36,7 +37,7 @@ namespace nuka::runtime::app::viewer {
 using WorkerClock = std::chrono::steady_clock;
 
 enum class CommandKind : uint8_t {
-    EditApply, Teleport, ParamSet, Perturb, Transport, ScriptCall, Timeline, Beauty, GainTest, IkSolve
+    EditApply, Teleport, ParamSet, Perturb, Transport, ScriptCall, Timeline, Beauty, GainTest, IkSolve, SensorRead
 };
 enum class ParamKind : uint8_t {
     Field, HoldGains, ControllerCommand, DisplayEnv, ScatterRows, Overlay, Registry, Telemetry, Iterations, Heatmap,
@@ -76,14 +77,16 @@ struct TickCommand {
     nuka_state_field_t field = NUKA_FIELD_DRIVE_TARGET;
     size_t offset = 0u;                   // bytes into the field; TargetTrack: 1 repeats its rows
     // Registry parameter; TargetRamp: its length in steps; TargetTrack: its rows; GainTest: the link.
+    // SensorRead: the camera, lidar or state sensor among its kind.
     uint32_t index = 0u;
-    uint32_t element = 0u;                // Registry element; TargetTrack: the links of a row
+    // Registry element; TargetTrack: the links of a row; SensorRead: a nuka_sensor_channel_t or kStatePlane.
+    uint32_t element = 0u;
     // Field values, gains (kp, kd), command, overlay flags, registry value, telemetry (mask, alert),
     // sweep budget, heatmap or joint watch flag, ghost flag, the keyframe interval and budget [MB],
     // a target ramp's (link, from, to) triples, the worker stamping `from`, a target track's links
     // then its rows, the teleop axes, or a gain test's (sine, amplitude, frequency, duration).
     std::vector<float> values;
-    // DisplayEnv, TargetTrack; the worker stamps pose writes with the shown one.
+    // DisplayEnv, TargetTrack, SensorRead; the worker stamps pose writes with the shown one.
     uint32_t env = 0u;
     std::vector<ScatterRow> rows;         // ScatterRows
     Perturbation perturb;                 // Perturb
@@ -199,6 +202,23 @@ struct IkReport {
 
 // Solves an IkSolve command on environment `cmd.env` of `world`, writing what `cmd.ik.write` asks.
 IkReport RunIk(nuka_world_handle world, uint32_t links_per_env, const TickCommand& cmd);
+
+// One environment's reading of a sensor: a camera plane of `height` x `width` x `channels`, a
+// lidar's ranges by azimuth (`width`) then elevation (`height`), or a state sensor's `width`
+// values. PRIM values are uint32 bit patterns; `instances` names their instance field's nodes.
+struct SensorReading {
+    uint64_t request = 0u;  // the SensorRead command's seq
+    uint64_t tick = 0u;
+    double sim_time = 0.0;
+    uint32_t plane = 0u;
+    uint32_t width = 0u, height = 0u, channels = 0u;
+    std::vector<float> values;
+    std::vector<std::string> instances;
+    std::string error;
+};
+
+// Renders `world`'s sensors when `plane` is an image and reads sensor `index` of its kind in `env`.
+SensorReading ReadSensor(nuka_world_handle world, uint32_t index, uint32_t plane, uint32_t env);
 
 // The newest records of this many count toward SolverStats::recent_caps.
 inline constexpr uint32_t kRecentRecords = 256u;
@@ -357,6 +377,8 @@ public:
     bool TakeGainTrace(GainTrace* out);
     // Moves the newest IK report into `out` once; readable from any thread.
     bool TakeIk(IkReport* out);
+    // Moves the newest sensor reading into `out` once; readable from any thread.
+    bool TakeSensorReading(SensorReading* out);
     // Copies the joint samples numbered `since` on, 0 being the first of `session`; returns the
     // count taken in it. Readable from any thread.
     uint64_t ReadJoints(uint64_t since, std::vector<JointSample>* out, uint64_t* session);
@@ -527,6 +549,9 @@ private:
     std::mutex ik_mu_;
     IkReport ik_;
     bool ik_ready_ = false;
+    std::mutex sensor_mu_;
+    SensorReading sensor_;
+    bool sensor_ready_ = false;
 };
 
 }  // namespace nuka::runtime::app::viewer

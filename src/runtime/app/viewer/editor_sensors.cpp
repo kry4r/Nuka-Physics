@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <fstream>
 #include <iterator>
 #include <utility>
 
@@ -282,6 +283,32 @@ std::string UniqueSensorName(const std::vector<scene::SensorDesc>& sensors, cons
         if (std::none_of(sensors.begin(), sensors.end(), [&](const scene::SensorDesc& s) { return s.name == name; }))
             return name;
     }
+}
+
+uint32_t SensorSlot(const std::vector<scene::SensorDesc>& sensors, size_t index) {
+    const auto kind = [](SensorType t) { return LidarSensor(t) ? 2 : RenderSensor(t) ? 1 : 0; };
+    const int want = kind(sensors[index].type);
+    return static_cast<uint32_t>(std::count_if(sensors.begin(), sensors.begin() + static_cast<std::ptrdiff_t>(index),
+                                               [&](const scene::SensorDesc& s) { return kind(s.type) == want; }));
+}
+
+bool WriteNpy(const std::string& path, const std::vector<uint32_t>& shape, bool uint32,
+              const std::vector<float>& values) {
+    std::string header = std::string("{'descr': '") + (uint32 ? "<u4" : "<f4") + "', 'fortran_order': False, 'shape': (";
+    for (const uint32_t n : shape) header += std::to_string(n) + ", ";
+    if (shape.size() > 1u) header.resize(header.size() - 2u);
+    header += "), }";
+    // The magic, version and length take 10 bytes; the header pads to a 64-byte boundary.
+    header.append(63u - (10u + header.size()) % 64u, ' ');
+    header += '\n';
+    std::ofstream out(path, std::ios::binary);
+    const uint16_t len = static_cast<uint16_t>(header.size());
+    out.write("\x93NUMPY\x01\x00", 8);
+    out.put(static_cast<char>(len & 0xFFu));
+    out.put(static_cast<char>(len >> 8u));
+    out.write(header.data(), static_cast<std::streamsize>(header.size()));
+    out.write(reinterpret_cast<const char*>(values.data()), static_cast<std::streamsize>(values.size() * sizeof(float)));
+    return static_cast<bool>(out);
 }
 
 }  // namespace nuka::runtime::app::viewer

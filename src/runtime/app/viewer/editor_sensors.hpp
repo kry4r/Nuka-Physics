@@ -37,5 +37,13 @@ void ShareSensorShape(const scene::SensorDesc& s, std::vector<scene::SensorDesc>
 void NewSensorDefaults(const std::vector<scene::SensorDesc>& sensors, scene::SensorDesc* s);
 // `base` with a number after it, unused by any of `sensors`.
 std::string UniqueSensorName(const std::vector<scene::SensorDesc>& sensors, const std::string& base);
+// Sensor `index`'s place among the world's cameras, its lidars or its state sensors, which
+// attach and cook in scene order.
+uint32_t SensorSlot(const std::vector<scene::SensorDesc>& sensors, size_t index);
+
+// Writes `values` to `path` as a little-endian .npy array of `shape`, float32 or, with `uint32`,
+// their bit patterns as uint32; false when the file cannot be written.
+bool WriteNpy(const std::string& path, const std::vector<uint32_t>& shape, bool uint32,
+              const std::vector<float>& values);
 
 }  // namespace nuka::runtime::app::viewer

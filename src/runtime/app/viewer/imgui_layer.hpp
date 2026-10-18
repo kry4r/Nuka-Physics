@@ -477,6 +477,14 @@ private:
     void BuildPoses(nui::VStack& root);
     void BuildPolicy(nui::VStack& root);
     void BuildDemos(nui::VStack& root);
+    // The scene's sensors and the live reading of one: a camera plane or lidar range image to
+    // hover over, or a state sensor's recent values.
+    void BuildSensors(nui::VStack& root);
+    void DrawSensorsPanel();
+    // The previewed sensor's newest reading: a plot of a state sensor's values, else its image.
+    void DrawSensorReading(const SensorItem* shown);
+    // Draws the reading as an image again when it changes, with depth and range in false color.
+    void UpdateSensorTexture();
     void BuildScript(nui::VStack& root);
     void BuildConsole(nui::VStack& root);
     // The script tab bar with its keys, completions, disk-change bar and close prompt.
@@ -590,6 +598,10 @@ private:
     std::unique_ptr<ImTextureData> rt_texture_;
     uint64_t rt_version_ = 0u;
     std::vector<std::unique_ptr<ImTextureData>> rt_retired_;  // until the backend destroys them
+    // The Sensors panel's image of the newest reading and the span its false color covers.
+    std::unique_ptr<ImTextureData> sensor_texture_;
+    uint64_t sensor_texture_version_ = 0u;
+    float sensor_lo_ = 0.0f, sensor_hi_ = 0.0f;
     char render_path_[512] = {0};  // the Render dialog's fields
     int render_size_[2] = {1920, 1080};
     int render_spp_ = 64;

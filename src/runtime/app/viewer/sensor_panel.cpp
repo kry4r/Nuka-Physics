@@ -1,11 +1,13 @@
-// The sensors in the editor: the types it offers, their overlays over the scene viewport, and the
-// selected sensor's fields in Properties.
+// The sensors in the editor: the types it offers, their overlays over the scene viewport, the
+// selected sensor's fields in Properties and the Sensors panel's live readings.
 
 #include "runtime/app/viewer/imgui_layer.hpp"
 
 #include "imgui.h"
 #include "imgui_internal.h"
+#include "implot.h"
 
+#include "nuka/nuka.h"
 #include "render/imgui/nuka_imgui.hpp"
 #include "render/imgui/nuka_theme.hpp"
 #include "runtime/app/viewer/shell_util.hpp"
@@ -14,6 +16,9 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <iterator>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -37,11 +42,76 @@ constexpr int kFanRays = 24, kFanRows = 4;
 constexpr std::pair<const char*, uint32_t> kAovs[] = {
     {"Color", 1u}, {"Depth", 2u}, {"Normal", 4u}, {"Albedo", 8u}, {"Instance", 16u}};
 constexpr uint32_t kAllAovs = 31u;
+// An instance plane's value where no surface was hit.
+constexpr uint32_t kMissId = 0xFFFFFFFFu;
+// The state plot draws this many of a sensor's values, in these colors.
+constexpr size_t kMaxSeries = 8u;
+constexpr ImVec4 kSeries[] = {theme::kAxisX, theme::kAxisY, theme::kAxisZ, theme::kWarn,
+                              theme::kInfo,  theme::kAccent, theme::kErr};
 
 json::Value Vec3Json(const math::Vec3& v) {
     json::Value a = json::Value::Array();
     for (const float c : {v.x, v.y, v.z}) a.PushBack(json::Value::Float(c));
     return a;
+}
+
+ImPlotSpec Line(const ImVec4& color, float weight) {
+    ImPlotSpec spec;
+    spec.LineColor = color;
+    spec.LineWeight = weight * nui::Scale();
+    return spec;
+}
+
+// Near surfaces warm, far ones cold.
+ImU32 FalseColor(float t) {
+    static constexpr float kStops[5][3] = {{1.00f, 0.96f, 0.72f}, {0.98f, 0.70f, 0.22f}, {0.84f, 0.29f, 0.30f},
+                                           {0.38f, 0.16f, 0.52f}, {0.06f, 0.07f, 0.18f}};
+    const float x = std::clamp(t, 0.0f, 1.0f) * 4.0f;
+    const int i = std::min(static_cast<int>(x), 3);
+    const float f = x - static_cast<float>(i);
+    const auto mix = [&](int c) { return static_cast<int>((kStops[i][c] + (kStops[i + 1][c] - kStops[i][c]) * f) * 255.0f); };
+    return IM_COL32(mix(0), mix(1), mix(2), 255);
+}
+
+// A steady color per instance.
+ImU32 InstanceColor(uint32_t instance) {
+    uint32_t h = (instance + 1u) * 2654435761u;
+    h ^= h >> 16u;
+    return IM_COL32(72u + (h & 0x9Fu), 72u + ((h >> 8u) & 0x9Fu), 72u + ((h >> 20u) & 0x9Fu), 255u);
+}
+
+// What a state sensor's value `k` is, when its type fixes how many it has; else v0, v1, ...
+std::string ValueName(const std::string& type, size_t count, size_t k) {
+    static const std::pair<const char*, std::vector<const char*>> kNames[] = {
+        {"imu", {"ax", "ay", "az", "wx", "wy", "wz"}},
+        {"frame_pose", {"x", "y", "z", "qw", "qx", "qy", "qz"}},
+        {"joint_state", {"q", "qd"}},
+        {"linear_velocity", {"vx", "vy", "vz"}},
+        {"force_torque", {"fx", "fy", "fz", "tx", "ty", "tz"}},
+        {"contact", {"f"}}};
+    for (const auto& [t, names] : kNames)
+        if (type == t && names.size() == count) return names[k];
+    return "v" + std::to_string(k);
+}
+
+// What pixel (x, y) of a reading holds, as hovering it shows; a range image runs azimuth to the
+// right and elevation up.
+std::string PixelText(const SensorPreview& p, const SensorItem& item, int x, int y) {
+    if (p.plane == kRangeChannel) {
+        const uint32_t el = p.height - 1u - static_cast<uint32_t>(y);
+        const float az = item.az_min + (item.az_max - item.az_min) * (static_cast<float>(x) + 0.5f) / static_cast<float>(p.width);
+        const float elev = item.el_min + (item.el_max - item.el_min) * (static_cast<float>(el) + 0.5f) / static_cast<float>(p.height);
+        return Fmt("az %.1f\xC2\xB0  el %.1f\xC2\xB0  %.3f m", az * kDeg, elev * kDeg,
+                   p.values[static_cast<size_t>(x) * p.height + el]);
+    }
+    const float* v = &p.values[(static_cast<size_t>(y) * p.width + static_cast<size_t>(x)) * p.channels];
+    const std::string at = Fmt("(%d, %d)  ", x, y);
+    if (p.plane == NUKA_SENSOR_CHANNEL_DEPTH) return at + Fmt("%.3f m", v[0]);
+    if (p.plane != NUKA_SENSOR_CHANNEL_PRIM) return at + Fmt("%.3f  %.3f  %.3f", v[0], v[1], v[2]);
+    uint32_t bits = 0u;
+    std::memcpy(&bits, v, sizeof(bits));
+    if (bits == kMissId) return at + Tr("no hit");
+    return at + Fmt("instance %u  prim %u  ", bits >> 20u, bits & 0xFFFFFu) + p.instances[bits >> 20u];
 }
 
 }  // namespace
@@ -143,6 +213,26 @@ void ImGuiLayer::DrawSensorHud(const ImVec2& vmin, const ImVec2& vmax) {
             draw::Chamfer(list, a, b, 3.0f * s, U32(theme::Alpha(theme::kBg0, 0.85f)),
                           U32(selected ? theme::kAccent : theme::Alpha(theme::kLineHi, 0.8f)));
             list->AddText(ImVec2(a.x + 5.0f * s, a.y + 2.0f * s), U32(selected ? theme::kAccent : theme::kFgMuted), text.c_str());
+        }
+    }
+    // The previewed lidar's returns in the shown environment; misses at its range limit stay out.
+    const SensorPreview& p = v.preview;
+    if (p.on && p.plane == kRangeChannel && p.read >= 0 && static_cast<size_t>(p.read) < v.items.size() &&
+        v.items[static_cast<size_t>(p.read)].lidar && v.items[static_cast<size_t>(p.read)].posed) {
+        const SensorItem& item = v.items[static_cast<size_t>(p.read)];
+        const ImU32 dot = U32(theme::kWarn);
+        const float r = 1.5f * s;
+        for (uint32_t a = 0; a < p.width; ++a) {
+            const float az = item.az_min + (item.az_max - item.az_min) * (static_cast<float>(a) + 0.5f) / static_cast<float>(p.width);
+            for (uint32_t e = 0; e < p.height; ++e) {
+                const float range = p.values[static_cast<size_t>(a) * p.height + e];
+                if (range >= item.max_range) continue;
+                const float el = item.el_min + (item.el_max - item.el_min) * (static_cast<float>(e) + 0.5f) / static_cast<float>(p.height);
+                const math::Vec3 dir{std::cos(el) * std::cos(az), std::cos(el) * std::sin(az), std::sin(el)};
+                ImVec2 at;
+                if (project(item.pose.TransformPoint(dir * range), &at))
+                    list->AddRectFilled(ImVec2(at.x - r, at.y - r), ImVec2(at.x + r, at.y + r), dot);
+            }
         }
     }
     list->PopClipRect();
@@ -313,6 +403,201 @@ void ImGuiLayer::DrawSensorInspector() {
     ImGui::EndTable();
     if (ImGui::Button(Iconed(icon::kTrash, Tr("Remove Sensor")).c_str()))
         Queue("sensor.remove", Args({{"index", json::Value::Int(sensor_edit_index_)}}));
+}
+
+void ImGuiLayer::BuildSensors(nui::VStack& root) {
+    root.Add<nui::Custom>([this] { DrawSensorsPanel(); });
+}
+
+void ImGuiLayer::UpdateSensorTexture() {
+    const SensorView& v = frame_.ui->sensors;
+    const SensorPreview& p = v.preview;
+    if (sensor_texture_version_ == p.version) return;
+    sensor_texture_version_ = p.version;
+    if (p.plane == kStatePlane || p.read < 0 || static_cast<size_t>(p.read) >= v.items.size()) return;
+    const SensorItem& item = v.items[static_cast<size_t>(p.read)];
+    const int w = static_cast<int>(p.width), h = static_cast<int>(p.height);
+    if (sensor_texture_ && (sensor_texture_->Width != w || sensor_texture_->Height != h)) {
+        sensor_texture_->SetStatus(ImTextureStatus_WantDestroy);
+        rt_retired_.push_back(std::move(sensor_texture_));
+    }
+    if (!sensor_texture_) {
+        sensor_texture_ = std::make_unique<ImTextureData>();
+        sensor_texture_->Create(ImTextureFormat_RGBA32, w, h);
+        ImGui::RegisterUserTexture(sensor_texture_.get());
+    } else {
+        sensor_texture_->UpdateRect = ImTextureRect{0, 0, static_cast<unsigned short>(w), static_cast<unsigned short>(h)};
+        if (sensor_texture_->Status == ImTextureStatus_OK) sensor_texture_->SetStatus(ImTextureStatus_WantUpdates);
+    }
+    // Depth and range spread their hits over the false color; misses sit at the far limit.
+    const float limit = p.plane == kRangeChannel ? item.max_range : item.far_clip;
+    const auto hit = [&](float d) { return std::isfinite(d) && d > 0.0f && d < limit; };
+    float lo = FLT_MAX, hi = 0.0f;
+    if (p.plane == NUKA_SENSOR_CHANNEL_DEPTH || p.plane == kRangeChannel)
+        for (const float d : p.values)
+            if (hit(d)) {
+                lo = std::min(lo, d);
+                hi = std::max(hi, d);
+            }
+    const auto shade = [&](float d) { return hit(d) ? FalseColor((d - lo) / std::max(hi - lo, 1.0e-6f)) : U32(theme::kBg0); };
+    const auto byte = [](float c) { return static_cast<int>(std::clamp(c, 0.0f, 1.0f) * 255.0f + 0.5f); };
+    ImU32* pixels = static_cast<ImU32*>(sensor_texture_->GetPixels());
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            ImU32& c = pixels[static_cast<size_t>(y) * static_cast<size_t>(w) + static_cast<size_t>(x)];
+            if (p.plane == kRangeChannel) {
+                c = shade(p.values[static_cast<size_t>(x) * p.height + (p.height - 1u - static_cast<uint32_t>(y))]);
+                continue;
+            }
+            const float* at = &p.values[(static_cast<size_t>(y) * p.width + static_cast<size_t>(x)) * p.channels];
+            uint32_t bits = 0u;
+            std::memcpy(&bits, at, sizeof(bits));
+            if (p.plane == NUKA_SENSOR_CHANNEL_DEPTH) c = shade(at[0]);
+            else if (p.plane == NUKA_SENSOR_CHANNEL_PRIM) c = bits == kMissId ? U32(theme::kBg0) : InstanceColor(bits >> 20u);
+            else if (p.plane == NUKA_SENSOR_CHANNEL_NORMAL)
+                c = IM_COL32(byte(at[0] * 0.5f + 0.5f), byte(at[1] * 0.5f + 0.5f), byte(at[2] * 0.5f + 0.5f), 255);
+            else c = IM_COL32(byte(at[0]), byte(at[1]), byte(at[2]), 255);
+        }
+    sensor_lo_ = lo;
+    sensor_hi_ = hi;
+}
+
+void ImGuiLayer::DrawSensorsPanel() {
+    const SensorView& v = frame_.ui->sensors;
+    const SensorPreview& p = v.preview;
+    const float s = nui::Scale();
+    if (v.items.empty()) {
+        ImGui::TextDisabled("%s", Tr("No sensors yet; add one from Create > Sensor."));
+        return;
+    }
+    const SensorItem* shown = p.sensor >= 0 ? &v.items[static_cast<size_t>(p.sensor)] : nullptr;
+    // A wide, short panel puts the list beside the reading, a tall one above it.
+    const ImVec2 room = ImGui::GetContentRegionAvail();
+    const bool wide = room.x > 2.0f * room.y;
+    if (wide) ImGui::BeginChild("##sensor_side", ImVec2(std::min(360.0f * s, 0.4f * room.x), 0.0f));
+    if (ImGui::Button(Iconed(p.on ? icon::kPause : icon::kPlay, Tr(p.on ? "Pause" : "Preview")).c_str()))
+        Queue("sensor.preview", Args({{"on", json::Value::Bool(!p.on)}}));
+    if (shown != nullptr && shown->camera) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(130.0f * s);
+        if (ImGui::BeginCombo("##plane", Tr(kAovs[p.channel].first))) {
+            for (uint32_t c = 0; c < std::size(kAovs); ++c)
+                if (ImGui::Selectable(Tr(kAovs[c].first), c == p.channel))
+                    Queue("sensor.preview", Args({{"channel", json::Value::Str(kSensorChannels[c])}}));
+            ImGui::EndCombo();
+        }
+    }
+
+    // Picking a row selects the sensor and reads it live.
+    const float rows = std::min(static_cast<float>(v.items.size()), 6.0f) + 1.0f;
+    const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp;
+    if (ImGui::BeginTable("##sensor_list", 3, flags, ImVec2(0.0f, wide ? -FLT_MIN : rows * ImGui::GetFrameHeight()))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn(Tr("Sensor"), ImGuiTableColumnFlags_WidthStretch, 1.4f);
+        ImGui::TableSetupColumn(Tr("Mount"), ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn(Tr("State"), ImGuiTableColumnFlags_WidthFixed, 56.0f * s);
+        ImGui::TableHeadersRow();
+        for (size_t i = 0; i < v.items.size(); ++i) {
+            const SensorItem& item = v.items[i];
+            const int index = static_cast<int>(i);
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::PushID(index);
+            if (ImGui::Selectable(Iconed(FindSensorKind(item.type).glyph, item.name.c_str()).c_str(), index == p.sensor,
+                                  ImGuiSelectableFlags_SpanAllColumns)) {
+                Queue("sensor.select", Args({{"index", json::Value::Int(index)}}));
+                Queue("sensor.preview", Args({{"index", json::Value::Int(index)}, {"on", json::Value::Bool(true)}}));
+            }
+            ImGui::PopID();
+            ImGui::TableSetColumnIndex(1);
+            const std::string mount = item.mount.empty() ? Tr("World") : item.mount.substr(item.mount.rfind('/') + 1u);
+            ImGui::TextColored(theme::kFgMuted, "%s", mount.c_str());
+            ImGui::TableSetColumnIndex(2);
+            if (index == p.sensor && !p.error.empty()) ImGui::TextColored(theme::kErr, "%s", Tr("ERROR"));
+            else if (index == p.sensor && p.on) ImGui::TextColored(theme::kAccent, "%s", Tr("LIVE"));
+            else ImGui::TextColored(theme::kFgDim, "%s", item.rate_hz > 0.0f ? Fmt("%.0f Hz", item.rate_hz).c_str() : "-");
+        }
+        ImGui::EndTable();
+    }
+    if (!wide) {
+        DrawSensorReading(shown);
+        return;
+    }
+    ImGui::EndChild();
+    ImGui::SameLine();
+    ImGui::BeginChild("##sensor_reading");
+    DrawSensorReading(shown);
+    ImGui::EndChild();
+}
+
+void ImGuiLayer::DrawSensorReading(const SensorItem* shown) {
+    const SensorPreview& p = frame_.ui->sensors.preview;
+    const float s = nui::Scale();
+    if (!p.error.empty()) ImGui::TextColored(theme::kErr, "%s", p.error.c_str());
+    if (shown == nullptr) {
+        ImGui::TextDisabled("%s", Tr("Pick a sensor to read it."));
+        return;
+    }
+    if (p.read != p.sensor || p.version == 0u) {
+        ImGui::TextDisabled("%s", Tr(p.on ? "Reading..." : "Press Preview to read this sensor live."));
+        return;
+    }
+
+    if (p.plane == kStatePlane) {
+        const int n = static_cast<int>(p.times.size());
+        const size_t plotted = std::min(p.values.size(), kMaxSeries);
+        // The plotted values ride the legend; the rest are listed under the plot.
+        std::string rest;
+        for (size_t k = plotted; k < p.values.size() && k < 2u * kMaxSeries; ++k)
+            rest += ValueName(shown->type, p.values.size(), k) + Fmt(" %.3f   ", p.values[k]);
+        if (p.values.size() > 2u * kMaxSeries) rest += "\xE2\x80\xA6";
+        const float caption = rest.empty() ? 0.0f : ImGui::GetTextLineHeightWithSpacing() * 2.0f;
+        const float height = std::max(80.0f * s, ImGui::GetContentRegionAvail().y - caption);
+        ImPlot::PushStyleVar(ImPlotStyleVar_PlotPadding, ImVec2(theme::kSpace * s, theme::kSpace * s));
+        // Steady values would otherwise sit on the plot's edges.
+        ImPlot::PushStyleVar(ImPlotStyleVar_FitPadding, ImVec2(0.02f, 0.1f));
+        if (ImPlot::BeginPlot("##sensor_plot", ImVec2(-FLT_MIN, height),
+                              ImPlotFlags_NoMenus | ImPlotFlags_NoBoxSelect | ImPlotFlags_NoFrame)) {
+            ImPlot::SetupAxes(nullptr, nullptr, ImPlotAxisFlags_AutoFit, ImPlotAxisFlags_AutoFit);
+            ImPlot::SetupLegend(ImPlotLocation_North,
+                                ImPlotLegendFlags_NoButtons | ImPlotLegendFlags_Outside | ImPlotLegendFlags_Horizontal);
+            for (size_t k = 0; k < plotted; ++k) {
+                // The part after ### keeps the line's id while its value changes.
+                const std::string label =
+                    ValueName(shown->type, p.values.size(), k) + Fmt(" %.3f###%zu", p.values[k], k);
+                ImPlot::PlotLine(label.c_str(), p.times.data(), p.series[k].data(), n,
+                                 Line(kSeries[k % std::size(kSeries)], 1.5f));
+            }
+            ImPlot::EndPlot();
+        }
+        ImPlot::PopStyleVar(2);
+        if (!rest.empty()) {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextColored(theme::kFgMuted, "%s", rest.c_str());
+            ImGui::PopTextWrapPos();
+        }
+        return;
+    }
+
+    UpdateSensorTexture();
+    const float w = static_cast<float>(p.width), h = static_cast<float>(p.height);
+    const ImVec2 room = ImGui::GetContentRegionAvail();
+    const float caption = ImGui::GetTextLineHeightWithSpacing();
+    ImVec2 size(room.x, room.x * h / w);
+    if (size.y > room.y - caption && room.y - caption > 60.0f * s) size = ImVec2((room.y - caption) * w / h, room.y - caption);
+    const ImVec2 at = ImGui::GetCursorScreenPos();
+    ImGui::Image(sensor_texture_->GetTexRef(), size);
+    if (ImGui::IsItemHovered()) {
+        const ImVec2 m = ImGui::GetMousePos();
+        const int x = std::clamp(static_cast<int>((m.x - at.x) / size.x * w), 0, static_cast<int>(p.width) - 1);
+        const int y = std::clamp(static_cast<int>((m.y - at.y) / size.y * h), 0, static_cast<int>(p.height) - 1);
+        ImGui::SetTooltip("%s", PixelText(p, *shown, x, y).c_str());
+    }
+    std::string line = Fmt("%u \xC3\x97 %u   %s", p.width, p.height, Tr(p.plane == kRangeChannel ? "Range" : kAovs[p.plane].first));
+    if (p.plane == NUKA_SENSOR_CHANNEL_DEPTH || p.plane == kRangeChannel)
+        line += sensor_hi_ > 0.0f ? Fmt("   %.2f\xE2\x80\x93%.2f m", sensor_lo_, sensor_hi_) : std::string("   ") + Tr("no hit");
+    line += Fmt("   tick %llu", static_cast<unsigned long long>(p.tick));
+    ImGui::TextColored(theme::kFgMuted, "%s", line.c_str());
 }
 
 }  // namespace nuka::runtime::app::viewer
