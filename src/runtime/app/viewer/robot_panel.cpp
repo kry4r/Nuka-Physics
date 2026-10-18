@@ -1,5 +1,6 @@
 // The Joints panel: each moving joint's limits, value, drive target and effort, the selected
-// joint's curves, drive conversion, the fixed base and keyboard teleop; and the Poses panel.
+// joint's curves, drive conversion, the fixed base and keyboard teleop; the Poses panel and
+// the Gain Tuner.
 
 #include "runtime/app/viewer/imgui_layer.hpp"
 
@@ -9,6 +10,7 @@
 
 #include "render/imgui/nuka_imgui.hpp"
 #include "render/imgui/nuka_theme.hpp"
+#include "runtime/app/viewer/robot_tools.hpp"
 #include "runtime/app/viewer/shell_util.hpp"
 
 #include <algorithm>
@@ -87,6 +89,21 @@ ImPlotSpec Line(const ImVec4& color, float weight) {
     return spec;
 }
 
+// A figure, or a dash where it does not apply.
+std::string Figure(const char* format, float v) {
+    return std::isfinite(v) ? Fmt(format, static_cast<double>(v)) : std::string("\xE2\x80\x94");
+}
+
+// A label cell, then the value cell, of the tuner's option table.
+void TunerLabel(const char* label) {
+    ImGui::TableNextRow();
+    ImGui::TableSetColumnIndex(0);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(theme::kFgMuted, "%s", Tr(label));
+    ImGui::TableSetColumnIndex(1);
+    ImGui::SetNextItemWidth(-FLT_MIN);
+}
+
 }  // namespace
 
 void ImGuiLayer::BuildJoints(nui::VStack& root) {
@@ -100,6 +117,8 @@ void ImGuiLayer::BuildJoints(nui::VStack& root) {
     base.text_fn = [robot] { return std::string(Tr(robot().floating ? "floating base" : "fixed base")); };
     base.tone_fn = [robot] { return robot().floating ? Tone::Info : Tone::Dim; };
     hero.Add<nui::Spacer>();
+    auto& tuner = hero.Add<nui::IconButton>(icon::kWaves, "Gain Tuner").Action("robot.gain_tuner");
+    tuner.checked_fn = [robot] { return robot().tuner.open; };
     auto& watch = hero.Add<nui::IconButton>(icon::kPlot, "Watch Joints").Action("robot.watch");
     watch.checked_fn = [robot] { return robot().watch; };
     hero.visible_if = [robot] { return !robot().joints.empty(); };
@@ -306,6 +325,184 @@ void ImGuiLayer::BuildPoses(nui::VStack& root) {
             ImGui::PopID();
         }
     });
+}
+
+void ImGuiLayer::DrawGainTuner() {
+    RobotView& v = frame_.ui->robot;
+    GainTuner& g = v.tuner;
+    if (!g.open || v.joints.empty()) return;
+    const float s = nui::Scale();
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowSize(ImVec2(std::min(600.0f * s, vp->WorkSize.x * 0.9f), std::min(600.0f * s, vp->WorkSize.y * 0.9f)),
+                             ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(vp->GetWorkCenter(), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
+    bool open = true;
+    const std::string title = std::string(Tr("Gain Tuner")) + "###gain_tuner";
+    if (ImGui::Begin(title.c_str(), &open, ImGuiWindowFlags_NoCollapse)) {
+        int j = FindJoint(v.joints, g.joint);
+        if (j < 0) {
+            j = std::max(v.focus, 0);
+            g.joint = v.joints[static_cast<size_t>(j)].name;
+        }
+        const RobotJoint& joint = v.joints[static_cast<size_t>(j)];
+        const bool position = joint.drive == "position";
+        if (ImGui::BeginTable("##gain_options", 2, ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed, 120.0f * s);
+            ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
+            TunerLabel("Joint");
+            if (ImGui::BeginCombo("##joint", joint.name.c_str())) {
+                for (size_t i = 0; i < v.joints.size(); ++i) {
+                    const std::string name = Iconed(v.joints[i].prismatic ? icon::kMove : icon::kRotate, v.joints[i].name.c_str());
+                    if (ImGui::Selectable(name.c_str(), static_cast<int>(i) == j)) g.joint = v.joints[i].name;
+                }
+                ImGui::EndCombo();
+            }
+            TunerLabel("Test");
+            if (ImGui::RadioButton(Tr("Step test"), !g.sine)) g.sine = false;
+            ImGui::SameLine();
+            if (ImGui::RadioButton(Tr("Sine test"), g.sine)) g.sine = true;
+            TunerLabel("Amplitude");
+            float amplitude = Shown(joint, g.amplitude);
+            if (ImGui::DragFloat("##amplitude", &amplitude, joint.prismatic ? 0.001f : 0.1f, 0.0f, 0.0f,
+                                 joint.prismatic ? "%.3f m" : "%.1f\xC2\xB0"))
+                g.amplitude = joint.prismatic ? amplitude : amplitude / kDegrees;
+            if (g.sine) {
+                TunerLabel("Frequency");
+                ImGui::DragFloat("##frequency", &g.frequency, 0.05f, 0.05f, 50.0f, "%.2f Hz", ImGuiSliderFlags_AlwaysClamp);
+            }
+            TunerLabel("Duration");
+            ImGui::DragFloat("##duration", &g.duration, 0.05f, 0.05f, 10.0f, "%.2f s", ImGuiSliderFlags_AlwaysClamp);
+            // The joint's gains are document fields: each drag ends in one undoable edit.
+            const char* const labels[3] = {"kp", "Damping", "Force limit"};
+            const char* const fields[3] = {"actuator.gain", "joint.damping", "actuator.force_limit"};
+            const char* const formats[3][2] = {{"%.1f N\xC2\xB7m/rad", "%.1f N/m"},
+                                               {"%.3f N\xC2\xB7m\xC2\xB7s/rad", "%.3f N\xC2\xB7s/m"},
+                                               {"%.1f N\xC2\xB7m", "%.1f N"}};
+            const float live[3] = {joint.kp, joint.damping, joint.force_limit};
+            for (int k = 0; k < 3; ++k) {
+                TunerLabel(labels[k]);
+                if (tuner_active_ != k) tuner_gains_[k] = live[k];
+                ImGui::BeginDisabled(k != 1 && !position);
+                ImGui::PushID(k);
+                ImGui::DragFloat("##gain", &tuner_gains_[k], std::max(0.01f, live[k] * 0.005f), 0.0f, FLT_MAX,
+                                 formats[k][joint.prismatic ? 1 : 0], ImGuiSliderFlags_AlwaysClamp);
+                if (ImGui::IsItemActive()) tuner_active_ = k;
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    json::Value op = Args({{"target", json::Value::Str(joint.path)},
+                                           {"field", json::Value::Str(fields[k])},
+                                           {"after", json::Value::Float(tuner_gains_[k])}});
+                    json::Value ops = json::Value::Array();
+                    ops.PushBack(std::move(op));
+                    Queue("edit.apply", Args({{"label", json::Value::Str(Tr(labels[k]))}, {"ops", std::move(ops)}}));
+                }
+                if (ImGui::IsItemDeactivated()) tuner_active_ = -1;
+                ImGui::PopID();
+                ImGui::EndDisabled();
+            }
+            ImGui::EndTable();
+        }
+        if (!position) {
+            ImGui::TextColored(theme::kWarn, "%s", Tr("The test drives a position target: make this joint a position drive."));
+            json::Value names = json::Value::Array();
+            names.PushBack(json::Value::Str(joint.name));
+            if (ImGui::Button(Iconed(icon::kDrive, Tr("Position Drive")).c_str()))
+                Queue("robot.drive", Args({{"joints", std::move(names)}}));
+        }
+        if (v.floating) {
+            ImGui::TextColored(theme::kWarn, "%s", Tr("The base is floating, so the robot falls during the test: fix it first."));
+            if (ImGui::Button(Iconed(icon::kStatic, Tr("Fixed Base")).c_str()))
+                Queue("robot.fix_base", Args({{"on", json::Value::Bool(true)}}));
+        }
+        ImGui::BeginDisabled(g.running != 0u || !position);
+        if (ImGui::Button(Iconed(icon::kRun, Tr("Run")).c_str()))
+            Queue("robot.gain_test", Args({{"joint", json::Value::Str(joint.name)},
+                                           {"kind", json::Value::Str(g.sine ? "sine" : "step")},
+                                           {"amplitude", json::Value::Float(g.amplitude)},
+                                           {"frequency", json::Value::Float(g.frequency)},
+                                           {"duration", json::Value::Float(g.duration)}}));
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(g.runs.empty());
+        if (ImGui::Button(Iconed(icon::kTrash, Tr("Clear")).c_str())) Queue("robot.gain_clear");
+        ImGui::EndDisabled();
+        if (g.running != 0u) {
+            ImGui::SameLine();
+            ImGui::TextColored(theme::kInfo, "%s", Tr("Running..."));
+        }
+
+        nui::draw::SectionHeader(Tr("Response"), Fmt("%zu / %zu", g.runs.size(), kGainRuns).c_str());
+        if (g.runs.empty()) {
+            ImGui::TextDisabled("%s", Tr("Run a test to see the joint's response; the world is put back afterwards."));
+        } else {
+            const GainRun& newest = g.runs.back();
+            ImPlot::PushStyleVar(ImPlotStyleVar_PlotPadding, ImVec2(theme::kSpace * s, theme::kSpace * s));
+            if (ImPlot::BeginPlot("##gain_plot", ImVec2(-FLT_MIN, 220.0f * s),
+                                  ImPlotFlags_NoMenus | ImPlotFlags_NoBoxSelect | ImPlotFlags_NoFrame)) {
+                ImPlot::SetupAxes(Tr("s"), newest.prismatic ? "m" : "\xC2\xB0", ImPlotAxisFlags_AutoFit, ImPlotAxisFlags_AutoFit);
+                ImPlot::SetupLegend(ImPlotLocation_South, ImPlotLegendFlags_NoButtons | ImPlotLegendFlags_Outside |
+                                                              ImPlotLegendFlags_Horizontal);
+                for (size_t k = 0; k < g.runs.size(); ++k) {
+                    const GainRun& run = g.runs[k];
+                    const float scale = run.prismatic ? 1.0f : kDegrees;
+                    std::vector<float> target(run.trace.target), q(run.trace.q);
+                    for (float& x : target) x *= scale;
+                    for (float& x : q) x *= scale;
+                    const ImVec4 color = ImPlot::GetColormapColor(static_cast<int>(k));
+                    const int n = static_cast<int>(q.size());
+                    ImPlotSpec faint = Line(theme::Alpha(color, 0.45f), 1.0f);
+                    faint.Flags = ImPlotItemFlags_NoLegend;
+                    ImPlot::PlotLine(Fmt("##target%zu", k).c_str(), run.trace.time.data(), target.data(), n, faint);
+                    const std::string label = Fmt(Tr("#%zu kp %.0f"), k + 1u, static_cast<double>(run.kp)) + Fmt("##run%zu", k);
+                    ImPlot::PlotLine(label.c_str(), run.trace.time.data(), q.data(), n, Line(color, 1.5f));
+                }
+                ImPlot::EndPlot();
+            }
+            ImPlot::PopStyleVar();
+            const char* const heads[] = {"#",          "Joint",    "Test",      "kp",       "Damping", "Rise",
+                                         "Overshoot",  "Settling", "Steady error", "\xCE\xB6", "\xCF\x89n", "Gain",
+                                         "Lag",        "RMSE",     "Saturated"};
+            constexpr int kColumns = static_cast<int>(sizeof(heads) / sizeof(heads[0]));
+            if (ImGui::BeginTable("##gain_runs", kColumns,
+                                  ImGuiTableFlags_ScrollX | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
+                                      ImGuiTableFlags_SizingFixedFit)) {
+                for (const char* head : heads) ImGui::TableSetupColumn(Tr(head));
+                ImGui::TableHeadersRow();
+                for (size_t k = 0; k < g.runs.size(); ++k) {
+                    const GainRun& run = g.runs[k];
+                    const GainMetrics& m = run.metrics;
+                    const float scale = run.prismatic ? 1.0f : kDegrees;
+                    const std::string cells[kColumns] = {
+                        Fmt("%zu", k + 1u),
+                        run.joint,
+                        run.trace.sine ? Fmt(Tr("sine %.2f Hz"), static_cast<double>(run.trace.frequency))
+                                       : std::string(Tr("step test")),
+                        Fmt("%.1f", static_cast<double>(run.kp)),
+                        Fmt("%.3f", static_cast<double>(run.damping)),
+                        Figure("%.3f s", m.rise),
+                        Figure("%.1f%%", m.overshoot),
+                        Figure("%.3f s", m.settling),
+                        Figure(run.prismatic ? "%+.4f m" : "%+.2f\xC2\xB0", m.steady_error * scale),
+                        Figure("%.2f", m.zeta),
+                        Figure("%.1f", m.omega),
+                        Figure("%+.1f dB", m.gain_db),
+                        Figure("%.1f\xC2\xB0", m.lag),
+                        Figure(run.prismatic ? "%.4f m" : "%.2f\xC2\xB0", m.rmse * scale),
+                        Figure("%.0f%%", m.saturation * 100.0f)};
+                    ImGui::TableNextRow();
+                    for (int c = 0; c < kColumns; ++c) {
+                        ImGui::TableSetColumnIndex(c);
+                        if (c == 0)
+                            ImGui::TextColored(ImPlot::GetColormapColor(static_cast<int>(k)), "%s", cells[c].c_str());
+                        else
+                            ImGui::TextUnformatted(cells[c].c_str());
+                    }
+                }
+                ImGui::EndTable();
+            }
+        }
+    }
+    ImGui::End();
+    if (!open) Queue("robot.gain_tuner", Args({{"on", json::Value::Bool(false)}}));
 }
 
 }  // namespace nuka::runtime::app::viewer

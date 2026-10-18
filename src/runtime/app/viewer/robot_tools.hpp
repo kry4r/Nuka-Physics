@@ -34,4 +34,10 @@ void DownloadJointSample(nuka_world_handle world, const WorldLayout& layout, uin
 // A joint's table entry with its live values.
 scene::json::Value JointJson(const RobotJoint& joint, const JointFrame& live);
 
+// A step test's rise, overshoot, peak and settling times, settled error and second-order fit,
+// or a sine test's gain, lag and tracking error; both with the share of saturated steps.
+GainMetrics FitGain(const GainTrace& trace);
+// A run's settings, gains and figures; `trace` adds its samples.
+scene::json::Value GainRunJson(const GainRun& run, bool trace);
+
 }  // namespace nuka::runtime::app::viewer

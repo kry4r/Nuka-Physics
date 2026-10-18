@@ -34,7 +34,7 @@ namespace nuka::runtime::app::viewer {
 
 using WorkerClock = std::chrono::steady_clock;
 
-enum class CommandKind : uint8_t { EditApply, Teleport, ParamSet, Perturb, Transport, ScriptCall, Timeline, Beauty };
+enum class CommandKind : uint8_t { EditApply, Teleport, ParamSet, Perturb, Transport, ScriptCall, Timeline, Beauty, GainTest };
 enum class ParamKind : uint8_t {
     Field, HoldGains, ControllerCommand, DisplayEnv, ScatterRows, Overlay, Registry, Telemetry, Iterations, Heatmap,
     JointWatch, TargetRamp
@@ -72,11 +72,12 @@ struct TickCommand {
     ParamKind param = ParamKind::Field;   // ParamSet
     nuka_state_field_t field = NUKA_FIELD_DRIVE_TARGET;
     size_t offset = 0u;                   // bytes into the field
-    uint32_t index = 0u;                  // Registry parameter; TargetRamp: its length in steps
+    uint32_t index = 0u;                  // Registry parameter; TargetRamp: its length in steps; GainTest: the link
     uint32_t element = 0u;                // Registry element
     // Field values, gains (kp, kd), command, overlay flags, registry value, telemetry (mask, alert),
     // sweep budget, heatmap or joint watch flag, ghost flag, the keyframe interval and budget [MB],
-    // or a target ramp's (link, from, to) triples; the worker stamps `from`.
+    // a target ramp's (link, from, to) triples, the worker stamping `from`, or a gain test's
+    // (sine, amplitude, frequency, duration).
     std::vector<float> values;
     uint32_t env = 0u;                    // DisplayEnv; the worker stamps pose writes with the shown one
     std::vector<ScatterRow> rows;         // ScatterRows
@@ -316,6 +317,8 @@ public:
     void ReadTimeline(TimelineInfo* info);
     // Moves the newest finished beauty render into `out` once; readable from any thread.
     bool TakeBeauty(BeautyImage* out);
+    // Moves the newest finished gain test into `out` once; readable from any thread.
+    bool TakeGainTrace(GainTrace* out);
     // Copies the joint samples numbered `since` on, 0 being the first of `session`; returns the
     // count taken in it. Readable from any thread.
     uint64_t ReadJoints(uint64_t since, std::vector<JointSample>* out, uint64_t* session);
@@ -333,6 +336,7 @@ private:
     void StampRamp(TickCommand& cmd);
     void StartRamp(const TickCommand& cmd, uint64_t start);
     void WriteRamp();
+    void RunGainTest(const TickCommand& cmd);
     void SampleJoints();
     void ReadTelemetry();
     void Publish();
@@ -454,6 +458,9 @@ private:
     std::mutex beauty_mu_;
     BeautyImage beauty_;
     bool beauty_ready_ = false;
+    std::mutex gain_mu_;
+    GainTrace gain_;
+    bool gain_ready_ = false;
 };
 
 }  // namespace nuka::runtime::app::viewer

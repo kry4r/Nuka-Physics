@@ -860,6 +860,7 @@ struct EditorHost::State : DocumentHost {
     void RegisterTimelineActions();
     void RegisterRobotActions();
     void RegisterPoseActions();
+    void RegisterGainActions();
     json::Value TimelineStatus();
     // What a recording must match to load: the document, the world's counts and step, and the
     // names of the link and body rows its poses fill.
@@ -977,6 +978,8 @@ struct EditorHost::State : DocumentHost {
     // Takes the joint samples the worker took since the last frame into the Joints view, which
     // follows the joint of the selected link.
     void SyncJoints();
+    // Adds a finished gain test to the tuner's runs with what it measured.
+    void SyncGainTest();
     void TakeWorkerResults();
     void PushTransport();
     void PushPoseWrites();
@@ -1091,6 +1094,7 @@ struct EditorHost::State : DocumentHost {
     std::vector<std::string> props_paths_;  // what the Properties schema was built for
     uint64_t props_scene_version_ = ~0ull;
     uint64_t props_revision_ = ~0ull;
+    uint64_t joints_revision_ = ~0ull;
     bool click_armed_ = false;
     float click_x_ = 0.0f, click_y_ = 0.0f;
     std::vector<std::string> instance_paths_;  // by shown instance; cleared when instances change
@@ -1750,6 +1754,11 @@ void EditorHost::State::SyncSolver() {
 
 void EditorHost::State::SyncJoints() {
     RobotView& v = ui_state_.robot;
+    // Live edits change gains without a rebuild.
+    if (doc_.Revision() != joints_revision_) {
+        joints_revision_ = doc_.Revision();
+        v.joints = RobotJoints(loaded_->scene, loaded_->Layout(), [this](scene::EntityId e) { return PathOfEntity(e); });
+    }
     std::vector<JointSample> fresh;
     uint64_t session = 0u;
     uint64_t count = worker_.ReadJoints(v.first + v.history.size(), &fresh, &session);
@@ -1775,6 +1784,18 @@ void EditorHost::State::SyncJoints() {
     v.focus = -1;
     for (size_t i = 0; i < v.joints.size(); ++i)
         if (v.joints[i].path == selected) v.focus = static_cast<int>(i);
+}
+
+void EditorHost::State::SyncGainTest() {
+    GainTuner& g = ui_state_.robot.tuner;
+    GainTrace trace;
+    if (!worker_.TakeGainTrace(&trace) || trace.request != g.running) return;
+    GainRun run = std::move(g.next);
+    run.metrics = FitGain(trace);
+    run.trace = std::move(trace);
+    g.runs.push_back(std::move(run));
+    while (g.runs.size() > kGainRuns) g.runs.pop_front();
+    g.running = 0u;
 }
 
 void EditorHost::State::TakeWorkerResults() {
@@ -2278,6 +2299,8 @@ void EditorHost::State::OnLoaded(const std::string& path) {
     script_host_.ClearScripts();
     live_scripts_.clear();
     SyncScripts();
+    ui_state_.robot.tuner.runs.clear();
+    ui_state_.robot.tuner.running = 0u;
     ui_state_.inspector = InspectorState{};
     last_seeded_ = scene::kInvalidEntity;
     xform_gesture_active_ = mat_gesture_active_ = gizmo_using_prev_ = false;
@@ -2725,6 +2748,83 @@ void EditorHost::State::RegisterRobotActions() {
                       return SubmitTxn(txn);
                   }});
     RegisterPoseActions();
+    RegisterGainActions();
+}
+
+void EditorHost::State::RegisterGainActions() {
+    const auto has_joints = [this] { return loaded_ != nullptr && !ui_state_.robot.joints.empty(); };
+    // Drives one joint's target through a step or sine from where it is, in a copy of the world the
+    // test throws away; defaults come from the tuner, its joint else the selected or first one, and
+    // the tuner keeps what ran.
+    actions_.Add({"robot.gain_test", "Run Gain Test", "robot", "", ShortcutScope::Global, has_joints, {},
+                  [this](const json::Value& args) {
+                      RobotView& v = ui_state_.robot;
+                      GainTuner& g = v.tuner;
+                      if (g.running != 0u) return ActionResult::Fail("a gain test is running");
+                      std::string fallback = g.joint;
+                      if (FindJoint(v.joints, fallback) < 0)
+                          fallback = v.joints[static_cast<size_t>(std::max(v.focus, 0))].name;
+                      const std::string name = StrArg(args, "joint", fallback);
+                      const int j = FindJoint(v.joints, name);
+                      if (j < 0) return ActionResult::Fail("no joint '" + name + "'");
+                      const std::string kind = StrArg(args, "kind", g.sine ? "sine" : "step");
+                      if (kind != "step" && kind != "sine") return ActionResult::Fail("the kind is step or sine");
+                      const double amplitude = NumArg(args, "amplitude", g.amplitude);
+                      const double frequency = NumArg(args, "frequency", g.frequency);
+                      const double duration = NumArg(args, "duration", g.duration);
+                      if (!std::isfinite(amplitude) || amplitude == 0.0)
+                          return ActionResult::Fail("the amplitude must be a nonzero number");
+                      if (!(duration > 0.0 && duration <= 10.0)) return ActionResult::Fail("the duration must be in (0, 10] s");
+                      if (kind == "sine" && !(frequency > 0.0 && std::isfinite(frequency)))
+                          return ActionResult::Fail("a sine's frequency must be above 0");
+                      const RobotJoint& joint = v.joints[static_cast<size_t>(j)];
+                      if (joint.drive != "position") return ActionResult::Fail("'" + name + "' has no position drive");
+                      g.joint = name;
+                      g.sine = kind == "sine";
+                      g.amplitude = static_cast<float>(amplitude);
+                      g.frequency = static_cast<float>(frequency);
+                      g.duration = static_cast<float>(duration);
+                      g.next = GainRun{name, joint.prismatic, joint.kp, joint.damping, joint.force_limit,
+                                       static_cast<float>(duration), {}, {}};
+                      TickCommand cmd;
+                      cmd.kind = CommandKind::GainTest;
+                      cmd.index = joint.link;
+                      cmd.values = {kind == "sine" ? 1.0f : 0.0f, static_cast<float>(amplitude), static_cast<float>(frequency),
+                                    static_cast<float>(duration)};
+                      g.running = worker_.Push(std::move(cmd));
+                      return Ok(Object({{"joint", json::Value::Str(name)},
+                                        {"kind", json::Value::Str(kind)},
+                                        {"steps", json::Value::Int(std::lround(duration / static_cast<double>(opt_.dt)))}}));
+                  }});
+    // Whether a test runs, how many runs the tuner keeps and the newest one's figures.
+    actions_.Add({"robot.gain_status", "Gain Test Status", "robot", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value&) {
+                      const GainTuner& g = ui_state_.robot.tuner;
+                      return Ok(Object({{"running", json::Value::Bool(g.running != 0u)},
+                                        {"runs", json::Value::Int(static_cast<int64_t>(g.runs.size()))},
+                                        {"last", g.runs.empty() ? json::Value::Null() : GainRunJson(g.runs.back(), false)}}));
+                  }});
+    // The kept runs, oldest first; `trace` adds their samples.
+    actions_.Add({"robot.gain_runs", "Gain Test Runs", "robot", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value& args) {
+                      const bool trace = BoolArg(args, "trace", false);
+                      json::Value runs = json::Value::Array();
+                      for (const GainRun& run : ui_state_.robot.tuner.runs) runs.PushBack(GainRunJson(run, trace));
+                      return Ok(std::move(runs));
+                  }});
+    actions_.Add({"robot.gain_clear", "Clear Gain Runs", "robot", "", ShortcutScope::Global,
+                  [this] { return !ui_state_.robot.tuner.runs.empty(); }, {},
+                  [this](const json::Value&) {
+                      ui_state_.robot.tuner.runs.clear();
+                      return Ok(Object({{"count", json::Value::Int(0)}}));
+                  }});
+    actions_.Add({"robot.gain_tuner", "Gain Tuner", "robot", "", ShortcutScope::Global, has_joints,
+                  [this] { return ui_state_.robot.tuner.open; },
+                  [this](const json::Value& args) {
+                      GainTuner& g = ui_state_.robot.tuner;
+                      g.open = BoolArg(args, "on", !g.open);
+                      return Ok(Object({{"on", json::Value::Bool(g.open)}}));
+                  }});
 }
 
 void EditorHost::State::RegisterPoseActions() {
@@ -4925,6 +5025,7 @@ void EditorHost::State::Frame(bool step_physics) {
     if (const Snapshot* snap = worker_.AcquireSnapshot()) ApplySnapshot(*snap);
     if (loaded_) SyncSolver();
     if (loaded_) SyncJoints();
+    SyncGainTest();
     if (loaded_) worker_.ReadTimeline(&ui_state_.timeline);
     double apply_ms = Ms(Clock::now() - apply_t0);
 

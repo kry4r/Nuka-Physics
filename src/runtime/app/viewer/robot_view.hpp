@@ -2,7 +2,9 @@
 // The robot workflow's joint state as the physics thread samples it and the Joints panel shows it.
 
 #include <cstdint>
+#include <cstddef>
 #include <deque>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -39,12 +41,67 @@ struct RobotJoint {
     std::string drive;         // the actuator type: position, motor, velocity or force; empty without one
     float kp = 0.0f;           // a position drive's gain
     float force_limit = 0.0f;  // 0 is unlimited
+    float damping = 0.0f;      // the joint's own
 };
 
 // Named joint positions in rad or m; applying one moves only the joints it names.
 struct JointPose {
     std::string name;
     std::vector<std::pair<std::string, float>> joints;
+};
+
+// A gain test of one joint: sample 0 is the state it started from, sample i the state after
+// step i, which drove `target[i]`.
+struct GainTrace {
+    uint64_t request = 0u;  // the test command's seq
+    uint32_t link = 0u;
+    bool sine = false;
+    float amplitude = 0.0f;  // rad or m
+    float frequency = 0.0f;  // Hz
+    float base = 0.0f;       // the target before the test
+    std::vector<float> time, target, q, qd, effort, saturated;
+};
+
+// What a gain test measured; NaN where a figure does not apply.
+struct GainMetrics {
+    static constexpr float kNone = std::numeric_limits<float>::quiet_NaN();
+    float rise = kNone;          // s, from 10% to 90% of the settled change
+    float overshoot = kNone;     // % of the settled change
+    float peak_time = kNone;     // s
+    float settling = kNone;      // s, after which it stays within 2% of the settled value
+    float steady_error = kNone;  // the target minus the settled value
+    float zeta = kNone;          // the damping ratio and natural frequency [rad/s] of a
+    float omega = kNone;         // second-order fit to the overshoot and peak time
+    float gain_db = kNone;       // sine: the response's amplitude over the command's
+    float lag = kNone;           // sine: degrees behind the command
+    float rmse = kNone;          // sine: tracking error over the second half
+    float saturation = 0.0f;     // the share of steps at the force limit
+};
+
+// One Gain Tuner run: the joint, the gains it ran with, its trace and what it measured.
+struct GainRun {
+    std::string joint;
+    bool prismatic = false;
+    float kp = 0.0f;
+    float damping = 0.0f;
+    float force_limit = 0.0f;
+    float duration = 0.0f;
+    GainTrace trace;
+    GainMetrics metrics;
+};
+
+inline constexpr size_t kGainRuns = 6u;  // the runs the tuner keeps
+
+struct GainTuner {
+    bool open = false;
+    std::string joint;  // the joint a test drives
+    bool sine = false;
+    float amplitude = 0.1f;  // rad or m
+    float frequency = 1.0f;  // Hz
+    float duration = 1.0f;   // s
+    uint64_t running = 0u;   // the running test's request; 0 while none runs
+    GainRun next;            // its joint and gains
+    std::deque<GainRun> runs;  // the newest last
 };
 
 struct RobotView {
@@ -62,6 +119,7 @@ struct RobotView {
     float drive_kp = 100.0f;  // the gain Position drive converts with
     std::vector<JointPose> poses;  // the document's pose library
     float pose_blend = 0.5f;       // the simulated seconds a click on a pose blends over
+    GainTuner tuner;
 };
 
 }  // namespace nuka::runtime::app::viewer

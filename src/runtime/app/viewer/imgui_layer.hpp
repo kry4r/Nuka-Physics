@@ -482,6 +482,8 @@ private:
     void DrawPrompt();
     void DrawImportWizard();
     void DrawCollisionDialog();
+    // The floating Gain Tuner while it is open.
+    void DrawGainTuner();
     // The heatmap's scale and the located element's marker over the scene viewport.
     void DrawSolverHud(const ImVec2& vmin, const ImVec2& vmax);
     // Each held load's pull from its grab point toward its target.
@@ -551,6 +553,8 @@ private:
     int render_spp_ = 64;
     char bookmark_name_[128] = {0};  // the bookmark rename field
     char pose_name_[128] = {0};      // the pose rename field
+    float tuner_gains_[3] = {};      // the tuner's kp, damping and force limit fields
+    int tuner_active_ = -1;          // the field being dragged, which keeps its own value
 
     bool palette_open_ = false;
     bool palette_focus_ = false;

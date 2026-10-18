@@ -292,6 +292,14 @@ bool PhysicsWorker::TakeBeauty(BeautyImage* out) {
     return true;
 }
 
+bool PhysicsWorker::TakeGainTrace(GainTrace* out) {
+    std::lock_guard<std::mutex> lock(gain_mu_);
+    if (!gain_ready_) return false;
+    *out = std::move(gain_);
+    gain_ready_ = false;
+    return true;
+}
+
 uint64_t PhysicsWorker::ReadJoints(uint64_t since, std::vector<JointSample>* out, uint64_t* session) {
     std::lock_guard<std::mutex> lock(joints_mu_);
     const uint64_t first = joint_count_ - joint_log_.size();
@@ -536,6 +544,9 @@ bool PhysicsWorker::Apply(const TickCommand& cmd) {
             beauty_ready_ = true;
             return false;
         }
+        case CommandKind::GainTest:
+            RunGainTest(cmd);
+            return false;
     }
     return false;
 }
@@ -729,6 +740,45 @@ void PhysicsWorker::WriteRamp() {
                     "upload drive target");
     }
     if (alpha >= 1.0f) ramp_ = TargetRamp{};
+}
+
+// Steps the drive alone, without loads, ramp or policy, writing one link's target each step,
+// then puts the world back; the trace starts with the state before the first step.
+void PhysicsWorker::RunGainTest(const TickCommand& cmd) {
+    Keyframe before;
+    CheckResult(nuka_world_checkpoint_capture(bind_.world, &before.state), "nuka_world_checkpoint_capture");
+    GainTrace trace;
+    trace.request = cmd.seq;
+    trace.link = cmd.index;
+    trace.sine = cmd.values[0] != 0.0f;
+    trace.amplitude = cmd.values[1];
+    trace.frequency = cmd.values[2];
+    const size_t row = static_cast<size_t>(bind_.env) * bind_.layout.links_per_env + cmd.index;
+    trace.base = DownloadRow<float>(bind_.world, NUKA_FIELD_DRIVE_TARGET, row);
+    const auto sample = [&](float time, float target) {
+        trace.time.push_back(time);
+        trace.target.push_back(target);
+        trace.q.push_back(DownloadRow<float>(bind_.world, NUKA_FIELD_JOINT_POSITION, row));
+        trace.qd.push_back(DownloadRow<float>(bind_.world, NUKA_FIELD_JOINT_VELOCITY, row));
+        trace.effort.push_back(DownloadRow<float>(bind_.world, NUKA_FIELD_ACTUATOR_EFFORT, row));
+        trace.saturated.push_back(DownloadRow<float>(bind_.world, NUKA_FIELD_ACTUATOR_SATURATED, row));
+    };
+    sample(0.0f, trace.base);
+    const uint32_t steps = static_cast<uint32_t>(std::lround(cmd.values[3] / bind_.dt));
+    for (uint32_t i = 0; i < steps; ++i) {
+        const float t = static_cast<float>(i) * bind_.dt;
+        const float shape = trace.sine ? std::sin(2.0f * 3.14159265f * trace.frequency * t) : 1.0f;
+        const float target = trace.base + trace.amplitude * shape;
+        CheckResult(nuka_world_upload_field(bind_.world, NUKA_FIELD_DRIVE_TARGET, &target, sizeof(float),
+                                            row * sizeof(float)),
+                    "upload drive target");
+        nuka_world_step(bind_.world);
+        sample(static_cast<float>(i + 1u) * bind_.dt, target);
+    }
+    CheckResult(nuka_world_checkpoint_restore(bind_.world, before.state), "nuka_world_checkpoint_restore");
+    std::lock_guard<std::mutex> lock(gain_mu_);
+    gain_ = std::move(trace);
+    gain_ready_ = true;
 }
 
 void PhysicsWorker::DispatchTick() {

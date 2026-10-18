@@ -1,6 +1,10 @@
 #include "runtime/app/viewer/robot_tools.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
+#include <initializer_list>
+#include <limits>
 #include <utility>
 
 namespace nuka::runtime::app::viewer {
@@ -30,6 +34,77 @@ void DownloadLinks(nuka_world_handle world, nuka_state_field_t field, const Worl
 }
 
 float At(const std::vector<float>& v, uint32_t i) { return i < v.size() ? v[i] : 0.0f; }
+
+constexpr double kPi = 3.14159265358979323846;
+
+// Step figures against the settled value, the mean of the last tenth of the samples.
+void FitStep(const GainTrace& t, GainMetrics* m) {
+    const size_t n = t.q.size(), tail = std::max<size_t>(n / 10u, 1u);
+    double settled = 0.0;
+    for (size_t i = n - tail; i < n; ++i) settled += t.q[i];
+    settled /= static_cast<double>(tail);
+    const double start = t.q[0], change = settled - start;
+    m->steady_error = static_cast<float>(t.base + t.amplitude - settled);
+    if (std::abs(change) < 1e-6) return;
+    double peak = -std::numeric_limits<double>::infinity();
+    size_t at = 0u, outside = 0u;
+    float t10 = GainMetrics::kNone, t90 = GainMetrics::kNone;
+    for (size_t i = 0; i < n; ++i) {
+        const double s = (t.q[i] - start) / change;
+        if (std::isnan(t10) && s >= 0.1) t10 = t.time[i];
+        if (std::isnan(t90) && s >= 0.9) t90 = t.time[i];
+        if (s > peak) {
+            peak = s;
+            at = i;
+        }
+        if (std::abs(t.q[i] - settled) > 0.02 * std::abs(change)) outside = i;
+    }
+    m->rise = t90 - t10;
+    if (outside + 1u < n) m->settling = t.time[outside + 1u];
+    // A peak inside the settled tail is the approach, not an overshoot.
+    const bool overshot = peak > 1.0 && at < n - tail;
+    m->overshoot = overshot ? static_cast<float>((peak - 1.0) * 100.0) : 0.0f;
+    if (!overshot) return;
+    m->peak_time = t.time[at];
+    const double l = std::log(peak - 1.0);
+    const double zeta = -l / std::sqrt(kPi * kPi + l * l);
+    m->zeta = static_cast<float>(zeta);
+    m->omega = static_cast<float>(kPi / (static_cast<double>(t.time[at]) * std::sqrt(1.0 - zeta * zeta)));
+}
+
+// Least squares of the second half onto a sine, a cosine and a constant at the command's frequency.
+void FitSine(const GainTrace& t, GainMetrics* m) {
+    const size_t n = t.q.size(), from = n / 2u;
+    const double w = 2.0 * kPi * t.frequency;
+    double a[3][4] = {};
+    double error = 0.0;
+    for (size_t i = from; i < n; ++i) {
+        const double basis[3] = {std::sin(w * t.time[i]), std::cos(w * t.time[i]), 1.0};
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) a[r][c] += basis[r] * basis[c];
+            a[r][3] += basis[r] * t.q[i];
+        }
+        error += (static_cast<double>(t.target[i]) - t.q[i]) * (static_cast<double>(t.target[i]) - t.q[i]);
+    }
+    m->rmse = static_cast<float>(std::sqrt(error / static_cast<double>(n - from)));
+    for (int p = 0; p < 3; ++p) {
+        int best = p;
+        for (int r = p + 1; r < 3; ++r)
+            if (std::abs(a[r][p]) > std::abs(a[best][p])) best = r;
+        std::swap(a[p], a[best]);
+        if (std::abs(a[p][p]) < 1e-12) return;
+        for (int r = 0; r < 3; ++r) {
+            if (r == p) continue;
+            const double f = a[r][p] / a[p][p];
+            for (int c = p; c < 4; ++c) a[r][c] -= f * a[p][c];
+        }
+    }
+    // a·sin + b·cos is R·sin(wt + phase); a negative amplitude flips the command.
+    const double sine = a[0][3] / a[0][0], cosine = a[1][3] / a[1][1];
+    const double phase = std::atan2(cosine, sine) * 180.0 / kPi + (t.amplitude < 0.0f ? 180.0 : 0.0);
+    m->gain_db = static_cast<float>(20.0 * std::log10(std::hypot(sine, cosine) / std::abs(t.amplitude)));
+    m->lag = static_cast<float>(std::remainder(-phase, 360.0));
+}
 
 }  // namespace
 
@@ -70,6 +145,7 @@ std::vector<RobotJoint> RobotJoints(const scene::SceneIR& scene, const WorldLayo
             r.kp = a.type == scene::ActuatorType::Position ? a.gain : 0.0f;
             r.force_limit = a.force_limit;
         }
+        r.damping = j->damping;
         joints.push_back(std::move(r));
     }
     return joints;
@@ -114,11 +190,53 @@ json::Value JointJson(const RobotJoint& joint, const JointFrame& live) {
     v.Set("drive", joint.drive.empty() ? json::Value::Null() : json::Value::Str(joint.drive));
     v.Set("kp", json::Value::Float(joint.kp));
     v.Set("force_limit", json::Value::Float(joint.force_limit));
+    v.Set("damping", json::Value::Float(joint.damping));
     v.Set("q", json::Value::Float(At(live.q, joint.link)));
     v.Set("qd", json::Value::Float(At(live.qd, joint.link)));
     v.Set("target", json::Value::Float(At(live.target, joint.link)));
     v.Set("effort", json::Value::Float(At(live.effort, joint.link)));
     v.Set("saturated", json::Value::Bool(At(live.saturated, joint.link) != 0.0f));
+    return v;
+}
+
+GainMetrics FitGain(const GainTrace& trace) {
+    GainMetrics m;
+    const size_t n = trace.q.size();
+    if (n < 3u) return m;
+    double saturated = 0.0;
+    for (size_t i = 1; i < n; ++i) saturated += trace.saturated[i] != 0.0f ? 1.0 : 0.0;
+    m.saturation = static_cast<float>(saturated / static_cast<double>(n - 1u));
+    if (trace.sine) FitSine(trace, &m);
+    else FitStep(trace, &m);
+    return m;
+}
+
+json::Value GainRunJson(const GainRun& run, bool trace) {
+    const auto number = [](float x) { return std::isfinite(x) ? json::Value::Float(x) : json::Value::Null(); };
+    const GainTrace& t = run.trace;
+    const GainMetrics& m = run.metrics;
+    json::Value v = json::Value::Object();
+    v.Set("joint", json::Value::Str(run.joint));
+    v.Set("kind", json::Value::Str(t.sine ? "sine" : "step"));
+    v.Set("amplitude", json::Value::Float(t.amplitude));
+    v.Set("frequency", t.sine ? json::Value::Float(t.frequency) : json::Value::Null());
+    v.Set("duration", json::Value::Float(run.duration));
+    v.Set("steps", json::Value::Int(t.q.empty() ? 0 : static_cast<int64_t>(t.q.size()) - 1));
+    v.Set("kp", json::Value::Float(run.kp));
+    v.Set("damping", json::Value::Float(run.damping));
+    v.Set("force_limit", json::Value::Float(run.force_limit));
+    for (const auto& [key, x] : std::initializer_list<std::pair<const char*, float>>{
+             {"rise", m.rise}, {"overshoot", m.overshoot}, {"peak_time", m.peak_time}, {"settling", m.settling},
+             {"steady_error", m.steady_error}, {"zeta", m.zeta}, {"omega", m.omega}, {"gain_db", m.gain_db},
+             {"lag", m.lag}, {"rmse", m.rmse}, {"saturation", m.saturation}})
+        v.Set(key, number(x));
+    if (!trace) return v;
+    for (const auto& [key, xs] : std::initializer_list<std::pair<const char*, const std::vector<float>*>>{
+             {"time", &t.time}, {"target", &t.target}, {"q", &t.q}, {"qd", &t.qd}, {"effort", &t.effort}}) {
+        json::Value list = json::Value::Array();
+        for (const float x : *xs) list.PushBack(json::Value::Float(x));
+        v.Set(key, std::move(list));
+    }
     return v;
 }
 
