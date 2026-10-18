@@ -337,14 +337,17 @@ std::string NodeKind(const nuka::scene::Registry& reg, nuka::scene::EntityId e) 
     return *badge != '\0' ? badge : "group";
 }
 
-// The scene graph as tree items: node id + 1, so item 0 stays the hidden root. Rebuilt when
-// the host bumps the scene version.
+// The scene graph as tree items: node id + 1, so item 0 stays the hidden root, and sensor i as
+// kSensorItems + i under the body it rides. Rebuilt when the scene or the sensor list changes.
 class SceneItems final : public nui::ItemModel {
 public:
+    static constexpr uint64_t kSensorItems = 1ull << 40;
+
     explicit SceneItems(const ImGuiLayer::Frame& frame) : frame_(frame) {}
 
     uint64_t Version() override {
-        const uint64_t version = frame_.scene == nullptr ? 0u : frame_.ui->scene_version * 2u + 1u;
+        const uint64_t version =
+            frame_.scene == nullptr ? 0u : (frame_.ui->scene_version * 1000003u + frame_.ui->sensors.version) * 2u + 1u;
         if (version != built_) Rebuild(version);
         return version;
     }
@@ -365,6 +368,8 @@ public:
     std::string_view Badge(uint64_t item) const override { return entries_.at(item).kind.badge; }
     const std::string& Path(uint64_t item) const { return entries_.at(item).path; }
     nuka::scene::EntityId Entity(uint64_t item) const { return entries_.at(item).entity; }
+    // The sensor index of a sensor row, else -1.
+    int Sensor(uint64_t item) const { return entries_.at(item).sensor; }
 
 private:
     struct Entry {
@@ -372,6 +377,7 @@ private:
         bool named = false;
         std::string path;
         nuka::scene::EntityId entity;
+        int sensor = -1;
         StageKind kind;
         std::vector<uint64_t> children;
     };
@@ -396,6 +402,20 @@ private:
                 stack.emplace_back(child, path.empty() ? child->name : path + "/" + child->name);
             }
             entry.path = std::move(path);
+        }
+        std::unordered_map<std::string, uint64_t> by_path;
+        for (const auto& [item, entry] : entries_) by_path.emplace(entry.path, item);
+        const std::vector<SensorItem>& sensors = frame_.ui->sensors.items;
+        for (size_t i = 0; i < sensors.size(); ++i) {
+            const SensorKind& kind = FindSensorKind(sensors[i].type);
+            Entry& entry = entries_[kSensorItems + i];
+            entry.label = sensors[i].name;
+            entry.named = true;
+            entry.entity = nuka::scene::kInvalidEntity;
+            entry.sensor = static_cast<int>(i);
+            entry.kind = {kind.glyph, theme::kInfo, kind.type};
+            const auto parent = by_path.find(sensors[i].mount);
+            entries_[parent != by_path.end() ? parent->second : 1u].children.push_back(kSensorItems + i);
         }
     }
 
@@ -768,6 +788,12 @@ void ImGuiLayer::BuildStage(nui::VStack& root) {
         if (ImGui::BeginPopup("##add_menu")) {
             for (const SpawnChoice& c : kSpawns)
                 if (ImGui::MenuItemEx(Tr(c.label), c.glyph)) Queue(std::string("scene.add_") + c.kind);
+            ImGui::Separator();
+            if (ImGui::BeginMenuEx(Tr("Sensor"), icon::kCamera)) {
+                for (const SensorKind& k : SensorKinds())
+                    if (ImGui::MenuItemEx(Tr(k.label), k.glyph)) Queue("sensor.add", Args({{"type", json::Value::Str(k.type)}}));
+                ImGui::EndMenu();
+            }
             ImGui::EndPopup();
         }
         ImGui::SameLine();
@@ -780,50 +806,79 @@ void ImGuiLayer::BuildStage(nui::VStack& root) {
     stage_tree_ = &tree;
     tree.filter = nui::Bind<std::string>([this] { return std::string(stage_filter_); });
     tree.is_selected = [this](uint64_t item) {
+        if (const int sensor = stage_items_->Sensor(item); sensor >= 0) return sensor == frame_.ui->sensors.selected;
         const std::vector<nuka::scene::EntityId>& sel = frame_.ui->selection;
         const nuka::scene::EntityId e = stage_items_->Entity(item);
         return e != nuka::scene::kInvalidEntity && std::find(sel.begin(), sel.end(), e) != sel.end();
     };
-    // A row clicked here is already in view, so the selection it makes needs no reveal.
+    // A row clicked here is already in view, so the selection it makes needs no reveal; a sensor row
+    // selects that sensor alone.
     const auto select = [this](uint64_t item, const char* mode) {
+        if (const int sensor = stage_items_->Sensor(item); sensor >= 0) {
+            revealed_sensor_ = sensor;
+            Queue("sensor.select", Args({{"index", json::Value::Int(sensor)}}));
+            return;
+        }
         revealed_ = stage_items_->Entity(item);
         Queue("scene.select", Args({{"path", json::Value::Str(stage_items_->Path(item))}, {"mode", json::Value::Str(mode)}}));
     };
     tree.on_select = [select](uint64_t item) { select(item, "replace"); };
     tree.on_toggle = [select](uint64_t item) { select(item, "toggle"); };
-    tree.on_range = [this](const std::vector<uint64_t>& items) {
+    tree.on_range = [this, select](const std::vector<uint64_t>& items) {
+        if (stage_items_->Sensor(items.back()) >= 0) {
+            select(items.back(), "replace");
+            return;
+        }
         json::Value paths = json::Value::Array();
-        for (const uint64_t item : items) paths.PushBack(json::Value::Str(stage_items_->Path(item)));
+        for (const uint64_t item : items)
+            if (stage_items_->Sensor(item) < 0) paths.PushBack(json::Value::Str(stage_items_->Path(item)));
         revealed_ = stage_items_->Entity(items.back());
         Queue("scene.select", Args({{"path", json::Value::Str(stage_items_->Path(items.back()))},
                                     {"mode", json::Value::Str("range")},
                                     {"paths", std::move(paths)}}));
     };
     tree.on_rename = [this](uint64_t item, const std::string& name) {
+        if (const int sensor = stage_items_->Sensor(item); sensor >= 0) {
+            Queue("sensor.set", Args({{"index", json::Value::Int(sensor)}, {"name", json::Value::Str(name)}}));
+            return;
+        }
         Queue("edit.rename", Args({{"path", json::Value::Str(stage_items_->Path(item))}, {"name", json::Value::Str(name)}}));
     };
     const auto listed = [this](const std::vector<std::string>& list, uint64_t item) {
-        return std::find(list.begin(), list.end(), stage_items_->Path(item)) != list.end();
+        return stage_items_->Sensor(item) < 0 && std::find(list.begin(), list.end(), stage_items_->Path(item)) != list.end();
     };
+    const auto node_row = [this](uint64_t item) { return stage_items_->Sensor(item) < 0; };
     tree.is_dimmed = [this, listed](uint64_t item) { return listed(frame_.ui->hidden, item); };
     tree.row_tools = {
         {icon::kEyeSlash, icon::kVisual, "Show/Hide", [this, listed](uint64_t item) { return listed(frame_.ui->hidden, item); },
          [this, listed](uint64_t item) {
              Queue("scene.set_visible", Args({{"path", json::Value::Str(stage_items_->Path(item))},
                                               {"value", json::Value::Bool(listed(frame_.ui->hidden, item))}}));
-         }},
+         },
+         node_row},
         {icon::kLock, icon::kLockOpen, "Lock/Unlock", [this, listed](uint64_t item) { return listed(frame_.ui->locked, item); },
          [this, listed](uint64_t item) {
              Queue("scene.set_locked", Args({{"path", json::Value::Str(stage_items_->Path(item))},
                                              {"value", json::Value::Bool(!listed(frame_.ui->locked, item))}}));
-         }}};
+         },
+         node_row}};
     tree.on_activate = [this](uint64_t) { Queue("view.frame_selected"); };
+    // A sensor dropped on a row rides that row's body, or the world on the scene root.
     tree.on_drop = [this](uint64_t dragged, uint64_t onto) {
+        if (stage_items_->Sensor(onto) >= 0) return;
+        if (const int sensor = stage_items_->Sensor(dragged); sensor >= 0) {
+            Queue("sensor.set", Args({{"index", json::Value::Int(sensor)}, {"mount", json::Value::Str(stage_items_->Path(onto))}}));
+            return;
+        }
         Queue("edit.reparent", Args({{"path", json::Value::Str(stage_items_->Path(dragged))},
                                      {"parent", json::Value::Str(stage_items_->Path(onto))}}));
     };
     tree.context_menu = [this](uint64_t item) {
         ViewerUiState& ui = *frame_.ui;
+        if (const int sensor = stage_items_->Sensor(item); sensor >= 0) {
+            SensorContextMenu(sensor);
+            return;
+        }
         const std::string path = stage_items_->Path(item);
         if (ImGui::IsWindowAppearing()) {
             const std::string_view name = stage_items_->Label(item);
@@ -844,6 +899,15 @@ void ImGuiLayer::BuildStage(nui::VStack& root) {
         if (ImGui::BeginMenuEx(Tr("Add primitive"), icon::kAdd)) {
             for (const SpawnChoice& c : kSpawns)
                 if (ImGui::MenuItemEx(Tr(c.label), c.glyph)) Queue("scene.spawn", Args({{"kind", json::Value::Str(c.kind)}}));
+            ImGui::EndMenu();
+        }
+        // A new sensor rides the body at or above the row.
+        if (ImGui::BeginMenuEx(Tr("Add Sensor"), icon::kCamera)) {
+            for (const SensorKind& k : SensorKinds()) {
+                if (!ImGui::MenuItemEx(Tr(k.label), k.glyph)) continue;
+                Queue("scene.select", Args({{"path", json::Value::Str(path)}}));
+                Queue("sensor.add", Args({{"type", json::Value::Str(k.type)}}));
+            }
             ImGui::EndMenu();
         }
         if (ImGui::MenuItemEx(Tr("Frame"), icon::kTarget, "F")) Queue("view.frame_selected");
@@ -880,6 +944,10 @@ void ImGuiLayer::BuildProperties(nui::VStack& root) {
         return frame_.ui->inspector.movable || frame_.ui->inspector.deformable ? Tone::Accent : Tone::Dim;
     };
     mobility.visible_if = editable;
+
+    auto& sensor = Fold(root.Add<nui::Collapsible>("Sensor", true, icon::kCamera), "sensor");
+    sensor.visible_if = [this] { return frame_.ui->sensors.selected >= 0; };
+    sensor.Add<nui::Custom>([this] { DrawSensorInspector(); });
 
     auto& transform = Fold(root.Add<nui::Collapsible>("Transform", true, icon::kMove), "transform");
     transform.visible_if = editable;
@@ -1413,6 +1481,10 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
         if (revealed_ != nuka::scene::kInvalidEntity)
             if (const auto node = scene->Ecs().NodeOf(revealed_)) stage_tree_->Reveal(node->id + 1u);
     }
+    if (stage_tree_ != nullptr && ui_state.sensors.selected != revealed_sensor_) {
+        revealed_sensor_ = ui_state.sensors.selected;
+        if (revealed_sensor_ >= 0) stage_tree_->Reveal(SceneItems::kSensorItems + static_cast<uint64_t>(revealed_sensor_));
+    }
     if (stage_tree_ != nullptr && stage_fold_ != 0) {
         if (stage_fold_ > 0) stage_tree_->ExpandAll();
         else stage_tree_->CollapseAll();
@@ -1495,6 +1567,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
             draw::ViewportFrame(vmin, vmax, hud, pane_count > 1u ? ImGui::GetFrameHeight() + 8.0f * nui::Scale() : 0.0f);
             DrawSolverHud(vmin, vmax);
             DrawRobotHud(vmin, vmax);
+            DrawSensorHud(vmin, vmax);
             DrawPerturbHud(vmin, vmax);
             DrawViewTools(vmin, vmax);
             DrawBookmarkBar(vmin, vmax);
@@ -1677,6 +1750,28 @@ void ImGuiLayer::DrawMenuBar() {
                 item("Inertia Boxes", "inertia", o.inertia);
                 ImGui::Separator();
                 item("Translucent Meshes", "translucent", o.translucent);
+                ImGui::EndMenu();
+            }
+            const SensorOverlays& so = frame_.ui->sensors.overlays;
+            if (ImGui::BeginMenuEx(Tr("Sensor Overlays"), icon::kCamera)) {
+                const auto item = [this](const char* label, const char* key, bool on) {
+                    if (ImGui::MenuItem(Tr(label), nullptr, on)) Queue("view.sensor_overlays", Args({{key, json::Value::Bool(!on)}}));
+                };
+                item("Show Overlays", "on", so.on);
+                ImGui::Separator();
+                item("Camera Frustums", "frustums", so.frustums);
+                item("Lidar Fans", "fans", so.fans);
+                item("Sensor Frames", "frames", so.frames);
+                item("Sensor Labels", "labels", so.labels);
+                ImGui::EndMenu();
+            }
+            any = true;
+        }
+        if (menu.title == "Create") {
+            ImGui::Separator();
+            if (ImGui::BeginMenuEx(Tr("Sensor"), icon::kCamera, frame_.ui->has_scene)) {
+                for (const SensorKind& k : SensorKinds())
+                    if (ImGui::MenuItemEx(Tr(k.label), k.glyph)) Queue("sensor.add", Args({{"type", json::Value::Str(k.type)}}));
                 ImGui::EndMenu();
             }
             any = true;
@@ -2738,8 +2833,9 @@ void ImGuiLayer::DrawGizmo(CameraController& camera, uint32_t vp_w, uint32_t vp_
                            math::Transform& world, bool& changed) {
     changed = false;
     GizmoState& gz = ui_state.gizmo;
-    if (!gz.enabled || ui_state.tool != ViewportTool::Select || ui_state.selected_entity == nuka::scene::kInvalidEntity ||
-        vp_w == 0u || vp_h == 0u || !viewport_.Valid() || !ui_state.window_focused) {
+    if (!gz.enabled || ui_state.tool != ViewportTool::Select ||
+        (ui_state.selected_entity == nuka::scene::kInvalidEntity && ui_state.sensors.selected < 0) || vp_w == 0u ||
+        vp_h == 0u || !viewport_.Valid() || !ui_state.window_focused) {
         gz.active = false;
         gz.using_now = false;
         return;

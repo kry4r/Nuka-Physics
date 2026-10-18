@@ -355,6 +355,7 @@ void TreeView::DrawSelf() {
                 }
                 for (size_t k = 0; k < row_tools.size(); ++k) {
                     const RowTool& tool = row_tools[k];
+                    if (tool.applies && !tool.applies(row.item)) continue;
                     const bool on = tool.on && tool.on(row.item);
                     const ImVec2 at(tools_x + static_cast<float>(k) * tool_w, pos.y);
                     ImGui::SetCursorScreenPos(at);

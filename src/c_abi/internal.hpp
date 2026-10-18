@@ -171,6 +171,8 @@ struct WorldRecord {
     // The batched camera sensor (lazily built by attach). Declared AFTER `world` so
     // it is destroyed BEFORE the World/backend drop. Null until a sensor is attached.
     std::unique_ptr<SensorAttachment> sensor;
+    // Scene sensors were attached once, so every rebuild re-attaches the new scene's.
+    bool scene_sensors = false;
 
     // The offline beauty render bridge (lazily built by the first render_beauty call).
     // Declared AFTER `world` so it (and the RT backend/scene it owns) tears down BEFORE
@@ -292,6 +294,8 @@ WorldRecipe MakeWorldRecipe(const nuka_world_desc_t& desc);
 nuka_result_t CreateWorld(DeviceRecord* device, WorldRecipe recipe, nuka::scene::SceneIR&& scene,
                           std::string scene_dir, nuka_world_handle* out);
 
+// The scene's cameras share one nonzero image size and its lidars one nonempty fan (sensor.cpp).
+bool SceneSensorShapesAgree(const nuka::scene::SceneIR& scene);
 // Replaces the record's sensors with the scene's authored cameras and lidars (defined in
 // sensor.cpp), carrying render settings and imaging models from `previous`.
 nuka_result_t AttachSceneSensors(WorldRecord& record, const SensorAttachment* previous,

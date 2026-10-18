@@ -438,6 +438,7 @@ if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)
         runtime/app/viewer/robot_panel.cpp
         runtime/app/viewer/scene_panels.cpp
         runtime/app/viewer/script_tabs.cpp
+        runtime/app/viewer/sensor_panel.cpp
         runtime/app/viewer/solver_panel.cpp
         runtime/app/viewer/timeline_panel.cpp
         runtime/app/viewer/nui/nui_capi.cpp
@@ -1259,6 +1260,7 @@ if(CMAKE_CUDA_COMPILER)
             runtime/app/viewer/editor_document.cpp
             runtime/app/viewer/editor_import.cpp
             runtime/app/viewer/editor_collision.cpp
+            runtime/app/viewer/editor_sensors.cpp
             runtime/app/viewer/editor_assets.cpp
             runtime/app/viewer/property_schema.cpp
             runtime/app/viewer/debug_overlay.cpp

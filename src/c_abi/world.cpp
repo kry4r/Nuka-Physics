@@ -1351,6 +1351,7 @@ nuka_result_t nuka_world_rebuild_from_scene(nuka_world_handle world, const char*
         using nuka::phi::Status;
         nuka::scene::SceneIR scene;
         if (!nuka::c_abi::LoadSceneByExtension(scene_path, &scene)) return NUKA_RESULT_NOT_SUPPORTED;
+        if (record->scene_sensors && !nuka::c_abi::SceneSensorShapesAgree(scene)) return NUKA_RESULT_INVALID_ARG;
         nuka::c_abi::CookedWorld cooked;
         nuka_result_t result = nuka::c_abi::CookWorld(record->recipe, scene, &cooked);
         if (result != NUKA_RESULT_OK) return result;
@@ -1387,7 +1388,8 @@ nuka_result_t nuka_world_rebuild_from_scene(nuka_world_handle world, const char*
         record->invariant_sampler.Reset();
         record->last_invariant_violations.clear();
         if (initial) record->simulated_step_count = 0u;
-        if (sensors) return nuka::c_abi::AttachSceneSensors(*record, sensors.get(), nullptr, nullptr);
+        if (record->scene_sensors)
+            return nuka::c_abi::AttachSceneSensors(*record, sensors.get(), nullptr, nullptr);
         return NUKA_RESULT_OK;
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;

@@ -396,7 +396,8 @@ nuka_result_t nuka_world_get_asset_root(nuka_world_handle world, char* out, size
 enum { NUKA_REBUILD_INITIAL_STATE = 1 };
 // Recooks the world in place from a scene file with its creation options and increments the generation.
 // Body and joint state carry over by unique body name unless INITIAL_STATE. Scene-authored sensors
-// re-attach from the new scene; explicitly attached or runtime-added sensors refuse it.
+// re-attach from the new scene, which then must give its cameras one size and lidars one fan
+// (else INVALID_ARG before anything changes); explicitly attached or runtime-added sensors refuse it.
 nuka_result_t nuka_world_rebuild_from_scene(nuka_world_handle world, const char* scene_path,
                                             uint32_t flags);
 // The same rebuild from the scene's initial state with `env_count` environments; later rebuilds keep it.
@@ -1287,8 +1288,8 @@ nuka_result_t nuka_world_download_sensor(nuka_world_handle world, nuka_sensor_ch
 // Replaces the world's sensors with the scene's authored Camera/Depth and Lidar/RangeScan
 // records, mounted as the cook mounts state sensors. Cameras must share one image size and
 // lidars one fan (else INVALID_ARG). Render DR, fidelity, AOV mask and imaging models carry
-// from the current attachment. A scene without such records detaches all sensors. A scene
-// rebuild re-runs this for an attachment made here. Counts may be NULL.
+// from the current attachment. A scene without such records, or without renderable geometry,
+// detaches all sensors (counts 0). Once called, every scene rebuild re-runs it. Counts may be NULL.
 nuka_result_t nuka_world_attach_scene_sensors(nuka_world_handle world, uint32_t* cameras,
                                               uint32_t* lidars);
 

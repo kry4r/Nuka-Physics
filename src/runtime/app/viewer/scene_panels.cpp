@@ -696,6 +696,7 @@ void ImGuiLayer::BuildFieldGroups(nui::VStack& root) {
     for (const PropertyGroup& g : ui.properties) {
         auto& group = Fold(root.Add<nui::Collapsible>(g.title, true, GroupGlyph(g.kind)), g.title + "/" + g.detail);
         group.trailing = g.targets.size() > 1u ? Fmt(Tr("%zu nodes"), g.targets.size()) : g.detail;
+        group.visible_if = [this] { return frame_.ui->sensors.selected < 0; };
         auto& grid = group.Add<nui::PropertyGrid>();
         for (const PropertyField& f : g.fields) {
             const auto staged = std::find_if(ui.staged.begin(), ui.staged.end(), [&](const StagedEdit& e) {

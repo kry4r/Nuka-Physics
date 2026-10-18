@@ -1,0 +1,39 @@
+{
+  "name": "sensors",
+  "launch": [],
+  "steps": [
+    {"action": "file.open", "args": {"path": "${scenario_dir}/../../examples/assets/nuka_lab/stage.nks"}},
+    {"frames": 20},
+    {"action": "file.import", "args": {"path": "${scenario_dir}/../../examples/scenes/go2_float.usda", "mode": "add",
+     "name": "go2", "pose": {"pos": [0.0, 0.0, 0.6], "quat": [1.0, 0.0, 0.0, 0.0]}}, "bind": "go2"},
+    {"frames": 10},
+    {"action": "window.layout_robot"},
+    {"action": "view.frame_all"},
+    {"action": "robot.links", "bind": "links"},
+
+    {"python": "import builtins\nfrom nuka.editor.app import ActionError\ndef fails(action, text, **args):\n    try:\n        app.actions.run(action, **args)\n    except ActionError as e:\n        assert text in str(e), (action, args, str(e))\n    else:\n        raise AssertionError((action, args))\ndef frames(n):\n    for _ in range(n):\n        app.update(True)\nrun = app.actions.run\nlinks = ${links}['links']\nbase = links[0]['path']\nhip = next(l['path'] for l in links if l['joint'])\nbuiltins.sn_fails, builtins.sn_frames, builtins.sn_base, builtins.sn_hip = fails, frames, base, hip\nbefore = run('sensor.list')\nprint('SENSORS_BEFORE', base, hip, before)\nassert before == [], before\nc = run('sensor.add', type='camera', mount=base, position=[0.28, 0.0, 0.05])\nprint('SENSOR_CAM', c)\nassert c['index'] == 0 and c['name'] == 'camera_1' and c['type'] == 'camera' and c['mount'] == base and c['frame'] == 'body', c\nassert c['camera']['width'] == 160 and c['camera']['height'] == 120 and abs(c['camera']['vfov'] - 60.0) < 1e-4, c\nq = c['offset']['quat']\nassert abs(q[0] - 0.5) < 1e-5 and abs(q[1] - 0.5) < 1e-5 and abs(q[2] + 0.5) < 1e-5 and abs(q[3] + 0.5) < 1e-5, q\nassert abs(c['offset']['pos'][0] - 0.28) < 1e-6, c['offset']\nl = run('sensor.add', type='lidar', mount=base, position=[0.0, 0.0, 0.12])\nassert l['index'] == 1 and l['name'] == 'lidar_1' and l['lidar']['az_count'] == 64 and l['lidar']['el_count'] == 16, l\nrun('scene.select', path=base)\ni = run('sensor.add', type='imu')\nassert i['index'] == 2 and i['mount'] == base and i['name'] == 'imu_1' and 'camera' not in i, i\nj = run('sensor.add', type='joint_state', mount=hip)\nassert j['index'] == 3 and j['mount'] == hip, j\nd = run('sensor.add', type='depth', mount=base, rotation_deg=[0.0, 30.0, 0.0])\nprint('SENSOR_DEPTH', d)\nassert d['index'] == 4 and d['camera']['width'] == 160 and abs(d['offset']['quat'][0] - 0.9659258) < 1e-4, d\nassert len(run('sensor.list')) == 5"},
+
+    {"python": "import builtins\nrun = app.actions.run\ns = run('sensor.set', index=0, camera={'width': 96, 'height': 72})\nassert s['camera']['width'] == 96 and s['camera']['height'] == 72, s\nlisted = run('sensor.list')\nassert [(x['camera']['width'], x['camera']['height']) for x in listed if 'camera' in x] == [(96, 72), (96, 72)], listed\ns = run('sensor.set', sensor='lidar_1', lidar={'az_count': 32, 'el_count': 8}, rate_hz=10.0)\nassert s['lidar']['az_count'] == 32 and s['lidar']['el_count'] == 8 and abs(s['rate_hz'] - 10.0) < 1e-6, s\ns = run('sensor.set', index=0, name='head_cam', position=[0.3, 0.0, 0.06])\nassert s['name'] == 'head_cam' and abs(s['offset']['pos'][0] - 0.3) < 1e-6 and abs(s['offset']['quat'][0] - 0.5) < 1e-5, s\no = dict(s['offset'], pos=[0.3, 0.0, 0.08])\ns = run('sensor.set', index=0, offset=o, aov_mask=3)\nassert s['aov_mask'] == 3 and abs(s['offset']['pos'][2] - 0.08) < 1e-6 and abs(s['offset']['quat'][0] - 0.5) < 1e-5, s\ns = run('sensor.set', index=4, type='imu')\nassert s['type'] == 'imu' and 'camera' not in s and s['mount'] == builtins.sn_base and s['name'] == 'depth_1', s\nassert run('sensor.select', index=0) == 0\nassert run('sensor.select', index=-1) == -1\nprint('SENSOR_LIST', run('sensor.list'))"},
+    {"tick": 20},
+    {"action": "view.sensor_overlays", "args": {"on": true}, "expect_value": {"on": true, "frustums": true, "fans": true, "frames": true, "labels": true}},
+    {"action": "scene.select", "args": {"path": "go2"}},
+    {"action": "view.frame_selected"},
+    {"action": "sensor.select", "args": {"sensor": "head_cam"}},
+    {"action": "window.focus", "args": {"panel": "property"}},
+    {"frames": 30},
+    {"screenshot": "00_sensors"},
+    {"python": "import builtins\nfails, base = builtins.sn_fails, builtins.sn_base\nfails('sensor.add', 'imu sensors mount on a body', type='imu', mount='')\nfails('sensor.add', 'no body at', type='camera', mount='nope/none')\nfails('sensor.add', 'every camera renders one image size', type='camera', mount=base, camera={'width': 64, 'height': 48})\nfails('sensor.add', 'unknown sensor type', type='sonar', mount=base)\nfails('sensor.add', 'a joint_state sensor mounts on a joint', type='joint_state', mount=base)\nfails('sensor.set', 'no such sensor', index=9, name='x')\nfails('sensor.select', 'no such sensor', index=9)\nassert len(app.actions.run('sensor.list')) == 5"},
+
+    {"python": "import builtins\nrun, frames = app.actions.run, builtins.sn_frames\nn = len(run('sensor.list'))\nrun('sensor.remove', index=4)\nframes(4)\nassert len(run('sensor.list')) == n - 1\nrun('edit.undo')\nframes(4)\nback = run('sensor.list')\nassert len(back) == n and back[4]['type'] == 'imu' and back[4]['name'] == 'depth_1', back\nrun('edit.redo')\nframes(4)\nassert len(run('sensor.list')) == n - 1\nrun('sensor.select', index=3)\nrun('edit.delete')\nframes(4)\nassert [x['type'] for x in run('sensor.list')] == ['camera', 'lidar', 'imu'], run('sensor.list')\nrun('edit.undo')\nframes(4)\nassert [x['type'] for x in run('sensor.list')] == ['camera', 'lidar', 'imu', 'joint_state'], run('sensor.list')\nbuiltins.sn_pre = run('sensor.list')"},
+    {"save_reopen": "${out}/sensors.nks"},
+    {"frames": 10},
+    {"python": "import builtins\npre, post = builtins.sn_pre, app.actions.run('sensor.list')\nprint('SENSOR_REOPEN', post)\nkey = lambda x: (x['name'], x['type'], x['mount'], x.get('camera', {}).get('width'), x.get('lidar', {}).get('az_count'))\nassert [key(x) for x in pre] == [key(x) for x in post], (pre, post)\nfor a, b in zip(pre, post):\n    assert all(abs(u - v) < 1e-6 for u, v in zip(a['offset']['pos'] + a['offset']['quat'], b['offset']['pos'] + b['offset']['quat'])), (a, b)\n    assert abs(a['rate_hz'] - b['rate_hz']) < 1e-6, (a, b)"},
+
+    {"python": "import builtins\nrun, frames = app.actions.run, builtins.sn_frames\nr = run('scene.spawn', kind='box', pose={'pos': [1.0, 1.0, 0.3], 'quat': [1.0, 0.0, 0.0, 0.0]})\nprint('SENSOR_SPAWN', r)\nbox = r['focus']\nk = run('sensor.add', type='imu', mount=box)\nassert k['mount'] == box and k['index'] == 4, k\nframes(4)\nrun('edit.delete', path=box)\nframes(4)\nleft = run('sensor.list')\nassert len(left) == 4 and all(x['mount'] != box for x in left), left\nrun('edit.undo')\nframes(4)\nassert [x['mount'] for x in run('sensor.list')].count(box) == 1, run('sensor.list')"},
+    {"tick": 10},
+
+    {"action": "file.close", "args": {"discard": true}},
+    {"frames": 4},
+    {"expect": {"loaded": false}}
+  ]
+}

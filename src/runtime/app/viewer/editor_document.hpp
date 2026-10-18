@@ -35,6 +35,8 @@ scene::json::Value TxnToJson(const EditTxn& txn);
 // Throws on a malformed transaction.
 EditTxn TxnFromJson(const scene::json::Value& v);
 scene::json::Value TransformToJson(const math::Transform& t);
+// Throws unless `v` holds "pos" (3 numbers) and "quat" (4, w first).
+math::Transform TransformFromJson(const scene::json::Value& v);
 scene::json::Value MaterialToJson(const scene::RenderMaterial& m);
 bool ParsePrimitiveKind(const std::string& s, PrimitiveKind* out);
 const char* PrimitiveKindName(PrimitiveKind kind);

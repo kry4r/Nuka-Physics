@@ -29,6 +29,7 @@
 #include "scene/scene_map.hpp"
 #include "scene/scene_ir.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <exception>
 #include <string>
@@ -255,31 +256,50 @@ void SplitSensors(const std::vector<nuka::scene::SensorDesc>& all,
 
 namespace nuka::c_abi {
 
+bool SceneSensorShapesAgree(const nuka::scene::SceneIR& scene) {
+    using Type = nuka::scene::SensorType;
+    const nuka::scene::SensorDesc* camera = nullptr;
+    const nuka::scene::SensorDesc* lidar = nullptr;
+    for (const nuka::scene::SensorDesc& s : scene.Sensors()) {
+        if (s.type == Type::Camera || s.type == Type::Depth) {
+            if (s.cam.width == 0u || s.cam.height == 0u ||
+                (camera && (s.cam.width != camera->cam.width || s.cam.height != camera->cam.height)))
+                return false;
+            camera = camera ? camera : &s;
+        } else if (s.type == Type::Lidar || s.type == Type::RangeScan) {
+            if (s.lidar.az_count == 0u || s.lidar.el_count == 0u ||
+                (lidar && (s.lidar.az_count != lidar->lidar.az_count || s.lidar.el_count != lidar->lidar.el_count)))
+                return false;
+            lidar = lidar ? lidar : &s;
+        }
+    }
+    return true;
+}
+
 // Cameras share one image size and lidars one fan, as the batched tensors require. Render
 // settings carry from `previous`; without one the first camera's authored AOV mask applies.
+// A scene without renderable geometry attaches nothing.
 nuka_result_t AttachSceneSensors(WorldRecord& record, const SensorAttachment* previous,
                                  uint32_t* cameras, uint32_t* lidars) {
-    std::unique_ptr<nuka::render::SensorBackendI> backend = nuka::render::CreateCudaSensorBackend();
-    if (!backend) return NUKA_RESULT_NOT_SUPPORTED;
+    record.scene_sensors = true;
+    if (!SceneSensorShapesAgree(*record.scene)) return NUKA_RESULT_INVALID_ARG;
+    using Type = nuka::scene::SensorType;
+    const auto& listed = record.scene->Sensors();
+    const bool rendered = std::any_of(listed.begin(), listed.end(), [](const nuka::scene::SensorDesc& s) {
+        return s.type == Type::Camera || s.type == Type::Depth || s.type == Type::Lidar || s.type == Type::RangeScan;
+    });
     nuka::render::SensorSceneDesc desc;
     std::vector<std::string> paths;
     std::vector<nuka::scene::SensorDesc> authored, cams, fans;
-    const bool geometry = BuildSensorSceneDesc(record, &desc, &paths, &authored);
-    SplitSensors(authored, &cams, &fans);
+    if (rendered && BuildSensorSceneDesc(record, &desc, &paths, &authored)) SplitSensors(authored, &cams, &fans);
     if (cameras) *cameras = static_cast<uint32_t>(cams.size());
     if (lidars) *lidars = static_cast<uint32_t>(fans.size());
     if (cams.empty() && fans.empty()) {
         record.sensor.reset();
         return NUKA_RESULT_OK;
     }
-    if (!geometry) return NUKA_RESULT_NOT_SUPPORTED;
-    for (const auto& s : cams)
-        if (s.cam.width == 0u || s.cam.height == 0u || s.cam.width != cams[0].cam.width ||
-            s.cam.height != cams[0].cam.height) return NUKA_RESULT_INVALID_ARG;
-    for (const auto& s : fans)
-        if (s.lidar.az_count == 0u || s.lidar.el_count == 0u ||
-            s.lidar.az_count != fans[0].lidar.az_count || s.lidar.el_count != fans[0].lidar.el_count)
-            return NUKA_RESULT_INVALID_ARG;
+    std::unique_ptr<nuka::render::SensorBackendI> backend = nuka::render::CreateCudaSensorBackend();
+    if (!backend) return NUKA_RESULT_NOT_SUPPORTED;
     desc.sensors = cams;
     desc.sensors.insert(desc.sensors.end(), fans.begin(), fans.end());
     nuka::render::SensorSceneHandle* handle = backend->BuildSensorScene(desc);

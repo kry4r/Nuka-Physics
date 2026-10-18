@@ -3,6 +3,7 @@
 #include "render/render_world.hpp"
 #include "runtime/app/viewer/editor_collision.hpp"
 #include "runtime/app/viewer/editor_import.hpp"
+#include "runtime/app/viewer/editor_sensors.hpp"
 #include "runtime/app/viewer/robot_tools.hpp"
 #include "scene/scene_fields.hpp"
 
@@ -23,7 +24,7 @@ constexpr uint32_t kNoParam = ~0u;
 bool IsStructural(const std::string& field) {
     return field == "spawn" || field == "delete" || field == "reparent" || field == "script" || field == "import" ||
            field == "collision" || field == "static" || field == "pin" || field == "drive" ||
-           field == "initial_position" || field == "attach";
+           field == "initial_position" || field == "attach" || field == "sensor";
 }
 
 json::Value Floats(const float* v, size_t n) {
@@ -35,17 +36,6 @@ json::Value Floats(const float* v, size_t n) {
 void ReadFloats(const json::Value& a, float* v, size_t n) {
     if (a.Size() != n) throw std::runtime_error("expected " + std::to_string(n) + " numbers");
     for (size_t i = 0; i < n; ++i) v[i] = a.Elements()[i].AsFloat();
-}
-
-math::Transform TransformFromJson(const json::Value& v) {
-    float p[3];
-    float q[4];
-    ReadFloats(v.At("pos"), p, 3u);
-    ReadFloats(v.At("quat"), q, 4u);
-    math::Transform t;
-    t.position = math::Vec3{p[0], p[1], p[2]};
-    t.rotation = math::Quat(q[0], q[1], q[2], q[3]);
-    return t;
 }
 
 // Overwrites the material fields the object names and keeps the rest.
@@ -127,6 +117,17 @@ json::Value TransformToJson(const math::Transform& t) {
     v.Set("pos", Floats(p, 3u));
     v.Set("quat", Floats(q, 4u));
     return v;
+}
+
+math::Transform TransformFromJson(const json::Value& v) {
+    float p[3];
+    float q[4];
+    ReadFloats(v.At("pos"), p, 3u);
+    ReadFloats(v.At("quat"), q, 4u);
+    math::Transform t;
+    t.position = math::Vec3{p[0], p[1], p[2]};
+    t.rotation = math::Quat(q[0], q[1], q[2], q[3]);
+    return t;
 }
 
 json::Value MaterialToJson(const scene::RenderMaterial& m) {
@@ -479,6 +480,60 @@ bool EditorDocument::ApplyOp(const EditOp& op, EditOp* done, EditOp* inverse, Op
         done->before = std::move(before);
         if (at != pins.end()) pins.erase(at);
         if (op.after.At("on").AsBool()) pins.push_back(vertex);
+        out->rebuild = true;
+    } else if (op.field == "sensor") {
+        // `after.index` names the sensor `after.sensor` changes or `after.remove` drops; without it `after.sensor`
+        // adds one. All cameras share one image size and all lidars one fan, so an edit of one carries to the rest.
+        std::vector<scene::SensorDesc> sensors = es_->scene.Sensors();
+        const size_t count = sensors.size();
+        const json::Value* index = op.after.Find("index");
+        const json::Value* remove = op.after.Find("remove");
+        const bool removing = remove != nullptr && remove->AsBool();
+        const size_t at = index != nullptr ? static_cast<size_t>(index->AsInt()) : count;
+        if ((index != nullptr && (index->AsInt() < 0 || at >= count)) || (removing && index == nullptr)) {
+            *error = index != nullptr ? "no sensor " + std::to_string(index->AsInt()) : "a removal names its sensor's index";
+            return false;
+        }
+        if (at < count) done->before = SensorToJson(es_->scene, sensors[at]);
+        if (removing) {
+            sensors.erase(sensors.begin() + static_cast<std::ptrdiff_t>(at));
+        } else {
+            const json::Value* fields = op.after.Find("sensor");
+            scene::SensorDesc s;
+            if (at < count) {
+                s = sensors[at];
+            } else {
+                s.mount = scene::MountFrame::World;
+                s.mount_index = scene::kInvalidBody;
+            }
+            // A new sensor, or one that changes type, starts from its type's defaults.
+            const json::Value* type = fields != nullptr ? fields->Find("type") : nullptr;
+            scene::SensorType next = s.type;
+            if (type != nullptr && ParseSensorType(type->AsString(), &next) && (at == count || next != s.type)) {
+                s.type = next;
+                NewSensorDefaults(sensors, &s);
+            }
+            if (!SensorFromJson(fields != nullptr ? *fields : json::Value::Object(), es_->scene, &s, error)) return false;
+            if (s.name.empty()) s.name = UniqueSensorName(sensors, SensorTypeName(s.type));
+            if (at < count) {
+                ShareSensorShape(s, &sensors);
+                sensors[at] = s;
+            } else {
+                sensors.push_back(s);
+            }
+        }
+        if (const std::string shape = SensorShapeError(sensors); !shape.empty()) {
+            *error = shape;
+            return false;
+        }
+        if (removing) {
+            es_->scene.RemoveSensor(static_cast<scene::SensorId>(at));
+        } else if (at < count) {
+            for (size_t i = 0; i < count; ++i) es_->scene.GetSensorMut(static_cast<scene::SensorId>(i)) = sensors[i];
+        } else {
+            es_->scene.AddSensor(sensors[at]);
+            done->after.Set("index", json::Value::Int(static_cast<int64_t>(at)));
+        }
         out->rebuild = true;
     } else if (op.field == "delete") {
         const size_t bodies = es_->scene.RigidBodyCount();

@@ -28,6 +28,7 @@
 #include "runtime/app/viewer/editor_instance.hpp"
 #include "runtime/app/viewer/editor_profile.hpp"
 #include "runtime/app/viewer/editor_scene.hpp"
+#include "runtime/app/viewer/editor_sensors.hpp"
 #include "runtime/app/viewer/entity_drag.hpp"
 #include "runtime/app/viewer/file_dialog.hpp"
 #include "runtime/app/viewer/imgui_layer.hpp"
@@ -940,6 +941,9 @@ struct EditorHost::State : DocumentHost {
     void RegisterAssemblyActions();
     void RegisterIkActions();
     void RegisterOverlayActions();
+    void RegisterSensorActions();
+    // Drops sensor `index` in one undo step and clears its selection.
+    ActionResult RemoveSensor(int index);
     void RegisterTeleopActions();
     void RegisterPolicyActions();
     void RegisterDemoActions();
@@ -1096,6 +1100,8 @@ struct EditorHost::State : DocumentHost {
     // Takes the joint samples the worker took since the last frame into the Joints view, which
     // follows the joint of the selected link.
     void SyncJoints();
+    // The sensor list follows the document, and the sensors' world poses the shown snapshot.
+    void SyncSensors();
     // Adds a finished gain test to the tuner's runs with what it measured.
     void SyncGainTest();
     // The selection and the scene body's offset from its parent link the Robot Assembler shows.
@@ -1111,6 +1117,9 @@ struct EditorHost::State : DocumentHost {
     // The gizmo on IK link `link`: a press holds the pins and the link's pose under the gizmo at
     // `live`; each move makes the next solve toward `gizmo`.
     void DragIk(int link, const math::Transform& live, const math::Transform& gizmo, bool changed, bool using_now);
+    // The gizmo on the selected sensor: a drag holds its offset on the mount and records one
+    // sensor edit at release.
+    void DragSensor(CameraController& camera, uint32_t vp_w, uint32_t vp_h);
     // The devices teleop can read: the keyboard, the virtual device, the SDL pads and the extensions'.
     void ListTeleopDevices();
     // The active device's reading through the mode's mapping into a controller command, a joint's
@@ -1260,6 +1269,7 @@ struct EditorHost::State : DocumentHost {
     uint64_t props_scene_version_ = ~0ull;
     uint64_t props_revision_ = ~0ull;
     uint64_t joints_revision_ = ~0ull;
+    uint64_t sensors_revision_ = ~0ull;
     bool click_armed_ = false;
     float click_x_ = 0.0f, click_y_ = 0.0f;
     std::vector<std::string> instance_paths_;  // by shown instance; cleared when instances change
@@ -1295,6 +1305,8 @@ struct EditorHost::State : DocumentHost {
     math::Transform ik_held_;
     std::vector<std::pair<uint32_t, math::Transform>> ik_pins_;
     std::optional<TickCommand> ik_next_;
+    int sensor_drag_ = -1;  // the sensor a gizmo drag holds, and its offset while held
+    math::Transform sensor_held_;
     // The Perturb tool's load while its drag lasts; the target slides on the view plane through the anchor.
     std::optional<Perturbation> grab_;
     math::Vec3 grab_anchor_ = math::Vec3::Zero();
@@ -2093,6 +2105,93 @@ void EditorHost::State::SyncJoints() {
         if (v.joints[i].path == selected) v.focus = static_cast<int>(i);
 }
 
+namespace {
+
+SensorItem SensorItemOf(const scene::SceneIR& scene, const scene::SensorDesc& s) {
+    SensorItem item;
+    item.name = s.name;
+    item.type = SensorTypeName(s.type);
+    const scene::BodyId body = SensorBody(scene, s);
+    item.mount = BodyPath(scene, body);
+    item.frame = body != scene::kInvalidBody             ? "body"
+                 : s.mount == scene::MountFrame::World ? "world"
+                 : s.mount == scene::MountFrame::Base  ? "base"
+                                                       : "link";
+    item.camera = RenderSensor(s.type) && !LidarSensor(s.type);
+    item.lidar = LidarSensor(s.type);
+    item.offset = s.local_offset;
+    item.rotation_deg = EulerDegFromQuat(s.local_offset.rotation);
+    item.rate_hz = s.sample_rate_hz;
+    item.update_period = s.update_period;
+    item.aov_mask = s.aov_mask;
+    item.width = s.cam.width;
+    item.height = s.cam.height;
+    item.vfov = s.cam.vfov_degrees;
+    item.near_clip = s.cam.near_clip;
+    item.far_clip = s.cam.far_clip;
+    item.az_count = s.lidar.az_count;
+    item.el_count = s.lidar.el_count;
+    item.az_min = s.lidar.az_min;
+    item.az_max = s.lidar.az_max;
+    item.el_min = s.lidar.el_min;
+    item.el_max = s.lidar.el_max;
+    item.min_range = s.lidar.min_range;
+    item.max_range = s.lidar.max_range;
+    return item;
+}
+
+}  // namespace
+
+void EditorHost::State::SyncSensors() {
+    SensorView& v = ui_state_.sensors;
+    if (!loaded_) {
+        if (!v.items.empty()) ++v.version;
+        v.items.clear();
+        v.bodies.clear();
+        v.selected = -1;
+        sensors_revision_ = ~0ull;
+        return;
+    }
+    const scene::SceneIR& scene = loaded_->scene;
+    if (doc_.Revision() != sensors_revision_) {
+        sensors_revision_ = doc_.Revision();
+        v.items.clear();
+        for (const scene::SensorDesc& s : scene.Sensors()) v.items.push_back(SensorItemOf(scene, s));
+        v.bodies.clear();
+        for (scene::BodyId b = 0; b < scene.RigidBodyCount(); ++b) v.bodies.push_back(BodyPath(scene, b));
+        ++v.version;
+    }
+    if (v.selected >= static_cast<int>(v.items.size())) v.selected = -1;
+    // A link rides the shown links, a free body the shown bodies, a static body its authored pose.
+    const std::vector<nuka_link_binding_t>& links = loaded_->Layout().links;
+    for (size_t i = 0; i < v.items.size(); ++i) {
+        const scene::SensorDesc& s = scene.GetSensor(static_cast<scene::SensorId>(i));
+        const scene::BodyId body = SensorBody(scene, s);
+        SensorItem& item = v.items[i];
+        item.posed = false;
+        math::Transform mount = math::Transform::Identity();
+        if (body == scene::kInvalidBody) {
+            item.posed = s.mount == scene::MountFrame::World;
+        } else {
+            const auto link = std::find_if(links.begin(), links.end(),
+                                           [&](const nuka_link_binding_t& l) { return l.body_index == body; });
+            const size_t row = static_cast<size_t>(link - links.begin());
+            if (link != links.end() && shown_ != nullptr && row < shown_->link_poses.size()) {
+                mount = shown_->link_poses[row];
+                item.posed = true;
+            } else if (link == links.end() && !scene.GetBody(body).is_static && shown_ != nullptr &&
+                       body < shown_->body_poses.size()) {
+                mount = shown_->body_poses[body];
+                item.posed = true;
+            } else if (link == links.end() && scene.GetBody(body).is_static) {
+                mount = AuthoredWorldTransform(scene, scene.EntityOfBody(body));
+                item.posed = true;
+            }
+        }
+        item.pose = mount * (static_cast<int>(i) == sensor_drag_ ? sensor_held_ : s.local_offset);
+    }
+}
+
 void EditorHost::State::SyncGainTest() {
     GainTuner& g = ui_state_.robot.tuner;
     GainTrace trace;
@@ -2206,6 +2305,26 @@ void EditorHost::State::DragIk(int link, const math::Transform& live, const math
     ik_drag_ = false;
     ik.link = -1;
     ik.missed = false;
+}
+
+void EditorHost::State::DragSensor(CameraController& camera, uint32_t vp_w, uint32_t vp_h) {
+    const int index = ui_state_.sensors.selected;
+    const SensorItem& item = ui_state_.sensors.items[static_cast<size_t>(index)];
+    const math::Transform mount = item.pose * (sensor_drag_ == index ? sensor_held_ : item.offset).Inverse();
+    math::Transform gizmo = item.pose;
+    bool changed = false;
+    ui_.DrawGizmo(camera, vp_w, vp_h, ui_state_, gizmo, changed);
+    const bool using_now = ui_state_.gizmo.using_now;
+    if (changed) {
+        sensor_drag_ = index;
+        sensor_held_ = mount.Inverse() * gizmo;
+    }
+    if (!using_now && sensor_drag_ >= 0) {
+        Queue("sensor.set", Object({{"index", json::Value::Int(sensor_drag_)}, {"offset", TransformToJson(sensor_held_)}}),
+              "ui");
+        sensor_drag_ = -1;
+    }
+    gizmo_using_prev_ = using_now;
 }
 
 void EditorHost::State::ListTeleopDevices() {
@@ -3059,6 +3178,9 @@ void EditorHost::State::ApplyLoad(const std::string& path) {
         SetLoadError(path);
         return;
     }
+    // The scene's cameras and lidars render from here on; every rebuild re-attaches them.
+    if (const nuka_result_t r = nuka_world_attach_scene_sensors(world_, nullptr, nullptr); r != NUKA_RESULT_OK)
+        Emit(stderr, std::string("[nuka_editor] scene sensors not attached: ") + nuka_result_message(r) + "\n");
     ApplyUnload();
     Attach(path);
 }
@@ -3098,6 +3220,7 @@ void EditorHost::State::OnLoaded(const std::string& path) {
     ui_state_.inspector = InspectorState{};
     last_seeded_ = scene::kInvalidEntity;
     xform_gesture_active_ = mat_gesture_active_ = gizmo_using_prev_ = false;
+    sensor_drag_ = -1;
     std::snprintf(ui_state_.save_path, sizeof(ui_state_.save_path), "%s", path.c_str());
     ui_state_.selected_entity = scene::kInvalidEntity;
     ui_state_.selection.clear();
@@ -3273,6 +3396,7 @@ ActionResult EditorHost::State::StepHistory(bool redo) {
     worker_.Exclusive([&] { result = redo ? doc_.Redo() : doc_.Undo(); });
     entity_drag_.Cancel();
     xform_gesture_active_ = mat_gesture_active_ = gizmo_using_prev_ = false;
+    sensor_drag_ = -1;
     Reselect(result.focus.empty() ? selected : std::vector<std::string>{result.focus});
     return Outcome(result);
 }
@@ -3451,6 +3575,7 @@ void EditorHost::State::RegisterActions() {
     RegisterSolverActions();
     RegisterTimelineActions();
     RegisterRobotActions();
+    RegisterSensorActions();
     RegisterScriptActions();
     ui_.RegisterActions(actions_);
 }
@@ -4414,6 +4539,110 @@ void EditorHost::State::RegisterOverlayActions() {
                   }});
 }
 
+void EditorHost::State::RegisterSensorActions() {
+    const auto has_scene = [this] { return loaded_ != nullptr; };
+    // `index` or `sensor` (a name) picks a sensor, else the selected one; -1 when none matches.
+    const auto pick = [this](const json::Value& args) {
+        const std::vector<scene::SensorDesc>& sensors = loaded_->scene.Sensors();
+        if (const json::Value* index = args.Find("index"))
+            return index->AsInt() >= 0 && static_cast<size_t>(index->AsInt()) < sensors.size() ? static_cast<int>(index->AsInt())
+                                                                                             : -1;
+        if (const json::Value* name = args.Find("sensor")) {
+            for (size_t i = 0; i < sensors.size(); ++i)
+                if (sensors[i].name == name->AsString()) return static_cast<int>(i);
+            return -1;
+        }
+        return ui_state_.sensors.selected;
+    };
+    // The fields of a sensor edit: every argument but the ones that pick the sensor.
+    const auto fields = [](const json::Value& args) {
+        json::Value v = json::Value::Object();
+        for (const auto& [key, value] : args.Items())
+            if (key != "index" && key != "sensor") v.Set(key, value);
+        return v;
+    };
+    const auto select = [this](int index) {
+        ui_state_.sensors.selected = index;
+        if (index >= 0) {
+            ui_state_.selected_entity = scene::kInvalidEntity;
+            ui_state_.selection.clear();
+        }
+    };
+    actions_.Add({"sensor.list", "List Sensors", "sensor", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value&) {
+                      json::Value list = json::Value::Array();
+                      for (const scene::SensorDesc& s : loaded_->scene.Sensors()) list.PushBack(SensorToJson(loaded_->scene, s));
+                      return Ok(std::move(list));
+                  },
+                  "", true});
+    // A sensor of `type` rides the body at `mount`, else the selected sensor's or the selection's body; ""
+    // mounts it in the world.
+    actions_.Add({"sensor.add", "Add Sensor", "sensor", "", ShortcutScope::Global, has_scene, {},
+                  [this, fields, select](const json::Value& args) {
+                      json::Value sensor = fields(args);
+                      const int at = ui_state_.sensors.selected;
+                      if (args.Find("mount") == nullptr)
+                          sensor.Set("mount", json::Value::Str(at >= 0 ? ui_state_.sensors.items[static_cast<size_t>(at)].mount
+                                                                       : BodyPath(loaded_->scene, BodyAtOrAbove(loaded_->scene, SelectedPath()))));
+                      const size_t index = loaded_->scene.SensorCount();
+                      const ActionResult r = SubmitTxn(EditTxn{"Add " + StrArg(args, "type", "sensor"),
+                                                               {EditOp{"", "sensor", json::Value(), Object({{"sensor", sensor}})}}});
+                      if (!r.ok) return r;
+                      select(static_cast<int>(index));
+                      return Ok(SensorToJson(loaded_->scene, loaded_->scene.GetSensor(static_cast<scene::SensorId>(index))));
+                  },
+                  "", true});
+    actions_.Add({"sensor.set", "Edit Sensor", "sensor", "", ShortcutScope::Global, has_scene, {},
+                  [this, pick, fields](const json::Value& args) {
+                      const int index = pick(args);
+                      if (index < 0) return ActionResult::Fail("no such sensor");
+                      const json::Value after = Object({{"index", json::Value::Int(index)}, {"sensor", fields(args)}});
+                      const ActionResult r = SubmitTxn(EditTxn{"Edit Sensor", {EditOp{"", "sensor", json::Value(), after}}});
+                      if (!r.ok) return r;
+                      return Ok(SensorToJson(loaded_->scene, loaded_->scene.GetSensor(static_cast<scene::SensorId>(index))));
+                  },
+                  "", true});
+    actions_.Add({"sensor.remove", "Remove Sensor", "sensor", "", ShortcutScope::Global, has_scene, {},
+                  [this, pick](const json::Value& args) {
+                      const int index = pick(args);
+                      if (index < 0) return ActionResult::Fail("no such sensor");
+                      return RemoveSensor(index);
+                  },
+                  "", true});
+    // Selects a sensor, which drops the node selection; `index` -1 selects none.
+    actions_.Add({"sensor.select", "Select Sensor", "sensor", "", ShortcutScope::Global, has_scene, {},
+                  [pick, select](const json::Value& args) {
+                      const json::Value* index = args.Find("index");
+                      const int picked = pick(args);
+                      if (picked < 0 && !(index != nullptr && index->AsInt() == -1)) return ActionResult::Fail("no such sensor");
+                      select(picked);
+                      return Ok(json::Value::Int(picked));
+                  },
+                  "", true});
+    // Each switch given sets it; the result holds them all.
+    actions_.Add({"view.sensor_overlays", "Sensor Overlays", "view", "", ShortcutScope::Global, {},
+                  [this] { return ui_state_.sensors.overlays.on; },
+                  [this](const json::Value& args) {
+                      SensorOverlays& o = ui_state_.sensors.overlays;
+                      json::Value v = json::Value::Object();
+                      for (const auto& [key, flag] : std::initializer_list<std::pair<const char*, bool*>>{
+                               {"on", &o.on}, {"frustums", &o.frustums}, {"fans", &o.fans}, {"frames", &o.frames},
+                               {"labels", &o.labels}}) {
+                          *flag = BoolArg(args, key, *flag);
+                          v.Set(key, json::Value::Bool(*flag));
+                      }
+                      return Ok(std::move(v));
+                  },
+                  "", true});
+}
+
+ActionResult EditorHost::State::RemoveSensor(int index) {
+    const json::Value after = Object({{"index", json::Value::Int(index)}, {"remove", json::Value::Bool(true)}});
+    const ActionResult r = SubmitTxn(EditTxn{"Remove Sensor", {EditOp{"", "sensor", json::Value(), after}}});
+    if (r.ok && ui_state_.sensors.selected == index) ui_state_.sensors.selected = -1;
+    return r;
+}
+
 void EditorHost::State::RegisterGainActions() {
     const auto has_joints = [this] { return loaded_ != nullptr && !ui_state_.robot.joints.empty(); };
     // Drives one joint's target through a step or sine from where it is, in a copy of the world the
@@ -4953,6 +5182,7 @@ void EditorHost::State::RegisterEditActions() {
     actions_.Add({"edit.delete", "Delete Subtree", "edit", "", ShortcutScope::Global, has_scene, {},
                   [this](const json::Value& args) {
                       const std::vector<std::string> paths = TargetPaths(args);
+                      if (paths.empty() && ui_state_.sensors.selected >= 0) return RemoveSensor(ui_state_.sensors.selected);
                       if (paths.empty()) return ActionResult::Fail("no node selected");
                       EditTxn txn{"Delete", {}};
                       for (const std::string& p : paths)
@@ -4990,6 +5220,7 @@ void EditorHost::State::RegisterEditActions() {
                       const std::string mode = StrArg(args, "mode", "replace");
                       const scene::EntityId e = path.empty() ? scene::kInvalidEntity : EntityOfPath(*loaded_, path);
                       if (!path.empty() && e == scene::kInvalidEntity) return ActionResult::Fail("no node at '" + path + "'");
+                      ui_state_.sensors.selected = -1;
                       std::vector<scene::EntityId>& sel = ui_state_.selection;
                       const auto at = std::find(sel.begin(), sel.end(), e);
                       if (mode == "replace") {
@@ -6920,6 +7151,7 @@ void EditorHost::State::ApplyUnload() {
     ui_state_.inspector = InspectorState{};
     last_seeded_ = scene::kInvalidEntity;
     xform_gesture_active_ = mat_gesture_active_ = gizmo_using_prev_ = false;
+    sensor_drag_ = -1;
     camera_.FrameAabb(math::Vec3{-1.0f, -1.0f, 0.0f}, math::Vec3{1.0f, 1.0f, 1.0f});
     start_stale_ = true;
 }
@@ -7135,6 +7367,7 @@ void EditorHost::State::Frame(bool step_physics) {
     if (const Snapshot* snap = worker_.AcquireSnapshot()) ApplySnapshot(*snap);
     if (loaded_) SyncSolver();
     if (loaded_) SyncJoints();
+    SyncSensors();
     SyncGainTest();
     if (loaded_) SyncAssembler();
     if (loaded_) worker_.ReadTimeline(&ui_state_.timeline);
@@ -7275,8 +7508,14 @@ void EditorHost::State::Frame(bool step_physics) {
     CameraController render_camera = camera_;
 
     // The gizmo edits the selection's live pose through the inspector's edit seam; one drag
-    // (press to release) records one op. On a jointed link with IK on it poses the robot instead.
-    if (loaded_ && ui_state_.selected_entity != scene::kInvalidEntity && ui_state_.inspector.valid) {
+    // (press to release) records one op. On a jointed link with IK on it poses the robot instead,
+    // and on a selected sensor it moves the sensor along its mount.
+    if (loaded_ && ui_state_.sensors.selected >= 0 &&
+        ui_state_.sensors.items[static_cast<size_t>(ui_state_.sensors.selected)].posed) {
+        ik_drag_ = false;
+        ui_state_.robot.ik.link = -1;
+        DragSensor(render_camera, vp_w, vp_h);
+    } else if (loaded_ && ui_state_.selected_entity != scene::kInvalidEntity && ui_state_.inspector.valid) {
         if (const render::RenderInstance* gi = PoseInstance(*loaded_, doc_.Records(), ui_state_.selected_entity)) {
             const math::Transform pre_drag = LiveWorldTransform(loaded_->scene, ui_state_.selected_entity, *gi);
             const int ik_link = ik_drag_ ? ui_state_.robot.ik.link : IkLink();

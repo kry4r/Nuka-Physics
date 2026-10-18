@@ -14,6 +14,7 @@
 #include "runtime/app/viewer/robot_view.hpp"
 #include "runtime/app/viewer/scene_viewport.hpp"
 #include "runtime/app/viewer/script_tabs.hpp"
+#include "runtime/app/viewer/sensor_view.hpp"
 #include "runtime/app/viewer/teleop_view.hpp"
 #include "runtime/app/viewer/timeline_view.hpp"
 #include "scene/ecs/entity.hpp"
@@ -301,6 +302,7 @@ struct ViewerUiState {
     PolicyView policy;
     DemoView demos;
     ClipView clips;
+    SensorView sensors;
 
     // Queued for the next frame top, so recording the UI never changes the world.
     std::vector<ActionCall> actions;
@@ -518,6 +520,12 @@ private:
     void DrawPerturbHud(const ImVec2& vmin, const ImVec2& vmax);
     // The robot overlays, the Measure tool's line and the hovered link's tooltip.
     void DrawRobotHud(const ImVec2& vmin, const ImVec2& vmax);
+    // Camera frustums, lidar fans, state sensors' axes and their names; the selected one brightest.
+    void DrawSensorHud(const ImVec2& vmin, const ImVec2& vmax);
+    // The selected sensor's fields in Properties; each finished edit is one sensor.set.
+    void DrawSensorInspector();
+    // A sensor row's popup body: rename it or remove it.
+    void SensorContextMenu(int index);
     ViewProjector Projector(const ImVec2& vmin, const ImVec2& vmax) const;
     // The viewport's top-right tools (RT preview, Render, layout, shading) and the box of a box selection.
     void DrawViewTools(const ImVec2& vmin, const ImVec2& vmax);
@@ -557,6 +565,7 @@ private:
     std::shared_ptr<SceneItems> stage_items_;
     nui::TreeView* stage_tree_ = nullptr;
     nuka::scene::EntityId revealed_ = nuka::scene::kInvalidEntity;
+    int revealed_sensor_ = -1;
     const nuka::scene::SceneIR* stage_scene_ = nullptr;
     // Pending Expand/Collapse All (+1/-1), applied after any scene-change reset of the tree.
     int stage_fold_ = 0;
@@ -587,6 +596,11 @@ private:
     int env_count_ = 1;              // the environment popup's count field
     char bookmark_name_[128] = {0};  // the bookmark rename field
     char pose_name_[128] = {0};      // the pose rename field
+    // The Properties copy of the selected sensor, taken again when the selection or the list changes.
+    SensorItem sensor_edit_;
+    int sensor_edit_index_ = -1;
+    uint64_t sensor_edit_version_ = ~0ull;
+    char sensor_name_[128] = {0};
     float tuner_gains_[3] = {};      // the tuner's kp, damping and force limit fields
     int tuner_active_ = -1;          // the field being dragged, which keeps its own value
     // A dope sheet drag: the clip as it was at the press, the keys it moves and the press point.

@@ -649,6 +649,7 @@ public:
         std::string tooltip;
         std::function<bool(uint64_t)> on;
         std::function<void(uint64_t)> on_click;
+        std::function<bool(uint64_t)> applies;  // rows without the tool when false; every row when unset
     };
 
     explicit TreeView(std::shared_ptr<ItemModel> items = nullptr) : model(std::move(items)) {}
