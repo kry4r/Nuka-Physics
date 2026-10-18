@@ -34,7 +34,9 @@ namespace nuka::runtime::app::viewer {
 
 using WorkerClock = std::chrono::steady_clock;
 
-enum class CommandKind : uint8_t { EditApply, Teleport, ParamSet, Perturb, Transport, ScriptCall, Timeline, Beauty, GainTest };
+enum class CommandKind : uint8_t {
+    EditApply, Teleport, ParamSet, Perturb, Transport, ScriptCall, Timeline, Beauty, GainTest, IkSolve
+};
 enum class ParamKind : uint8_t {
     Field, HoldGains, ControllerCommand, DisplayEnv, ScatterRows, Overlay, Registry, Telemetry, Iterations, Heatmap,
     JointWatch, TargetRamp
@@ -98,6 +100,10 @@ struct TickCommand {
     uint32_t width = 0u;
     uint32_t height = 0u;
     uint32_t spp = 0u;
+    // IkSolve: the solve's settings and targets; a zero `write` takes the transport's, drive
+    // targets while playing and the joints at rest as well while paused.
+    nuka_ik_request_t ik{};
+    std::vector<nuka_ik_target_t> ik_targets;
 
     static TickCommand Transport(TransportOp op);
     static TickCommand Param(ParamKind param, std::vector<float> values);
@@ -174,6 +180,22 @@ struct BeautyImage {
     std::vector<uint8_t> rgb;
     std::string error;
 };
+
+// What an IK command solved on the shown environment, or why the world refused it.
+struct IkReport {
+    uint64_t request = 0u;               // the IkSolve command's seq
+    std::vector<float> q;                // per link
+    std::vector<float> targets;          // the drive targets after it, per link
+    std::vector<float> position_error;   // per target [m]
+    std::vector<float> rotation_error;   // per target [rad]
+    uint32_t iterations = 0u;
+    uint32_t joints = 0u;
+    uint32_t at_limit = 0u;
+    std::string error;
+};
+
+// Solves an IkSolve command on environment `cmd.env` of `world`, writing what `cmd.ik.write` asks.
+IkReport RunIk(nuka_world_handle world, uint32_t links_per_env, const TickCommand& cmd);
 
 // The newest records of this many count toward SolverStats::recent_caps.
 inline constexpr uint32_t kRecentRecords = 256u;
@@ -319,6 +341,8 @@ public:
     bool TakeBeauty(BeautyImage* out);
     // Moves the newest finished gain test into `out` once; readable from any thread.
     bool TakeGainTrace(GainTrace* out);
+    // Moves the newest IK report into `out` once; readable from any thread.
+    bool TakeIk(IkReport* out);
     // Copies the joint samples numbered `since` on, 0 being the first of `session`; returns the
     // count taken in it. Readable from any thread.
     uint64_t ReadJoints(uint64_t since, std::vector<JointSample>* out, uint64_t* session);
@@ -337,6 +361,7 @@ private:
     void StartRamp(const TickCommand& cmd, uint64_t start);
     void WriteRamp();
     void RunGainTest(const TickCommand& cmd);
+    void SolveIk(const TickCommand& cmd);
     void SampleJoints();
     void ReadTelemetry();
     void Publish();
@@ -461,6 +486,9 @@ private:
     std::mutex gain_mu_;
     GainTrace gain_;
     bool gain_ready_ = false;
+    std::mutex ik_mu_;
+    IkReport ik_;
+    bool ik_ready_ = false;
 };
 
 }  // namespace nuka::runtime::app::viewer

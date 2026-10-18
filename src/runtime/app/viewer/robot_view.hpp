@@ -135,6 +135,23 @@ struct Assembler {
     float offset_rot[3] = {0.0f, 0.0f, 0.0f};
 };
 
+// How the gizmo drags a link through IK, and what the newest solve reached.
+struct IkState {
+    bool on = true;
+    std::string root;               // the chain's root link; empty is the articulation root
+    std::vector<std::string> pins;  // links a drag holds where they were when it began
+    bool lock_orientation = true;   // a move keeps the link's orientation from the press
+    float rotation_weight = 0.1f;   // m per rad
+    uint64_t pending = 0u;          // the gizmo's solve in flight; 0 while none
+    int link = -1;                  // the dragged link, by index into the links; -1 when none
+    bool missed = false;            // the newest solve fell short of the dragged link's goal
+    float error_mm = 0.0f;
+    float error_deg = 0.0f;
+    float target[3] = {0.0f, 0.0f, 0.0f};  // the dragged link's goal
+    float at[3] = {0.0f, 0.0f, 0.0f};      // where the link is
+    std::string error;
+};
+
 struct RobotView {
     std::vector<RobotJoint> joints;  // in link order
     std::vector<RobotLink> links;    // in link order
@@ -153,6 +170,7 @@ struct RobotView {
     float pose_blend = 0.5f;       // the simulated seconds a click on a pose blends over
     GainTuner tuner;
     Assembler assembler;
+    IkState ik;
 };
 
 }  // namespace nuka::runtime::app::viewer

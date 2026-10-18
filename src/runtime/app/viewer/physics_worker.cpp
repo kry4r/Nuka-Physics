@@ -300,6 +300,14 @@ bool PhysicsWorker::TakeGainTrace(GainTrace* out) {
     return true;
 }
 
+bool PhysicsWorker::TakeIk(IkReport* out) {
+    std::lock_guard<std::mutex> lock(ik_mu_);
+    if (!ik_ready_) return false;
+    *out = std::move(ik_);
+    ik_ready_ = false;
+    return true;
+}
+
 uint64_t PhysicsWorker::ReadJoints(uint64_t since, std::vector<JointSample>* out, uint64_t* session) {
     std::lock_guard<std::mutex> lock(joints_mu_);
     const uint64_t first = joint_count_ - joint_log_.size();
@@ -376,7 +384,10 @@ bool PhysicsWorker::ApplyCommands(std::vector<TickCommand>& cmds) {
         if (!bound_) {
             if (cmd.kind == CommandKind::ScriptCall) Apply(cmd);
         } else if (!Superseded(cmds, i)) {
-            if (cmd.kind == CommandKind::EditApply || cmd.kind == CommandKind::Teleport) cmd.env = bind_.env;
+            if (cmd.kind == CommandKind::EditApply || cmd.kind == CommandKind::Teleport || cmd.kind == CommandKind::IkSolve)
+                cmd.env = bind_.env;
+            if (cmd.kind == CommandKind::IkSolve && cmd.ik.write == 0u)
+                cmd.ik.write = playing_ ? NUKA_IK_WRITE_TARGETS : NUKA_IK_WRITE_POSITIONS | NUKA_IK_WRITE_TARGETS;
             cmd.perturb.env = bind_.env;
             if (cmd.kind == CommandKind::ParamSet && cmd.param == ParamKind::TargetRamp) StampRamp(cmd);
             if (Recorded(cmd)) Record(cmd);
@@ -547,6 +558,9 @@ bool PhysicsWorker::Apply(const TickCommand& cmd) {
         case CommandKind::GainTest:
             RunGainTest(cmd);
             return false;
+        case CommandKind::IkSolve:
+            SolveIk(cmd);
+            return true;
     }
     return false;
 }
@@ -779,6 +793,37 @@ void PhysicsWorker::RunGainTest(const TickCommand& cmd) {
     std::lock_guard<std::mutex> lock(gain_mu_);
     gain_ = std::move(trace);
     gain_ready_ = true;
+}
+
+IkReport RunIk(nuka_world_handle world, uint32_t links_per_env, const TickCommand& cmd) {
+    IkReport report;
+    report.request = cmd.seq;
+    report.q.resize(links_per_env);
+    report.targets.resize(links_per_env);
+    report.position_error.resize(cmd.ik_targets.size());
+    report.rotation_error.resize(cmd.ik_targets.size());
+    nuka_ik_request_t request = cmd.ik;
+    request.env = cmd.env;
+    request.targets = cmd.ik_targets.data();
+    request.target_count = static_cast<uint32_t>(cmd.ik_targets.size());
+    nuka_ik_result_t result{report.q.data(), report.position_error.data(), report.rotation_error.data(), 0u, 0u, 0u};
+    const nuka_result_t r = nuka_world_solve_ik(world, &request, &result);
+    if (r != NUKA_RESULT_OK) report.error = nuka_result_message(r);
+    report.iterations = result.iterations;
+    report.joints = result.joints;
+    report.at_limit = result.at_limit;
+    const size_t bytes = static_cast<size_t>(links_per_env) * sizeof(float);
+    CheckResult(nuka_world_download_field(world, NUKA_FIELD_DRIVE_TARGET, report.targets.data(), bytes, cmd.env * bytes),
+                "nuka_world_download_field");
+    return report;
+}
+
+void PhysicsWorker::SolveIk(const TickCommand& cmd) {
+    IkReport report = RunIk(bind_.world, bind_.layout.links_per_env, cmd);
+    last_mirror_ = WorkerClock::time_point{};
+    std::lock_guard<std::mutex> lock(ik_mu_);
+    ik_ = std::move(report);
+    ik_ready_ = true;
 }
 
 void PhysicsWorker::DispatchTick() {

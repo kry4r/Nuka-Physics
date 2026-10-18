@@ -488,7 +488,8 @@ private:
     void DrawAssembler();
     // The heatmap's scale and the located element's marker over the scene viewport.
     void DrawSolverHud(const ImVec2& vmin, const ImVec2& vmax);
-    // Each held load's pull from its grab point toward its target.
+    // Each held load's pull from its grab point toward its target, and an IK drag's miss as a dashed
+    // line from the link to its goal.
     void DrawPerturbHud(const ImVec2& vmin, const ImVec2& vmax);
     // The viewport's top-right tools (RT preview, Render, layout, shading) and the box of a box selection.
     void DrawViewTools(const ImVec2& vmin, const ImVec2& vmax);

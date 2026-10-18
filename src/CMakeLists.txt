@@ -610,6 +610,7 @@ target_compile_options(nuka_phi2 PRIVATE
 
 add_library(nuka_nk STATIC
     nk/model/model.cpp
+    nk/model/articulation_ik.cpp
     nk/data/arena.cpp
     nk/data/data.cpp
     nk/pipeline/pipeline.cpp

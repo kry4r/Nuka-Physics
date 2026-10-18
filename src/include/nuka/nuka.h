@@ -405,6 +405,48 @@ nuka_result_t nuka_world_release_storage(nuka_world_handle world, uint64_t gener
 // Recomputes link and body poses from joint state and base poses without advancing time.
 nuka_result_t nuka_world_forward_kinematics(nuka_world_handle world);
 
+enum { NUKA_IK_ORIENT = 1 };
+// A point of link `link` (per-environment index, in its frame) that should reach world `position`;
+// with NUKA_IK_ORIENT the link frame should also take world rotation (w, x, y, z). `weight` scales it.
+typedef struct nuka_ik_target_t {
+    uint32_t link;
+    uint32_t flags;
+    float point[3];
+    float position[3];
+    float rotation[4];
+    float weight;
+} nuka_ik_target_t;
+
+enum { NUKA_IK_WRITE_POSITIONS = 1, NUKA_IK_WRITE_TARGETS = 2 };
+typedef struct nuka_ik_request_t {
+    uint32_t env;
+    uint32_t root;  // the chains start below this link; UINT32_MAX is each target's articulation root
+    const nuka_ik_target_t* targets;
+    uint32_t target_count;
+    uint32_t iterations;
+    float rotation_weight;     // metres per radian of rotation error
+    float damping;
+    float max_step;            // rad or m per iteration and joint
+    float position_tolerance;  // m
+    float rotation_tolerance;  // rad
+    uint32_t write;            // NUKA_IK_WRITE_* bits
+} nuka_ik_request_t;
+
+// Caller arrays: q takes links_per_env coordinates, the errors target_count values; each may be NULL.
+typedef struct nuka_ik_result_t {
+    float* q;
+    float* position_error;  // m
+    float* rotation_error;  // rad, 0 for targets without NUKA_IK_ORIENT
+    uint32_t iterations;
+    uint32_t joints;    // the free joints
+    uint32_t at_limit;  // free joints ending at a limit
+} nuka_ik_result_t;
+
+// Damped least squares from the environment's joint positions over the moving joints between `root` and the
+// targets, mimic followers following; WRITE_POSITIONS also zeroes their velocity and re-poses the world.
+nuka_result_t nuka_world_solve_ik(nuka_world_handle world, const nuka_ik_request_t* request,
+                                  nuka_ik_result_t* result);
+
 // The CUDA stream the world executes on, as a cudaStream_t.
 nuka_result_t nuka_world_get_stream(nuka_world_handle world, void** out_stream);
 // Records a caller-created cudaEvent_t on the world's stream after all submitted work.

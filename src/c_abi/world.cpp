@@ -4,6 +4,7 @@
 #include "render/sensor_backend.hpp"
 
 #include "nk/pipeline/world.hpp"
+#include "nk/model/articulation_ik.hpp"
 #include "nk/solve/nk_row.hpp"  // L1: kPairDrivenRowsPerSlot (general row budget)
 #include "runtime/articulation/articulation_cooker.hpp"
 #include "runtime/articulation/articulation_state.hpp"
@@ -1439,6 +1440,86 @@ nuka_result_t nuka_world_forward_kinematics(nuka_world_handle world) {
     if (!record->world) return NUKA_RESULT_NOT_SUPPORTED;
     try {
         return nuka::c_abi::MapStatusToResult(record->world->ForwardKinematics());
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+nuka_result_t nuka_world_solve_ik(nuka_world_handle world, const nuka_ik_request_t* request,
+                                  nuka_ik_result_t* result) {
+    if (request == nullptr || result == nullptr) return NUKA_RESULT_INVALID_ARG;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->world) return NUKA_RESULT_NOT_SUPPORTED;
+    try {
+        using nuka::math::Transform;
+        namespace nk = nuka::nk;
+        nk::World& w = *record->world;
+        const nk::Model& model = w.GetModel();
+        const uint64_t links = model.capacities.links_per_env;
+        const uint64_t trees = model.capacities.articulations_per_env;
+        if (links == 0u || request->env >= model.capacities.env_count ||
+            (request->root != ~uint32_t(0) && request->root >= links))
+            return NUKA_RESULT_INVALID_ARG;
+        std::vector<nk::IkTarget> targets(request->target_count);
+        for (uint32_t i = 0u; i < request->target_count; ++i) {
+            const nuka_ik_target_t& in = request->targets[i];
+            if (in.link >= links) return NUKA_RESULT_INVALID_ARG;
+            nk::IkTarget& t = targets[i];
+            t.link = in.link;
+            t.point = nuka::math::Vec3{in.point[0], in.point[1], in.point[2]};
+            t.position = nuka::math::Vec3{in.position[0], in.position[1], in.position[2]};
+            t.rotation = nuka::math::Quat(in.rotation[0], in.rotation[1], in.rotation[2], in.rotation[3]).Normalized();
+            t.orient = (in.flags & NUKA_IK_ORIENT) != 0u;
+            t.weight = in.weight;
+        }
+        nk::IkOptions options;
+        options.root = request->root;
+        options.rotation_weight = request->rotation_weight;
+        options.damping = request->damping;
+        options.max_step = request->max_step;
+        options.iterations = request->iterations;
+        options.position_tolerance = request->position_tolerance;
+        options.rotation_tolerance = request->rotation_tolerance;
+
+        nk::Data& data = w.GetData();
+        const uint64_t row = uint64_t{request->env} * links * sizeof(float);
+        const uint64_t bytes = links * sizeof(float);
+        std::vector<float> q(links), values(links);
+        std::vector<Transform> bases(trees);
+        if (!data.DownloadField(nk::FieldId::Q, q.data(), bytes, row) ||
+            !data.DownloadField(nk::FieldId::BasePose, bases.data(), trees * sizeof(Transform),
+                                uint64_t{request->env} * trees * sizeof(Transform)))
+            return NUKA_RESULT_INTERNAL;
+        nk::IkSolution solution;
+        if (!nk::SolveArticulationIk(model.articulation, q.data(), bases.data(), targets, options, &solution))
+            return NUKA_RESULT_INVALID_ARG;
+        // Each write keeps the row's other links as they are.
+        const auto write = [&](nk::FieldId field, bool solved) {
+            if (!data.DownloadField(field, values.data(), bytes, row)) return false;
+            for (uint32_t link : solution.moved) values[link] = solved ? solution.q[link] : 0.0f;
+            return data.UploadField(field, values.data(), bytes, row);
+        };
+        if ((request->write & NUKA_IK_WRITE_POSITIONS) != 0u) {
+            if (!write(nk::FieldId::Q, true) || !write(nk::FieldId::Qdot, false)) return NUKA_RESULT_INTERNAL;
+            const auto status = w.ForwardKinematics();
+            if (status != nuka::phi::Status::Ok) return nuka::c_abi::MapStatusToResult(status);
+        }
+        if ((request->write & NUKA_IK_WRITE_TARGETS) != 0u && !write(nk::FieldId::DriveTarget, true))
+            return NUKA_RESULT_INTERNAL;
+        if (result->q != nullptr) std::copy(solution.q.begin(), solution.q.end(), result->q);
+        if (result->position_error != nullptr)
+            std::copy(solution.position_error.begin(), solution.position_error.end(), result->position_error);
+        if (result->rotation_error != nullptr)
+            std::copy(solution.rotation_error.begin(), solution.rotation_error.end(), result->rotation_error);
+        result->iterations = solution.iterations;
+        result->joints = solution.joints;
+        result->at_limit = solution.at_limit;
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
     } catch (const std::exception& error) {
         return nuka::c_abi::MapExceptionToResult(error);
     } catch (...) {

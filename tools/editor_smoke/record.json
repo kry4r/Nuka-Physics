@@ -28,7 +28,7 @@
     {"wait": "timeline.status", "until": {"tick": 50, "applied": true}},
     {"action": "timeline.save", "args": {"path": "${out}/run.nkrec"}, "bind": "saved"},
     {"python": "s = ${saved}\nassert s['start'] == 0 and s['head'] == 90 and s['keyframes'] >= 6 and s['inputs'] == 2, s"},
-    {"python": "import os\nfrom nuka.editor import nkrec\nr = nkrec.read('${out}/run.nkrec')\nm = r.manifest\nassert m['tick'] == 50 and m['head'] == 90 and m['exact'] and m['format'] == 1, m\nassert len(r.keyframes) == m['keyframes'] and r.inputs == 2, (len(r.keyframes), r.inputs)\nassert any(k.loads for k in r.keyframes), [k.loads for k in r.keyframes]\nassert r.samples and r.samples[0].bodies.shape[1] == 7 and r.samples[-1].tick <= 90, len(r.samples)\nassert len(m['bodies']) == r.samples[0].bodies.shape[0], (m['bodies'], r.samples[0].bodies.shape)\nout = nkrec.to_rerun(r, '${out}/run.rrd')\nassert os.path.getsize(out) > 0, out"},
+    {"python": "import os\nfrom nuka.editor import nkrec\nr = nkrec.read('${out}/run.nkrec')\nm = r.manifest\nassert m['tick'] == 50 and m['head'] == 90 and m['exact'] and m['format'] == 2, m\nassert len(r.keyframes) == m['keyframes'] and r.inputs == 2, (len(r.keyframes), r.inputs)\nassert any(k.loads for k in r.keyframes), [k.loads for k in r.keyframes]\nassert r.samples and r.samples[0].bodies.shape[1] == 7 and r.samples[-1].tick <= 90, len(r.samples)\nassert len(m['bodies']) == r.samples[0].bodies.shape[0], (m['bodies'], r.samples[0].bodies.shape)\nout = nkrec.to_rerun(r, '${out}/run.rrd')\nassert os.path.getsize(out) > 0, out"},
 
     {"action": "timeline.clear"},
     {"tick": 20},

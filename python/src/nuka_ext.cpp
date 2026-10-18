@@ -21,6 +21,7 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <map>
@@ -635,6 +636,59 @@ public:
         check(nuka_world_forward_kinematics(h_), "nuka_world_forward_kinematics");
     }
 
+    // Each target is a dict {link, position, rotation (w, x, y, z) to orient, point in the link frame, weight}.
+    nb::dict solve_ik(const nb::list& targets, std::optional<uint32_t> root, uint32_t env, bool write_positions,
+                      bool write_targets, float rotation_weight, float damping, float max_step, uint32_t iterations,
+                      float position_tolerance, float rotation_tolerance) {
+        std::vector<nuka_ik_target_t> in;
+        for (nb::handle item : targets) {
+            nb::dict d = nb::cast<nb::dict>(item);
+            nuka_ik_target_t t{};
+            t.link = nb::cast<uint32_t>(d["link"]);
+            const auto position = nb::cast<std::array<float, 3>>(d["position"]);
+            std::copy(position.begin(), position.end(), t.position);
+            t.rotation[0] = 1.0f;
+            if (d.contains("rotation") && !d["rotation"].is_none()) {
+                const auto rotation = nb::cast<std::array<float, 4>>(d["rotation"]);
+                std::copy(rotation.begin(), rotation.end(), t.rotation);
+                t.flags = NUKA_IK_ORIENT;
+            }
+            if (d.contains("point")) {
+                const auto point = nb::cast<std::array<float, 3>>(d["point"]);
+                std::copy(point.begin(), point.end(), t.point);
+            }
+            t.weight = d.contains("weight") ? nb::cast<float>(d["weight"]) : 1.0f;
+            in.push_back(t);
+        }
+        nuka_ik_request_t request{};
+        request.env = env;
+        request.root = root.value_or(~uint32_t(0));
+        request.targets = in.data();
+        request.target_count = static_cast<uint32_t>(in.size());
+        request.iterations = iterations;
+        request.rotation_weight = rotation_weight;
+        request.damping = damping;
+        request.max_step = max_step;
+        request.position_tolerance = position_tolerance;
+        request.rotation_tolerance = rotation_tolerance;
+        request.write = (write_positions ? NUKA_IK_WRITE_POSITIONS : 0u) | (write_targets ? NUKA_IK_WRITE_TARGETS : 0u);
+        const uint32_t links = base_link_count();
+        float* q = new float[links > 0u ? links : 1u];
+        nb::capsule owner(q, [](void* p) noexcept { delete[] static_cast<float*>(p); });
+        std::vector<float> position_error(in.size()), rotation_error(in.size());
+        nuka_ik_result_t result{q, position_error.data(), rotation_error.data(), 0u, 0u, 0u};
+        check(unlocked([&] { return nuka_world_solve_ik(h_, &request, &result); }), "nuka_world_solve_ik");
+        size_t shape[1] = {links};
+        nb::dict out;
+        out["q"] = nb::cast(nb::ndarray<nb::numpy, float>(q, 1, shape, owner));
+        out["position_error"] = position_error;
+        out["rotation_error"] = rotation_error;
+        out["iterations"] = result.iterations;
+        out["joints"] = result.joints;
+        out["at_limit"] = result.at_limit;
+        return out;
+    }
+
     uintptr_t cuda_stream() const {
         void* stream = nullptr;
         check(nuka_world_get_stream(h_, &stream), "nuka_world_get_stream");
@@ -871,10 +925,16 @@ public:
     }
 
     uint32_t env_count() const { return env_count_; }
-    uint32_t base_link_count() const { return base_link_count_; }
+    uint32_t base_link_count() const {
+        sync_counts();
+        return base_link_count_;
+    }
     // Per-env particle count of a coupled world (0 if particle-free). buffer_view(
     // Field.PARTICLE_POSITION) has element_count == env_count * particle_count.
-    uint32_t particle_count() const { return particle_count_; }
+    uint32_t particle_count() const {
+        sync_counts();
+        return particle_count_;
+    }
     // action_dim == the number of ACTUATED joint DOFs a policy controls ==
     // base_link_count_ - 1. The engine's JOINT_POSITION / DRIVE_TARGET buffers are
     // base_link_count_ wide; slot 0 is the root link, which on a floating base
@@ -886,7 +946,8 @@ public:
     // targets/gains set on slots 1:13). Use `base_link_count` for the raw buffer
     // width; use `action_dim` for the policy/RL action width.
     uint32_t action_dim() const {
-        return base_link_count_ > 0u ? base_link_count_ - 1u : 0u;
+        const uint32_t links = base_link_count();
+        return links > 0u ? links - 1u : 0u;
     }
     float dt() const { return dt_; }
 
@@ -1061,9 +1122,15 @@ private:
         refresh_counts();
     }
 
+    // A borrowed world's owner may rebuild it in place, so the counts follow its generation.
+    void sync_counts() const {
+        if (generation() != counts_generation_) refresh_counts();
+    }
+
     // Per-env link and particle counts, read from the JOINT_POSITION and PARTICLE_POSITION
     // views; a world without articulations or particles reads 0.
-    void refresh_counts() {
+    void refresh_counts() const {
+        counts_generation_ = generation();
         nuka_buffer_view_t view{};
         base_link_count_ = env_count_ > 0u && nuka_world_get_buffer_view(
                                                   h_, NUKA_FIELD_JOINT_POSITION, &view) == NUKA_RESULT_OK
@@ -1078,10 +1145,11 @@ private:
     nuka_world_handle h_ = nullptr;
     bool owned_ = true;
     uint32_t env_count_ = 0u;
-    uint32_t base_link_count_ = 0u;
+    mutable uint32_t base_link_count_ = 0u;
     float dt_ = 0.0f;
     // Per-env particle count (0 for a particle-free world), so a caller can reshape the field.
-    uint32_t particle_count_ = 0u;
+    mutable uint32_t particle_count_ = 0u;
+    mutable uint64_t counts_generation_ = 0u;
     // Live view leases per generation.
     std::map<uint64_t, uint32_t> leases_;
     // Last attached camera image size + cameras per env (the (E,S,H,W,ch) shaping).
@@ -2393,6 +2461,15 @@ NB_MODULE(_nuka_ext, m) {
              "views keep valid storage but are stale; worlds with sensors or observations refuse it.")
         .def("forward_kinematics", &World::forward_kinematics,
              "Recompute link and body poses from joint state and base poses without stepping.")
+        .def("solve_ik", &World::solve_ik, nb::arg("targets"), nb::arg("root") = nb::none(), nb::arg("env") = 0u,
+             nb::arg("write_positions") = false, nb::arg("write_targets") = false, nb::arg("rotation_weight") = 0.1f,
+             nb::arg("damping") = 1.0e-3f, nb::arg("max_step") = 0.2f, nb::arg("iterations") = 200u,
+             nb::arg("position_tolerance") = 1.0e-5f, nb::arg("rotation_tolerance") = 1.0e-4f,
+             "Damped least-squares IK of env `env` from its joint positions. targets: dicts {link, position, "
+             "rotation (w, x, y, z), point, weight}; root: the link the chains start below, None for each "
+             "target's articulation root. write_positions sets the solved joints at rest and re-poses the world, "
+             "write_targets makes them the drive targets. Returns {q, position_error, rotation_error, "
+             "iterations, joints, at_limit}.")
         .def_prop_ro("cuda_stream", &World::cuda_stream,
                      "The cudaStream_t the world executes on, as an integer.")
         .def("record_event", &World::record_event, nb::arg("event"),

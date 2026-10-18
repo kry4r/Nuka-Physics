@@ -32,7 +32,7 @@ using KeyRef = std::shared_ptr<Keyframe>;
 // A recording is a magic and a format number, then chunks of a 4-byte tag, a byte count and the
 // bytes: the JSON manifest, each keyframe, the inputs, the pose samples and the solver records.
 constexpr char kRecordingMagic[8] = {'N', 'K', 'R', 'E', 'C', '\0', '\0', '\0'};
-constexpr uint32_t kRecordingFormat = 1u;
+constexpr uint32_t kRecordingFormat = 2u;
 static_assert(sizeof(math::Transform) == 7u * sizeof(float), "a recorded pose is 7 floats");
 
 template <class T>
@@ -129,6 +129,9 @@ void PutInput(std::string& out, const LoggedInput& input) {
     PutRange(out, c.values);
     Put(out, c.pose);
     Put(out, c.perturb);
+    Put(out, c.ik);
+    Put(out, static_cast<uint32_t>(c.ik_targets.size()));
+    PutRange(out, c.ik_targets);
 }
 
 LoggedInput GetInput(Cursor& in) {
@@ -145,6 +148,8 @@ LoggedInput GetInput(Cursor& in) {
     in.GetRange(&c.values, in.Get<uint32_t>());
     c.pose = in.Get<PoseWrite>();
     c.perturb = in.Get<Perturbation>();
+    c.ik = in.Get<nuka_ik_request_t>();
+    in.GetRange(&c.ik_targets, in.Get<uint32_t>());
     return input;
 }
 
@@ -163,6 +168,7 @@ bool PhysicsWorker::Recorded(const TickCommand& cmd) {
         case CommandKind::EditApply:
         case CommandKind::Teleport:
         case CommandKind::Perturb:
+        case CommandKind::IkSolve:
             return true;
         case CommandKind::ParamSet:
             return cmd.param == ParamKind::Field || cmd.param == ParamKind::HoldGains ||

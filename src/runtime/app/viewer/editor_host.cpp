@@ -109,6 +109,12 @@ constexpr float kGrabHz = 3.0f;
 constexpr float kForceArrow = 0.3f;
 // The RT preview renders the viewport scaled down to this many pixels on its long side.
 constexpr float kRtMaxSide = 1920.0f;
+// A gizmo move's locked orientation weighs this much against its position, so a short chain
+// still reaches the point.
+constexpr float kIkLockWeight = 0.1f;
+// A gizmo IK solve this far from its goal draws the miss.
+constexpr float kIkMissMm = 1.0f;
+constexpr float kIkMissDeg = 0.5f;
 
 struct LaunchOptions {
     std::string scene_path;
@@ -369,6 +375,35 @@ bool ParseOptions(const std::vector<std::string>& args, LaunchOptions* opt) {
         else if (a.rfind("--", 0) != 0) opt->scene_path = a;
     }
     return true;
+}
+
+// An IK goal for the origin of `link`: `goal`'s position, its rotation as well when `orient`.
+nuka_ik_target_t IkGoal(uint32_t link, const math::Transform& goal, bool orient, float weight) {
+    nuka_ik_target_t t{};
+    t.link = link;
+    t.flags = orient ? static_cast<uint32_t>(NUKA_IK_ORIENT) : 0u;
+    const float p[3] = {goal.position.x, goal.position.y, goal.position.z};
+    const float r[4] = {goal.rotation.w, goal.rotation.x, goal.rotation.y, goal.rotation.z};
+    std::copy(p, p + 3, t.position);
+    std::copy(r, r + 4, t.rotation);
+    t.weight = weight;
+    return t;
+}
+
+// An IK solve of `targets` below link `root` (-1 for each target's articulation root) with the
+// core's iteration settings; it writes what the transport does with a drag.
+TickCommand IkCommand(std::vector<nuka_ik_target_t> targets, int root, float rotation_weight) {
+    TickCommand cmd;
+    cmd.kind = CommandKind::IkSolve;
+    cmd.ik.root = root < 0 ? ~uint32_t{0} : static_cast<uint32_t>(root);
+    cmd.ik.iterations = 200u;
+    cmd.ik.rotation_weight = rotation_weight;
+    cmd.ik.damping = 1.0e-3f;
+    cmd.ik.max_step = 0.2f;
+    cmd.ik.position_tolerance = 1.0e-5f;
+    cmd.ik.rotation_tolerance = 1.0e-4f;
+    cmd.ik_targets = std::move(targets);
+    return cmd;
 }
 
 void ClearModelUi(ViewerUiState& ui) {
@@ -862,6 +897,7 @@ struct EditorHost::State : DocumentHost {
     void RegisterPoseActions();
     void RegisterGainActions();
     void RegisterAssemblyActions();
+    void RegisterIkActions();
     json::Value TimelineStatus();
     // What a recording must match to load: the document, the world's counts and step, and the
     // names of the link and body rows its poses fill.
@@ -983,6 +1019,17 @@ struct EditorHost::State : DocumentHost {
     void SyncGainTest();
     // The selection and the scene body's offset from its parent link the Robot Assembler shows.
     void SyncAssembler();
+    // The link `name` names by node path or incoming joint, by index into the robot's links; -1 when none.
+    int FindLink(const std::string& name) const;
+    // The selected link the gizmo drags through IK; -1 for a root or while IK is off.
+    int IkLink() const;
+    // Shows an IK report: the gizmo drag's miss, and the drive targets no edit holds.
+    void TakeIkReport(const IkReport& report);
+    // Takes the newest IK report and sends the drag's next solve once the last one is done.
+    void SyncIk();
+    // The gizmo on IK link `link`: a press holds the pins and the link's pose under the gizmo at
+    // `live`; each move makes the next solve toward `gizmo`.
+    void DragIk(int link, const math::Transform& live, const math::Transform& gizmo, bool changed, bool using_now);
     void TakeWorkerResults();
     void PushTransport();
     void PushPoseWrites();
@@ -1125,6 +1172,14 @@ struct EditorHost::State : DocumentHost {
     std::string mat_gesture_path_;
     scene::RenderMaterial mat_before_{};
     bool gizmo_using_prev_ = false;
+    // An IK drag: the link's pose in the gizmo's frame and at the press, the gizmo while held, the
+    // pins' press poses and the solve waiting for the one in flight.
+    bool ik_drag_ = false;
+    math::Transform ik_offset_;
+    math::Transform ik_press_;
+    math::Transform ik_held_;
+    std::vector<std::pair<uint32_t, math::Transform>> ik_pins_;
+    std::optional<TickCommand> ik_next_;
     // The Perturb tool's load while its drag lasts; the target slides on the view plane through the anchor.
     std::optional<Perturbation> grab_;
     math::Vec3 grab_anchor_ = math::Vec3::Zero();
@@ -1678,6 +1733,10 @@ void EditorHost::State::BindWorker(uint64_t tick, double sim_time) {
     sent_contacts_ = binding.contacts;
     sent_static_revision_ = loaded_->sim->StaticRevision();
     bound_epoch_ = worker_.Bind(std::move(binding));
+    ui_state_.robot.ik.pending = 0u;
+    ui_state_.robot.ik.link = -1;
+    ik_drag_ = false;
+    ik_next_.reset();
     shown_ = nullptr;
     // A new binding starts paused; the transport re-sends the UI's play state.
     if (const Snapshot* snap = worker_.AcquireSnapshot()) ApplySnapshot(*snap);
@@ -1821,6 +1880,84 @@ void EditorHost::State::SyncAssembler() {
     const float values[6] = {offset.position.x, offset.position.y, offset.position.z, rot.x, rot.y, rot.z};
     std::copy(values, values + 3, a.offset_pos);
     std::copy(values + 3, values + 6, a.offset_rot);
+}
+
+int EditorHost::State::FindLink(const std::string& name) const {
+    const std::vector<RobotLink>& links = ui_state_.robot.links;
+    for (size_t i = 0; i < links.size(); ++i)
+        if (links[i].path == name || (!links[i].joint.empty() && links[i].joint == name)) return static_cast<int>(i);
+    return -1;
+}
+
+int EditorHost::State::IkLink() const {
+    const RobotView& v = ui_state_.robot;
+    if (!v.ik.on || shown_ == nullptr || ui_state_.selected_entity == scene::kInvalidEntity) return -1;
+    const int link = FindLink(PathOfEntity(ui_state_.selected_entity));
+    return link >= 0 && v.links[static_cast<size_t>(link)].parent >= 0 ? link : -1;
+}
+
+void EditorHost::State::TakeIkReport(const IkReport& report) {
+    IkState& ik = ui_state_.robot.ik;
+    if (report.request >= ik.pending) ik.pending = 0u;
+    for (size_t l = 0; l < std::min(report.targets.size(), ui_state_.drive_targets.size()); ++l)
+        if (ui_state_.drive_dirty[l] == 0u) ui_state_.drive_targets[l] = report.targets[l];
+    ik.error = report.error;
+    if (ik.link < 0 || report.position_error.empty()) return;
+    ik.error_mm = report.position_error[0] * 1000.0f;
+    ik.error_deg = report.rotation_error[0] * 180.0f / kPi;
+    ik.missed = !report.error.empty() || ik.error_mm > kIkMissMm || ik.error_deg > kIkMissDeg;
+}
+
+void EditorHost::State::SyncIk() {
+    IkState& ik = ui_state_.robot.ik;
+    IkReport report;
+    if (worker_.TakeIk(&report)) TakeIkReport(report);
+    if (ik.pending == 0u && ik_next_) {
+        ik.pending = worker_.Push(std::move(*ik_next_));
+        ik_next_.reset();
+    }
+    if (ik.link < 0 || shown_ == nullptr) return;
+    const math::Vec3 at = shown_->link_poses[static_cast<size_t>(ik.link)].position;
+    const float p[3] = {at.x, at.y, at.z};
+    std::copy(p, p + 3, ik.at);
+}
+
+void EditorHost::State::DragIk(int link, const math::Transform& live, const math::Transform& gizmo, bool changed,
+                               bool using_now) {
+    IkState& ik = ui_state_.robot.ik;
+    if (using_now && !ik_drag_) {
+        const std::vector<math::Transform>& poses = shown_->link_poses;
+        ik_drag_ = true;
+        ik.link = link;
+        ik.missed = false;
+        ik_press_ = poses[static_cast<size_t>(link)];
+        ik_offset_ = live.Inverse() * ik_press_;
+        ik_held_ = live;
+        ik_pins_.clear();
+        for (const std::string& pin : ik.pins)
+            if (const int p = FindLink(pin); p >= 0 && p != link)
+                ik_pins_.emplace_back(static_cast<uint32_t>(p), poses[static_cast<size_t>(p)]);
+    }
+    if (ik_drag_ && changed) {
+        // A move takes the link's origin with the gizmo, a turn its orientation about where it is.
+        ik_held_ = gizmo;
+        const math::Transform goal = gizmo * ik_offset_;
+        const bool turn = ui_state_.gizmo.op == GizmoState::Op::Rotate;
+        math::Transform aim;
+        aim.position = turn ? ik_press_.position : goal.position;
+        aim.rotation = turn ? goal.rotation : ik_press_.rotation;
+        const auto l = static_cast<uint32_t>(link);
+        std::vector<nuka_ik_target_t> targets = {IkGoal(l, aim, turn, 1.0f)};
+        if (!turn && ik.lock_orientation) targets.push_back(IkGoal(l, aim, true, kIkLockWeight));
+        for (const auto& [p, pose] : ik_pins_) targets.push_back(IkGoal(p, pose, true, 1.0f));
+        ik_next_ = IkCommand(std::move(targets), FindLink(ik.root), ik.rotation_weight);
+        const float t[3] = {aim.position.x, aim.position.y, aim.position.z};
+        std::copy(t, t + 3, ik.target);
+    }
+    if (using_now) return;
+    ik_drag_ = false;
+    ik.link = -1;
+    ik.missed = false;
 }
 
 void EditorHost::State::TakeWorkerResults() {
@@ -2775,6 +2912,96 @@ void EditorHost::State::RegisterRobotActions() {
     RegisterPoseActions();
     RegisterGainActions();
     RegisterAssemblyActions();
+    RegisterIkActions();
+}
+
+void EditorHost::State::RegisterIkActions() {
+    const auto has_links = [this] { return loaded_ != nullptr && shown_ != nullptr && !ui_state_.robot.joints.empty(); };
+    // Moves `link` (node path or joint name) to world `pos`, and `quat` or XYZ-degree `rot`, keeping `pins` put.
+    // `apply` (default) writes the solution as a gizmo drag does, else it only reports it.
+    actions_.Add({"robot.ik", "Solve IK", "robot", "", ShortcutScope::Global, has_links, {},
+                  [this](const json::Value& args) {
+                      const IkState& ik = ui_state_.robot.ik;
+                      const std::vector<math::Transform>& poses = shown_->link_poses;
+                      const std::string name = StrArg(args, "link");
+                      const int link = FindLink(name);
+                      if (link < 0) return ActionResult::Fail("no link '" + name + "'");
+                      math::Transform goal = poses[static_cast<size_t>(link)];
+                      const auto& pos = args.At("pos").Elements();
+                      goal.position = math::Vec3{pos[0].AsFloat(), pos[1].AsFloat(), pos[2].AsFloat()};
+                      const json::Value* quat = args.Find("quat");
+                      const json::Value* rot = args.Find("rot");
+                      if (quat != nullptr) {
+                          const auto& e = quat->Elements();
+                          goal.rotation = math::Quat(e[0].AsFloat(), e[1].AsFloat(), e[2].AsFloat(), e[3].AsFloat()).Normalized();
+                      } else if (rot != nullptr) {
+                          const auto& e = rot->Elements();
+                          goal.rotation = QuatFromEulerDeg(math::Vec3{e[0].AsFloat(), e[1].AsFloat(), e[2].AsFloat()});
+                      }
+                      const bool orient = (quat != nullptr || rot != nullptr) && !BoolArg(args, "position_only", false);
+                      std::vector<nuka_ik_target_t> targets = {IkGoal(static_cast<uint32_t>(link), goal, orient, 1.0f)};
+                      for (const std::string& pin : args.Find("pins") != nullptr ? StrListArg(args, "pins") : ik.pins) {
+                          const int p = FindLink(pin);
+                          if (p < 0) return ActionResult::Fail("no link '" + pin + "'");
+                          targets.push_back(IkGoal(static_cast<uint32_t>(p), poses[static_cast<size_t>(p)], true, 1.0f));
+                      }
+                      const std::string root_name = StrArg(args, "root", ik.root);
+                      const int root = FindLink(root_name);
+                      if (!root_name.empty() && root < 0) return ActionResult::Fail("no link '" + root_name + "'");
+                      TickCommand cmd = IkCommand(std::move(targets), root,
+                                                  static_cast<float>(NumArg(args, "rotation_weight", ik.rotation_weight)));
+                      const bool apply = BoolArg(args, "apply", true);
+                      IkReport report;
+                      if (apply) {
+                          worker_.Push(std::move(cmd));
+                          worker_.Exclusive([] {});
+                          worker_.TakeIk(&report);
+                          TakeIkReport(report);
+                      } else {
+                          cmd.env = shown_->env;
+                          worker_.Exclusive([&] { report = RunIk(world_, loaded_->Layout().links_per_env, cmd); });
+                      }
+                      if (!report.error.empty()) return ActionResult::Fail(report.error);
+                      json::Value q = json::Value::Object();
+                      for (const RobotJoint& j : ui_state_.robot.joints) q.Set(j.name, json::Value::Float(report.q[j.link]));
+                      json::Value position_error = json::Value::Array(), rotation_error = json::Value::Array();
+                      for (float e : report.position_error) position_error.PushBack(json::Value::Float(e));
+                      for (float e : report.rotation_error) rotation_error.PushBack(json::Value::Float(e));
+                      return Ok(Object({{"q", std::move(q)},
+                                        {"position_error", std::move(position_error)},
+                                        {"rotation_error", std::move(rotation_error)},
+                                        {"iterations", json::Value::Int(report.iterations)},
+                                        {"joints", json::Value::Int(report.joints)},
+                                        {"at_limit", json::Value::Int(report.at_limit)},
+                                        {"applied", json::Value::Bool(apply)}}));
+                  }});
+    // The gizmo's IK: the chain root (empty for the articulation's), the links a drag pins, whether a
+    // move locks the orientation and the rotation weight [m/rad]; an argument given replaces its setting.
+    actions_.Add({"robot.ik_settings", "IK Settings", "robot", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value& args) {
+                      IkState& ik = ui_state_.robot.ik;
+                      const std::string root = StrArg(args, "root", ik.root);
+                      const std::vector<std::string> pins = args.Find("pins") != nullptr ? StrListArg(args, "pins") : ik.pins;
+                      for (const std::string& link : pins)
+                          if (FindLink(link) < 0) return ActionResult::Fail("no link '" + link + "'");
+                      if (!root.empty() && FindLink(root) < 0) return ActionResult::Fail("no link '" + root + "'");
+                      ik.root = root;
+                      ik.pins = pins;
+                      ik.lock_orientation = BoolArg(args, "lock_orientation", ik.lock_orientation);
+                      ik.rotation_weight = static_cast<float>(NumArg(args, "rotation_weight", ik.rotation_weight));
+                      return Ok(Object({{"on", json::Value::Bool(ik.on)},
+                                        {"root", json::Value::Str(ik.root)},
+                                        {"pins", StrList(ik.pins)},
+                                        {"lock_orientation", json::Value::Bool(ik.lock_orientation)},
+                                        {"rotation_weight", json::Value::Float(ik.rotation_weight)}}));
+                  }});
+    // While on, the gizmo on a jointed link poses the robot through IK; without `on` it toggles.
+    actions_.Add({"tool.ik", "IK Drag", "sim", "", ShortcutScope::Global, {}, [this] { return ui_state_.robot.ik.on; },
+                  [this](const json::Value& args) {
+                      IkState& ik = ui_state_.robot.ik;
+                      ik.on = BoolArg(args, "on", !ik.on);
+                      return Ok(Object({{"on", json::Value::Bool(ik.on)}}));
+                  }});
 }
 
 void EditorHost::State::RegisterGainActions() {
@@ -5298,26 +5525,31 @@ void EditorHost::State::Frame(bool step_physics) {
 
     CameraController render_camera = camera_;
 
-    // The gizmo edits the selection's live pose through the inspector's edit seam;
-    // one drag (press to release) records one op.
+    // The gizmo edits the selection's live pose through the inspector's edit seam; one drag
+    // (press to release) records one op. On a jointed link with IK on it poses the robot instead.
     if (loaded_ && ui_state_.selected_entity != scene::kInvalidEntity && ui_state_.inspector.valid) {
         if (const render::RenderInstance* gi = PoseInstance(*loaded_, doc_.Records(), ui_state_.selected_entity)) {
             const math::Transform pre_drag = LiveWorldTransform(loaded_->scene, ui_state_.selected_entity, *gi);
-            math::Transform gworld = pre_drag;
+            const int ik_link = ik_drag_ ? ui_state_.robot.ik.link : IkLink();
+            math::Transform gworld = ik_drag_ ? ik_held_ : pre_drag;
             bool gizmo_changed = false;
             ui_.DrawGizmo(render_camera, vp_w, vp_h, ui_state_, gworld, gizmo_changed);
             const bool using_now = ui_state_.gizmo.using_now;
-            if (using_now && !gizmo_using_prev_ && !xform_gesture_active_) {
-                xform_gesture_active_ = true;
-                xform_dirty_ = false;
-                xform_gesture_path_ = PathOfEntity(ui_state_.selected_entity);
-                xform_before_ = pre_drag;
-                xform_after_ = pre_drag;
-            }
-            if (gizmo_changed) {
-                ApplyTransformEdit(*loaded_, doc_.Records(), ui_state_.selected_entity, gworld, /*commit=*/false);
-                xform_after_ = gworld;
-                xform_dirty_ = true;
+            if (ik_link >= 0) {
+                DragIk(ik_link, pre_drag, gworld, gizmo_changed, using_now);
+            } else {
+                if (using_now && !gizmo_using_prev_ && !xform_gesture_active_) {
+                    xform_gesture_active_ = true;
+                    xform_dirty_ = false;
+                    xform_gesture_path_ = PathOfEntity(ui_state_.selected_entity);
+                    xform_before_ = pre_drag;
+                    xform_after_ = pre_drag;
+                }
+                if (gizmo_changed) {
+                    ApplyTransformEdit(*loaded_, doc_.Records(), ui_state_.selected_entity, gworld, /*commit=*/false);
+                    xform_after_ = gworld;
+                    xform_dirty_ = true;
+                }
             }
             if (!using_now && gizmo_using_prev_ && xform_gesture_active_) {
                 if (xform_dirty_)
@@ -5333,7 +5565,10 @@ void EditorHost::State::Frame(bool step_physics) {
         ui_state_.gizmo.active = false;
         ui_state_.gizmo.using_now = false;
         gizmo_using_prev_ = false;
+        ik_drag_ = false;
+        ui_state_.robot.ik.link = -1;
     }
+    SyncIk();
 
     const auto& scene_rect = ui_.Viewport();
     if (!scene_rect.Valid()) {

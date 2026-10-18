@@ -557,6 +557,7 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
         registry.Decorate(id, glyph, false);
     registry.Decorate("tool.perturb", icon::kGrab, false);
     registry.Decorate("tool.pin", icon::kPin, false);
+    registry.Decorate("tool.ik", icon::kJoint, false);
     for (const auto& [id, glyph] : {std::pair{"robot.fix_base", icon::kStatic}, std::pair{"robot.drive", icon::kDrive},
                                     std::pair{"robot.watch", icon::kPlot}, std::pair{"robot.pose_capture", icon::kAdd},
                                     std::pair{"robot.poses_save", icon::kSave}, std::pair{"robot.poses_load", icon::kOpen},
@@ -579,7 +580,7 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
                            "view.views", "robot.joints", "robot.set_targets", "robot.samples", "robot.poses",
                            "robot.pose_apply", "robot.pose_initial", "robot.pose_rename", "robot.pose_remove",
                            "robot.gain_status", "robot.gain_runs", "robot.links", "robot.asset_links", "robot.attach",
-                           "robot.attach_asset"})
+                           "robot.attach_asset", "robot.ik", "robot.ik_settings"})
         registry.Decorate(id, "", true);
     registry.Rebind("file.open", "Ctrl+O");
     registry.Rebind("file.save", "Ctrl+S");
@@ -1771,6 +1772,7 @@ void ImGuiLayer::DrawToolbar() {
                              rotate ? "%.1f\xC2\xB0" : "%.3f m", ImGuiSliderFlags_AlwaysClamp);
             ImGui::EndPopup();
         }
+        action("tool.ik", icon::kJoint, ui.robot.ik.on);
         ImGui::EndDisabled();
         divider();
         if (toggle("##perturb", icon::kGrab, ui.tool == ViewportTool::Perturb, Tr("Perturb (right-click for the stiffness)")))
@@ -1876,6 +1878,14 @@ void ImGuiLayer::DrawStatusBar() {
         if (!path.empty()) left += (left.empty() ? "" : "      ") + Iconed(icon::kTarget, Upper(path).c_str());
         const ImVec2 lsize = font->CalcTextSizeA(px, FLT_MAX, 0.0f, left.c_str());
         list->AddText(font, px, ImVec2(wpos.x + 10.0f * s, cy - lsize.y * 0.5f), U32(theme::kFgDim), left.c_str());
+        // How far an IK drag's solve fell short of the gizmo.
+        if (const IkState& ik = frame_.ui->robot.ik; ik.link >= 0 && ik.missed) {
+            const std::string miss =
+                ik.error.empty() ? Fmt(Tr("IK MISS %.1f MM  %.1f\xC2\xB0"), static_cast<double>(ik.error_mm), static_cast<double>(ik.error_deg))
+                                 : Upper(ik.error);
+            list->AddText(font, px, ImVec2(wpos.x + lsize.x + 34.0f * s, cy - lsize.y * 0.5f), U32(theme::kWarn),
+                          Iconed(icon::kWarn, miss.c_str()).c_str());
+        }
         const std::string right = Fmt("%.0f FPS   %.2f MS", stats.fps, stats.frame_time_ms);
         const ImVec2 rsize = font->CalcTextSizeA(px, FLT_MAX, 0.0f, right.c_str());
         list->AddText(font, px, ImVec2(wpos.x + wsize.x - rsize.x - 10.0f * s, cy - rsize.y * 0.5f), U32(theme::kFgDim),
@@ -2353,7 +2363,9 @@ ImTextureData* ImGuiLayer::Thumbnail(const std::string& file) {
 
 void ImGuiLayer::DrawPerturbHud(const ImVec2& vmin, const ImVec2& vmax) {
     const ViewerUiState& ui = *frame_.ui;
-    if (ui.held.empty()) return;
+    const IkState& ik = ui.robot.ik;
+    const bool missed = ik.link >= 0 && ik.missed;
+    if (ui.held.empty() && !missed) return;
     float view_m[16], proj[16];
     CameraMatrices(*frame_.camera, view_m, proj);
     const auto project = [&](const float p[3], ImVec2* out) {
@@ -2388,6 +2400,19 @@ void ImGuiLayer::DrawPerturbHud(const ImVec2& vmin, const ImVec2& vmax) {
         draw::Chamfer(list, l0, ImVec2(l0.x + ts.x + 12.0f * s, l0.y + ts.y + 6.0f * s), 3.0f * s,
                       U32(theme::Alpha(theme::kBg0, 0.85f)), U32(theme::Alpha(theme::kAccent, 0.7f)));
         list->AddText(font, px, ImVec2(l0.x + 6.0f * s, l0.y + 3.0f * s), accent, label.c_str());
+    }
+    ImVec2 a, t;
+    if (missed && project(ik.at, &a) && project(ik.target, &t)) {
+        const ImU32 warn = U32(theme::kWarn);
+        const float dx = t.x - a.x, dy = t.y - a.y, length = std::sqrt(dx * dx + dy * dy);
+        const float dash = 6.0f * s;
+        for (float d = 0.0f; d < length; d += 2.0f * dash) {
+            const float e = std::min(d + dash, length);
+            list->AddLine(ImVec2(a.x + dx * d / length, a.y + dy * d / length),
+                          ImVec2(a.x + dx * e / length, a.y + dy * e / length), warn, 1.5f * s);
+        }
+        list->AddCircle(t, 5.0f * s, warn, 16, 1.5f * s);
+        list->AddCircleFilled(a, 2.5f * s, warn);
     }
     list->PopClipRect();
 }

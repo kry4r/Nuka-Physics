@@ -1,6 +1,6 @@
 // The Joints panel: each moving joint's limits, value, drive target and effort, the selected
-// joint's curves, drive conversion, the fixed base and keyboard teleop; the Poses panel and
-// the Gain Tuner.
+// joint's curves, drive conversion, the fixed base, the gizmo's IK and keyboard teleop; the
+// Poses panel and the Gain Tuner.
 
 #include "runtime/app/viewer/imgui_layer.hpp"
 
@@ -259,6 +259,65 @@ void ImGuiLayer::BuildJoints(nui::VStack& root) {
             ImPlot::EndPlot();
         }
         ImPlot::PopStyleVar();
+    });
+
+    // How the gizmo poses the robot: the chain root, the links a drag pins and the orientation lock.
+    auto& ik = root.Add<nui::Collapsible>("IK", false, icon::kJoint);
+    auto& igrid = ik.Add<nui::PropertyGrid>();
+    igrid.Add<nui::BoolField>("Gizmo drag", nui::Ref(&ui.robot.ik.on));
+    igrid.Add<nui::BoolField>("Lock orientation", nui::Ref(&ui.robot.ik.lock_orientation));
+    auto& weight = igrid.Add<nui::FloatField>("Rotation weight", nui::Ref(&ui.robot.ik.rotation_weight), 0.01f, 0.0f, 10.0f);
+    weight.unit = "m/rad";
+    weight.format = "%.2f";
+    ik.Add<nui::Custom>([this] {
+        const RobotView& v = frame_.ui->robot;
+        const IkState& k = v.ik;
+        const auto leaf = [](const std::string& path) { return path.substr(path.rfind('/') + 1u); };
+        const auto set_pins = [this](const std::vector<std::string>& pins) {
+            json::Value list = json::Value::Array();
+            for (const std::string& p : pins) list.PushBack(json::Value::Str(p));
+            Queue("robot.ik_settings", Args({{"pins", std::move(list)}}));
+        };
+        ImGui::TextDisabled("%s", Tr("Chain root"));
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        const std::string root_name = k.root.empty() ? std::string(Tr("Articulation root")) : leaf(k.root);
+        if (ImGui::BeginCombo("##ik_root", root_name.c_str())) {
+            if (ImGui::Selectable(Tr("Articulation root"), k.root.empty()))
+                Queue("robot.ik_settings", Args({{"root", json::Value::Str(std::string())}}));
+            for (size_t i = 0; i < v.links.size(); ++i) {
+                ImGui::PushID(static_cast<int>(i));
+                if (ImGui::Selectable(leaf(v.links[i].path).c_str(), v.links[i].path == k.root))
+                    Queue("robot.ik_settings", Args({{"root", json::Value::Str(v.links[i].path)}}));
+                ImGui::PopID();
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::TextDisabled("%s", Tr("Pinned links"));
+        for (size_t i = 0; i < k.pins.size(); ++i) {
+            ImGui::PushID(static_cast<int>(i));
+            if (nui::draw::IconButton("##unpin", icon::kTrash, false, Tr("Unpin"))) {
+                std::vector<std::string> pins = k.pins;
+                pins.erase(pins.begin() + static_cast<std::ptrdiff_t>(i));
+                set_pins(pins);
+            }
+            ImGui::SameLine();
+            ImGui::TextUnformatted(leaf(k.pins[i]).c_str());
+            ImGui::PopID();
+        }
+        if (k.pins.empty()) ImGui::TextDisabled("%s", Tr("None; a drag moves the whole chain."));
+        const scene::SceneIR* sc = frame_.scene;
+        const scene::EntityId e = frame_.ui->selected_entity;
+        const std::string selected =
+            sc == nullptr || e == scene::kInvalidEntity ? std::string() : sc->Tree().PathOf(sc->Ecs().NodeOf(e));
+        const bool linked = std::any_of(v.links.begin(), v.links.end(), [&](const RobotLink& l) { return l.path == selected; });
+        const bool pinned = std::find(k.pins.begin(), k.pins.end(), selected) != k.pins.end();
+        ImGui::BeginDisabled(!linked || pinned);
+        if (ImGui::Button(Iconed(icon::kPin, Tr("Pin Selected")).c_str())) {
+            std::vector<std::string> pins = k.pins;
+            pins.push_back(selected);
+            set_pins(pins);
+        }
+        ImGui::EndDisabled();
     });
 
     const size_t n = ui.drive_targets.size();

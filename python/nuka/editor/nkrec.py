@@ -22,7 +22,7 @@ from typing import List, Optional, Sequence, Union
 import numpy as np
 
 MAGIC = b"NKREC\0\0\0"
-FORMAT = 1
+FORMAT = 2
 
 # The leading fields of a nuka_telemetry_record_t.
 _RECORD = struct.Struct("<6I4fI3f")
