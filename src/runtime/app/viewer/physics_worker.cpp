@@ -57,7 +57,7 @@ bool Superseded(const std::vector<TickCommand>& cmds, size_t i) {
 
 }  // namespace
 
-SensorReading ReadSensor(nuka_world_handle world, uint32_t index, uint32_t plane, uint32_t env) {
+SensorReading ReadSensor(nuka_world_handle world, uint32_t index, uint32_t plane, uint32_t env, bool render) {
     SensorReading out;
     out.plane = plane;
     nuka_result_t r = NUKA_RESULT_OK;
@@ -70,7 +70,7 @@ SensorReading ReadSensor(nuka_world_handle world, uint32_t index, uint32_t plane
             r = nuka_world_download_state_sensor(world, index, out.values.data(), out.values.size() * sizeof(float),
                                                  size_t{env} * out.values.size() * sizeof(float));
     } else {
-        r = nuka_world_render_sensors(world);
+        if (render) r = nuka_world_render_sensors(world);
         if (r == NUKA_RESULT_OK && plane == NUKA_SENSOR_CHANNEL_RANGE) {
             r = nuka_world_get_lidar_dims(world, nullptr, nullptr, &out.width, &out.height);
             out.channels = 1u;

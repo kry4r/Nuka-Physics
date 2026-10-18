@@ -50,6 +50,7 @@ struct SensorPreview {
     bool on = false;
     int sensor = -1;        // by index into `items`
     uint32_t channel = 0u;  // the camera plane shown; lidars show ranges, state sensors values
+    bool semantic = false;  // the instance plane shows each instance's semantic class
     std::string error;
     // The newest reading: the sensor it is of, a camera plane (height x width x channels), a
     // lidar's ranges by azimuth (width) then elevation (height), or a state sensor's values.

@@ -194,6 +194,8 @@ void ImGuiLayer::DrawRandomizePanel() {
     ImGui::PushTextWrapPos(0.0f);
     ImGui::TextDisabled("%s", Tr("Every environment draws its own values; the draw is part of the timeline."));
     ImGui::PopTextWrapPos();
+    if (ImGui::Button(Iconed(icon::kDatabase, Tr("Export Dataset...")).c_str()))
+        Queue("dataset.exporter", Args({{"on", json::Value::Bool(true)}}));
 }
 
 }  // namespace nuka::runtime::app::viewer

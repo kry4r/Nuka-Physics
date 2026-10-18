@@ -10,6 +10,7 @@
 #include "nuka/nuka.h"
 #include "render/imgui/nuka_imgui.hpp"
 #include "render/imgui/nuka_theme.hpp"
+#include "runtime/app/viewer/editor_dataset.hpp"
 #include "runtime/app/viewer/shell_util.hpp"
 
 #include <algorithm>
@@ -80,6 +81,11 @@ ImU32 InstanceColor(uint32_t instance) {
     return IM_COL32(72u + (h & 0x9Fu), 72u + ((h >> 8u) & 0x9Fu), 72u + ((h >> 20u) & 0x9Fu), 255u);
 }
 
+// A steady color per semantic class; surfaces without a label stay dim.
+ImU32 ClassColor(uint32_t k) {
+    return k == 0u ? U32(theme::kFgDim) : InstanceColor(k * 40503u);
+}
+
 // What a state sensor's value `k` is, when its type fixes how many it has; else v0, v1, ...
 std::string ValueName(const std::string& type, size_t count, size_t k) {
     static const std::pair<const char*, std::vector<const char*>> kNames[] = {
@@ -96,7 +102,7 @@ std::string ValueName(const std::string& type, size_t count, size_t k) {
 
 // What pixel (x, y) of a reading holds, as hovering it shows; a range image runs azimuth to the
 // right and elevation up.
-std::string PixelText(const SensorPreview& p, const SensorItem& item, int x, int y) {
+std::string PixelText(const SensorPreview& p, const SensorItem& item, const LabelView& labels, int x, int y) {
     if (p.plane == kRangeChannel) {
         const uint32_t el = p.height - 1u - static_cast<uint32_t>(y);
         const float az = item.az_min + (item.az_max - item.az_min) * (static_cast<float>(x) + 0.5f) / static_cast<float>(p.width);
@@ -111,7 +117,12 @@ std::string PixelText(const SensorPreview& p, const SensorItem& item, int x, int
     uint32_t bits = 0u;
     std::memcpy(&bits, v, sizeof(bits));
     if (bits == kMissId) return at + Tr("no hit");
-    return at + Fmt("instance %u  prim %u  ", bits >> 20u, bits & 0xFFFFFu) + p.instances[bits >> 20u];
+    const std::string& node = p.instances[bits >> 20u];
+    if (p.semantic) {
+        const std::string label = LabelOf(labels.labels, node);
+        return at + (label.empty() ? std::string(Tr("unlabeled")) : label) + "  " + node;
+    }
+    return at + Fmt("instance %u  prim %u  ", bits >> 20u, bits & 0xFFFFFu) + node;
 }
 
 }  // namespace
@@ -412,8 +423,13 @@ void ImGuiLayer::BuildSensors(nui::VStack& root) {
 void ImGuiLayer::UpdateSensorTexture() {
     const SensorView& v = frame_.ui->sensors;
     const SensorPreview& p = v.preview;
-    if (sensor_texture_version_ == p.version) return;
+    const LabelView& labels = frame_.ui->labels;
+    if (sensor_texture_version_ == p.version && sensor_texture_labels_ == labels.version &&
+        sensor_texture_semantic_ == p.semantic)
+        return;
     sensor_texture_version_ = p.version;
+    sensor_texture_labels_ = labels.version;
+    sensor_texture_semantic_ = p.semantic;
     if (p.plane == kStatePlane || p.read < 0 || static_cast<size_t>(p.read) >= v.items.size()) return;
     const SensorItem& item = v.items[static_cast<size_t>(p.read)];
     const int w = static_cast<int>(p.width), h = static_cast<int>(p.height);
@@ -441,6 +457,9 @@ void ImGuiLayer::UpdateSensorTexture() {
             }
     const auto shade = [&](float d) { return hit(d) ? FalseColor((d - lo) / std::max(hi - lo, 1.0e-6f)) : U32(theme::kBg0); };
     const auto byte = [](float c) { return static_cast<int>(std::clamp(c, 0.0f, 1.0f) * 255.0f + 0.5f); };
+    const bool semantic = p.semantic && p.plane == NUKA_SENSOR_CHANNEL_PRIM;
+    const std::vector<uint32_t> classes =
+        semantic ? InstanceClasses(labels.labels, labels.classes, p.instances) : std::vector<uint32_t>();
     ImU32* pixels = static_cast<ImU32*>(sensor_texture_->GetPixels());
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x) {
@@ -453,7 +472,9 @@ void ImGuiLayer::UpdateSensorTexture() {
             uint32_t bits = 0u;
             std::memcpy(&bits, at, sizeof(bits));
             if (p.plane == NUKA_SENSOR_CHANNEL_DEPTH) c = shade(at[0]);
-            else if (p.plane == NUKA_SENSOR_CHANNEL_PRIM) c = bits == kMissId ? U32(theme::kBg0) : InstanceColor(bits >> 20u);
+            else if (p.plane == NUKA_SENSOR_CHANNEL_PRIM && bits == kMissId) c = U32(theme::kBg0);
+            else if (semantic) c = ClassColor(classes[bits >> 20u]);
+            else if (p.plane == NUKA_SENSOR_CHANNEL_PRIM) c = InstanceColor(bits >> 20u);
             else if (p.plane == NUKA_SENSOR_CHANNEL_NORMAL)
                 c = IM_COL32(byte(at[0] * 0.5f + 0.5f), byte(at[1] * 0.5f + 0.5f), byte(at[2] * 0.5f + 0.5f), 255);
             else c = IM_COL32(byte(at[0]), byte(at[1]), byte(at[2]), 255);
@@ -480,10 +501,12 @@ void ImGuiLayer::DrawSensorsPanel() {
     if (shown != nullptr && shown->camera) {
         ImGui::SameLine();
         ImGui::SetNextItemWidth(130.0f * s);
-        if (ImGui::BeginCombo("##plane", Tr(kAovs[p.channel].first))) {
+        if (ImGui::BeginCombo("##plane", Tr(p.semantic ? "Semantic" : kAovs[p.channel].first))) {
             for (uint32_t c = 0; c < std::size(kAovs); ++c)
-                if (ImGui::Selectable(Tr(kAovs[c].first), c == p.channel))
+                if (ImGui::Selectable(Tr(kAovs[c].first), c == p.channel && !p.semantic))
                     Queue("sensor.preview", Args({{"channel", json::Value::Str(kSensorChannels[c])}}));
+            if (ImGui::Selectable(Tr("Semantic"), p.semantic))
+                Queue("sensor.preview", Args({{"channel", json::Value::Str("semantic")}}));
             ImGui::EndCombo();
         }
     }
@@ -591,9 +614,12 @@ void ImGuiLayer::DrawSensorReading(const SensorItem* shown) {
         const ImVec2 m = ImGui::GetMousePos();
         const int x = std::clamp(static_cast<int>((m.x - at.x) / size.x * w), 0, static_cast<int>(p.width) - 1);
         const int y = std::clamp(static_cast<int>((m.y - at.y) / size.y * h), 0, static_cast<int>(p.height) - 1);
-        ImGui::SetTooltip("%s", PixelText(p, *shown, x, y).c_str());
+        ImGui::SetTooltip("%s", PixelText(p, *shown, frame_.ui->labels, x, y).c_str());
     }
-    std::string line = Fmt("%u \xC3\x97 %u   %s", p.width, p.height, Tr(p.plane == kRangeChannel ? "Range" : kAovs[p.plane].first));
+    const char* plane = p.plane == kRangeChannel                               ? "Range"
+                        : p.semantic && p.plane == NUKA_SENSOR_CHANNEL_PRIM ? "Semantic"
+                                                                              : kAovs[p.plane].first;
+    std::string line = Fmt("%u \xC3\x97 %u   %s", p.width, p.height, Tr(plane));
     if (p.plane == NUKA_SENSOR_CHANNEL_DEPTH || p.plane == kRangeChannel)
         line += sensor_hi_ > 0.0f ? Fmt("   %.2f\xE2\x80\x93%.2f m", sensor_lo_, sensor_hi_) : std::string("   ") + Tr("no hit");
     line += Fmt("   tick %llu", static_cast<unsigned long long>(p.tick));

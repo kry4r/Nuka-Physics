@@ -430,8 +430,10 @@ if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)
         runtime/app/viewer/camera_controller.cpp
         runtime/app/viewer/clip_panel.cpp
         runtime/app/viewer/clips.cpp
+        runtime/app/viewer/dataset_panel.cpp
         runtime/app/viewer/debug_draw.cpp
         runtime/app/viewer/editor_actions.cpp
+        runtime/app/viewer/editor_dataset.cpp
         runtime/app/viewer/file_dialog.cpp
         runtime/app/viewer/imgui_layer.cpp
         runtime/app/viewer/randomize_panel.cpp

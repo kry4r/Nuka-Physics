@@ -150,8 +150,8 @@ const std::vector<MenuSpec>& Menus() {
         return std::vector<MenuSpec>{
             {"File",
              {"file"},
-             {"file.new", "file.open", "file.open_recent", "file.open_window", "-", "file.import", "-", "file.save",
-              "file.save_as", "file.revert", "-", "file.close", "app.exit"}},
+             {"file.new", "file.open", "file.open_recent", "file.open_window", "-", "file.import",
+              "dataset.exporter", "-", "file.save", "file.save_as", "file.revert", "-", "file.close", "app.exit"}},
             {"Edit", {"edit"}, {"edit.undo", "edit.redo", "-", "edit.delete", "-", "scene.set_visible", "scene.set_locked"}},
             {"Create",
              {"scene"},
@@ -598,6 +598,7 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
         {"sim.step", icon::kStep},          {"sim.reset", icon::kReset},              {"view.frame_all", icon::kFrame},
         {"view.frame_selected", icon::kTarget}, {"view.reset_camera", icon::kHome},   {"view.colliders", icon::kCollider},
         {"view.contacts", icon::kAtom},     {"view.hide_overlays", icon::kVisual},    {"view.screenshot", icon::kCamera},
+        {"dataset.exporter", icon::kDatabase},
         {"file.import", icon::kImport},     {"scene.collision_dialog", icon::kHull},  {"scene.set_visible", icon::kEyeSlash},
         {"scene.set_locked", icon::kLock},  {"assets.add_folder", icon::kFolderPlus}, {"assets.rescan", icon::kReset}};
     for (const auto& [id, glyph] : icons) registry.Decorate(id, glyph, false);
@@ -918,6 +919,7 @@ void ImGuiLayer::BuildStage(nui::VStack& root) {
             }
             ImGui::EndMenu();
         }
+        SemanticMenu(path);
         if (ImGui::MenuItemEx(Tr("Frame"), icon::kTarget, "F")) Queue("view.frame_selected");
         if (ImGui::MenuItemEx(Tr("Generate Collision..."), icon::kHull)) {
             const std::vector<nuka::scene::EntityId>& sel = ui.selection;
@@ -952,6 +954,8 @@ void ImGuiLayer::BuildProperties(nui::VStack& root) {
         return frame_.ui->inspector.movable || frame_.ui->inspector.deformable ? Tone::Accent : Tone::Dim;
     };
     mobility.visible_if = editable;
+    auto& semantic = root.Add<nui::Custom>([this] { DrawSemanticField(); });
+    semantic.visible_if = selected;
 
     auto& sensor = Fold(root.Add<nui::Collapsible>("Sensor", true, icon::kCamera), "sensor");
     sensor.visible_if = [this] { return frame_.ui->sensors.selected >= 0; };
@@ -1599,6 +1603,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
     DrawImportWizard();
     DrawCollisionDialog();
     DrawGainTuner();
+    DrawDatasetExporter();
     DrawClipEditor();
     DrawAssembler();
     DrawPrompt();

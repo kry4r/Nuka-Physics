@@ -6,6 +6,7 @@
 #include "nuka/nuka.h"
 #include "render/render_world.hpp"
 #include "runtime/app/viewer/clip_view.hpp"
+#include "runtime/app/viewer/dataset_view.hpp"
 #include "runtime/app/viewer/demo_view.hpp"
 #include "runtime/app/viewer/editor_actions.hpp"
 #include "runtime/app/viewer/nui/nui.hpp"
@@ -305,6 +306,8 @@ struct ViewerUiState {
     ClipView clips;
     SensorView sensors;
     RandomizeView randomize;
+    LabelView labels;
+    DatasetView dataset;
 
     // Queued for the next frame top, so recording the UI never changes the world.
     std::vector<ActionCall> actions;
@@ -490,6 +493,10 @@ private:
     // Render jitters, physics ranges and parameter ranges, each edit applied on release.
     void BuildRandomize(nui::VStack& root);
     void DrawRandomizePanel();
+    // The selection's semantic label in Properties, with the inherited one as the hint.
+    void DrawSemanticField();
+    // The Stage menu's Semantic Label submenu for the node at `path`.
+    void SemanticMenu(const std::string& path);
     void BuildScript(nui::VStack& root);
     void BuildConsole(nui::VStack& root);
     // The script tab bar with its keys, completions, disk-change bar and close prompt.
@@ -516,6 +523,8 @@ private:
     void DrawCollisionDialog();
     // The floating Gain Tuner while it is open.
     void DrawGainTuner();
+    // The floating Export Dataset window while it is open, with the running export's progress.
+    void DrawDatasetExporter();
     // The floating Clip Editor while it is open: its toolbar, dope sheet and curve editor.
     void DrawClipEditor();
     // One row a joint under a summary row, each key a diamond to select, box-select and drag in time.
@@ -606,6 +615,8 @@ private:
     // The Sensors panel's image of the newest reading and the span its false color covers.
     std::unique_ptr<ImTextureData> sensor_texture_;
     uint64_t sensor_texture_version_ = 0u;
+    uint64_t sensor_texture_labels_ = 0u;  // the labels a semantic image was colored by
+    bool sensor_texture_semantic_ = false;
     float sensor_lo_ = 0.0f, sensor_hi_ = 0.0f;
     char render_path_[512] = {0};  // the Render dialog's fields
     int render_size_[2] = {1920, 1080};
@@ -620,6 +631,13 @@ private:
     // The Randomize panel's copy of the settings, taken again when they change.
     RandomizeConfig randomize_edit_;
     uint64_t randomize_edit_version_ = ~0ull;
+    DatasetForm dataset_form_;
+    bool dataset_form_open_ = false;  // the window was open last frame
+    // The semantic field's text, taken again when the selection or the labels change.
+    char label_buf_[128] = {0};
+    std::string label_path_;
+    uint64_t label_version_ = ~0ull;
+    char new_label_[128] = {0};  // the Stage menu's new label field
     char sensor_name_[128] = {0};
     float tuner_gains_[3] = {};      // the tuner's kp, damping and force limit fields
     int tuner_active_ = -1;          // the field being dragged, which keeps its own value

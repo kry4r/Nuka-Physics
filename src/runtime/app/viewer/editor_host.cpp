@@ -21,6 +21,7 @@
 #include "runtime/app/viewer/editor_actions.hpp"
 #include "runtime/app/viewer/editor_assets.hpp"
 #include "runtime/app/viewer/editor_collision.hpp"
+#include "runtime/app/viewer/editor_dataset.hpp"
 #include "runtime/app/viewer/editor_document.hpp"
 #include "runtime/app/viewer/editor_edits.hpp"
 #include "runtime/app/viewer/editor_extensions.hpp"
@@ -670,6 +671,42 @@ json::Value StrList(const std::vector<std::string>& values) {
     return list;
 }
 
+// x, y, z, qw, qx, qy, qz
+json::Value TransformJson(const math::Transform& t) {
+    json::Value a = json::Value::Array();
+    const math::Vec3& p = t.position;
+    const math::Quat& q = t.rotation;
+    for (const float c : {p.x, p.y, p.z, q.w, q.x, q.y, q.z}) a.PushBack(json::Value::Float(c));
+    return a;
+}
+
+// An export in progress: the sensors it reads each frame and what it learns along the way.
+struct DatasetJob {
+    std::string out, capture;  // the dataset folder and the raw capture inside it
+    uint32_t frames = 0u, every = 1u, seed = 0u, env = 0u;
+    bool render = false, physics = false;  // drawn again for every frame
+    std::vector<size_t> cameras, lidars, states;  // by sensor index
+    std::vector<uint32_t> planes;  // read of every camera
+    std::vector<std::string> channels;
+    uint64_t revision = 0u;  // the document's, which has to hold until the end
+    uint64_t seq = 0u;  // the command the next move waits for
+    uint64_t target = 0u;  // the tick the frame being stepped is read at
+    bool stepping = false;
+    bool drew = false;
+    bool cancel = false;
+    uint32_t frame = 0u;  // frames read
+    std::vector<uint64_t> ticks;
+    std::vector<double> times;
+    std::vector<std::vector<math::Transform>> poses;  // each camera's, then each lidar's, by frame
+    std::vector<std::string> instances;  // the node path of each instance of the instance plane
+    std::map<size_t, std::pair<uint32_t, uint32_t>> sizes;  // by sensor index, the width and height read
+};
+
+// The raw file of one sensor's plane in a capture.
+std::string StreamName(size_t sensor, uint32_t plane) {
+    return std::to_string(sensor) + "_" + (plane == kStatePlane ? "state" : kSensorChannels[plane]) + ".bin";
+}
+
 ActionResult Ok(json::Value value = json::Value()) {
     ActionResult result;
     result.value = std::move(value);
@@ -949,6 +986,7 @@ struct EditorHost::State : DocumentHost {
     void RegisterOverlayActions();
     void RegisterSensorActions();
     void RegisterRandomizeActions();
+    void RegisterDatasetActions();
     // Drops sensor `index` in one undo step and clears its selection.
     ActionResult RemoveSensor(int index);
     void RegisterTeleopActions();
@@ -1037,9 +1075,27 @@ struct EditorHost::State : DocumentHost {
     void SaveRandomize();
     // Sends the randomization in force to the worker as one logged input.
     void PushRandomize();
+    // Sends the randomization `c` instead; the document's own stays as it is.
+    void PushRandomize(const RandomizeConfig& c);
     json::Value RandomizeJson() const;
     // The last push drew masses, armature and gravity, which the next one returns to nominal values.
     bool physics_drawn_ = false;
+    // The document's label file in the profile; empty while untitled.
+    std::string LabelFile() const;
+    void SaveLabels();
+    // Shows the labels as they stand and keeps them in the profile.
+    void CommitLabels();
+    json::Value LabelsJson() const;
+    // Starts the export `args` asks for, or fails with why it cannot.
+    ActionResult StartDataset(const json::Value& args);
+    // Moves the running export on: reads the frame its step reached, then steps toward the next.
+    void StepDataset();
+    // Reads the frame's sensors into the capture; returns why it failed, empty when it read them.
+    std::string CaptureDataset();
+    // Ends the export and, unless `error` says why not, builds the dataset from what it read.
+    void FinishDataset(const std::string& error);
+    json::Value DatasetStatus() const;
+    std::optional<DatasetJob> dataset_;
     int FindClip(const std::string& name) const;
     // The clip `args` names as `clip`, else the edited one; -1 with `error` saying why when none.
     int ClipArg(const json::Value& args, std::string* error) const;
@@ -1162,6 +1218,8 @@ struct EditorHost::State : DocumentHost {
     // Runs nuka.editor.demos.`fn` between the HDF5 file at `path` and the exchange files in the
     // cache; returns why it failed, empty when it ran.
     std::string RunDemoExchange(const char* fn, const std::string& path);
+    // Runs `code` in the editor's Python; returns the exception it raised, empty when it ran.
+    std::string RunPython(const std::string& code, const char* source);
     void TakeWorkerResults();
     void PushTransport();
     void PushPoseWrites();
@@ -2956,10 +3014,15 @@ void EditorHost::State::SaveRandomize() {
     std::ofstream(Utf8Path(file), std::ios::binary | std::ios::trunc) << text;
 }
 
-// A flag per kind leaves it be (0), returns it to nominal values (1) or draws it (2).
 void EditorHost::State::PushRandomize() {
     RandomizeView& r = ui_state_.randomize;
-    const RandomizeConfig& c = r.config;
+    PushRandomize(r.config);
+    r.drawn = r.config.Active();
+}
+
+// A flag per kind leaves it be (0), returns it to nominal values (1) or draws it (2).
+void EditorHost::State::PushRandomize(const RandomizeConfig& c) {
+    const RandomizeView& r = ui_state_.randomize;
     std::vector<float> values;
     values.push_back(r.camera ? (c.render ? 2.0f : 1.0f) : 0.0f);
     values.insert(values.end(), c.jitter.begin(), c.jitter.end());
@@ -2973,7 +3036,6 @@ void EditorHost::State::PushRandomize() {
     TickCommand cmd = TickCommand::Param(ParamKind::Randomize, std::move(values));
     cmd.index = c.seed;
     worker_.Push(std::move(cmd));
-    r.drawn = c.Active();
     physics_drawn_ = r.articulated && c.physics;
 }
 
@@ -2985,6 +3047,307 @@ json::Value EditorHost::State::RandomizeJson() const {
     v.Set("drawn", json::Value::Bool(r.drawn));
     v.Set("keys", StrList(r.param_keys));
     return v;
+}
+
+std::string EditorHost::State::LabelFile() const {
+    return doc_path_.empty() ? std::string() : PathText(profile_->Dir() / "labels" / (Hex(Fnv1a(doc_path_)) + ".json"));
+}
+
+// A document without labels keeps no file.
+void EditorHost::State::SaveLabels() {
+    const std::string file = LabelFile();
+    const std::map<std::string, std::string>& labels = ui_state_.labels.labels;
+    if (file.empty()) return;
+    if (labels.empty()) {
+        fs::remove(Utf8Path(file));
+        return;
+    }
+    fs::create_directories(Utf8Path(file).parent_path());
+    std::ofstream(Utf8Path(file), std::ios::binary | std::ios::trunc) << LabelsToJson(labels).Dump(2);
+}
+
+void EditorHost::State::CommitLabels() {
+    LabelView& v = ui_state_.labels;
+    v.classes = LabelClasses(v.labels);
+    ++v.version;
+    SaveLabels();
+}
+
+json::Value EditorHost::State::LabelsJson() const {
+    const LabelView& v = ui_state_.labels;
+    json::Value out = LabelsToJson(v.labels);
+    out.Set("classes", StrList(v.classes));
+    return out;
+}
+
+ActionResult EditorHost::State::StartDataset(const json::Value& args) {
+    if (dataset_) return ActionResult::Fail("an export is running");
+    if (!script_host_.Valid()) return ActionResult::Fail("datasets need the editor's Python");
+    const std::vector<scene::SensorDesc>& sensors = loaded_->scene.Sensors();
+    const RandomizeView& r = ui_state_.randomize;
+    DatasetJob j;
+    j.out = StrArg(args, "out");
+    if (j.out.empty()) j.out = OpenFolderDialog(nui::Tr("Export Dataset"));
+    if (j.out.empty()) return ActionResult::Fail("no folder chosen");
+    const double frames = NumArg(args, "frames", 100.0), every = NumArg(args, "every", 1.0);
+    if (frames < 1.0 || every < 1.0) return ActionResult::Fail("an export takes at least 1 frame of at least 1 tick");
+    j.frames = static_cast<uint32_t>(frames);
+    j.every = static_cast<uint32_t>(every);
+    j.seed = static_cast<uint32_t>(NumArg(args, "seed", r.config.seed));
+    j.env = ui_state_.env_index % loaded_->Layout().env_count;
+    // Without `randomize`, the export draws what the document's settings turn on.
+    const bool params =
+        std::any_of(r.config.params.begin(), r.config.params.end(), [](const ParamRange& p) { return p.on; });
+    const json::Value* draw = args.Find("randomize");
+    const json::Value none = json::Value::Object();
+    j.render = BoolArg(draw != nullptr ? *draw : none, "render", r.config.render);
+    j.physics = BoolArg(draw != nullptr ? *draw : none, "physics", r.config.physics || params);
+    if (j.render && !r.camera) return ActionResult::Fail("render randomization needs a camera sensor");
+    j.channels = args.Find("channels") != nullptr ? StrListArg(args, "channels")
+                                                  : std::vector<std::string>{"rgb", "depth", "instance", "semantic"};
+    for (const std::string& c : j.channels)
+        if (std::find(std::begin(kDatasetChannels), std::end(kDatasetChannels), c) == std::end(kDatasetChannels))
+            return ActionResult::Fail("no channel '" + c +
+                                      "'; they are rgb, depth, instance, semantic, normal, albedo");
+    const std::pair<const char*, uint32_t> planes[] = {{"rgb", NUKA_SENSOR_CHANNEL_COLOR},
+                                                       {"depth", NUKA_SENSOR_CHANNEL_DEPTH},
+                                                       {"normal", NUKA_SENSOR_CHANNEL_NORMAL},
+                                                       {"albedo", NUKA_SENSOR_CHANNEL_ALBEDO}};
+    for (const auto& [channel, plane] : planes)
+        if (std::find(j.channels.begin(), j.channels.end(), channel) != j.channels.end()) j.planes.push_back(plane);
+    // The instance plane is always read: the boxes and the semantic classes come from it.
+    j.planes.push_back(NUKA_SENSOR_CHANNEL_PRIM);
+    const bool listed = args.Find("cameras") != nullptr;
+    const std::vector<std::string> named = StrListArg(args, "cameras");
+    for (const std::string& name : named)
+        if (std::none_of(sensors.begin(), sensors.end(), [&](const scene::SensorDesc& s) {
+                return s.name == name && RenderSensor(s.type) && !LidarSensor(s.type);
+            }))
+            return ActionResult::Fail("no camera named '" + name + "'");
+    for (size_t i = 0; i < sensors.size(); ++i) {
+        const scene::SensorDesc& s = sensors[i];
+        if (LidarSensor(s.type)) {
+            if (BoolArg(args, "lidar", true)) j.lidars.push_back(i);
+        } else if (RenderSensor(s.type)) {
+            if (!listed || std::find(named.begin(), named.end(), s.name) != named.end()) j.cameras.push_back(i);
+        } else if (BoolArg(args, "state", true)) {
+            j.states.push_back(i);
+        }
+    }
+    for (const size_t c : j.cameras)
+        for (const uint32_t plane : j.planes)
+            if (sensors[c].aov_mask != 0u && (sensors[c].aov_mask & (1u << plane)) == 0u)
+                return ActionResult::Fail("camera '" + sensors[c].name + "' leaves out its " + kSensorChannels[plane] +
+                                          " plane");
+    if (j.cameras.empty() && j.lidars.empty() && j.states.empty())
+        return ActionResult::Fail("the export reads no sensor");
+    j.out = NormalPath(j.out);
+    j.capture = PathText(Utf8Path(j.out) / ".capture");
+    std::error_code ec;
+    fs::remove_all(Utf8Path(j.capture), ec);
+    if (!fs::create_directories(Utf8Path(j.capture), ec)) return ActionResult::Fail("cannot write to " + j.out);
+    j.revision = doc_.Revision();
+    j.poses.resize(j.cameras.size() + j.lidars.size());
+    ui_state_.playing = false;
+    PushTransport();
+    j.seq = transport_seq_;
+    if (BoolArg(args, "reset", true)) {
+        j.seq = transport_seq_ = worker_.Push(TickCommand::Transport(TransportOp::Reset));
+        teleop_command_sent_.reset();
+        sent_playing_ = false;
+        // The new history logs the document's draw unless the export draws its own.
+        if (r.config.Active() && !j.render && !j.physics) PushRandomize();
+    }
+    json::Value cameras = json::Value::Array();
+    for (const size_t c : j.cameras) cameras.PushBack(json::Value::Str(sensors[c].name));
+    json::Value out = Object({{"out", json::Value::Str(j.out)},
+                              {"frames", json::Value::Int(j.frames)},
+                              {"cameras", std::move(cameras)},
+                              {"channels", StrList(j.channels)}});
+    DatasetView& v = ui_state_.dataset;
+    v.running = true;
+    v.cancelled = false;
+    v.frame = 0u;
+    v.frames = j.frames;
+    v.out = j.out;
+    v.error.clear();
+    ++v.version;
+    dataset_ = std::move(j);
+    return Ok(std::move(out));
+}
+
+void EditorHost::State::StepDataset() {
+    if (!dataset_) return;
+    DatasetJob& j = *dataset_;
+    if (!loaded_ || doc_.Revision() != j.revision) return FinishDataset("the scene changed during the export");
+    if (shown_ == nullptr || shown_->acked < j.seq) return;
+    if (j.stepping) {
+        if (shown_->tick < j.target) return;
+        if (shown_->tick > j.target) return FinishDataset("the simulation ran on during the export");
+        if (const std::string error = CaptureDataset(); !error.empty()) return FinishDataset(error);
+        j.stepping = false;
+        ui_state_.dataset.frame = ++j.frame;
+        if (j.frame == j.frames) return FinishDataset(std::string());
+    }
+    if (j.cancel) return FinishDataset(std::string());
+    // Every frame draws from its own seed, so a frame looks the same in any export of that seed.
+    if (j.render || j.physics) {
+        RandomizeConfig c = ui_state_.randomize.config;
+        c.seed = j.seed + j.frame;
+        c.render = j.render;
+        c.physics = j.physics;
+        if (!j.physics)
+            for (ParamRange& p : c.params) p.on = false;
+        PushRandomize(c);
+        j.drew = true;
+    }
+    TickCommand cmd = TickCommand::Transport(TransportOp::Step);
+    cmd.steps = j.every;
+    j.seq = worker_.Push(std::move(cmd));
+    j.target = shown_->tick + j.every;
+    j.stepping = true;
+}
+
+std::string EditorHost::State::CaptureDataset() {
+    DatasetJob& j = *dataset_;
+    const std::vector<scene::SensorDesc>& sensors = loaded_->scene.Sensors();
+    std::string error;
+    worker_.Exclusive([&] {
+        bool rendered = false;
+        const auto read = [&](size_t index, uint32_t plane) {
+            if (!error.empty()) return;
+            const bool image = plane != kStatePlane;
+            SensorReading r = ReadSensor(world_, SensorSlot(sensors, index), plane, j.env, image && !rendered);
+            rendered = rendered || image;
+            if (!r.error.empty()) {
+                error = sensors[index].name + ": " + r.error;
+                return;
+            }
+            if (!r.instances.empty()) j.instances = std::move(r.instances);
+            j.sizes[index] = {r.width, r.height};
+            AppendRaw(Utf8Path(j.capture) / StreamName(index, plane), r.values);
+        };
+        for (const size_t c : j.cameras)
+            for (const uint32_t plane : j.planes) read(c, plane);
+        for (const size_t l : j.lidars) read(l, kRangeChannel);
+        for (const size_t s : j.states) read(s, kStatePlane);
+        j.ticks.push_back(worker_.Tick());
+        j.times.push_back(worker_.SimTime());
+    });
+    const std::vector<SensorItem>& items = ui_state_.sensors.items;
+    for (size_t k = 0; k < j.cameras.size(); ++k) j.poses[k].push_back(items[j.cameras[k]].pose);
+    for (size_t k = 0; k < j.lidars.size(); ++k) j.poses[j.cameras.size() + k].push_back(items[j.lidars[k]].pose);
+    return error;
+}
+
+void EditorHost::State::FinishDataset(const std::string& error) {
+    DatasetJob& j = *dataset_;
+    std::string why = error;
+    // The document's own draw comes back.
+    if (j.drew && loaded_) PushRandomize();
+    if (why.empty() && j.frame > 0u) {
+        const scene::SceneIR& ir = loaded_->scene;
+        const std::vector<scene::SensorDesc>& sensors = ir.Sensors();
+        json::Value ticks = json::Value::Array(), times = json::Value::Array();
+        for (uint32_t k = 0; k < j.frame; ++k) {
+            ticks.PushBack(json::Value::Int(static_cast<int64_t>(j.ticks[k])));
+            times.PushBack(json::Value::Float(j.times[k]));
+        }
+        const auto sensor = [&](size_t i) {
+            const scene::SensorDesc& s = sensors[i];
+            return Object({{"name", json::Value::Str(s.name)},
+                           {"type", json::Value::Str(SensorTypeName(s.type))},
+                           {"mount", json::Value::Str(BodyPath(ir, SensorBody(ir, s)))},
+                           {"offset", TransformJson(s.local_offset)}});
+        };
+        const auto poses = [&](size_t k) {
+            json::Value list = json::Value::Array();
+            for (const math::Transform& t : j.poses[k]) list.PushBack(TransformJson(t));
+            return list;
+        };
+        json::Value cameras = json::Value::Array(), lidars = json::Value::Array(), states = json::Value::Array();
+        for (size_t k = 0; k < j.cameras.size(); ++k) {
+            const scene::CameraIntrinsics& cam = sensors[j.cameras[k]].cam;
+            json::Value c = sensor(j.cameras[k]);
+            json::Value streams = json::Value::Object();
+            for (const uint32_t plane : j.planes)
+                streams.Set(kSensorChannels[plane], json::Value::Str(StreamName(j.cameras[k], plane)));
+            c.Set("width", json::Value::Int(j.sizes[j.cameras[k]].first));
+            c.Set("height", json::Value::Int(j.sizes[j.cameras[k]].second));
+            c.Set("vfov", json::Value::Float(cam.vfov_degrees));
+            c.Set("near", json::Value::Float(cam.near_clip));
+            c.Set("far", json::Value::Float(cam.far_clip));
+            c.Set("poses", poses(k));
+            c.Set("streams", std::move(streams));
+            cameras.PushBack(std::move(c));
+        }
+        for (size_t k = 0; k < j.lidars.size(); ++k) {
+            const scene::LidarPattern& f = sensors[j.lidars[k]].lidar;
+            json::Value l = sensor(j.lidars[k]);
+            l.Set("az_count", json::Value::Int(f.az_count));
+            l.Set("el_count", json::Value::Int(f.el_count));
+            for (const auto& [key, value] : {std::pair{"az_min", f.az_min}, std::pair{"az_max", f.az_max},
+                                             std::pair{"el_min", f.el_min}, std::pair{"el_max", f.el_max},
+                                             std::pair{"min_range", f.min_range}, std::pair{"max_range", f.max_range}})
+                l.Set(key, json::Value::Float(value));
+            l.Set("poses", poses(j.cameras.size() + k));
+            l.Set("stream", json::Value::Str(StreamName(j.lidars[k], kRangeChannel)));
+            lidars.PushBack(std::move(l));
+        }
+        for (const size_t i : j.states) {
+            json::Value s = sensor(i);
+            s.Set("stream", json::Value::Str(StreamName(i, kStatePlane)));
+            states.PushBack(std::move(s));
+        }
+        const LabelView& labels = ui_state_.labels;
+        const json::Value m = Object(
+            {{"format", json::Value::Str("nkcapture")},
+             {"version", json::Value::Int(1)},
+             {"scene", json::Value::Str(doc_path_)},
+             {"dt", json::Value::Float(opt_.dt)},
+             {"env", json::Value::Int(j.env)},
+             {"every", json::Value::Int(j.every)},
+             {"seed", json::Value::Int(j.seed)},
+             {"frames", json::Value::Int(j.frame)},
+             {"randomize", Object({{"render", json::Value::Bool(j.render)},
+                                   {"physics", json::Value::Bool(j.physics)},
+                                   {"config", RandomizeToJson(ui_state_.randomize.config)}})},
+             {"labels", LabelsToJson(labels.labels).At("labels")},
+             {"classes", StrList(labels.classes)},
+             {"instances", StrList(j.instances)},
+             {"channels", StrList(j.channels)},
+             {"ticks", std::move(ticks)},
+             {"times", std::move(times)},
+             {"cameras", std::move(cameras)},
+             {"lidars", std::move(lidars)},
+             {"states", std::move(states)}});
+        std::ofstream(Utf8Path(j.capture) / "manifest.json", std::ios::binary | std::ios::trunc) << m.Dump(2);
+        const std::string out = json::Value::Str(j.out).Dump(0);
+        why = RunPython("import nuka.editor.dataset\nnuka.editor.dataset.build(" + out + ")\n", "<dataset>");
+    } else {
+        fs::remove_all(Utf8Path(j.capture));
+    }
+    DatasetView& v = ui_state_.dataset;
+    v.running = false;
+    v.cancelled = j.cancel;
+    v.frame = j.frame;
+    v.error = why;
+    ++v.version;
+    if (why.empty())
+        ui_.Nui().Toast(nui::Level::Ok, Format(nui::Tr("Exported %u frames"), j.frame));
+    else
+        ui_.Nui().Toast(nui::Level::Err, why);
+    dataset_.reset();
+}
+
+json::Value EditorHost::State::DatasetStatus() const {
+    const DatasetView& v = ui_state_.dataset;
+    return Object({{"running", json::Value::Bool(v.running)},
+                   {"frame", json::Value::Int(v.frame)},
+                   {"frames", json::Value::Int(v.frames)},
+                   {"out", json::Value::Str(v.out)},
+                   {"cancelled", json::Value::Bool(v.cancelled)},
+                   {"error", json::Value::Str(v.error)}});
 }
 
 int EditorHost::State::FindClip(const std::string& name) const {
@@ -3581,6 +3944,7 @@ ActionResult EditorHost::State::SaveScene(const std::string& path) {
     SavePoses();
     SaveClips();
     SaveRandomize();
+    SaveLabels();
     start_stale_ = true;
     assets_stale_ = true;
     // The recent list shows the viewport as it was saved.
@@ -3631,6 +3995,12 @@ ActionResult EditorHost::State::OpenDocument(const std::string& file, const std:
         Emit(stderr, "[nuka_editor] " + RandomizeFile() + ": " + error + "\n");
     ++randomize.version;
     if (randomize.config.Active()) PushRandomize();
+    LabelView& labels = ui_state_.labels;
+    labels.labels.clear();
+    if (!doc_path_.empty() && ReadEntireFile(LabelFile(), &text))
+        labels.labels = LabelsFromJson(json::Value::Parse(text));
+    labels.classes = LabelClasses(labels.labels);
+    ++labels.version;
     start_stale_ = true;
     assets_stale_ = true;
     Emit(stdout, "[nuka_editor] opened " + file + "\n");
@@ -3730,6 +4100,7 @@ void EditorHost::State::RegisterActions() {
     RegisterRobotActions();
     RegisterSensorActions();
     RegisterRandomizeActions();
+    RegisterDatasetActions();
     RegisterScriptActions();
     ui_.RegisterActions(actions_);
 }
@@ -4728,6 +5099,68 @@ void EditorHost::State::RegisterRandomizeActions() {
                   }});
 }
 
+void EditorHost::State::RegisterDatasetActions() {
+    const auto has_scene = [this] { return loaded_ != nullptr; };
+    // The labels by node path and their classes; with `path`, the label that node has and the node
+    // it comes `from`, itself or an ancestor.
+    actions_.Add({"label.list", "Semantic Labels", "sensor", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      json::Value out = LabelsJson();
+                      if (args.Find("path") != nullptr) {
+                          std::string from;
+                          const std::string label = LabelOf(ui_state_.labels.labels, StrArg(args, "path"), &from);
+                          out.Set("label", json::Value::Str(label));
+                          out.Set("from", json::Value::Str(from));
+                      }
+                      return Ok(std::move(out));
+                  },
+                  "", true});
+    // Gives the nodes at `paths` (or `path`, else the selected ones) `label`; "" clears theirs, so
+    // they inherit their parent's again.
+    actions_.Add({"label.set", "Set Semantic Label", "sensor", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      std::vector<std::string> paths = StrListArg(args, "paths");
+                      if (args.Find("path") != nullptr) paths.push_back(StrArg(args, "path"));
+                      if (args.Find("paths") == nullptr && args.Find("path") == nullptr)
+                          for (const scene::EntityId e : ui_state_.selection) paths.push_back(PathOfEntity(e));
+                      if (paths.empty()) return ActionResult::Fail("select a node or name one with `path`");
+                      for (const std::string& p : paths)
+                          if (EntityOfPath(*loaded_, p) == scene::kInvalidEntity)
+                              return ActionResult::Fail("no node at '" + p + "'");
+                      const std::string label = StrArg(args, "label");
+                      for (const std::string& p : paths)
+                          if (label.empty())
+                              ui_state_.labels.labels.erase(p);
+                          else
+                              ui_state_.labels.labels[p] = label;
+                      CommitLabels();
+                      return Ok(LabelsJson());
+                  },
+                  "", true});
+    // Steps `frames` frames of `every` ticks from a reset (unless `reset` is false), drawing the
+    // `randomize` kinds again for each from `seed` + frame, and writes the `cameras`' `channels`,
+    // the lidars and the state sensors under `out` (a folder dialog without it).
+    actions_.Add({"dataset.export", "Export Dataset", "sensor", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) { return StartDataset(args); }, "", true});
+    actions_.Add({"dataset.status", "Dataset Export Status", "sensor", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value&) { return Ok(DatasetStatus()); }, "", true});
+    // Stops after the frame being read and writes the frames read so far.
+    actions_.Add({"dataset.cancel", "Cancel Dataset Export", "sensor", "", ShortcutScope::Global,
+                  [this] { return dataset_.has_value(); }, {},
+                  [this](const json::Value&) {
+                      dataset_->cancel = true;
+                      return Ok(DatasetStatus());
+                  },
+                  "", true});
+    actions_.Add({"dataset.exporter", "Export Dataset...", "file", "", ShortcutScope::Global, has_scene,
+                  [this] { return ui_state_.dataset.open; },
+                  [this](const json::Value& args) {
+                      DatasetView& v = ui_state_.dataset;
+                      v.open = BoolArg(args, "on", !v.open);
+                      return Ok(Object({{"on", json::Value::Bool(v.open)}}));
+                  }});
+}
+
 void EditorHost::State::RegisterSensorActions() {
     const auto has_scene = [this] { return loaded_ != nullptr; };
     // `index` or `sensor` (a name) picks a sensor, else the selected one; -1 when none matches.
@@ -4824,17 +5257,22 @@ void EditorHost::State::RegisterSensorActions() {
                           if (p.sensor < 0) return ActionResult::Fail("no such sensor");
                       }
                       if (const json::Value* c = args.Find("channel")) {
-                          const int plane = channel(c->AsString());
+                          const bool semantic = c->AsString() == "semantic";
+                          const int plane =
+                              semantic ? static_cast<int>(NUKA_SENSOR_CHANNEL_PRIM) : channel(c->AsString());
                           if (plane < 0 || plane == static_cast<int>(kRangeChannel))
-                              return ActionResult::Fail("a camera shows color, depth, normal, albedo or instance");
+                              return ActionResult::Fail(
+                                  "a camera shows color, depth, normal, albedo, instance or semantic");
                           p.channel = static_cast<uint32_t>(plane);
+                          p.semantic = semantic;
                       }
                       p.on = BoolArg(args, "on", p.on);
                       if (p.on && p.sensor < 0) p.sensor = ui_state_.sensors.selected;
                       sensor_asked_[4] = ~0ull;
                       return Ok(Object({{"on", json::Value::Bool(p.on)},
                                         {"index", json::Value::Int(p.sensor)},
-                                        {"channel", json::Value::Str(kSensorChannels[p.channel])},
+                                        {"channel",
+                                         json::Value::Str(p.semantic ? "semantic" : kSensorChannels[p.channel])},
                                         {"read", json::Value::Int(p.read)},
                                         {"tick", json::Value::Int(static_cast<int64_t>(p.tick))},
                                         {"error", json::Value::Str(p.error)}}));
@@ -4843,17 +5281,22 @@ void EditorHost::State::RegisterSensorActions() {
     // Renders and reads a sensor of environment `env` (the shown one by default) now: a camera's
     // `channel` plane (color by default), a lidar's ranges or a state sensor's values. The result
     // has their shape and statistics, the values up to 4096 of them, and with `path` a .npy of all.
+    // A semantic plane holds 1 + the index of each pixel's label in `classes`, 0 for none.
     actions_.Add({"sensor.read", "Read Sensor", "sensor", "", ShortcutScope::Global, has_scene, {},
                   [this, pick, channel](const json::Value& args) {
                       const int index = pick(args);
                       if (index < 0) return ActionResult::Fail("no such sensor");
                       const std::vector<scene::SensorDesc>& sensors = loaded_->scene.Sensors();
                       const scene::SensorType type = sensors[static_cast<size_t>(index)].type;
+                      const std::string asked = StrArg(args, "channel", "color");
+                      const bool semantic = RenderSensor(type) && asked == "semantic";
                       const int plane = LidarSensor(type)   ? static_cast<int>(kRangeChannel)
-                                        : RenderSensor(type) ? channel(StrArg(args, "channel", "color"))
+                                        : semantic           ? static_cast<int>(NUKA_SENSOR_CHANNEL_PRIM)
+                                        : RenderSensor(type) ? channel(asked)
                                                              : static_cast<int>(kStatePlane);
                       if (plane < 0 || (!LidarSensor(type) && plane == static_cast<int>(kRangeChannel)))
-                          return ActionResult::Fail("a camera reads color, depth, normal, albedo or instance");
+                          return ActionResult::Fail(
+                              "a camera reads color, depth, normal, albedo, instance or semantic");
                       const auto env = static_cast<uint32_t>(
                           NumArg(args, "env", shown_ != nullptr ? static_cast<double>(shown_->env) : 0.0));
                       SensorReading r;
@@ -4864,6 +5307,16 @@ void EditorHost::State::RegisterSensorActions() {
                           r.sim_time = worker_.SimTime();
                       });
                       if (!r.error.empty()) return ActionResult::Fail(r.error);
+                      if (semantic) {
+                          const LabelView& l = ui_state_.labels;
+                          const std::vector<uint32_t> classes = InstanceClasses(l.labels, l.classes, r.instances);
+                          for (float& v : r.values) {
+                              uint32_t bits = 0u;
+                              std::memcpy(&bits, &v, sizeof(bits));
+                              bits = PixelClass(bits, classes);
+                              std::memcpy(&v, &bits, sizeof(bits));
+                          }
+                      }
                       const bool ids = plane == NUKA_SENSOR_CHANNEL_PRIM;
                       std::vector<uint32_t> shape = {r.height, r.width};
                       if (plane == static_cast<int>(kStatePlane)) shape = {r.width};
@@ -4884,7 +5337,8 @@ void EditorHost::State::RegisterSensorActions() {
                       for (const uint32_t n : shape) dims.PushBack(json::Value::Int(n));
                       json::Value out = Object({{"index", json::Value::Int(index)},
                                                 {"name", json::Value::Str(sensors[static_cast<size_t>(index)].name)},
-                                                {"channel", json::Value::Str(plane == static_cast<int>(kStatePlane)
+                                                {"channel", json::Value::Str(semantic ? "semantic"
+                                                                             : plane == static_cast<int>(kStatePlane)
                                                                                  ? "state"
                                                                                  : kSensorChannels[plane])},
                                                 {"env", json::Value::Int(env)},
@@ -4903,9 +5357,10 @@ void EditorHost::State::RegisterSensorActions() {
                           out.Set("values", std::move(values));
                       }
                       if (ids) {
-                          json::Value paths = json::Value::Array();
-                          for (const std::string& path : r.instances) paths.PushBack(json::Value::Str(path));
-                          out.Set("instances", std::move(paths));
+                          json::Value names = json::Value::Array();
+                          for (const std::string& name : semantic ? ui_state_.labels.classes : r.instances)
+                              names.PushBack(json::Value::Str(name));
+                          out.Set(semantic ? "classes" : "instances", std::move(names));
                       }
                       if (args.Find("path") != nullptr) {
                           const std::string path = StrArg(args, "path");
@@ -5325,6 +5780,9 @@ void EditorHost::State::RegisterFileActions() {
                       ui_state_.randomize.config = RandomizeConfig{};
                       ui_state_.randomize.drawn = false;
                       ++ui_state_.randomize.version;
+                      ui_state_.labels.labels.clear();
+                      ui_state_.labels.classes.clear();
+                      ++ui_state_.labels.version;
                       return Ok();
                   }});
     actions_.Add({"file.recover", "Recover Autosave", "file", "", ShortcutScope::Global, owns_world, {},
@@ -7417,12 +7875,16 @@ std::string EditorHost::State::RunDemoExchange(const char* fn, const std::string
     const auto literal = [](const std::string& s) { return json::Value::Str(s).Dump(0); };
     const std::string code = std::string("import nuka.editor.demos\nnuka.editor.demos.") + fn + "(" + literal(path) +
                              ", " + literal(cache_.File("demos.json")) + ", " + literal(cache_.File("demos.bin")) + ")\n";
+    return RunPython(code, "<demos>");
+}
+
+std::string EditorHost::State::RunPython(const std::string& code, const char* source) {
     bool failed = false;
-    const std::string text = script_host_.RunString(code, "<demos>", false, &failed);
+    const std::string text = script_host_.RunString(code, source, false, &failed);
     if (!failed) return std::string();
     // A traceback ends with the exception.
     const size_t end = text.find_last_not_of("\r\n");
-    if (end == std::string::npos) return "nuka.editor.demos failed";
+    if (end == std::string::npos) return std::string(source) + " failed";
     const size_t nl = text.find_last_of('\n', end);
     const size_t begin = nl == std::string::npos ? 0u : nl + 1u;
     return text.substr(begin, end + 1u - begin);
@@ -7677,6 +8139,7 @@ void EditorHost::State::Frame(bool step_physics) {
     if (loaded_) SyncJoints();
     SyncSensors();
     StepSensorPreview();
+    StepDataset();
     SyncGainTest();
     if (loaded_) SyncAssembler();
     if (loaded_) worker_.ReadTimeline(&ui_state_.timeline);

@@ -218,8 +218,9 @@ struct SensorReading {
     std::string error;
 };
 
-// Renders `world`'s sensors when `plane` is an image and reads sensor `index` of its kind in `env`.
-SensorReading ReadSensor(nuka_world_handle world, uint32_t index, uint32_t plane, uint32_t env);
+// Renders `world`'s sensors when `plane` is an image, unless `render` is false because a read of this
+// tick already did, and reads sensor `index` of its kind in `env`.
+SensorReading ReadSensor(nuka_world_handle world, uint32_t index, uint32_t plane, uint32_t env, bool render = true);
 
 // The newest records of this many count toward SolverStats::recent_caps.
 inline constexpr uint32_t kRecentRecords = 256u;

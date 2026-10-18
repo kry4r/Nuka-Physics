@@ -198,5 +198,7 @@ inline constexpr const char kGamepad[] = "\xEE\x89\xAE";     // game-controller
 inline constexpr const char kBrain[] = "\xEE\x9D\x8E";
 inline constexpr const char kRecord[] = "\xEE\x8F\xAE";
 inline constexpr const char kShuffle[] = "\xEE\x90\xA2";
+inline constexpr const char kTag[] = "\xEE\x91\xB8";
+inline constexpr const char kDatabase[] = "\xEE\x87\x9E";
 
 }  // namespace nuka::render::imgui::icon
