@@ -87,7 +87,7 @@ const PanelSpec kPanels[] = {{"stage", "Stage", icon::kStage},       {"property"
                              {"stats", "Stats", icon::kStats},       {"debug", "Debug", icon::kDebug},
                              {"solver", "Solver", icon::kPlot},      {"timeline", "Timeline", icon::kTimeline},
                              {"camera", "Camera", icon::kCamera},
-                             {"drive", "Drive", icon::kDrive},
+                             {"joints", "Joints", icon::kJoint},
                              {"script", "Script", icon::kScript},    {"console", "Console", icon::kConsole},
                              {"nui", "UI Inspector", icon::kInspector}};
 
@@ -101,9 +101,9 @@ const LayoutPreset kLayouts[] = {
     {"authoring", "Authoring", {"stage", "file"}, {"property", "camera"},
      {"assets", "console", "script", "stats", "timeline"}},
     {"debug", "Debug", {"stage"}, {"solver", "debug", "stats", "property"}, {"console", "timeline", "script", "assets"}},
-    {"robot", "Robot", {"stage"}, {"drive", "property"}, {"console", "timeline", "stats", "assets"}},
+    {"robot", "Robot", {"stage"}, {"joints", "property"}, {"console", "timeline", "stats", "assets"}},
     {"data", "Data", {"file", "stage"}, {"stats", "camera", "property"}, {"assets", "console", "script", "timeline"}},
-    {"training", "Training", {"stats", "stage"}, {"drive", "camera"}, {"console", "script", "assets", "timeline"}},
+    {"training", "Training", {"stats", "stage"}, {"joints", "camera"}, {"console", "script", "assets", "timeline"}},
 };
 
 const LayoutPreset* FindLayout(std::string_view name) {
@@ -159,6 +159,7 @@ const std::vector<MenuSpec>& Menus() {
              {"sim", "solver", "timeline"},
              {"sim.toggle_play", "sim.step", "sim.reset", "-", "timeline.fork", "timeline.ghost", "timeline.clear", "-",
               "tool.perturb", "tool.pin", "-", "solver.telemetry", "solver.heatmap", "solver.locate"}},
+            {"Robot", {"robot"}, {"robot.fix_base", "robot.drive", "robot.watch"}},
             {"Tools",
              {"script", "tools"},
              {"script.new", "script.open", "script.save", "-", "script.run", "script.stop", "script.toggle_rerun", "-",
@@ -420,7 +421,7 @@ const std::vector<ImGuiLayer::BuiltinExtension>& ImGuiLayer::Builtins() {
         {"nuka.solver", "Solver", "Solver residuals, sweep budget alerts and the residual heatmap.", {"solver"}},
         {"nuka.timeline", "Timeline", "Seek, replay and fork the run, and compare branches with a ghost.", {"timeline"}},
         {"nuka.camera", "Camera", "Camera pose, framing and controls.", {"camera"}},
-        {"nuka.drive", "Drive", "Joint drive targets and keyboard teleop.", {"drive"}},
+        {"nuka.joints", "Joints", "Joint states, drive targets and gains, the fixed base and keyboard teleop.", {"joints"}},
         {"nuka.script", "Script", "The Python script editor and the console.", {"script", "console"}},
         {"nuka.ui_inspector", "UI Inspector", "The nui component tree, for extension authors.", {"nui"}},
     };
@@ -432,7 +433,7 @@ void ImGuiLayer::AddBuiltinPanel(const std::string& panel_id) {
     const Builder builders[] = {&ImGuiLayer::BuildStage,  &ImGuiLayer::BuildProperties, &ImGuiLayer::BuildFile,
                                 &ImGuiLayer::BuildAssets, &ImGuiLayer::BuildStats,      &ImGuiLayer::BuildDebug,
                                 &ImGuiLayer::BuildSolver, &ImGuiLayer::BuildTimeline,   &ImGuiLayer::BuildCamera,
-                                &ImGuiLayer::BuildDrive,  &ImGuiLayer::BuildScript,     &ImGuiLayer::BuildConsole,
+                                &ImGuiLayer::BuildJoints, &ImGuiLayer::BuildScript,     &ImGuiLayer::BuildConsole,
                                 &ImGuiLayer::BuildInspector};
     const size_t i = static_cast<size_t>(
         std::find_if(std::begin(kPanels), std::end(kPanels), [&](const PanelSpec& p) { return panel_id == p.id; }) -
@@ -443,9 +444,9 @@ void ImGuiLayer::AddBuiltinPanel(const std::string& panel_id) {
     panel.build = [this, build](nui::VStack& root) { (this->*build)(root); };
     panel.dock = LayoutColumn(*FindLayout(layout_), panel_id);
     panel.open = !panel.dock.empty();
-    if (panel_id == "drive")
+    if (panel_id == "joints")
         panel.key = [this] {
-            return static_cast<uint64_t>(frame_.ui->drive_targets.size()) * 7919u + frame_.ui->dof_labels.size();
+            return static_cast<uint64_t>(frame_.ui->drive_targets.size()) * 7919u + frame_.ui->robot.joints.size();
         };
     if (panel_id == "property") panel.key = [this] { return frame_.ui->properties_version * 1000003u + staged_version_; };
 }
@@ -551,6 +552,9 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
         registry.Decorate(id, glyph, false);
     registry.Decorate("tool.perturb", icon::kGrab, false);
     registry.Decorate("tool.pin", icon::kPin, false);
+    for (const auto& [id, glyph] : {std::pair{"robot.fix_base", icon::kStatic}, std::pair{"robot.drive", icon::kDrive},
+                                    std::pair{"robot.watch", icon::kPlot}})
+        registry.Decorate(id, glyph, false);
     const std::pair<const char*, const char*> script_icons[] = {
         {"script.new", icon::kNew},   {"script.open", icon::kOpen},     {"script.save", icon::kSave},
         {"script.stop", icon::kStop}, {"script.toggle_rerun", icon::kRepeat}, {"script.eval", icon::kTerminal}};
@@ -564,7 +568,7 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
                            "solver.records", "solver.set_iterations", "window.restore", "window.state", "timeline.status",
                            "timeline.seek", "timeline.branch", "timeline.rename", "timeline.configure", "timeline.hash",
                            "sim.perturb", "sim.grab_particle", "sim.release", "sim.loads", "view.layout", "view.view",
-                           "view.views"})
+                           "view.views", "robot.joints", "robot.set_targets", "robot.samples"})
         registry.Decorate(id, "", true);
     registry.Rebind("file.open", "Ctrl+O");
     registry.Rebind("file.save", "Ctrl+S");
@@ -1048,44 +1052,6 @@ void ImGuiLayer::BuildCamera(nui::VStack& root) {
                                                         {"Wheel", "zoom"},               {"W A S D Q E", "fly"},
                                                         {"F / Home", "frame selection / all"}, {"Ctrl+LMB", "pick and drag a body"}};
     for (const auto& [key, what] : keys) root.Add<nui::Stat>(key, nullptr, Tone::Muted).value = what;
-}
-
-void ImGuiLayer::BuildDrive(nui::VStack& root) {
-    ViewerUiState& ui = *frame_.ui;
-    const size_t n = ui.drive_targets.size();
-    root.Add<nui::Label>("No articulation DOFs", Tone::Dim).visible = n == 0u;
-    auto& summary = root.Add<nui::Label>(std::string(), Tone::Dim, TextStyle::Label);
-    summary.text_fn = [this, n] { return Fmt(Tr("%zu DOF   env %u"), n, frame_.ui->env_index); };
-    summary.visible = n != 0u;
-    auto& grid = root.Add<nui::PropertyGrid>();
-    const bool labelled = ui.dof_labels.size() == n;
-    for (size_t d = 0; d < n; ++d) {
-        const std::string label = labelled && !ui.dof_labels[d].empty() ? ui.dof_labels[d] : Fmt("dof %zu", d);
-        auto& field = grid.Add<nui::FloatField>(label,
-                                                nui::Bind<float>([this, d] { return frame_.ui->drive_targets[d]; },
-                                                                 [this, d](const float& v) {
-                                                                     frame_.ui->drive_targets[d] = v;
-                                                                     frame_.ui->drive_dirty[d] = 1u;
-                                                                 }),
-                                                0.01f, -3.1416f, 3.1416f);
-        field.slider = true;
-    }
-
-    auto& teleop = root.Add<nui::Collapsible>("Teleop", false, icon::kKeyboard);
-    auto& tgrid = teleop.Add<nui::PropertyGrid>();
-    tgrid.Add<nui::BoolField>("Keyboard", nui::Ref(&ui.teleop_enabled));
-    tgrid.Add<nui::IntField>("DOF", nui::Ref(&ui.teleop_dof), 0, std::max(static_cast<int>(n) - 1, 0));
-    tgrid.Add<nui::FloatField>("Step size", nui::Ref(&ui.teleop_step), 0.005f);
-    tgrid.Add<nui::BoolField>("PD hold", nui::Ref(&ui.teleop_hold));
-    tgrid.Add<nui::FloatField>("kp", nui::Ref(&ui.teleop_kp), 0.5f);
-    tgrid.Add<nui::FloatField>("kd", nui::Ref(&ui.teleop_kd), 0.05f);
-    teleop.Add<nui::Label>("[ / ] nudge the DOF and - / = pick it. With a policy, W A S D move and Q / E turn.", Tone::Dim)
-        .wrap = true;
-    auto& cmd = teleop.Add<nui::Label>(std::string(), Tone::Accent, TextStyle::Mono);
-    cmd.text_fn = [this] {
-        const float* c = frame_.ui->teleop_cmd;
-        return Fmt("cmd  vx %.2f  vy %.2f  wyaw %.2f", c[0], c[1], c[2]);
-    };
 }
 
 void ImGuiLayer::BuildScript(nui::VStack& root) {

@@ -1,0 +1,43 @@
+<?xml version="1.0"?>
+<!-- A three-joint arm on a massless (fixed) base, for the robot workflow smokes. -->
+<robot name="arm3">
+  <link name="base">
+    <visual><geometry><box size="0.24 0.24 0.08"/></geometry></visual>
+    <collision><geometry><box size="0.24 0.24 0.08"/></geometry></collision>
+  </link>
+  <link name="turret">
+    <inertial><origin xyz="0 0 0.08"/><mass value="2.0"/><inertia ixx="0.01" iyy="0.01" izz="0.01" ixy="0" ixz="0" iyz="0"/></inertial>
+    <visual><origin xyz="0 0 0.08"/><geometry><box size="0.14 0.14 0.16"/></geometry></visual>
+    <collision><origin xyz="0 0 0.08"/><geometry><box size="0.14 0.14 0.16"/></geometry></collision>
+  </link>
+  <link name="upper_arm">
+    <inertial><origin xyz="0 0 0.18"/><mass value="1.5"/><inertia ixx="0.02" iyy="0.02" izz="0.003" ixy="0" ixz="0" iyz="0"/></inertial>
+    <visual><origin xyz="0 0 0.18"/><geometry><box size="0.08 0.08 0.36"/></geometry></visual>
+    <collision><origin xyz="0 0 0.18"/><geometry><box size="0.08 0.08 0.36"/></geometry></collision>
+  </link>
+  <link name="forearm">
+    <inertial><origin xyz="0 0 0.15"/><mass value="1.0"/><inertia ixx="0.01" iyy="0.01" izz="0.002" ixy="0" ixz="0" iyz="0"/></inertial>
+    <visual><origin xyz="0 0 0.15"/><geometry><box size="0.06 0.06 0.30"/></geometry></visual>
+    <collision><origin xyz="0 0 0.15"/><geometry><box size="0.06 0.06 0.30"/></geometry></collision>
+  </link>
+  <link name="tool">
+    <inertial><mass value="0.2"/><inertia ixx="0.0005" iyy="0.0005" izz="0.0005" ixy="0" ixz="0" iyz="0"/></inertial>
+    <visual><geometry><sphere radius="0.04"/></geometry></visual>
+    <collision><geometry><sphere radius="0.04"/></geometry></collision>
+  </link>
+  <joint name="shoulder_yaw" type="revolute">
+    <parent link="base"/><child link="turret"/><origin xyz="0 0 0.04"/><axis xyz="0 0 1"/>
+    <limit lower="-2.5" upper="2.5" effort="40" velocity="4"/>
+  </joint>
+  <joint name="shoulder_pitch" type="revolute">
+    <parent link="turret"/><child link="upper_arm"/><origin xyz="0 0 0.16"/><axis xyz="0 1 0"/>
+    <limit lower="-1.5" upper="1.5" effort="40" velocity="4"/>
+  </joint>
+  <joint name="elbow" type="revolute">
+    <parent link="upper_arm"/><child link="forearm"/><origin xyz="0 0 0.36"/><axis xyz="0 1 0"/>
+    <limit lower="-2.4" upper="0.2" effort="20" velocity="4"/>
+  </joint>
+  <joint name="tool_mount" type="fixed">
+    <parent link="forearm"/><child link="tool"/><origin xyz="0 0 0.32"/>
+  </joint>
+</robot>

@@ -34,6 +34,7 @@
 #include "runtime/app/viewer/physics_worker.hpp"
 #include "runtime/app/viewer/pose_scatter.hpp"
 #include "runtime/app/viewer/property_schema.hpp"
+#include "runtime/app/viewer/robot_tools.hpp"
 #include "runtime/app/viewer/script_host.hpp"
 #include "runtime/app/viewer/teleop.hpp"
 #include "runtime/inference/go2_policy_controller.hpp"
@@ -373,7 +374,8 @@ bool ParseOptions(const std::vector<std::string>& args, LaunchOptions* opt) {
 void ClearModelUi(ViewerUiState& ui) {
     ui.drive_targets.clear();
     ui.drive_dirty.clear();
-    ui.dof_labels.clear();
+    ui.robot.joints.clear();
+    ui.robot.roots.clear();
     ui.selected_entity = scene::kInvalidEntity;
     ui.playing = false;
 }
@@ -654,6 +656,8 @@ SDL_HitTestResult SDLCALL TitleBarHitTest(SDL_Window* window, const SDL_Point* p
 
 // The Solver view keeps this many of the newest telemetry records.
 constexpr size_t kSolverHistory = 2048u;
+// The Joints view keeps this many of the newest joint samples.
+constexpr size_t kJointHistory = 4096u;
 
 // One telemetry record as the solver actions report it.
 json::Value RecordJson(const nuka_telemetry_record_t& r, uint64_t number) {
@@ -826,6 +830,7 @@ struct EditorHost::State : DocumentHost {
     void RegisterViewActions();
     void RegisterSolverActions();
     void RegisterTimelineActions();
+    void RegisterRobotActions();
     json::Value TimelineStatus();
     // What a recording must match to load: the document, the world's counts and step, and the
     // names of the link and body rows its poses fill.
@@ -936,6 +941,9 @@ struct EditorHost::State : DocumentHost {
     void ApplySnapshot(const Snapshot& snap);
     // Takes the telemetry records the worker read since the last frame into the Solver view.
     void SyncSolver();
+    // Takes the joint samples the worker took since the last frame into the Joints view, which
+    // follows the joint of the selected link.
+    void SyncJoints();
     void TakeWorkerResults();
     void PushTransport();
     void PushPoseWrites();
@@ -1527,12 +1535,18 @@ void EditorHost::State::SyncScripts() {
     ui_state_.script_node_count = loaded_ ? static_cast<int>(loaded_->scene.ScriptCount()) : 0;
 }
 
-// The per-DOF drive editor starts from environment 0's live targets.
+// The joint table and the per-DOF drive editor, from environment 0's live targets.
 void EditorHost::State::SeedDriveTargets() {
     ui_state_.drive_targets.clear();
     ui_state_.drive_dirty.clear();
-    ui_state_.dof_labels.clear();
-    const uint32_t links = loaded_->Layout().links_per_env;
+    const WorldLayout& layout = loaded_->Layout();
+    RobotView& robot = ui_state_.robot;
+    const auto path_of = [this](scene::EntityId e) { return PathOfEntity(e); };
+    robot.joints = RobotJoints(loaded_->scene, layout, path_of);
+    robot.roots = RobotRoots(loaded_->scene, layout, path_of);
+    robot.floating = std::any_of(layout.links.begin(), layout.links.end(),
+                                 [](const nuka_link_binding_t& l) { return l.is_floating != 0u; });
+    const uint32_t links = layout.links_per_env;
     if (links == 0u) return;
     ui_state_.drive_targets.assign(links, 0.0f);
     ui_state_.drive_dirty.assign(links, 0u);
@@ -1639,6 +1653,7 @@ void EditorHost::State::ApplySnapshot(const Snapshot& snap) {
     loaded_->sim->ApplyPoses(snap.link_poses, snap.body_poses);
     loaded_->sim->ApplyGhost(snap.ghost_links, snap.ghost_bodies);
     if (!snap.particles.empty()) loaded_->sim->ApplyParticles(snap.particles, snap.heat, ui_state_.solver.alert);
+    ui_state_.robot.live = snap.joints;
     // A spring draws as a band to its target, a plain force as an arrow along it.
     for (const Perturbation& p : snap.perturbs) {
         math::Vec3 at = p.target, target = p.target;
@@ -1698,6 +1713,35 @@ void EditorHost::State::SyncSolver() {
     v.recent_caps = stats.recent_caps;
     v.recent_records = static_cast<uint32_t>(std::min<uint64_t>(stats.records, kRecentRecords));
     v.dropped = stats.dropped;
+}
+
+void EditorHost::State::SyncJoints() {
+    RobotView& v = ui_state_.robot;
+    std::vector<JointSample> fresh;
+    uint64_t session = 0u;
+    uint64_t count = worker_.ReadJoints(v.first + v.history.size(), &fresh, &session);
+    if (session != v.session) {
+        v.history.clear();
+        v.first = 0u;
+        v.session = session;
+        count = worker_.ReadJoints(0u, &fresh, &session);
+    }
+    // Samples the worker's log dropped before this frame read them leave a gap.
+    const uint64_t from = count - fresh.size();
+    if (from != v.first + v.history.size()) {
+        v.history.clear();
+        v.first = from;
+    }
+    for (JointSample& s : fresh) v.history.push_back(std::move(s));
+    while (v.history.size() > kJointHistory) {
+        v.history.pop_front();
+        ++v.first;
+    }
+    const std::string selected =
+        ui_state_.selected_entity == scene::kInvalidEntity ? std::string() : PathOfEntity(ui_state_.selected_entity);
+    v.focus = -1;
+    for (size_t i = 0; i < v.joints.size(); ++i)
+        if (v.joints[i].path == selected) v.focus = static_cast<int>(i);
 }
 
 void EditorHost::State::TakeWorkerResults() {
@@ -2517,8 +2561,111 @@ void EditorHost::State::RegisterActions() {
     RegisterViewActions();
     RegisterSolverActions();
     RegisterTimelineActions();
+    RegisterRobotActions();
     RegisterScriptActions();
     ui_.RegisterActions(actions_);
+}
+
+void EditorHost::State::RegisterRobotActions() {
+    const auto has_joints = [this] { return loaded_ != nullptr && !ui_state_.robot.joints.empty(); };
+    // The moving joints with their limits and drives, and the shown environment's live values.
+    actions_.Add({"robot.joints", "Robot Joints", "robot", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value&) {
+                      const RobotView& v = ui_state_.robot;
+                      json::Value joints = json::Value::Array();
+                      for (const RobotJoint& j : v.joints) joints.PushBack(JointJson(j, v.live));
+                      return Ok(Object({{"joints", std::move(joints)},
+                                        {"roots", StrList(v.roots)},
+                                        {"floating", json::Value::Bool(v.floating)},
+                                        {"env", json::Value::Int(ui_state_.env_index)},
+                                        {"watch", json::Value::Bool(v.watch)}}));
+                  }});
+    // {targets: {joint: value}} in rad or m, for the shown environment; the next step reads them.
+    actions_.Add({"robot.set_targets", "Set Joint Targets", "robot", "", ShortcutScope::Global, has_joints, {},
+                  [this](const json::Value& args) {
+                      const RobotView& v = ui_state_.robot;
+                      std::vector<std::pair<uint32_t, float>> writes;
+                      for (const auto& [name, value] : args.At("targets").Items()) {
+                          const int j = FindJoint(v.joints, name);
+                          if (j < 0) return ActionResult::Fail("no joint '" + name + "'");
+                          writes.emplace_back(v.joints[static_cast<size_t>(j)].link, value.AsFloat());
+                      }
+                      for (const auto& [link, value] : writes) {
+                          ui_state_.drive_targets[link] = value;
+                          ui_state_.drive_dirty[link] = 1u;
+                      }
+                      PushEdits();
+                      return Ok(Object({{"set", json::Value::Int(static_cast<int64_t>(writes.size()))}}));
+                  }});
+    // While on, every step samples the shown environment's joints for robot.samples and the curves.
+    actions_.Add({"robot.watch", "Watch Joints", "robot", "", ShortcutScope::Global, has_joints,
+                  [this] { return ui_state_.robot.watch; },
+                  [this](const json::Value& args) {
+                      RobotView& v = ui_state_.robot;
+                      v.watch = BoolArg(args, "on", !v.watch);
+                      worker_.Push(TickCommand::Param(ParamKind::JointWatch, {v.watch ? 1.0f : 0.0f}));
+                      return Ok(Object({{"on", json::Value::Bool(v.watch)}}));
+                  }});
+    // The newest `count` samples of one joint, oldest first; `total` counts the watch's samples.
+    actions_.Add({"robot.samples", "Joint Samples", "robot", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value& args) {
+                      const RobotView& v = ui_state_.robot;
+                      const std::string name = StrArg(args, "joint");
+                      const int j = FindJoint(v.joints, name);
+                      if (j < 0) return ActionResult::Fail("no joint '" + name + "'");
+                      const uint32_t link = v.joints[static_cast<size_t>(j)].link;
+                      const size_t count = std::min(
+                          static_cast<size_t>(NumArg(args, "count", static_cast<double>(v.history.size()))), v.history.size());
+                      json::Value tick = json::Value::Array(), t = json::Value::Array(), q = json::Value::Array(),
+                                  target = json::Value::Array(), effort = json::Value::Array();
+                      for (size_t i = v.history.size() - count; i < v.history.size(); ++i) {
+                          const JointSample& s = v.history[i];
+                          tick.PushBack(json::Value::Int(static_cast<int64_t>(s.tick)));
+                          t.PushBack(json::Value::Float(s.time));
+                          q.PushBack(json::Value::Float(s.q[link]));
+                          target.PushBack(json::Value::Float(s.target[link]));
+                          effort.PushBack(json::Value::Float(s.effort[link]));
+                      }
+                      return Ok(Object({{"joint", json::Value::Str(name)},
+                                        {"count", json::Value::Int(static_cast<int64_t>(count))},
+                                        {"total", json::Value::Int(static_cast<int64_t>(v.first + v.history.size()))},
+                                        {"watch", json::Value::Bool(v.watch)},
+                                        {"tick", std::move(tick)},
+                                        {"t", std::move(t)},
+                                        {"q", std::move(q)},
+                                        {"target", std::move(target)},
+                                        {"effort", std::move(effort)}}));
+                  }});
+    // One undoable edit gives `joints` (all by default) a drive of `type`; a position drive takes kp.
+    actions_.Add({"robot.drive", "Position Drive", "robot", "", ShortcutScope::Global, has_joints, {},
+                  [this](const json::Value& args) {
+                      const RobotView& v = ui_state_.robot;
+                      const std::string type = StrArg(args, "type", "position");
+                      json::Value after = Object({{"type", json::Value::Str(type)}});
+                      if (type == "position") after.Set("kp", json::Value::Float(NumArg(args, "kp", v.drive_kp)));
+                      std::vector<std::string> names = StrListArg(args, "joints");
+                      if (names.empty())
+                          for (const RobotJoint& j : v.joints) names.push_back(j.name);
+                      EditTxn txn{"Drive " + type, {}};
+                      for (const std::string& name : names) {
+                          const int j = FindJoint(v.joints, name);
+                          if (j < 0) return ActionResult::Fail("no joint '" + name + "'");
+                          txn.ops.push_back(EditOp{v.joints[static_cast<size_t>(j)].path, "drive", json::Value(), after});
+                      }
+                      return SubmitTxn(txn);
+                  }});
+    // Static roots are fixed bases; without `on` it toggles.
+    actions_.Add({"robot.fix_base", "Fixed Base", "robot", "", ShortcutScope::Global,
+                  [this] { return loaded_ != nullptr && !ui_state_.robot.roots.empty(); },
+                  [this] { return !ui_state_.robot.roots.empty() && !ui_state_.robot.floating; },
+                  [this](const json::Value& args) {
+                      const RobotView& v = ui_state_.robot;
+                      const bool on = BoolArg(args, "on", v.floating);
+                      EditTxn txn{on ? "Fix Base" : "Free Base", {}};
+                      for (const std::string& root : v.roots)
+                          txn.ops.push_back(EditOp{root, "static", json::Value(), json::Value::Bool(on)});
+                      return SubmitTxn(txn);
+                  }});
 }
 
 void EditorHost::State::RegisterFileActions() {
@@ -4589,6 +4736,7 @@ void EditorHost::State::Frame(bool step_physics) {
     const auto apply_t0 = Clock::now();
     if (const Snapshot* snap = worker_.AcquireSnapshot()) ApplySnapshot(*snap);
     if (loaded_) SyncSolver();
+    if (loaded_) SyncJoints();
     if (loaded_) worker_.ReadTimeline(&ui_state_.timeline);
     double apply_ms = Ms(Clock::now() - apply_t0);
 

@@ -432,6 +432,7 @@ if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)
         runtime/app/viewer/editor_actions.cpp
         runtime/app/viewer/file_dialog.cpp
         runtime/app/viewer/imgui_layer.cpp
+        runtime/app/viewer/robot_panel.cpp
         runtime/app/viewer/scene_panels.cpp
         runtime/app/viewer/script_tabs.cpp
         runtime/app/viewer/solver_panel.cpp
@@ -1259,6 +1260,7 @@ if(CMAKE_CUDA_COMPILER)
             runtime/app/viewer/debug_overlay.cpp
             runtime/app/viewer/physics_worker.cpp
             runtime/app/viewer/physics_history.cpp
+            runtime/app/viewer/robot_tools.cpp
             runtime/app/viewer/script_host.cpp
         )
         set_target_properties(nuka_editor_core PROPERTIES POSITION_INDEPENDENT_CODE ON)

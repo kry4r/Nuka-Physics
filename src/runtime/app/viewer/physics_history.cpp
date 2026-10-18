@@ -472,6 +472,9 @@ void PhysicsWorker::PublishTimeline(Snapshot& s) {
     t.bytes = key_bytes_;
     t.budget = key_budget_;
     t.keyframes = key_count_;
+    // The current branch's head moves every step; the rest change with the revision.
+    for (TimelineBranchInfo& info : t.branches)
+        if (info.id == branch_) info.head = b.head;
     if (t.revision == history_revision_) return;
     t.revision = history_revision_;
     t.branches.clear();

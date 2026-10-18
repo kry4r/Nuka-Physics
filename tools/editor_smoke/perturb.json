@@ -74,7 +74,7 @@
     {"action": "file.import", "args": {"path": "${scenario_dir}/../../examples/scenes/go2_stand.urdf", "mode": "add",
      "profile": "legacy", "name": "go2", "pose": {"pos": [1.0, 0.5, 0.0], "quat": [1.0, 0.0, 0.0, 0.0]}}, "bind": "robot"},
     {"frames": 10},
-    {"python": "from nuka.editor.app import ActionError\nlinks = [n['path'] for n in app.actions.run('scene.nodes', under='${robot.focus}', kind='body')]\nassert links, links\ntry:\n    app.actions.run('edit.apply', ops=[{'target': links[0], 'field': 'static', 'after': True}])\nexcept ActionError as e:\n    assert 'articulation links cannot be pinned' in str(e), e\nelse:\n    raise AssertionError('a link was pinned')\nv = app.actions.run('sim.perturb', path=links[-1], force=[0.0, 0.0, 30.0])\nassert v['held'], v"},
+    {"python": "from nuka.editor.app import ActionError\nlinks = [n['path'] for n in app.actions.run('scene.nodes', under='${robot.focus}', kind='body')]\nassert links, links\ntry:\n    app.actions.run('edit.apply', ops=[{'target': links[-1], 'field': 'static', 'after': True}])\nexcept ActionError as e:\n    assert 'root link can be static' in str(e), e\nelse:\n    raise AssertionError('a link was pinned')\nv = app.actions.run('sim.perturb', path=links[-1], force=[0.0, 0.0, 30.0])\nassert v['held'], v"},
     {"frames": 8},
     {"action": "sim.loads", "bind": "ll"},
     {"python": "assert len(${ll}) == 1 and ${ll}[0]['path'].startswith('${robot.focus}/'), ${ll}"},

@@ -1,6 +1,7 @@
 #include "runtime/app/viewer/physics_worker.hpp"
 
 #include "runtime/app/viewer/editor_scene.hpp"
+#include "runtime/app/viewer/robot_tools.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -20,6 +21,8 @@ constexpr std::chrono::milliseconds kMirrorPeriod{33};
 constexpr std::chrono::milliseconds kBatchPublishPeriod{33};
 // The solver log keeps this many of the newest telemetry records.
 constexpr size_t kSolverLog = 4096u;
+// The joint samples kept: 20 s at 200 Hz.
+constexpr size_t kJointLog = 4096u;
 
 bool Capped(const nuka_telemetry_record_t& r) { return (r.flags & NUKA_TELEMETRY_CAP) != 0u; }
 
@@ -206,6 +209,7 @@ uint64_t PhysicsWorker::Bind(WorkerBinding binding) {
     timeline_value_ = 0u;
     last_mirror_ = WorkerClock::time_point{};
     telemetry_ = WorkerTelemetry{};
+    mirror_joints_ = JointFrame{};
     {
         std::lock_guard<std::mutex> lock(solver_mu_);
         if (solver_.mask != 0u)
@@ -213,6 +217,12 @@ uint64_t PhysicsWorker::Bind(WorkerBinding binding) {
                         "nuka_world_set_telemetry_mask");
         CheckResult(nuka_world_get_velocity_iterations(bind_.world, &solver_.iterations),
                     "nuka_world_get_velocity_iterations");
+    }
+    {
+        std::lock_guard<std::mutex> lock(joints_mu_);
+        joint_log_.clear();
+        joint_count_ = 0u;
+        ++joint_session_;
     }
     ResetHistory();
     Publish();
@@ -278,6 +288,15 @@ bool PhysicsWorker::TakeBeauty(BeautyImage* out) {
     *out = std::move(beauty_);
     beauty_ready_ = false;
     return true;
+}
+
+uint64_t PhysicsWorker::ReadJoints(uint64_t since, std::vector<JointSample>* out, uint64_t* session) {
+    std::lock_guard<std::mutex> lock(joints_mu_);
+    const uint64_t first = joint_count_ - joint_log_.size();
+    const uint64_t from = std::min(std::max(since, first), joint_count_);
+    out->assign(joint_log_.begin() + static_cast<std::ptrdiff_t>(from - first), joint_log_.end());
+    *session = joint_session_;
+    return joint_count_;
 }
 
 void PhysicsWorker::Report(uint64_t seq, std::string text, bool error) {
@@ -425,6 +444,16 @@ bool PhysicsWorker::Apply(const TickCommand& cmd) {
                     heatmap_ = cmd.values[0] != 0.0f;
                     last_mirror_ = WorkerClock::time_point{};
                     return true;
+                case ParamKind::JointWatch: {
+                    // Stopping keeps the recorded samples; starting begins a new record.
+                    watch_ = cmd.values[0] != 0.0f;
+                    if (!watch_) return false;
+                    std::lock_guard<std::mutex> lock(joints_mu_);
+                    joint_log_.clear();
+                    joint_count_ = 0u;
+                    ++joint_session_;
+                    return false;
+                }
             }
             return false;
         case CommandKind::Perturb:
@@ -578,6 +607,7 @@ bool PhysicsWorker::StepOnce() {
     const bool healthy = nuka_world_step(bind_.world) == NUKA_RESULT_OK;
     SetTick(tick_ + 1u);
     sim_time_ += static_cast<double>(bind_.dt);
+    if (watch_ && bind_.layout.links_per_env != 0u) SampleJoints();
     HistoryBranch& b = Current();
     if (recording) {
         b.head = tick_;
@@ -670,6 +700,23 @@ void PhysicsWorker::DispatchTick() {
     Report(0u, std::move(text));
 }
 
+// A sample at or before the last one starts a new session: the playhead went back.
+void PhysicsWorker::SampleJoints() {
+    JointSample sample;
+    sample.tick = tick_;
+    sample.time = sim_time_;
+    DownloadJointSample(bind_.world, bind_.layout, bind_.env, &sample);
+    std::lock_guard<std::mutex> lock(joints_mu_);
+    if (!joint_log_.empty() && joint_log_.back().tick >= sample.tick) {
+        joint_log_.clear();
+        joint_count_ = 0u;
+        ++joint_session_;
+    }
+    joint_log_.push_back(std::move(sample));
+    ++joint_count_;
+    while (joint_log_.size() > kJointLog) joint_log_.pop_front();
+}
+
 // Appends the records written since the last read; the worker is the log's only writer.
 void PhysicsWorker::ReadTelemetry() {
     records_scratch_.resize(1024u);
@@ -710,6 +757,7 @@ void PhysicsWorker::Publish() {
     if (mirrored_) {
         DownloadEnvPoses(bind_.world, bind_.layout, bind_.env, &mirror_links_, &mirror_bodies_);
         DownloadEnvParticles(bind_.world, bind_.layout, bind_.env, &mirror_particles_);
+        if (bind_.layout.links_per_env != 0u) DownloadJointFrame(bind_.world, bind_.layout, bind_.env, &mirror_joints_);
         ReadOverlayData(bind_.world, bind_.layout, bind_.env, bind_.colliders, bind_.contacts, &overlay_);
         if (solver_.mask != 0u) ReadTelemetry();
         mirror_heat_.clear();
@@ -729,6 +777,7 @@ void PhysicsWorker::Publish() {
     s.body_poses = mirror_bodies_;
     s.particles = mirror_particles_;
     s.heat = mirror_heat_;
+    s.joints = mirror_joints_;
     s.perturbs.clear();
     for (const Perturbation& p : perturbs_)
         if (p.env == bind_.env) s.perturbs.push_back(p);

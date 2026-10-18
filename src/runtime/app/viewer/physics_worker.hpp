@@ -9,6 +9,7 @@
 #include "runtime/app/viewer/debug_overlay.hpp"
 #include "runtime/app/viewer/editor_world.hpp"
 #include "runtime/app/viewer/pose_scatter.hpp"
+#include "runtime/app/viewer/robot_view.hpp"
 #include "runtime/app/viewer/script_host.hpp"
 #include "runtime/app/viewer/timeline_view.hpp"
 #include "runtime/inference/world_controller.hpp"
@@ -35,7 +36,8 @@ using WorkerClock = std::chrono::steady_clock;
 
 enum class CommandKind : uint8_t { EditApply, Teleport, ParamSet, Perturb, Transport, ScriptCall, Timeline, Beauty };
 enum class ParamKind : uint8_t {
-    Field, HoldGains, ControllerCommand, DisplayEnv, ScatterRows, Overlay, Registry, Telemetry, Iterations, Heatmap
+    Field, HoldGains, ControllerCommand, DisplayEnv, ScatterRows, Overlay, Registry, Telemetry, Iterations, Heatmap,
+    JointWatch
 };
 enum class TransportOp : uint8_t { Play, Pause, Step, Speed, Reset };
 enum class TimelineOp : uint8_t { Seek, Fork, Branch, Rename, Ghost, Configure, Clear };
@@ -73,7 +75,7 @@ struct TickCommand {
     uint32_t index = 0u;                  // Registry parameter
     uint32_t element = 0u;                // Registry element
     // Field values, gains (kp, kd), command, overlay flags, registry value, telemetry (mask, alert),
-    // sweep budget, heatmap flag, ghost flag or the keyframe interval and budget [MB].
+    // sweep budget, heatmap or joint watch flag, ghost flag or the keyframe interval and budget [MB].
     std::vector<float> values;
     uint32_t env = 0u;                    // DisplayEnv; the worker stamps pose writes with the shown one
     std::vector<ScatterRow> rows;         // ScatterRows
@@ -200,6 +202,7 @@ struct Snapshot {
     std::vector<math::Transform> body_poses;
     std::vector<math::Vec3> particles;  // the shown environment's
     std::vector<float> heat;            // its per-particle residuals while the heatmap reads them
+    JointFrame joints;                  // its joints
     std::vector<Perturbation> perturbs;  // the loads held on it
     OverlayData overlay;
     WorkerTelemetry telemetry;
@@ -312,6 +315,9 @@ public:
     void ReadTimeline(TimelineInfo* info);
     // Moves the newest finished beauty render into `out` once; readable from any thread.
     bool TakeBeauty(BeautyImage* out);
+    // Copies the joint samples numbered `since` on, 0 being the first of `session`; returns the
+    // count taken in it. Readable from any thread.
+    uint64_t ReadJoints(uint64_t since, std::vector<JointSample>* out, uint64_t* session);
 
 private:
     void Loop();
@@ -323,6 +329,7 @@ private:
     double Advance();
     bool StepOnce();
     void WritePerturbations();
+    void SampleJoints();
     void ReadTelemetry();
     void Publish();
     void DispatchTick();
@@ -393,6 +400,7 @@ private:
     std::vector<math::Transform> mirror_bodies_;
     std::vector<math::Vec3> mirror_particles_;
     std::vector<float> mirror_heat_;
+    JointFrame mirror_joints_;
     OverlayData overlay_;
     WorkerTelemetry telemetry_;
 
@@ -403,6 +411,14 @@ private:
     std::mutex solver_mu_;
     std::deque<nuka_telemetry_record_t> solver_log_;
     SolverStats solver_;
+
+    // While watched, every step samples the shown environment's joints; a new session starts
+    // with each watch, binding or step back.
+    bool watch_ = false;
+    std::mutex joints_mu_;
+    std::deque<JointSample> joint_log_;
+    uint64_t joint_count_ = 0u;
+    uint64_t joint_session_ = 0u;
 
     // The history; behind the current branch's head its log replays from `cursor_`.
     std::map<uint32_t, HistoryBranch> branches_;

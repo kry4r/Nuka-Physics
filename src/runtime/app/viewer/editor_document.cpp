@@ -3,6 +3,7 @@
 #include "render/render_world.hpp"
 #include "runtime/app/viewer/editor_collision.hpp"
 #include "runtime/app/viewer/editor_import.hpp"
+#include "runtime/app/viewer/robot_tools.hpp"
 #include "scene/scene_fields.hpp"
 
 #include <algorithm>
@@ -19,7 +20,7 @@ constexpr uint32_t kNoParam = ~0u;
 
 bool IsStructural(const std::string& field) {
     return field == "spawn" || field == "delete" || field == "reparent" || field == "script" || field == "import" ||
-           field == "collision" || field == "static" || field == "pin";
+           field == "collision" || field == "static" || field == "pin" || field == "drive";
 }
 
 json::Value Floats(const float* v, size_t n) {
@@ -220,7 +221,7 @@ bool EditorDocument::ApplyOp(const EditOp& op, EditOp* done, EditOp* inverse, Op
     const scene::EntityId e = EntityAt(op.target);
     const bool needs_node = !op.target.empty() || op.field == "transform" || op.field == "material" ||
                             op.field == "name" || op.field == "delete" || op.field == "reparent" ||
-                            op.field == "static" || op.field == "pin";
+                            op.field == "static" || op.field == "pin" || op.field == "drive";
     if (needs_node && e == scene::kInvalidEntity) {
         *error = "no node at '" + op.target + "'";
         return false;
@@ -294,15 +295,47 @@ bool EditorDocument::ApplyOp(const EditOp& op, EditOp* done, EditOp* inverse, Op
             *error = "'" + op.target + "' is not a body";
             return false;
         }
+        // A static root is a fixed base; the other links move with their joints.
         for (const nuka_link_binding_t& link : es_->Layout().links) {
-            if (link.body_index == it->second) {
-                *error = "articulation links cannot be pinned";
+            if (link.body_index == it->second && link.is_root == 0u) {
+                *error = "only an articulation's root link can be static";
                 return false;
             }
         }
         scene::RigidBodyRecord& body = es_->scene.GetBodyMut(it->second);
         done->before = json::Value::Bool(body.is_static);
         body.is_static = op.after.AsBool();
+        out->rebuild = true;
+    } else if (op.field == "drive") {
+        const auto it = records_.body.find(e);
+        const scene::JointRecord* joint = nullptr;
+        for (const scene::JointRecord& j : es_->scene.Joints())
+            if (it != records_.body.end() && j.child_body == it->second) joint = &j;
+        scene::ActuatorType type = scene::ActuatorType::Position;
+        if (joint == nullptr || !ParseActuatorType(op.after.At("type").AsString(), &type)) {
+            *error = joint == nullptr ? "'" + op.target + "' is no joint's child link"
+                                      : "the drive type is position, motor, velocity or force";
+            return false;
+        }
+        scene::ActuatorId act = static_cast<scene::ActuatorId>(es_->scene.Actuators().size());
+        for (const scene::ActuatorRecord& a : es_->scene.Actuators())
+            if (a.joint_id == joint->id) act = a.id;
+        if (act == es_->scene.Actuators().size()) {
+            done->before = json::Value::Null();
+            scene::ActuatorRecord rec;
+            rec.name = joint->name;
+            rec.joint_id = joint->id;
+            act = es_->scene.AddActuator(rec);
+        } else {
+            const scene::ActuatorRecord& a = es_->scene.GetActuator(act);
+            json::Value before = json::Value::Object();
+            before.Set("type", json::Value::Str(ActuatorTypeName(a.type)));
+            before.Set("kp", json::Value::Float(a.gain));
+            done->before = std::move(before);
+        }
+        scene::ActuatorRecord& a = es_->scene.GetActuatorMut(act);
+        a.type = type;
+        if (const json::Value* kp = op.after.Find("kp")) a.gain = kp->AsFloat();
         out->rebuild = true;
     } else if (op.field == "pin") {
         const auto it = records_.media.find(e);

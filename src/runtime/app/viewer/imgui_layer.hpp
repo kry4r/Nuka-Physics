@@ -8,6 +8,7 @@
 #include "runtime/app/viewer/editor_actions.hpp"
 #include "runtime/app/viewer/nui/nui.hpp"
 #include "runtime/app/viewer/property_schema.hpp"
+#include "runtime/app/viewer/robot_view.hpp"
 #include "runtime/app/viewer/scene_viewport.hpp"
 #include "runtime/app/viewer/script_tabs.hpp"
 #include "runtime/app/viewer/timeline_view.hpp"
@@ -272,7 +273,7 @@ struct ViewerUiState {
     // Per-DOF drive targets of the selected env; a moved slider latches drive_dirty[d].
     std::vector<float> drive_targets;
     std::vector<uint8_t> drive_dirty;
-    std::vector<std::string> dof_labels;  // empty or one per DOF
+    RobotView robot;
 
     // Keyboard teleop: [ / ] nudge a DOF, WASD/QE feed a command-consuming controller.
     bool teleop_enabled = false;
@@ -455,7 +456,7 @@ private:
     void BuildSolver(nui::VStack& root);
     void BuildTimeline(nui::VStack& root);
     void BuildCamera(nui::VStack& root);
-    void BuildDrive(nui::VStack& root);
+    void BuildJoints(nui::VStack& root);
     void BuildScript(nui::VStack& root);
     void BuildConsole(nui::VStack& root);
     // The script tab bar with its keys, completions, disk-change bar and close prompt.
