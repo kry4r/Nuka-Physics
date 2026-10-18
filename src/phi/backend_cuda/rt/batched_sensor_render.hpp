@@ -212,4 +212,7 @@ uint32_t LidarsPerEnv(const BatchedSensorSceneDevice& device);
 uint32_t LidarAzCount(const BatchedSensorSceneDevice& device);
 uint32_t LidarElCount(const BatchedSensorSceneDevice& device);
 
+// Copies `bytes` of a sensor output view to host memory once the backend stream drains.
+void DownloadSensorOutput(const void* source, void* destination, size_t bytes, phi::Backend* backend);
+
 }  // namespace nuka::rt

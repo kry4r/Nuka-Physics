@@ -118,6 +118,9 @@ public:
     // the accessor points into, as of the last RenderLidars (all-zero before it).
     virtual SensorRangeShape RangeShape(const SensorSceneHandle* handle) const = 0;
 
+    // Copies `bytes` from one of the device views above into host memory after pending renders finish.
+    virtual void DownloadSensorOutput(const void* device, void* host, size_t bytes) const = 0;
+
     // Record the per-env render-DR config and (re)fill the per-env appearance
     // tables for `env_count` envs (cfg.enabled==false -> exact base replicas, so
     // the cross-env tiles stay byte-identical). Idempotent for a fixed seed.

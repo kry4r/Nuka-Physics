@@ -1627,4 +1627,12 @@ uint32_t LidarElCount(const BatchedSensorSceneDevice& device) {
     return const_cast<BatchedSensorSceneDevice&>(device).GetImpl()->lidar_el;
 }
 
+void DownloadSensorOutput(const void* source, void* destination, size_t bytes, phi::Backend* backend) {
+    const auto ctx = ResolveRtContext(backend);
+    phi::ScopedDeviceGuard guard(ctx.device_id);
+    CheckCuda(cudaMemcpyAsync(destination, source, bytes, cudaMemcpyDeviceToHost, ctx.stream),
+              "download sensor output");
+    CheckCuda(cudaStreamSynchronize(ctx.stream), "download sensor output");
+}
+
 }  // namespace nuka::rt

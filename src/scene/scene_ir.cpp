@@ -194,6 +194,12 @@ SensorId SceneIR::AddSensor(SensorDesc record) {
     return id;
 }
 
+void SceneIR::RemoveSensor(SensorId id) {
+    if (id >= sensors_.size()) throw std::out_of_range("SceneIR::RemoveSensor - invalid SensorId");
+    sensors_.erase(sensors_.begin() + id);
+    for (SensorId i = id; i < sensors_.size(); ++i) sensors_[i].id = i;
+}
+
 MaterialId SceneIR::AddMaterial(MaterialRecord record) {
     const auto id = static_cast<MaterialId>(materials_.size());
     record.id = id;

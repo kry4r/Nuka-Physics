@@ -1033,6 +1033,62 @@ public:
         return {e, s, az, el};
     }
 
+    // Replaces the attachment with the scene's authored cameras and lidars.
+    std::array<uint32_t, 2> attach_scene_sensors() {
+        uint32_t cameras = 0u, lidars = 0u;
+        check(nuka_world_attach_scene_sensors(h_, &cameras, &lidars), "nuka_world_attach_scene_sensors");
+        uint32_t e = 0u, s = 0u, hh = 0u, ww = 0u, ch = 0u, az = 0u, el = 0u;
+        nuka_world_get_sensor_dims(h_, &e, &s, &hh, &ww, &ch);
+        nuka_world_get_lidar_dims(h_, &e, &s, &az, &el);
+        sensor_width_ = cameras ? ww : 0u;
+        sensor_height_ = cameras ? hh : 0u;
+        sensor_count_ = cameras;
+        lidar_count_ = lidars;
+        lidar_az_ = lidars ? az : 0u;
+        lidar_el_ = lidars ? el : 0u;
+        return {cameras, lidars};
+    }
+
+    // One (env, sensor) tile on the host: (H,W,ch) for camera planes, (az,el) for RANGE.
+    nb::object download_sensor(nuka_sensor_channel_t channel, uint32_t env, uint32_t sensor) const {
+        uint64_t count = 0u;
+        check(nuka_world_download_sensor(h_, channel, env, sensor, nullptr, 0u, &count),
+              "nuka_world_download_sensor(size)");
+        uint32_t e = 0u, s = 0u, a = 0u, b = 0u, ch = 0u;
+        if (channel == NUKA_SENSOR_CHANNEL_RANGE) check(nuka_world_get_lidar_dims(h_, &e, &s, &a, &b),
+                                                        "nuka_world_get_lidar_dims");
+        else check(nuka_world_get_sensor_dims(h_, &e, &s, &a, &b, &ch), "nuka_world_get_sensor_dims");
+        const size_t shape[3] = {a, b, static_cast<size_t>(count / (uint64_t{a} * b))};
+        const size_t ndim = channel == NUKA_SENSOR_CHANNEL_RANGE ? 2u : 3u;
+        if (channel == NUKA_SENSOR_CHANNEL_PRIM)
+            return download_tile<uint32_t>(channel, env, sensor, count, ndim, shape);
+        return download_tile<float>(channel, env, sensor, count, ndim, shape);
+    }
+
+    template <typename T>
+    nb::object download_tile(nuka_sensor_channel_t channel, uint32_t env, uint32_t sensor,
+                             uint64_t count, size_t ndim, const size_t* shape) const {
+        T* out = new T[count == 0u ? 1u : count];
+        nb::capsule owner(out, [](void* p) noexcept { delete[] static_cast<T*>(p); });
+        check(unlocked([&] { return nuka_world_download_sensor(h_, channel, env, sensor, out, count, &count); }),
+              "nuka_world_download_sensor");
+        return nb::cast(nb::ndarray<nb::numpy, T>(out, ndim, shape, owner));
+    }
+
+    // Scene node path per render instance, indexed by the PRIM plane's instance field.
+    std::vector<std::string> sensor_instances() const {
+        size_t need = 0u;
+        check(nuka_world_get_sensor_instances(h_, nullptr, 0u, &need), "nuka_world_get_sensor_instances(size)");
+        std::string buf(need + 1u, '\0');
+        check(nuka_world_get_sensor_instances(h_, buf.data(), buf.size(), &need),
+              "nuka_world_get_sensor_instances");
+        std::vector<std::string> paths;
+        for (size_t start = 0u, end = buf.find('\n'); end != std::string::npos && end < need;
+             start = end + 1u, end = buf.find('\n', start))
+            paths.push_back(buf.substr(start, end - start));
+        return paths;
+    }
+
     void render_sensors() {
         check(unlocked([this] { return nuka_world_render_sensors(h_); }), "nuka_world_render_sensors");
     }
@@ -2474,7 +2530,8 @@ NB_MODULE(_nuka_ext, m) {
              nb::arg("migrate_state") = true,
              "Recook the world in place from a scene file with its creation options. Body and "
              "joint state carry over by unique body name unless migrate_state is False. Earlier "
-             "views keep valid storage but are stale; worlds with sensors or observations refuse it.")
+             "views keep valid storage but are stale. Scene-attached sensors re-attach from the new "
+             "scene; explicitly attached or runtime-added sensors and observations refuse it.")
         .def("rebuild_with_envs", &World::rebuild_with_envs, nb::arg("path"), nb::arg("env_count"),
              "Recook the world in place from a scene file's initial state with env_count environments; "
              "later rebuilds keep the count. Earlier views go stale as with rebuild_from_scene.")
@@ -2962,6 +3019,18 @@ NB_MODULE(_nuka_ext, m) {
              "The attached lidar fan shape as a 4-tuple (env_count, sensors_per_env, "
              "az_count, el_count). Valid after attach_lidar_sensor; raises "
              "NOT_SUPPORTED if no lidar is attached.")
+        .def("attach_scene_sensors", &World::attach_scene_sensors,
+             "Replace the attached sensors with the scene's authored Camera/Depth and "
+             "Lidar/RangeScan records; returns (cameras, lidars). Cameras share one image "
+             "size and lidars one fan. Render DR, fidelity, AOV mask and imaging models "
+             "carry over, and a scene rebuild re-attaches them from the new scene.")
+        .def("download_sensor", &World::download_sensor, nb::arg("channel"),
+             nb::arg("env") = 0u, nb::arg("sensor") = 0u,
+             "Copy one (env, sensor) tile to a numpy array after render_sensors: "
+             "(H, W, ch) float32 for camera planes (uint32 for PRIM), (az, el) for RANGE.")
+        .def("sensor_instances", &World::sensor_instances,
+             "Scene node path of each render instance of the sensor scene, indexed by "
+             "PRIM >> 20; empty strings for particle surfaces.")
         // Per-env render domain randomization (the vision-policy / sim2real lever):
         // each env gets its OWN appearance set, deterministic + seeded.
         .def(

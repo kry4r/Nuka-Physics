@@ -94,6 +94,10 @@ struct SensorAttachment {
     // camera/lidar re-attach so an observation pipeline keeps its selected planes.
     uint32_t aov_mask = 0u;
     uint64_t revision = 1u;
+    // Built from the scene's authored cameras and lidars, so a scene rebuild re-attaches it.
+    bool from_scene = false;
+    // Scene node path per render instance (the PRIM plane's instance field); empty for particles.
+    std::vector<std::string> instance_paths;
     std::vector<nuka::sensor::CameraResponse> camera_responses;
     std::vector<nuka::sensor::RangeResponse> depth_responses, lidar_responses;
     SensorAttachment();     // out-of-line (the SensorDesc vector member is incomplete here).
@@ -287,5 +291,10 @@ WorldRecipe MakeWorldRecipe(const nuka_world_desc_t& desc);
 // create path). On failure returns the cook or build error and leaves *out null.
 nuka_result_t CreateWorld(DeviceRecord* device, WorldRecipe recipe, nuka::scene::SceneIR&& scene,
                           std::string scene_dir, nuka_world_handle* out);
+
+// Replaces the record's sensors with the scene's authored cameras and lidars (defined in
+// sensor.cpp), carrying render settings and imaging models from `previous`.
+nuka_result_t AttachSceneSensors(WorldRecord& record, const SensorAttachment* previous,
+                                 uint32_t* cameras, uint32_t* lidars);
 
 } // namespace nuka::c_abi

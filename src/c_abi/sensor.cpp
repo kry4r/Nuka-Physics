@@ -4,7 +4,8 @@
 // S cameras per env (each attach appends one mount) rendered into a single
 // (env_count, sensors_per_env, height, width, channels) device AOV tensor using
 // the persistent high-quality sensor trace. The in-the-loop observation stack
-// reads zero-copy (nuka_world_get_sensor_view + torch.from_dlpack); no host download.
+// reads zero-copy (nuka_world_get_sensor_view + torch.from_dlpack); tools copy single
+// tiles to host with nuka_world_download_sensor.
 //
 // THE COOK BRIDGE: the per-env visual binding (which mesh/material each visual
 // instance is + the link/body it follows + its physics->visual offset) is built
@@ -25,9 +26,12 @@
 #include "render/rt_adapter.hpp"
 #include "render/sensor_backend.hpp"
 #include "scene/cook/cook_to_model.hpp"
+#include "scene/scene_map.hpp"
 #include "scene/scene_ir.hpp"
 
+#include <cstring>
 #include <exception>
+#include <string>
 #include <vector>
 
 namespace nuka::c_abi {
@@ -78,8 +82,11 @@ void CarryImagingModels(SensorAttachment& target, const SensorAttachment* previo
 }
 
 // Lower the world's cooked scene to the env-shared sensor binding: RenderWorld ->
-// TwoLevelScene + per-instance rows/blas_id/material_id. False if no geometry.
-bool BuildSensorSceneDesc(const WorldRecord& record, nuka::render::SensorSceneDesc* out) {
+// TwoLevelScene + per-instance rows/blas_id/material_id and scene node paths. False if no
+// geometry. `authored` receives the scene's cameras and lidars with mounts on live pose rows.
+bool BuildSensorSceneDesc(const WorldRecord& record, nuka::render::SensorSceneDesc* out,
+                          std::vector<std::string>* paths,
+                          std::vector<nuka::scene::SensorDesc>* authored) {
     const auto& scene = *record.scene;
     const uint32_t env_count = record.world->EnvCount();
     // Cook to recover the EntityId<->row SceneMap (the binding render needs), at
@@ -113,6 +120,7 @@ bool BuildSensorSceneDesc(const WorldRecord& record, nuka::render::SensorSceneDe
         r.cached_visual_local[6] = inst.cached_visual_local.rotation.z;
         out->rows.push_back(r);
         out->blas_id.push_back(inst.mesh_id);  // blas_id == mesh_id (1:1 mesh map).
+        paths->push_back(scene.Tree().PathOf(scene.Ecs().NodeOf(inst.entity)));
         out->material_id.push_back((inst.render_material_id < mat_count)
                                        ? inst.render_material_id
                                        : default_mat_id);
@@ -142,8 +150,26 @@ bool BuildSensorSceneDesc(const WorldRecord& record, nuka::render::SensorSceneDe
         surface.normal_offset = topology.normal_offset;
         surface.smooth_iters = topology.smooth_iters;
         surface.smooth_lambda = topology.smooth_lambda;
+        paths->emplace_back();
         nuka::render::AppendParticleSurface(*out, std::move(surface),
             topology.render_material_id < mat_count ? topology.render_material_id : default_mat_id);
+    }
+    if (authored) for (nuka::scene::SensorDesc s : scene.Sensors()) {
+        using Type = nuka::scene::SensorType;
+        if (s.type != Type::Camera && s.type != Type::Depth && s.type != Type::Lidar &&
+            s.type != Type::RangeScan) continue;
+        if (s.joint_id != nuka::scene::kInvalidJoint) {
+            s.mount = nuka::scene::MountFrame::Body;
+            s.mount_index = scene.GetJoint(s.joint_id).child_body;
+        }
+        if (s.mount == nuka::scene::MountFrame::Body) {
+            const auto* binding = cooked.scene_map.RefOf(scene.EntityOfBody(s.mount_index));
+            if (binding->link_index != nuka::scene::SceneMap::kNoRow) {
+                s.mount = nuka::scene::MountFrame::Link;
+                s.mount_index = binding->link_index;
+            } else s.mount_index = binding->body_row;
+        }
+        authored->push_back(s);
     }
     return !out->rows.empty();
 }
@@ -227,7 +253,148 @@ void SplitSensors(const std::vector<nuka::scene::SensorDesc>& all,
 
 }  // namespace nuka::c_abi
 
+namespace nuka::c_abi {
+
+// Cameras share one image size and lidars one fan, as the batched tensors require. Render
+// settings carry from `previous`; without one the first camera's authored AOV mask applies.
+nuka_result_t AttachSceneSensors(WorldRecord& record, const SensorAttachment* previous,
+                                 uint32_t* cameras, uint32_t* lidars) {
+    std::unique_ptr<nuka::render::SensorBackendI> backend = nuka::render::CreateCudaSensorBackend();
+    if (!backend) return NUKA_RESULT_NOT_SUPPORTED;
+    nuka::render::SensorSceneDesc desc;
+    std::vector<std::string> paths;
+    std::vector<nuka::scene::SensorDesc> authored, cams, fans;
+    const bool geometry = BuildSensorSceneDesc(record, &desc, &paths, &authored);
+    SplitSensors(authored, &cams, &fans);
+    if (cameras) *cameras = static_cast<uint32_t>(cams.size());
+    if (lidars) *lidars = static_cast<uint32_t>(fans.size());
+    if (cams.empty() && fans.empty()) {
+        record.sensor.reset();
+        return NUKA_RESULT_OK;
+    }
+    if (!geometry) return NUKA_RESULT_NOT_SUPPORTED;
+    for (const auto& s : cams)
+        if (s.cam.width == 0u || s.cam.height == 0u || s.cam.width != cams[0].cam.width ||
+            s.cam.height != cams[0].cam.height) return NUKA_RESULT_INVALID_ARG;
+    for (const auto& s : fans)
+        if (s.lidar.az_count == 0u || s.lidar.el_count == 0u ||
+            s.lidar.az_count != fans[0].lidar.az_count || s.lidar.el_count != fans[0].lidar.el_count)
+            return NUKA_RESULT_INVALID_ARG;
+    desc.sensors = cams;
+    desc.sensors.insert(desc.sensors.end(), fans.begin(), fans.end());
+    nuka::render::SensorSceneHandle* handle = backend->BuildSensorScene(desc);
+    if (handle == nullptr) return NUKA_RESULT_INTERNAL;
+    auto attach = std::make_unique<SensorAttachment>();
+    attach->backend = std::move(backend);
+    attach->handle = handle;
+    attach->sensors = std::move(desc.sensors);
+    attach->instance_paths = std::move(paths);
+    attach->width = cams.empty() ? 0u : cams[0].cam.width;
+    attach->height = cams.empty() ? 0u : cams[0].cam.height;
+    attach->lidar_az = fans.empty() ? 0u : fans[0].lidar.az_count;
+    attach->lidar_el = fans.empty() ? 0u : fans[0].lidar.el_count;
+    attach->lidars_per_env = static_cast<uint32_t>(fans.size());
+    attach->from_scene = true;
+    attach->aov_mask = cams.empty() ? 0u : cams[0].aov_mask;
+    if (previous) {
+        attach->render_dr = previous->render_dr;
+        attach->fidelity = previous->fidelity;
+        attach->aov_mask = previous->aov_mask;
+    }
+    if (attach->render_dr.enabled)
+        attach->backend->SetRenderDr(attach->handle, attach->render_dr, record.world->EnvCount());
+    attach->backend->SetSensorFidelity(attach->handle, attach->fidelity);
+    attach->backend->SetSensorAovMask(attach->handle, attach->aov_mask);
+    CarryImagingModels(*attach, previous, previous && previous->width == attach->width &&
+                                              previous->height == attach->height);
+    record.sensor = std::move(attach);
+    return NUKA_RESULT_OK;
+}
+
+}  // namespace nuka::c_abi
+
 extern "C" {
+
+nuka_result_t nuka_world_attach_scene_sensors(nuka_world_handle world, uint32_t* cameras,
+                                              uint32_t* lidars) {
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->world || !record->scene) return NUKA_RESULT_NOT_SUPPORTED;
+    try {
+        return nuka::c_abi::AttachSceneSensors(*record, record->sensor.get(), cameras, lidars);
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+nuka_result_t nuka_world_download_sensor(nuka_world_handle world, nuka_sensor_channel_t channel,
+                                         uint32_t env, uint32_t sensor, void* out,
+                                         uint64_t capacity, uint64_t* out_count) {
+    if (out_count != nullptr) *out_count = 0u;
+    if (channel > NUKA_SENSOR_CHANNEL_RANGE) return NUKA_RESULT_INVALID_ARG;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->sensor || !record->sensor->rendered) return NUKA_RESULT_NOT_SUPPORTED;
+    try {
+        const nuka::c_abi::SensorAttachment& s = *record->sensor;
+        const nuka::render::SensorAovShape shape = s.backend->AovShape(s.handle);
+        const nuka::render::SensorRangeShape range = s.backend->RangeShape(s.handle);
+        const bool lidar = channel == NUKA_SENSOR_CHANNEL_RANGE;
+        const uint32_t envs = lidar ? range.env_count : shape.env_count;
+        const uint32_t per_env = lidar ? range.sensors_per_env : shape.sensors_per_env;
+        if (env >= envs || sensor >= per_env) return NUKA_RESULT_INVALID_ARG;
+        const bool rgb = channel == NUKA_SENSOR_CHANNEL_COLOR || channel == NUKA_SENSOR_CHANNEL_NORMAL ||
+                         channel == NUKA_SENSOR_CHANNEL_ALBEDO;
+        const uint64_t tile = lidar ? uint64_t{range.az_count} * range.el_count
+                                    : uint64_t{shape.height} * shape.width * (rgb ? 3u : 1u);
+        const void* base = nullptr;
+        switch (channel) {
+            case NUKA_SENSOR_CHANNEL_COLOR: base = s.backend->SensorColorDevice(s.handle); break;
+            case NUKA_SENSOR_CHANNEL_DEPTH: base = s.backend->SensorDepthDevice(s.handle); break;
+            case NUKA_SENSOR_CHANNEL_NORMAL: base = s.backend->SensorNormalDevice(s.handle); break;
+            case NUKA_SENSOR_CHANNEL_ALBEDO: base = s.backend->SensorAlbedoDevice(s.handle); break;
+            case NUKA_SENSOR_CHANNEL_PRIM: base = s.backend->SensorPrimDevice(s.handle); break;
+            case NUKA_SENSOR_CHANNEL_RANGE: base = s.backend->SensorRangeDevice(s.handle); break;
+        }
+        if (base == nullptr) return NUKA_RESULT_NOT_SUPPORTED;
+        if (out_count != nullptr) *out_count = tile;
+        if (out == nullptr) return NUKA_RESULT_OK;
+        if (capacity < tile) return NUKA_RESULT_INVALID_ARG;
+        // Every plane holds 4-byte elements (float, or uint32 for PRIM).
+        const size_t offset = static_cast<size_t>((uint64_t{env} * per_env + sensor) * tile * 4u);
+        s.backend->DownloadSensorOutput(static_cast<const char*>(base) + offset, out,
+                                        static_cast<size_t>(tile * 4u));
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+nuka_result_t nuka_world_get_sensor_instances(nuka_world_handle world, char* out, size_t cap,
+                                              size_t* out_len) {
+    if (out_len != nullptr) *out_len = 0u;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->sensor) return NUKA_RESULT_NOT_SUPPORTED;
+    std::string joined;
+    for (const std::string& path : record->sensor->instance_paths) {
+        joined += path;
+        joined += '\n';
+    }
+    if (out_len != nullptr) *out_len = joined.size();
+    if (out == nullptr) return NUKA_RESULT_OK;
+    if (joined.size() + 1u > cap) return NUKA_RESULT_INVALID_ARG;
+    std::memcpy(out, joined.c_str(), joined.size() + 1u);
+    return NUKA_RESULT_OK;
+}
 
 nuka_result_t nuka_world_attach_camera_sensor(nuka_world_handle world,
                                               nuka_sensor_mount_t mount_frame,
@@ -260,7 +427,8 @@ nuka_result_t nuka_world_attach_camera_sensor(nuka_world_handle world,
         }
 
         nuka::render::SensorSceneDesc desc;
-        if (!nuka::c_abi::BuildSensorSceneDesc(*record, &desc)) {
+        std::vector<std::string> paths;
+        if (!nuka::c_abi::BuildSensorSceneDesc(*record, &desc, &paths, nullptr)) {
             return NUKA_RESULT_NOT_SUPPORTED;  // scene has no renderable geometry.
         }
 
@@ -307,6 +475,7 @@ nuka_result_t nuka_world_attach_camera_sensor(nuka_world_handle world,
         attach->backend = std::move(backend);
         attach->handle = handle;
         attach->sensors = std::move(desc.sensors);
+        attach->instance_paths = std::move(paths);
         attach->width = width;
         attach->height = height;
         attach->rendered = false;
@@ -377,7 +546,8 @@ nuka_result_t nuka_world_attach_lidar_sensor(nuka_world_handle world,
         }
 
         nuka::render::SensorSceneDesc desc;
-        if (!nuka::c_abi::BuildSensorSceneDesc(*record, &desc)) {
+        std::vector<std::string> paths;
+        if (!nuka::c_abi::BuildSensorSceneDesc(*record, &desc, &paths, nullptr)) {
             return NUKA_RESULT_NOT_SUPPORTED;  // scene has no renderable geometry.
         }
 
@@ -410,6 +580,7 @@ nuka_result_t nuka_world_attach_lidar_sensor(nuka_world_handle world,
         attach->backend = std::move(backend);
         attach->handle = handle;
         attach->sensors = std::move(desc.sensors);
+        attach->instance_paths = std::move(paths);
         attach->width = carry_w;
         attach->height = carry_h;
         attach->rendered = false;
@@ -726,7 +897,8 @@ nuka_result_t nuka_world_set_camera_intrinsics(
         // Apply the lens knobs onto every stored camera (width/height/vfov/mount
         // unchanged) and rebuild the sensor scene from the SAME cooked binding.
         nuka::render::SensorSceneDesc rebuilt;
-        if (!nuka::c_abi::BuildSensorSceneDesc(*record, &rebuilt)) {
+        std::vector<std::string> paths;
+        if (!nuka::c_abi::BuildSensorSceneDesc(*record, &rebuilt, &paths, nullptr)) {
             return NUKA_RESULT_NOT_SUPPORTED;
         }
         rebuilt.sensors = s.sensors;
@@ -746,6 +918,7 @@ nuka_result_t nuka_world_set_camera_intrinsics(
         s.backend->FreeSensorScene(s.handle);
         s.handle = handle;
         s.sensors = std::move(rebuilt.sensors);
+        s.instance_paths = std::move(paths);
         s.rendered = false;
         // Re-apply the retained per-env DR + default high-quality sensor profile.
         if (s.render_dr.enabled) {

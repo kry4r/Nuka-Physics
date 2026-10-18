@@ -395,7 +395,8 @@ nuka_result_t nuka_world_get_asset_root(nuka_world_handle world, char* out, size
 
 enum { NUKA_REBUILD_INITIAL_STATE = 1 };
 // Recooks the world in place from a scene file with its creation options and increments the generation.
-// Body and joint state carry over by unique body name unless INITIAL_STATE; attached sensors refuse it.
+// Body and joint state carry over by unique body name unless INITIAL_STATE. Scene-authored sensors
+// re-attach from the new scene; explicitly attached or runtime-added sensors refuse it.
 nuka_result_t nuka_world_rebuild_from_scene(nuka_world_handle world, const char* scene_path,
                                             uint32_t flags);
 // The same rebuild from the scene's initial state with `env_count` environments; later rebuilds keep it.
@@ -1274,6 +1275,28 @@ nuka_result_t nuka_world_set_sensor_aov_mask(nuka_world_handle world,
 nuka_result_t nuka_world_get_sensor_view(nuka_world_handle world,
                                          nuka_sensor_channel_t channel,
                                          nuka_buffer_view_t* out);
+
+// Copies one (env, sensor) tile of `channel` to host memory after a render: H*W*ch values
+// for camera planes, az*el for RANGE; all are 4-byte float (uint32 for PRIM). *out_count
+// gets the tile's value count; a NULL `out` only reports it, and INVALID_ARG means `capacity`
+// (in values) is short or env/sensor is out of range. NOT_SUPPORTED before the first render.
+nuka_result_t nuka_world_download_sensor(nuka_world_handle world, nuka_sensor_channel_t channel,
+                                         uint32_t env, uint32_t sensor, void* out,
+                                         uint64_t capacity, uint64_t* out_count);
+
+// Replaces the world's sensors with the scene's authored Camera/Depth and Lidar/RangeScan
+// records, mounted as the cook mounts state sensors. Cameras must share one image size and
+// lidars one fan (else INVALID_ARG). Render DR, fidelity, AOV mask and imaging models carry
+// from the current attachment. A scene without such records detaches all sensors. A scene
+// rebuild re-runs this for an attachment made here. Counts may be NULL.
+nuka_result_t nuka_world_attach_scene_sensors(nuka_world_handle world, uint32_t* cameras,
+                                              uint32_t* lidars);
+
+// The scene node path of each render instance of the attached sensor scene, one per line
+// in the order the PRIM plane's instance field indexes them (empty lines for particle
+// surfaces). Sizes like nuka_world_get_asset_root. NOT_SUPPORTED without an attachment.
+nuka_result_t nuka_world_get_sensor_instances(nuka_world_handle world, char* out, size_t cap,
+                                              size_t* out_len);
 
 // The attached sensor block's logical shape: env_count, sensors_per_env (S cameras
 // per env), per-camera height/width, and `channels` (3 for the color/normal/albedo

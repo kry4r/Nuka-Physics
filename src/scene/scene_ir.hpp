@@ -556,6 +556,8 @@ public:
 
     SensorId AddSensor(std::string name, BodyId body);
     SensorId AddSensor(SensorDesc record);
+    // Erases one sensor record; later sensors shift down one id.
+    void     RemoveSensor(SensorId id);
     MaterialId AddMaterial(MaterialRecord record);
     CameraId AddCamera(CameraRecord record);
     LightId AddLight(LightRecord record);

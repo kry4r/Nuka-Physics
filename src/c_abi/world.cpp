@@ -1342,9 +1342,10 @@ nuka_result_t nuka_world_rebuild_from_scene(nuka_world_handle world, const char*
     auto* record = nuka::c_abi::WorldTable().Get(world);
     if (record == nullptr) return NUKA_RESULT_NULL_HANDLE;
     if (!record->world) return NUKA_RESULT_NOT_SUPPORTED;
-    // Sensors and observations bind to the cooked layout and are not carried across.
-    if (record->sensor || !record->field_observations.empty() ||
-        record->world->StateSensors().Count() != 0u)
+    // Explicit sensors, runtime state sensors and observations bind to the cooked layout and
+    // are not carried; scene-authored sensors are re-cooked with the new scene.
+    if ((record->sensor && !record->sensor->from_scene) || !record->field_observations.empty() ||
+        record->world->StateSensors().Count() != record->world->GetModel().state_sensors.size())
         return NUKA_RESULT_NOT_SUPPORTED;
     try {
         using nuka::phi::Status;
@@ -1370,6 +1371,7 @@ nuka_result_t nuka_world_rebuild_from_scene(nuka_world_handle world, const char*
             status = rebuilt->SetExecutionMode(nuka::nk::World::ExecutionMode::Graph);
         if (status != Status::Ok) return nuka::c_abi::MapStatusToResult(status);
 
+        const std::unique_ptr<nuka::c_abi::SensorAttachment> sensors = std::move(record->sensor);
         // Leased storage stays alive until its last view releases it.
         {
             std::lock_guard<std::mutex> lock(nuka::c_abi::LeaseMutex());
@@ -1385,6 +1387,7 @@ nuka_result_t nuka_world_rebuild_from_scene(nuka_world_handle world, const char*
         record->invariant_sampler.Reset();
         record->last_invariant_violations.clear();
         if (initial) record->simulated_step_count = 0u;
+        if (sensors) return nuka::c_abi::AttachSceneSensors(*record, sensors.get(), nullptr, nullptr);
         return NUKA_RESULT_OK;
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;

@@ -143,6 +143,10 @@ public:
         return rt::SensorPrimDevice(handle->scene);
     }
 
+    void DownloadSensorOutput(const void* device, void* host, size_t bytes) const override {
+        rt::DownloadSensorOutput(device, host, bytes, backend_);
+    }
+
     SensorAovShape AovShape(const SensorSceneHandle* handle) const override {
         return handle->shape;
     }
