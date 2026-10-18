@@ -74,7 +74,7 @@ struct TickCommand {
     PoseWrite pose;                       // EditApply, Teleport
     ParamKind param = ParamKind::Field;   // ParamSet
     nuka_state_field_t field = NUKA_FIELD_DRIVE_TARGET;
-    size_t offset = 0u;                   // bytes into the field
+    size_t offset = 0u;                   // bytes into the field; TargetTrack: 1 repeats its rows
     // Registry parameter; TargetRamp: its length in steps; TargetTrack: its rows; GainTest: the link.
     uint32_t index = 0u;
     uint32_t element = 0u;                // Registry element; TargetTrack: the links of a row
@@ -454,13 +454,14 @@ private:
     };
     TargetRamp ramp_;
     // Rows of environment `env`'s drive targets, one per step from tick `start`, written in place
-    // of the controller; empty `values` is none.
+    // of the controller, over and over with `loop`; empty `values` is none.
     struct TargetTrack {
         uint64_t start = 0u;
         uint32_t rows = 0u;
         uint32_t columns = 0u;  // the links of a row, the first `columns` values
         uint32_t env = 0u;
         std::vector<float> values;
+        bool loop = false;
     };
     TargetTrack track_;
     std::vector<float> track_scratch_;

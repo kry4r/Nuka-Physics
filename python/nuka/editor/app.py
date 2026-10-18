@@ -329,6 +329,89 @@ class Demos:
         return self._app.actions.run("demo.discard", **({} if episode is None else {"episode": episode}))
 
 
+class Clips:
+    """Joint animation clips through the ``clip.*`` actions. A clip keys drive targets per joint with
+    step, linear or Bezier interpolation; ``clip`` names one, else the edited clip is meant."""
+
+    def __init__(self, app: "EditorApp"):
+        self._app = weakref.proxy(app)
+
+    def _run(self, action: str, **args) -> dict:
+        return self._app.actions.run(action, **{k: v for k, v in args.items() if v is not None})
+
+    def list(self) -> dict:
+        """The clips, the edited one with its playhead and selection, and the clip playing."""
+        return self._run("clip.list")
+
+    def get(self, clip: Optional[str] = None) -> dict:
+        """A clip's {name, duration, loop, tracks: [{joint, keys: [{time, value, interp, in, out}]}]}."""
+        return self._run("clip.get", clip=clip)
+
+    def new(self, name: Optional[str] = None, duration: float = 1.0, loop: bool = False) -> dict:
+        return self._run("clip.new", name=name, duration=duration, loop=loop)
+
+    def set(self, clip: Optional[str] = None, duration: Optional[float] = None, loop: Optional[bool] = None) -> dict:
+        return self._run("clip.set", clip=clip, duration=duration, loop=loop)
+
+    def rename(self, to: str, clip: Optional[str] = None) -> dict:
+        return self._run("clip.rename", clip=clip, to=to)
+
+    def remove(self, clip: Optional[str] = None) -> dict:
+        return self._run("clip.remove", clip=clip)
+
+    def key(self, joint: Optional[str] = None, time: Optional[float] = None, value: Optional[float] = None,
+            interp: Optional[str] = None, slope_in: Optional[float] = None, slope_out: Optional[float] = None,
+            keys: Optional[list] = None, clip: Optional[str] = None) -> dict:
+        """Set one key, or each of ``keys`` [{joint, time, value, interp, in, out}]; time defaults to the
+        playhead and value to the joint's drive target."""
+        return self._run("clip.key", clip=clip, joint=joint, time=time, value=value, interp=interp,
+                         keys=keys, **{"in": slope_in, "out": slope_out})
+
+    def key_pose(self, time: Optional[float] = None, pose: Optional[str] = None, source: Optional[str] = None,
+                 clip: Optional[str] = None) -> dict:
+        """Key every joint from library pose ``pose``, else the live positions (``source`` "q") or the
+        drive targets ("target")."""
+        return self._run("clip.key_pose", clip=clip, time=time, pose=pose, **{"from": source})
+
+    def remove_keys(self, keys: Optional[list] = None, joint: Optional[str] = None, time: Optional[float] = None,
+                    clip: Optional[str] = None) -> dict:
+        """Remove ``keys`` [{joint, time}], else those of ``joint`` and/or at ``time``, else the selection."""
+        return self._run("clip.remove_keys", clip=clip, keys=keys, joint=joint, time=time)
+
+    def move_keys(self, dt: float = 0.0, dv: float = 0.0, keys: Optional[list] = None,
+                  clip: Optional[str] = None) -> dict:
+        return self._run("clip.move_keys", clip=clip, keys=keys, dt=dt, dv=dv)
+
+    def sample(self, time: Optional[float] = None, apply: bool = False, clip: Optional[str] = None) -> dict:
+        """Each keyed joint's value at ``time``; ``apply`` makes them the drive targets at once."""
+        return self._run("clip.sample", clip=clip, time=time, apply=apply)
+
+    def play(self, clip: Optional[str] = None, loop: Optional[bool] = None, play: bool = True) -> dict:
+        """Drive the shown environment through the clip a step a row; ``play`` starts the transport."""
+        return self._run("clip.play", clip=clip, loop=loop, play=play)
+
+    def stop(self) -> dict:
+        return self._run("clip.stop")
+
+    def save(self, path: str, clip: Optional[str] = None) -> dict:
+        """Write the clip as portable ``.nkclip.json``."""
+        return self._run("clip.save", clip=clip, path=path)
+
+    def load(self, path: str) -> dict:
+        """Add a ``.nkclip.json`` clip, replacing one of its name."""
+        return self._run("clip.load", path=path)
+
+    def editor(self, on: Optional[bool] = None, **args) -> dict:
+        """Open or close the Clip Editor and set its clip, playhead, auto_key, interp, curve and selected."""
+        return self._run("clip.editor", on=on, **args)
+
+    def undo(self) -> dict:
+        return self._run("clip.undo")
+
+    def redo(self) -> dict:
+        return self._run("clip.redo")
+
+
 class EditorApp:
     """The editor over a world: a window, or a display-less surface with ``--offscreen``.
 
@@ -358,6 +441,7 @@ class EditorApp:
         self.teleop = Teleop(self)
         self.policy = Policy(self)
         self.demos = Demos(self)
+        self.clips = Clips(self)
         self.ui = UI(weakref.proxy(self))
         atexit.register(self.close)
 

@@ -846,6 +846,42 @@ bool ReadPoses(const std::string& path, std::vector<JointPose>* out) {
     return true;
 }
 
+// The clip undo history's depth, and the frames within which merging commits fold together.
+constexpr size_t kClipUndoDepth = 100u;
+constexpr uint64_t kClipMergeFrames = 15u;
+
+// {"clips": [...]}, as the profile keeps a document's clips.
+json::Value ClipsJson(const std::vector<Clip>& clips) {
+    json::Value list = json::Value::Array();
+    for (const Clip& c : clips) list.PushBack(ClipJson(c));
+    return Object({{"clips", std::move(list)}});
+}
+
+// The clips a file holds; false when it cannot be read.
+bool ReadClips(const std::string& path, std::vector<Clip>* out) {
+    std::string text;
+    if (!ReadEntireFile(path, &text)) return false;
+    const json::Value doc = json::Value::Parse(text);
+    std::vector<Clip> clips;
+    for (const json::Value& c : doc.At("clips").Elements()) clips.push_back(ClipFromJson(c));
+    *out = std::move(clips);
+    return true;
+}
+
+json::Value KeyRefsJson(const std::vector<ClipKeyRef>& keys) {
+    json::Value list = json::Value::Array();
+    for (const ClipKeyRef& k : keys)
+        list.PushBack(Object({{"joint", json::Value::Str(k.joint)}, {"time", json::Value::Float(k.time)}}));
+    return list;
+}
+
+// [{joint, time}] as key refs.
+std::vector<ClipKeyRef> KeyRefsArg(const json::Value& list) {
+    std::vector<ClipKeyRef> keys;
+    for (const json::Value& k : list.Elements()) keys.push_back(ClipKeyRef{k.At("joint").AsString(), k.At("time").AsFloat()});
+    return keys;
+}
+
 // The most recent samples of one frame timing.
 struct SampleWindow {
     std::vector<double> values;
@@ -907,6 +943,7 @@ struct EditorHost::State : DocumentHost {
     void RegisterTeleopActions();
     void RegisterPolicyActions();
     void RegisterDemoActions();
+    void RegisterClipActions();
     json::Value TimelineStatus();
     // What a recording must match to load: the document, the world's counts and step, and the
     // names of the link and body rows its poses fill.
@@ -981,6 +1018,25 @@ struct EditorHost::State : DocumentHost {
     std::string PoseFile() const;
     JointPose* FindPose(const std::string& name);
     void SavePoses();
+    // The document's clip file in the profile; empty while untitled.
+    std::string ClipFile() const;
+    void SaveClips();
+    int FindClip(const std::string& name) const;
+    // The clip `args` names as `clip`, else the edited one; -1 with `error` saying why when none.
+    int ClipArg(const json::Value& args, std::string* error) const;
+    // The clips as they stand become an undo point and the profile's copy; a `merge` soon after
+    // another folds into its point, so one slider drag undoes at once.
+    void CommitClips(bool merge = false);
+    void RestoreClips(std::vector<Clip> clips);
+    // Fits the editor's clip, selection, playhead and undo state to the clips.
+    void SyncClipView();
+    // An editor change of the clips in place becomes an undo point.
+    void SyncClips();
+    json::Value ClipStatus() const;
+    // With auto-key on, keys the edited clip at the playhead with the drive targets of `links`.
+    void AutoKey(const std::vector<uint32_t>& links);
+    // Drives the shown environment through clip `k` sampled a row a step.
+    ActionResult PlayClip(size_t k, bool loop, bool play);
     // A load on the link or free body `inst` draws, acting at the world point `at` with a spring of
     // `gain` times the default toward it; false for an instance no dynamics move.
     bool BodyLoad(const render::RenderInstance& inst, const math::Vec3& at, float gain, Perturbation* out) const;
@@ -1073,7 +1129,7 @@ struct EditorHost::State : DocumentHost {
     json::Value PolicyStatus();
     // Ends the demonstration recording; each environment's consecutive steps become an episode.
     void StopDemo();
-    // Ends a replay; the drive targets keep its last row.
+    // Ends a demonstration replay or clip playback; the drive targets keep their last row.
     void StopReplay();
     void SyncDemoView();
     json::Value DemoStatus() const;
@@ -1113,7 +1169,10 @@ struct EditorHost::State : DocumentHost {
     DemoSet demos_;              // the demonstrations recorded or loaded
     bool demo_recording_ = false;
     std::vector<float> demo_axes_;  // the teleop axes last sent while recording, by the set's names
-    uint64_t demo_play_seq_ = 0u;   // the replay's track command
+    uint64_t track_seq_ = 0u;       // the newest target track command, a replay's or a clip's
+    std::vector<Clip> clips_saved_;  // the clips at the newest undo point
+    std::vector<std::vector<Clip>> clip_undo_, clip_redo_;
+    uint64_t clip_merge_until_ = 0u;  // merging commits before this frame fold into the newest point
     std::unique_ptr<EditorScene> loaded_;
     bool attach_pending_ = false;
     EntityDrag entity_drag_;
@@ -1896,6 +1955,8 @@ void EditorHost::State::BindWorker(uint64_t tick, double sim_time) {
     }
     ui_state_.demos.playing = -1;
     ui_state_.demos.left = 0u;
+    ui_state_.clips.playing = -1;
+    ui_state_.clips.left = 0u;
     teleop_command_sent_.reset();
     bound_epoch_ = worker_.Bind(std::move(binding));
     ui_state_.robot.ik.pending = 0u;
@@ -1923,10 +1984,16 @@ void EditorHost::State::ApplySnapshot(const Snapshot& snap) {
     ui_state_.robot.live = snap.joints;
     RecordPolicyNorm(snap);
     DemoView& demo = ui_state_.demos;
+    ClipView& clips = ui_state_.clips;
     demo.samples = worker_.DemoCount();
-    if (snap.acked >= demo_play_seq_) {
-        demo.left = snap.track_left;
-        if (demo.left == 0u) demo.playing = -1;
+    // The newest track command reports how far its replay or clip has come; the edited clip's
+    // playhead follows its playback.
+    if (snap.acked >= track_seq_) {
+        demo.left = clips.left = snap.track_left;
+        if (clips.playing >= 0 && clips.playing == clips.edited)
+            clips.playhead = clips.left == 0u ? clips.clips[static_cast<size_t>(clips.edited)].duration
+                                              : static_cast<float>((clips.rows - clips.left) % clips.rows) * opt_.dt;
+        if (snap.track_left == 0u) demo.playing = clips.playing = -1;
     }
     ui_state_.robot.link_poses = snap.link_poses;
     // A spring draws as a band to its target, a plain force as an arrow along it.
@@ -2075,8 +2142,13 @@ int EditorHost::State::IkLink() const {
 void EditorHost::State::TakeIkReport(const IkReport& report) {
     IkState& ik = ui_state_.robot.ik;
     if (report.request >= ik.pending) ik.pending = 0u;
-    for (size_t l = 0; l < std::min(report.targets.size(), ui_state_.drive_targets.size()); ++l)
-        if (ui_state_.drive_dirty[l] == 0u) ui_state_.drive_targets[l] = report.targets[l];
+    std::vector<uint32_t> moved;
+    for (size_t l = 0; l < std::min(report.targets.size(), ui_state_.drive_targets.size()); ++l) {
+        if (ui_state_.drive_dirty[l] != 0u || ui_state_.drive_targets[l] == report.targets[l]) continue;
+        ui_state_.drive_targets[l] = report.targets[l];
+        moved.push_back(static_cast<uint32_t>(l));
+    }
+    AutoKey(moved);
     ik.error = report.error;
     if (ik.link < 0 || report.position_error.empty()) return;
     ik.error_mm = report.position_error[0] * 1000.0f;
@@ -2441,6 +2513,7 @@ void EditorHost::State::PushEdits() {
     if (ui_state_.drive_dirty.size() == ui_state_.drive_targets.size()) {
         const WorldLayout& layout = loaded_->Layout();
         const size_t env = ui_state_.env_index % layout.env_count;
+        std::vector<uint32_t> moved;
         for (size_t d = 0; d < ui_state_.drive_targets.size(); ++d) {
             if (!ui_state_.drive_dirty[d]) continue;
             TickCommand cmd = TickCommand::Param(ParamKind::Field, {ui_state_.drive_targets[d]});
@@ -2448,7 +2521,9 @@ void EditorHost::State::PushEdits() {
             cmd.offset = (env * layout.links_per_env + d) * sizeof(float);
             worker_.Push(std::move(cmd));
             ui_state_.drive_dirty[d] = 0u;
+            moved.push_back(static_cast<uint32_t>(d));
         }
+        AutoKey(moved);
     }
 }
 
@@ -2632,6 +2707,161 @@ void EditorHost::State::SavePoses() {
     }
     fs::create_directories(Utf8Path(file).parent_path());
     std::ofstream(Utf8Path(file), std::ios::binary | std::ios::trunc) << PosesJson(poses).Dump(2);
+}
+
+std::string EditorHost::State::ClipFile() const {
+    return doc_path_.empty() ? std::string() : PathText(profile_->Dir() / "clips" / (Hex(Fnv1a(doc_path_)) + ".json"));
+}
+
+void EditorHost::State::SaveClips() {
+    const std::string file = ClipFile();
+    const std::vector<Clip>& clips = ui_state_.clips.clips;
+    if (file.empty()) return;
+    if (clips.empty()) {
+        fs::remove(Utf8Path(file));
+        return;
+    }
+    fs::create_directories(Utf8Path(file).parent_path());
+    std::ofstream(Utf8Path(file), std::ios::binary | std::ios::trunc) << ClipsJson(clips).Dump(2);
+}
+
+int EditorHost::State::FindClip(const std::string& name) const {
+    const std::vector<Clip>& clips = ui_state_.clips.clips;
+    const auto it = std::find_if(clips.begin(), clips.end(), [&](const Clip& c) { return c.name == name; });
+    return it == clips.end() ? -1 : static_cast<int>(it - clips.begin());
+}
+
+int EditorHost::State::ClipArg(const json::Value& args, std::string* error) const {
+    const std::string name = StrArg(args, "clip");
+    const int k = name.empty() ? ui_state_.clips.edited : FindClip(name);
+    if (k < 0) *error = name.empty() ? "no clip is being edited; name one with `clip`" : "no clip '" + name + "'";
+    return k;
+}
+
+void EditorHost::State::CommitClips(bool merge) {
+    if (!merge || frame_index_ >= clip_merge_until_) {
+        clip_undo_.push_back(std::move(clips_saved_));
+        if (clip_undo_.size() > kClipUndoDepth) clip_undo_.erase(clip_undo_.begin());
+    }
+    clip_redo_.clear();
+    clip_merge_until_ = merge ? frame_index_ + kClipMergeFrames : 0u;
+    clips_saved_ = ui_state_.clips.clips;
+    SaveClips();
+    SyncClipView();
+}
+
+void EditorHost::State::RestoreClips(std::vector<Clip> clips) {
+    ui_state_.clips.clips = clips;
+    clips_saved_ = std::move(clips);
+    clip_merge_until_ = 0u;
+    SaveClips();
+    SyncClipView();
+}
+
+void EditorHost::State::SyncClipView() {
+    ClipView& c = ui_state_.clips;
+    const int n = static_cast<int>(c.clips.size());
+    if (c.playing >= n) StopReplay();
+    c.edited = n == 0 ? -1 : std::clamp(c.edited, 0, n - 1);
+    if (c.edited >= 0) {
+        Clip& clip = c.clips[static_cast<size_t>(c.edited)];
+        std::erase_if(c.selected, [&](const ClipKeyRef& r) { return FindKey(&clip, r.joint, r.time) == nullptr; });
+        c.playhead = std::clamp(c.playhead, 0.0f, clip.duration);
+    } else {
+        c.selected.clear();
+    }
+    c.can_undo = !clip_undo_.empty();
+    c.can_redo = !clip_redo_.empty();
+    c.dt = opt_.dt;
+}
+
+void EditorHost::State::SyncClips() {
+    if (!ui_state_.clips.commit) return;
+    ui_state_.clips.commit = false;
+    CommitClips();
+}
+
+json::Value EditorHost::State::ClipStatus() const {
+    const ClipView& c = ui_state_.clips;
+    json::Value list = json::Value::Array();
+    for (const Clip& clip : c.clips) {
+        json::Value joints = json::Value::Array();
+        for (const ClipTrack& t : clip.tracks) joints.PushBack(json::Value::Str(t.joint));
+        list.PushBack(Object({{"name", json::Value::Str(clip.name)},
+                              {"duration", json::Value::Float(clip.duration)},
+                              {"loop", json::Value::Bool(clip.loop)},
+                              {"keys", json::Value::Int(static_cast<int64_t>(KeyCount(clip)))},
+                              {"joints", std::move(joints)}}));
+    }
+    const auto name = [&](int k) {
+        return k >= 0 ? json::Value::Str(c.clips[static_cast<size_t>(k)].name) : json::Value::Null();
+    };
+    return Object({{"clips", std::move(list)},
+                   {"edited", name(c.edited)},
+                   {"open", json::Value::Bool(c.open)},
+                   {"playhead", json::Value::Float(c.playhead)},
+                   {"auto_key", json::Value::Bool(c.auto_key)},
+                   {"interp", json::Value::Str(InterpName(c.interp))},
+                   {"curve", json::Value::Str(c.curve)},
+                   {"selected", KeyRefsJson(c.selected)},
+                   {"playing", name(c.playing)},
+                   {"loop", json::Value::Bool(c.playing >= 0 && c.looping)},
+                   {"left", json::Value::Int(c.left)},
+                   {"can_undo", json::Value::Bool(!clip_undo_.empty())},
+                   {"can_redo", json::Value::Bool(!clip_redo_.empty())}});
+}
+
+void EditorHost::State::AutoKey(const std::vector<uint32_t>& links) {
+    ClipView& c = ui_state_.clips;
+    if (!c.open || !c.auto_key || c.edited < 0 || c.playing >= 0 || links.empty()) return;
+    Clip& clip = c.clips[static_cast<size_t>(c.edited)];
+    for (const RobotJoint& j : ui_state_.robot.joints) {
+        if (std::find(links.begin(), links.end(), j.link) == links.end()) continue;
+        const float value = ui_state_.drive_targets[j.link];
+        // A key already at the playhead keeps its shape and takes the new value.
+        if (ClipKey* k = FindKey(&clip, j.name, c.playhead)) k->value = value;
+        else SetKey(&clip, j.name, ClipKey{c.playhead, value, c.interp});
+    }
+    CommitClips(true);
+}
+
+ActionResult EditorHost::State::PlayClip(size_t k, bool loop, bool play) {
+    ClipView& c = ui_state_.clips;
+    const Clip& clip = c.clips[k];
+    const RobotView& v = ui_state_.robot;
+    if (clip.tracks.empty()) return ActionResult::Fail("clip '" + clip.name + "' has no keys");
+    std::vector<float> values;
+    std::string missing;
+    for (const ClipTrack& t : clip.tracks) {
+        const int j = FindJoint(v.joints, t.joint);
+        if (j >= 0) values.push_back(static_cast<float>(v.joints[static_cast<size_t>(j)].link));
+        else missing += (missing.empty() ? "" : ", ") + t.joint;
+    }
+    if (!missing.empty()) return ActionResult::Fail("clip '" + clip.name + "' keys joints the robot lacks: " + missing);
+    // Row r holds the targets for the step that ends at (r + 1) dt.
+    const uint32_t rows = static_cast<uint32_t>(std::max(1L, std::lround(clip.duration / opt_.dt)));
+    for (uint32_t r = 0; r < rows; ++r) {
+        const float t = std::min(static_cast<float>(r + 1u) * opt_.dt, clip.duration);
+        for (const ClipTrack& track : clip.tracks) values.push_back(SampleTrack(track, t));
+    }
+    const uint32_t env = ui_state_.env_index % loaded_->Layout().env_count;
+    TickCommand cmd = TickCommand::Param(ParamKind::TargetTrack, std::move(values));
+    cmd.index = rows;
+    cmd.element = static_cast<uint32_t>(clip.tracks.size());
+    cmd.env = env;
+    cmd.offset = loop ? 1u : 0u;
+    track_seq_ = worker_.Push(std::move(cmd));
+    ui_state_.demos.playing = -1;
+    c.playing = static_cast<int>(k);
+    c.looping = loop;
+    c.rows = rows;
+    c.left = rows;
+    if (c.edited == c.playing) c.playhead = 0.0f;
+    if (play) ui_state_.playing = true;
+    return Ok(Object({{"clip", json::Value::Str(clip.name)},
+                      {"rows", json::Value::Int(rows)},
+                      {"loop", json::Value::Bool(loop)},
+                      {"env", json::Value::Int(env)}}));
 }
 
 const std::vector<std::string>& EditorHost::State::InstancePaths() {
@@ -3082,6 +3312,7 @@ ActionResult EditorHost::State::SaveScene(const std::string& path) {
     profile_->TouchRecent(doc_path_);
     SyncBookmarks(true);
     SavePoses();
+    SaveClips();
     start_stale_ = true;
     assets_stale_ = true;
     // The recent list shows the viewport as it was saved.
@@ -3112,6 +3343,17 @@ ActionResult EditorHost::State::OpenDocument(const std::string& file, const std:
     SyncBookmarks(false);
     ui_state_.robot.poses.clear();
     if (!doc_path_.empty()) ReadPoses(PoseFile(), &ui_state_.robot.poses);
+    ClipView& clips = ui_state_.clips;
+    clips.clips.clear();
+    if (!doc_path_.empty()) ReadClips(ClipFile(), &clips.clips);
+    clips.edited = 0;
+    clips.playhead = 0.0f;
+    clips.selected.clear();
+    clips.curve.clear();
+    clips_saved_ = clips.clips;
+    clip_undo_.clear();
+    clip_redo_.clear();
+    SyncClipView();
     start_stale_ = true;
     assets_stale_ = true;
     Emit(stdout, "[nuka_editor] opened " + file + "\n");
@@ -3340,6 +3582,7 @@ void EditorHost::State::RegisterRobotActions() {
     RegisterTeleopActions();
     RegisterPolicyActions();
     RegisterDemoActions();
+    RegisterClipActions();
 }
 
 void EditorHost::State::RegisterIkActions() {
@@ -3739,7 +3982,8 @@ void EditorHost::State::RegisterDemoActions() {
                       cmd.index = static_cast<uint32_t>(e.Steps());
                       cmd.element = static_cast<uint32_t>(demos_.links.size());
                       cmd.env = e.env;
-                      demo_play_seq_ = worker_.Push(std::move(cmd));
+                      track_seq_ = worker_.Push(std::move(cmd));
+                      ui_state_.clips.playing = -1;
                       ui_state_.demos.playing = static_cast<int>(k);
                       ui_state_.demos.left = static_cast<uint32_t>(e.Steps());
                       if (BoolArg(args, "play", true)) ui_state_.playing = true;
@@ -3819,6 +4063,337 @@ void EditorHost::State::RegisterDemoActions() {
                       if (ui_state_.demos.playing >= 0) StopReplay();
                       SyncDemoView();
                       return Ok(DemoStatus());
+                  }});
+}
+
+void EditorHost::State::RegisterClipActions() {
+    const auto has_robot = [this] { return loaded_ != nullptr && !ui_state_.robot.joints.empty(); };
+    const auto has_clip = [this] { return loaded_ != nullptr && ui_state_.clips.edited >= 0; };
+    // A key from {joint, time, value, interp, in, out}: the time defaults to the playhead, the value
+    // to the joint's drive target and the interpolation to the editor's; returns why it is not one.
+    const auto key_arg = [this](const json::Value& a, const Clip& clip, std::string* joint, ClipKey* key) {
+        const ClipView& c = ui_state_.clips;
+        const RobotView& v = ui_state_.robot;
+        *joint = StrArg(a, "joint");
+        const int j = FindJoint(v.joints, *joint);
+        if (j < 0) return "no joint '" + *joint + "'";
+        key->time = static_cast<float>(NumArg(a, "time", c.playhead));
+        if (!(key->time >= 0.0f && key->time <= clip.duration))
+            return Format("time: 0 to %g s", static_cast<double>(clip.duration));
+        key->value = static_cast<float>(NumArg(a, "value", ui_state_.drive_targets[v.joints[static_cast<size_t>(j)].link]));
+        key->interp = c.interp;
+        const std::string interp = StrArg(a, "interp");
+        if (!interp.empty() && !ParseInterp(interp, &key->interp)) return std::string("interp: step, linear or bezier");
+        key->in_slope = static_cast<float>(NumArg(a, "in", 0.0));
+        key->out_slope = static_cast<float>(NumArg(a, "out", 0.0));
+        return std::string();
+    };
+    // The clips, the edited one with its playhead and selection, and the clip playing.
+    actions_.Add({"clip.list", "Clips", "robot", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value&) { return Ok(ClipStatus()); }});
+    // A clip's tracks and keys, the edited clip's without `clip`.
+    actions_.Add({"clip.get", "Clip Keys", "robot", "", ShortcutScope::Global, has_clip, {},
+                  [this](const json::Value& args) {
+                      std::string error;
+                      const int k = ClipArg(args, &error);
+                      if (k < 0) return ActionResult::Fail(error);
+                      return Ok(ClipJson(ui_state_.clips.clips[static_cast<size_t>(k)]));
+                  }});
+    // A clip of `duration` seconds (1 by default) named `name`, else "Clip N"; the editor edits it.
+    actions_.Add({"clip.new", "New Clip", "robot", "", ShortcutScope::Global, has_robot, {},
+                  [this](const json::Value& args) {
+                      ClipView& c = ui_state_.clips;
+                      std::string name = StrArg(args, "name");
+                      for (size_t n = c.clips.size() + 1u; name.empty(); ++n)
+                          if (FindClip(Format("Clip %zu", n)) < 0) name = Format("Clip %zu", n);
+                      if (FindClip(name) >= 0) return ActionResult::Fail("a clip named '" + name + "' exists");
+                      const double duration = NumArg(args, "duration", 1.0);
+                      if (!(duration > 0.0)) return ActionResult::Fail("duration must be above 0 s");
+                      c.clips.push_back(Clip{name, static_cast<float>(duration), BoolArg(args, "loop", false), {}});
+                      c.edited = static_cast<int>(c.clips.size()) - 1;
+                      c.playhead = 0.0f;
+                      c.selected.clear();
+                      CommitClips();
+                      return Ok(ClipJson(c.clips.back()));
+                  }});
+    // Sets a clip's `duration` or `loop`; keys past a shorter end stay but no longer play.
+    actions_.Add({"clip.set", "Clip Settings", "robot", "", ShortcutScope::Global, has_clip, {},
+                  [this](const json::Value& args) {
+                      std::string error;
+                      const int k = ClipArg(args, &error);
+                      if (k < 0) return ActionResult::Fail(error);
+                      Clip& clip = ui_state_.clips.clips[static_cast<size_t>(k)];
+                      const double duration = NumArg(args, "duration", clip.duration);
+                      if (!(duration > 0.0)) return ActionResult::Fail("duration must be above 0 s");
+                      clip.duration = static_cast<float>(duration);
+                      clip.loop = BoolArg(args, "loop", clip.loop);
+                      CommitClips();
+                      return Ok(ClipJson(clip));
+                  }});
+    actions_.Add({"clip.rename", "Rename Clip", "robot", "", ShortcutScope::Global, has_clip, {},
+                  [this](const json::Value& args) {
+                      std::string error;
+                      const int k = ClipArg(args, &error);
+                      if (k < 0) return ActionResult::Fail(error);
+                      Clip& clip = ui_state_.clips.clips[static_cast<size_t>(k)];
+                      const std::string to = StrArg(args, "to");
+                      if (to.empty() || (to != clip.name && FindClip(to) >= 0))
+                          return ActionResult::Fail("the new name is empty or taken");
+                      clip.name = to;
+                      CommitClips();
+                      return Ok(Object({{"name", json::Value::Str(to)}}));
+                  }});
+    actions_.Add({"clip.remove", "Remove Clip", "robot", "", ShortcutScope::Global, has_clip, {},
+                  [this](const json::Value& args) {
+                      ClipView& c = ui_state_.clips;
+                      std::string error;
+                      const int k = ClipArg(args, &error);
+                      if (k < 0) return ActionResult::Fail(error);
+                      if (c.playing == k) StopReplay();
+                      else if (c.playing > k) --c.playing;
+                      if (c.edited > k) --c.edited;
+                      c.clips.erase(c.clips.begin() + k);
+                      c.selected.clear();
+                      CommitClips();
+                      return Ok(ClipStatus());
+                  }});
+    // Sets one key from the arguments or each of `keys`, replacing any at their times; their
+    // {joint, time, value, interp, in, out} default as `key_arg` says.
+    actions_.Add({"clip.key", "Set Key", "robot", "", ShortcutScope::Global, has_clip, {},
+                  [this, key_arg](const json::Value& args) {
+                      std::string error;
+                      const int k = ClipArg(args, &error);
+                      if (k < 0) return ActionResult::Fail(error);
+                      Clip& clip = ui_state_.clips.clips[static_cast<size_t>(k)];
+                      std::vector<const json::Value*> specs;
+                      if (const json::Value* list = args.Find("keys"))
+                          for (const json::Value& a : list->Elements()) specs.push_back(&a);
+                      else
+                          specs.push_back(&args);
+                      std::vector<std::pair<std::string, ClipKey>> keys(specs.size());
+                      for (size_t i = 0; i < specs.size(); ++i) {
+                          error = key_arg(*specs[i], clip, &keys[i].first, &keys[i].second);
+                          if (!error.empty()) return ActionResult::Fail(error);
+                      }
+                      for (const auto& [joint, key] : keys) SetKey(&clip, joint, key);
+                      CommitClips();
+                      return Ok(Object({{"clip", json::Value::Str(clip.name)},
+                                        {"set", json::Value::Int(static_cast<int64_t>(keys.size()))},
+                                        {"keys", json::Value::Int(static_cast<int64_t>(KeyCount(clip)))}}));
+                  }});
+    // Keys every joint at `time` (the playhead) from library pose `pose`, else from the shown
+    // environment's positions, or its drive targets with `from` "target".
+    actions_.Add({"clip.key_pose", "Key Pose", "robot", "", ShortcutScope::Global, has_clip, {},
+                  [this](const json::Value& args) {
+                      ClipView& c = ui_state_.clips;
+                      const RobotView& v = ui_state_.robot;
+                      std::string error;
+                      const int k = ClipArg(args, &error);
+                      if (k < 0) return ActionResult::Fail(error);
+                      Clip& clip = c.clips[static_cast<size_t>(k)];
+                      const float time = static_cast<float>(NumArg(args, "time", c.playhead));
+                      if (!(time >= 0.0f && time <= clip.duration))
+                          return ActionResult::Fail(Format("time: 0 to %g s", static_cast<double>(clip.duration)));
+                      std::vector<std::pair<std::string, float>> values;
+                      const std::string pose = StrArg(args, "pose"), from = StrArg(args, "from", "q");
+                      if (!pose.empty()) {
+                          const JointPose* p = FindPose(pose);
+                          if (p == nullptr) return ActionResult::Fail("no pose '" + pose + "'");
+                          for (const auto& [joint, q] : p->joints)
+                              if (FindJoint(v.joints, joint) >= 0) values.emplace_back(joint, q);
+                      } else if (from == "q" || from == "target") {
+                          for (const RobotJoint& j : v.joints)
+                              values.emplace_back(j.name, from == "target"           ? ui_state_.drive_targets[j.link]
+                                                          : j.link < v.live.q.size() ? v.live.q[j.link]
+                                                                                     : 0.0f);
+                      } else {
+                          return ActionResult::Fail("from: q or target");
+                      }
+                      if (values.empty()) return ActionResult::Fail("pose '" + pose + "' names none of the robot's joints");
+                      for (const auto& [joint, value] : values) SetKey(&clip, joint, ClipKey{time, value, c.interp});
+                      CommitClips();
+                      return Ok(Object({{"clip", json::Value::Str(clip.name)},
+                                        {"time", json::Value::Float(time)},
+                                        {"set", json::Value::Int(static_cast<int64_t>(values.size()))}}));
+                  }});
+    // Removes `keys` [{joint, time}], else every key of `joint` and/or at `time`, else the selection.
+    actions_.Add({"clip.remove_keys", "Remove Keys", "robot", "", ShortcutScope::Global, has_clip, {},
+                  [this](const json::Value& args) {
+                      ClipView& c = ui_state_.clips;
+                      std::string error;
+                      const int k = ClipArg(args, &error);
+                      if (k < 0) return ActionResult::Fail(error);
+                      Clip& clip = c.clips[static_cast<size_t>(k)];
+                      std::vector<ClipKeyRef> refs = c.selected;
+                      const json::Value* time = args.Find("time");
+                      const std::string joint = StrArg(args, "joint");
+                      if (const json::Value* list = args.Find("keys")) {
+                          refs = KeyRefsArg(*list);
+                      } else if (time != nullptr || !joint.empty()) {
+                          refs.clear();
+                          for (const ClipTrack& t : clip.tracks)
+                              for (const ClipKey& key : t.keys)
+                                  if ((joint.empty() || t.joint == joint) &&
+                                      (time == nullptr || std::abs(key.time - time->AsFloat()) < kClipKeyEpsilon))
+                                      refs.push_back(ClipKeyRef{t.joint, key.time});
+                      }
+                      size_t removed = 0u;
+                      for (const ClipKeyRef& r : refs) removed += RemoveKey(&clip, r.joint, r.time) ? 1u : 0u;
+                      if (removed == 0u) return ActionResult::Fail("no key matches");
+                      CommitClips();
+                      return Ok(Object({{"removed", json::Value::Int(static_cast<int64_t>(removed))},
+                                        {"keys", json::Value::Int(static_cast<int64_t>(KeyCount(clip)))}}));
+                  }});
+    // Shifts `keys` [{joint, time}], else the selection, by `dt` seconds and `dv` in value; keys
+    // stay within the clip and replace those where they land.
+    actions_.Add({"clip.move_keys", "Move Keys", "robot", "", ShortcutScope::Global, has_clip, {},
+                  [this](const json::Value& args) {
+                      ClipView& c = ui_state_.clips;
+                      std::string error;
+                      const int k = ClipArg(args, &error);
+                      if (k < 0) return ActionResult::Fail(error);
+                      const json::Value* list = args.Find("keys");
+                      std::vector<ClipKeyRef> refs = list != nullptr ? KeyRefsArg(*list) : c.selected;
+                      if (refs.empty()) return ActionResult::Fail("no keys to move");
+                      if (!MoveKeys(&c.clips[static_cast<size_t>(k)], &refs, static_cast<float>(NumArg(args, "dt", 0.0)),
+                                    static_cast<float>(NumArg(args, "dv", 0.0))))
+                          return ActionResult::Fail("a key is not on the clip or is named twice");
+                      if (list == nullptr) c.selected = refs;
+                      CommitClips();
+                      return Ok(Object({{"keys", KeyRefsJson(refs)}}));
+                  }});
+    // Each keyed joint's value at `time` (the playhead); with `apply` they become the shown
+    // environment's drive targets at once.
+    actions_.Add({"clip.sample", "Sample Clip", "robot", "", ShortcutScope::Global, has_clip, {},
+                  [this](const json::Value& args) {
+                      const RobotView& v = ui_state_.robot;
+                      std::string error;
+                      const int k = ClipArg(args, &error);
+                      if (k < 0) return ActionResult::Fail(error);
+                      const Clip& clip = ui_state_.clips.clips[static_cast<size_t>(k)];
+                      const float time = static_cast<float>(NumArg(args, "time", ui_state_.clips.playhead));
+                      const bool apply = BoolArg(args, "apply", false);
+                      json::Value values = json::Value::Object();
+                      std::vector<float> ramp;
+                      for (const ClipTrack& t : clip.tracks) {
+                          const float value = SampleTrack(t, time);
+                          values.Set(t.joint, json::Value::Float(value));
+                          const int j = FindJoint(v.joints, t.joint);
+                          if (!apply || j < 0) continue;
+                          const uint32_t link = v.joints[static_cast<size_t>(j)].link;
+                          ramp.insert(ramp.end(), {static_cast<float>(link), 0.0f, value});
+                          ui_state_.drive_targets[link] = value;
+                      }
+                      if (!ramp.empty()) worker_.Push(TickCommand::Param(ParamKind::TargetRamp, std::move(ramp)));
+                      return Ok(Object({{"time", json::Value::Float(time)}, {"values", std::move(values)}}));
+                  }});
+    // Drives the shown environment through a clip a step a row from now, over and over with
+    // `loop` (the clip's own by default); `play` (the default) starts the transport.
+    actions_.Add({"clip.play", "Play Clip", "robot", "", ShortcutScope::Global, has_clip, {},
+                  [this](const json::Value& args) {
+                      std::string error;
+                      const int k = ClipArg(args, &error);
+                      if (k < 0) return ActionResult::Fail(error);
+                      const Clip& clip = ui_state_.clips.clips[static_cast<size_t>(k)];
+                      return PlayClip(static_cast<size_t>(k), BoolArg(args, "loop", clip.loop), BoolArg(args, "play", true));
+                  }});
+    actions_.Add({"clip.stop", "Stop Clip", "robot", "", ShortcutScope::Global,
+                  [this] { return ui_state_.clips.playing >= 0; }, {},
+                  [this](const json::Value&) {
+                      StopReplay();
+                      return Ok(ClipStatus());
+                  }});
+    // Writes a clip as {"format": "nkclip", "version": 1, "clip": ...}; the dialog asks without `path`.
+    actions_.Add({"clip.save", "Export Clip...", "robot", "", ShortcutScope::Global, has_clip, {},
+                  [this](const json::Value& args) {
+                      std::string error;
+                      const int k = ClipArg(args, &error);
+                      if (k < 0) return ActionResult::Fail(error);
+                      const Clip& clip = ui_state_.clips.clips[static_cast<size_t>(k)];
+                      std::string path = StrArg(args, "path");
+                      if (path.empty())
+                          path = SaveFileDialog(nui::Tr("Export Clip"), nui::Tr("Joint clips"), "*.nkclip.json",
+                                                (clip.name + ".nkclip.json").c_str());
+                      if (path.empty()) return ActionResult::Fail("no clip file chosen");
+                      std::ofstream out(Utf8Path(path), std::ios::binary | std::ios::trunc);
+                      out << Object({{"format", json::Value::Str("nkclip")}, {"version", json::Value::Int(1)}, {"clip", ClipJson(clip)}})
+                                 .Dump(2);
+                      if (!out) return ActionResult::Fail("cannot write " + path);
+                      return Ok(Object({{"path", json::Value::Str(path)}, {"clip", json::Value::Str(clip.name)}}));
+                  }});
+    // Adds a clip file's clip, replacing one of its name; the editor edits it.
+    actions_.Add({"clip.load", "Import Clip...", "robot", "", ShortcutScope::Global, has_robot, {},
+                  [this](const json::Value& args) {
+                      ClipView& c = ui_state_.clips;
+                      std::string path = StrArg(args, "path");
+                      if (path.empty()) path = OpenFileDialog(nui::Tr("Import Clip"), nui::Tr("Joint clips"), "*.nkclip.json");
+                      if (path.empty()) return ActionResult::Fail("no clip file chosen");
+                      std::string text;
+                      if (!ReadEntireFile(path, &text)) return ActionResult::Fail("cannot read " + path);
+                      const json::Value doc = json::Value::Parse(text);
+                      const json::Value* format = doc.Find("format");
+                      if (format == nullptr || format->AsString() != "nkclip" || doc.At("version").AsInt() != 1)
+                          return ActionResult::Fail("'" + FileName(path) + "' is not a version 1 clip file");
+                      Clip clip = ClipFromJson(doc.At("clip"));
+                      int k = FindClip(clip.name);
+                      if (k >= 0) {
+                          c.clips[static_cast<size_t>(k)] = std::move(clip);
+                      } else {
+                          c.clips.push_back(std::move(clip));
+                          k = static_cast<int>(c.clips.size()) - 1;
+                      }
+                      c.edited = k;
+                      c.selected.clear();
+                      CommitClips();
+                      const Clip& loaded = c.clips[static_cast<size_t>(k)];
+                      return Ok(Object({{"path", json::Value::Str(path)},
+                                        {"clip", json::Value::Str(loaded.name)},
+                                        {"keys", json::Value::Int(static_cast<int64_t>(KeyCount(loaded)))}}));
+                  }});
+    // Opens or closes the Clip Editor (bare, it toggles) and sets what it shows: the `clip`, the
+    // `playhead`, `auto_key`, the `interp` of new keys, the `curve` joint and the `selected` keys.
+    actions_.Add({"clip.editor", "Clip Editor", "robot", "", ShortcutScope::Global, has_robot,
+                  [this] { return ui_state_.clips.open; },
+                  [this](const json::Value& args) {
+                      ClipView& c = ui_state_.clips;
+                      const std::string name = StrArg(args, "clip"), interp = StrArg(args, "interp"),
+                                        curve = StrArg(args, "curve");
+                      const int k = name.empty() ? c.edited : FindClip(name);
+                      if (!name.empty() && k < 0) return ActionResult::Fail("no clip '" + name + "'");
+                      ClipInterp shape = c.interp;
+                      if (!interp.empty() && !ParseInterp(interp, &shape))
+                          return ActionResult::Fail("interp: step, linear or bezier");
+                      if (!curve.empty() && FindJoint(ui_state_.robot.joints, curve) < 0)
+                          return ActionResult::Fail("no joint '" + curve + "'");
+                      if (k != c.edited) c.selected.clear();
+                      c.edited = k;
+                      c.interp = shape;
+                      if (!curve.empty()) c.curve = curve;
+                      c.open = BoolArg(args, "on", args.Items().empty() ? !c.open : c.open);
+                      c.auto_key = BoolArg(args, "auto_key", c.auto_key);
+                      c.playhead = static_cast<float>(NumArg(args, "playhead", c.playhead));
+                      if (const json::Value* selected = args.Find("selected")) c.selected = KeyRefsArg(*selected);
+                      SyncClipView();
+                      return Ok(ClipStatus());
+                  }});
+    // Steps back through the clip edits, or forward again; scene edits keep their own history.
+    actions_.Add({"clip.undo", "Undo Clip Edit", "robot", "", ShortcutScope::Global, [this] { return !clip_undo_.empty(); }, {},
+                  [this](const json::Value&) {
+                      if (clip_undo_.empty()) return ActionResult::Fail("no clip edit to undo");
+                      clip_redo_.push_back(std::move(clips_saved_));
+                      std::vector<Clip> back = std::move(clip_undo_.back());
+                      clip_undo_.pop_back();
+                      RestoreClips(std::move(back));
+                      return Ok(ClipStatus());
+                  }});
+    actions_.Add({"clip.redo", "Redo Clip Edit", "robot", "", ShortcutScope::Global, [this] { return !clip_redo_.empty(); }, {},
+                  [this](const json::Value&) {
+                      if (clip_redo_.empty()) return ActionResult::Fail("no clip edit to redo");
+                      clip_undo_.push_back(std::move(clips_saved_));
+                      std::vector<Clip> next = std::move(clip_redo_.back());
+                      clip_redo_.pop_back();
+                      RestoreClips(std::move(next));
+                      return Ok(ClipStatus());
                   }});
 }
 
@@ -6262,9 +6837,11 @@ void EditorHost::State::StopDemo() {
 }
 
 void EditorHost::State::StopReplay() {
-    demo_play_seq_ = worker_.Push(TickCommand::Param(ParamKind::TargetTrack, {}));
+    track_seq_ = worker_.Push(TickCommand::Param(ParamKind::TargetTrack, {}));
     ui_state_.demos.playing = -1;
     ui_state_.demos.left = 0u;
+    ui_state_.clips.playing = -1;
+    ui_state_.clips.left = 0u;
 }
 
 void EditorHost::State::SyncDemoView() {
@@ -6868,8 +7445,10 @@ void EditorHost::State::Frame(bool step_physics) {
     // Shortcuts queue their actions; viewport ones need the pointer over a free viewport.
     const bool viewport_keys = !io.WantCaptureKeyboard && !io.WantTextInput && !io.AppFocusLost &&
                                ui_.OwnsScenePointer() && !ui_state_.gizmo.active;
+    // The focused Clip Editor keeps undo, redo and delete for its keys.
     for (const std::string& id : actions_.Pressed(!io.WantCaptureKeyboard, viewport_keys))
-        Queue(id, json::Value::Object(), "shortcut");
+        if (!ui_state_.clips.focused || (id != "edit.undo" && id != "edit.redo" && id != "edit.delete"))
+            Queue(id, json::Value::Object(), "shortcut");
 
     // The WASD/QE camera fly, unless ImGui owns the keyboard.
     if (!io.WantCaptureKeyboard) {
@@ -6890,6 +7469,7 @@ void EditorHost::State::Frame(bool step_physics) {
     ImGui::Render();
     PushTransport();
     PushEdits();
+    SyncClips();
 
     StepRt(render_camera);
     // The active pane leads: its instance flags outline the selection in every pane.

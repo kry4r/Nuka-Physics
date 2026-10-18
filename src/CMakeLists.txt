@@ -428,6 +428,8 @@ endif()
 if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)
     add_library(nuka_viewer STATIC
         runtime/app/viewer/camera_controller.cpp
+        runtime/app/viewer/clip_panel.cpp
+        runtime/app/viewer/clips.cpp
         runtime/app/viewer/debug_draw.cpp
         runtime/app/viewer/editor_actions.cpp
         runtime/app/viewer/file_dialog.cpp

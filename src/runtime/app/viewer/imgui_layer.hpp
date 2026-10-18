@@ -5,6 +5,7 @@
 #include "math/transform.hpp"
 #include "nuka/nuka.h"
 #include "render/render_world.hpp"
+#include "runtime/app/viewer/clip_view.hpp"
 #include "runtime/app/viewer/demo_view.hpp"
 #include "runtime/app/viewer/editor_actions.hpp"
 #include "runtime/app/viewer/nui/nui.hpp"
@@ -299,6 +300,7 @@ struct ViewerUiState {
     TeleopView teleop;
     PolicyView policy;
     DemoView demos;
+    ClipView clips;
 
     // Queued for the next frame top, so recording the UI never changes the world.
     std::vector<ActionCall> actions;
@@ -499,6 +501,14 @@ private:
     void DrawCollisionDialog();
     // The floating Gain Tuner while it is open.
     void DrawGainTuner();
+    // The floating Clip Editor while it is open: its toolbar, dope sheet and curve editor.
+    void DrawClipEditor();
+    // One row a joint under a summary row, each key a diamond to select, box-select and drag in time.
+    void DrawDopeSheet(float height);
+    // The curve joint's track as a line through draggable keys and Bezier handles.
+    void DrawClipCurves();
+    // The editor's keys while it has the keyboard: delete, copy, paste, undo and redo.
+    void ClipKeys();
     // The floating Robot Assembler while it is open.
     void DrawAssembler();
     // The heatmap's scale and the located element's marker over the scene viewport.
@@ -579,6 +589,16 @@ private:
     char pose_name_[128] = {0};      // the pose rename field
     float tuner_gains_[3] = {};      // the tuner's kp, damping and force limit fields
     int tuner_active_ = -1;          // the field being dragged, which keeps its own value
+    // A dope sheet drag: the clip as it was at the press, the keys it moves and the press point.
+    Clip clip_drag_base_;
+    std::vector<ClipKeyRef> clip_drag_keys_;
+    float clip_drag_x_ = 0.0f;
+    bool clip_dragging_ = false;
+    bool clip_boxing_ = false;  // a box selection from clip_box_from_
+    ImVec2 clip_box_from_{};
+    bool clip_curve_held_ = false;     // a curve key or handle is being dragged
+    bool clip_curve_changed_ = false;  // and that drag moved it
+    bool clip_scrubbing_ = false;      // the playhead is being dragged
 
     bool palette_open_ = false;
     bool palette_focus_ = false;

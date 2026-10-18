@@ -302,14 +302,15 @@ void PhysicsWorker::ResumeRamp() {
     }
 }
 
-// The newest track the log applied before the playhead, when it still has rows to write.
+// The newest track the log applied before the playhead, when it loops or still has rows to write.
 void PhysicsWorker::ResumeTrack() {
     track_ = TargetTrack{};
     const std::vector<LoggedInput>& log = Current().log;
     for (size_t i = cursor_; i-- > 0u;) {
         const TickCommand& c = log[i].cmd;
         if (c.kind != CommandKind::ParamSet || c.param != ParamKind::TargetTrack) continue;
-        if (log[i].tick + c.index > tick_) track_ = TargetTrack{log[i].tick, c.index, c.element, c.env, c.values};
+        if (c.offset != 0u || log[i].tick + c.index > tick_)
+            track_ = TargetTrack{log[i].tick, c.index, c.element, c.env, c.values, c.offset != 0u};
         return;
     }
 }

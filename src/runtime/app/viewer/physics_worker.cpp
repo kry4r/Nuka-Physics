@@ -490,8 +490,9 @@ bool PhysicsWorker::Apply(const TickCommand& cmd) {
                     return true;
                 case ParamKind::TargetTrack:
                     // A track of no rows stops the one driving.
-                    track_ = cmd.index == 0u ? TargetTrack{}
-                                             : TargetTrack{tick_, cmd.index, cmd.element, cmd.env, cmd.values};
+                    track_ = cmd.index == 0u
+                                 ? TargetTrack{}
+                                 : TargetTrack{tick_, cmd.index, cmd.element, cmd.env, cmd.values, cmd.offset != 0u};
                     return true;
                 case ParamKind::TeleopAxes:
                     axes_ = cmd.values;
@@ -778,9 +779,9 @@ void PhysicsWorker::WriteRamp() {
     if (alpha >= 1.0f) ramp_ = TargetRamp{};
 }
 
-// The track's row for the step from the current tick; the last row ends the track.
+// The track's row for the step from the current tick; the last row ends the track unless it loops.
 void PhysicsWorker::WriteTrack() {
-    const uint64_t row = tick_ - track_.start;
+    const uint64_t row = (tick_ - track_.start) % track_.rows;
     const size_t links = bind_.layout.links_per_env, offset = static_cast<size_t>(track_.env) * links * sizeof(float);
     track_scratch_.resize(links);
     CheckResult(nuka_world_download_field(bind_.world, NUKA_FIELD_DRIVE_TARGET, track_scratch_.data(),
@@ -791,7 +792,7 @@ void PhysicsWorker::WriteTrack() {
     CheckResult(nuka_world_upload_field(bind_.world, NUKA_FIELD_DRIVE_TARGET, track_scratch_.data(), links * sizeof(float),
                                         offset),
                 "upload drive target");
-    if (row + 1u >= track_.rows) track_ = TargetTrack{};
+    if (!track_.loop && row + 1u >= track_.rows) track_ = TargetTrack{};
 }
 
 void PhysicsWorker::RecordDemo(std::vector<uint32_t> envs) {
@@ -987,7 +988,7 @@ void PhysicsWorker::Publish() {
     for (const Perturbation& p : perturbs_)
         if (p.env == bind_.env) s.perturbs.push_back(p);
     s.overlay = overlay_;
-    s.track_left = track_.values.empty() ? 0u : static_cast<uint32_t>(track_.start + track_.rows - tick_);
+    s.track_left = track_.values.empty() ? 0u : track_.rows - static_cast<uint32_t>((tick_ - track_.start) % track_.rows);
     s.published = WorkerClock::now();
     last_publish_ = s.published;
     telemetry_.publish_ms = Ms(s.published - start);
