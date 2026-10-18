@@ -224,6 +224,7 @@ struct Snapshot {
     bool healthy = true;
     std::vector<math::Transform> link_poses;
     std::vector<math::Transform> body_poses;
+    std::vector<PoseSample> envs;       // the other displayed environments' poses
     std::vector<math::Vec3> particles;  // the shown environment's
     std::vector<float> heat;            // its per-particle residuals while the heatmap reads them
     JointFrame joints;                  // its joints
@@ -280,6 +281,7 @@ struct WorkerBinding {
     inference::WorldController* controller = nullptr;
     PoseScatter* scatter = nullptr;  // null publishes through host downloads
     uint32_t env = 0u;
+    std::vector<uint32_t> shown;  // other environments drawn beside it
     float dt = 0.005f;
     float speed = 1.0f;
     bool colliders = false;
@@ -441,6 +443,7 @@ private:
     WorkerClock::time_point last_mirror_{};
     std::vector<math::Transform> mirror_links_;
     std::vector<math::Transform> mirror_bodies_;
+    std::vector<PoseSample> mirror_envs_;
     std::vector<math::Vec3> mirror_particles_;
     std::vector<float> mirror_heat_;
     JointFrame mirror_joints_;

@@ -109,12 +109,23 @@ std::vector<ScatterRow> BuildScatterRows(const render::RenderWorld& render_world
 // deforming instance per particle surface owned by its medium's entity.
 class EditorSim {
 public:
+    // One copy row of `env_instances`: the environment it draws and the instance it copies.
+    struct EnvCopy {
+        uint32_t env;
+        uint32_t instance;
+    };
+
     EditorSim(WorldLayout layout, render::RenderWorld render_world, const scene::SceneIR& scene);
 
     // Re-poses instances, cameras and lights from one environment's poses.
     void ApplyPoses(const std::vector<math::Transform>& links, const std::vector<math::Transform>& bodies);
     // Poses the ghost copies of the physics-driven instances; empty poses clear them.
     void ApplyGhost(const std::vector<math::Transform>& links, const std::vector<math::Transform>& bodies);
+    // Clears the other environments' copies; AddEnv appends one environment's moving instances at `offset`.
+    void ClearEnvs();
+    void AddEnv(uint32_t env, const std::vector<math::Transform>& links, const std::vector<math::Transform>& bodies,
+                const math::Vec3& offset);
+    const std::vector<EnvCopy>& EnvCopies() const { return env_copies_; }
     // Rebuilds the particle surfaces from one environment's particles; per-particle residuals
     // colour them as a heatmap, an empty `heat` draws their materials.
     void ApplyParticles(const std::vector<math::Vec3>& positions, const std::vector<float>& heat, float alert);
@@ -143,6 +154,7 @@ private:
     std::vector<Surface> surfaces_;
     uint32_t heat_material_ = render::kNoId;
     uint32_t ghost_material_ = render::kNoId;
+    std::vector<EnvCopy> env_copies_;
     std::vector<PoseWrite> pose_writes_;
     uint64_t static_revision_ = 0u;
 };

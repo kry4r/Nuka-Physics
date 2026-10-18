@@ -294,6 +294,10 @@ struct RenderWorld {
     // opaque scene by the raster present pass only; empty while no branch is compared.
     std::vector<RenderInstance>        ghost_instances;
 
+    // Other environments' moving instances at their grid offsets, drawn opaque and pickable
+    // by the raster present pass only; empty while one environment is shown.
+    std::vector<RenderInstance>        env_instances;
+
     MeshLibrary                        meshes;
     std::vector<scene::RenderMaterial> materials;  // indexed by render_material_id
     std::vector<RenderCamera>          cameras;

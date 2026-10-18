@@ -250,6 +250,15 @@ struct ViewPane {
     std::string camera;  // the scene camera node it looks through; empty is the free camera
 };
 
+// The environment grid: the world's count, how many cells of the current one's page the
+// viewport draws, and the metres between cells (0 sizes them from the robot).
+struct EnvView {
+    uint32_t count = 1u;
+    uint32_t show = 1u;
+    float spacing = 0.0f;
+};
+inline constexpr uint32_t kMaxGridEnvs = 16u;
+
 // Transport, selection and panel state. The UI queues actions for anything that changes the
 // world and edits only this plain state in place.
 struct ViewerUiState {
@@ -259,6 +268,7 @@ struct ViewerUiState {
     bool playing = false;
     float speed = 1.0f;  // simulated seconds per wall second
     uint32_t env_index = 0u;
+    EnvView envs;
 
     bool show_colliders = false;
     bool show_contacts = false;
@@ -505,8 +515,10 @@ private:
     ViewProjector Projector(const ImVec2& vmin, const ImVec2& vmax) const;
     // The viewport's top-right tools (RT preview, Render, layout, shading) and the box of a box selection.
     void DrawViewTools(const ImVec2& vmin, const ImVec2& vmax);
-    // The RT preview, Render and layout buttons on one line.
+    // The RT preview, Render, environment and layout buttons on one line.
     void DrawViewButtons();
+    // The environment popup: the count, the grid's cells and spacing, and the current page's cells.
+    void DrawEnvGrid();
     // The RT preview image over the viewport, under its HUD.
     void DrawRtImage(const ImVec2& vmin, const ImVec2& vmax);
     // Camera bookmark chips along the viewport's bottom edge.
@@ -566,6 +578,7 @@ private:
     char render_path_[512] = {0};  // the Render dialog's fields
     int render_size_[2] = {1920, 1080};
     int render_spp_ = 64;
+    int env_count_ = 1;              // the environment popup's count field
     char bookmark_name_[128] = {0};  // the bookmark rename field
     char pose_name_[128] = {0};      // the pose rename field
     float tuner_gains_[3] = {};      // the tuner's kp, damping and force limit fields

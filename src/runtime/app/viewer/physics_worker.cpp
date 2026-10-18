@@ -421,6 +421,8 @@ bool PhysicsWorker::Apply(const TickCommand& cmd) {
                     return false;
                 case ParamKind::DisplayEnv:
                     bind_.env = cmd.env % bind_.layout.env_count;
+                    bind_.shown.clear();
+                    for (const float e : cmd.values) bind_.shown.push_back(static_cast<uint32_t>(e) % bind_.layout.env_count);
                     last_mirror_ = WorkerClock::time_point{};
                     return true;
                 case ParamKind::ScatterRows:
@@ -889,6 +891,12 @@ void PhysicsWorker::Publish() {
     mirrored_ = bind_.scatter == nullptr || !playing_ || start - last_mirror_ >= kMirrorPeriod;
     if (mirrored_) {
         DownloadEnvPoses(bind_.world, bind_.layout, bind_.env, &mirror_links_, &mirror_bodies_);
+        mirror_envs_.resize(bind_.shown.size());
+        for (size_t i = 0; i < bind_.shown.size(); ++i) {
+            mirror_envs_[i].tick = tick_;
+            mirror_envs_[i].env = bind_.shown[i];
+            DownloadEnvPoses(bind_.world, bind_.layout, bind_.shown[i], &mirror_envs_[i].links, &mirror_envs_[i].bodies);
+        }
         DownloadEnvParticles(bind_.world, bind_.layout, bind_.env, &mirror_particles_);
         if (bind_.layout.links_per_env != 0u) DownloadJointFrame(bind_.world, bind_.layout, bind_.env, &mirror_joints_);
         ReadOverlayData(bind_.world, bind_.layout, bind_.env, bind_.colliders, bind_.contacts, &overlay_);
@@ -908,6 +916,7 @@ void PhysicsWorker::Publish() {
     }
     s.link_poses = mirror_links_;
     s.body_poses = mirror_bodies_;
+    s.envs = mirror_envs_;
     s.particles = mirror_particles_;
     s.heat = mirror_heat_;
     s.joints = mirror_joints_;

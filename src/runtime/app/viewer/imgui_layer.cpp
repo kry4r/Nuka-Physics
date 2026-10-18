@@ -1937,7 +1937,9 @@ void ImGuiLayer::DrawStatusBar() {
             list->AddText(font, px, ImVec2(wpos.x + lsize.x + 34.0f * s, cy - lsize.y * 0.5f), U32(theme::kWarn),
                           Iconed(icon::kWarn, miss.c_str()).c_str());
         }
-        const std::string right = Fmt("%.0f FPS   %.2f MS", stats.fps, stats.frame_time_ms);
+        std::string right = Fmt("%.0f FPS   %.2f MS", stats.fps, stats.frame_time_ms);
+        if (const EnvView& envs = frame_.ui->envs; envs.count > 1u)
+            right = Fmt(Tr("ENV %u / %u"), frame_.ui->env_index % envs.count, envs.count) + "      " + right;
         const ImVec2 rsize = font->CalcTextSizeA(px, FLT_MAX, 0.0f, right.c_str());
         list->AddText(font, px, ImVec2(wpos.x + wsize.x - rsize.x - 10.0f * s, cy - rsize.y * 0.5f), U32(theme::kFgDim),
                       right.c_str());
@@ -2485,6 +2487,15 @@ void ImGuiLayer::DrawViewButtons() {
         ImGui::EndPopup();
     }
     ImGui::SameLine(0.0f, 4.0f * s);
+    if (draw::IconButton("##envs", icon::kCopy, ui.envs.show > 1u, Tr("Environments"))) {
+        env_count_ = static_cast<int>(ui.envs.count);
+        ImGui::OpenPopup("##envs");
+    }
+    if (ImGui::BeginPopup("##envs")) {
+        DrawEnvGrid();
+        ImGui::EndPopup();
+    }
+    ImGui::SameLine(0.0f, 4.0f * s);
     const char* layout_icon = ui.view_layout == ViewLayout::Quad    ? icon::kViewQuad
                               : ui.view_layout == ViewLayout::Split ? icon::kViewSplit
                                                                     : icon::kViewSingle;
@@ -2493,6 +2504,53 @@ void ImGuiLayer::DrawViewButtons() {
         for (const char* id : {"view.layout_single", "view.layout_split", "view.layout_quad", "view.maximize"}) MenuAction(id);
         ImGui::EndPopup();
     }
+}
+
+void ImGuiLayer::DrawEnvGrid() {
+    const ViewerUiState& ui = *frame_.ui;
+    const EnvView& envs = ui.envs;
+    const float s = nui::Scale();
+    ImGui::TextUnformatted(Tr("Environments"));
+    ImGui::SetNextItemWidth(120.0f * s);
+    ImGui::InputInt(Tr("Count"), &env_count_);
+    env_count_ = std::clamp(env_count_, 1, 4096);
+    ImGui::SameLine();
+    ImGui::BeginDisabled(static_cast<uint32_t>(env_count_) == envs.count);
+    if (ImGui::Button(Tr("Rebuild"))) Queue("sim.envs", Args({{"count", json::Value::Int(env_count_)}}));
+    ImGui::EndDisabled();
+    int show = static_cast<int>(envs.show);
+    ImGui::SetNextItemWidth(120.0f * s);
+    if (ImGui::SliderInt(Tr("Shown"), &show, 1, static_cast<int>(std::min(kMaxGridEnvs, envs.count))))
+        Queue("view.envs", Args({{"show", json::Value::Int(show)}}));
+    float spacing = envs.spacing;
+    ImGui::SetNextItemWidth(120.0f * s);
+    if (ImGui::DragFloat(Tr("Spacing"), &spacing, 0.01f, 0.0f, 100.0f, spacing > 0.0f ? "%.2f m" : Tr("auto")))
+        Queue("view.envs", Args({{"spacing", json::Value::Float(spacing)}}));
+    // The current page's cells as the viewport lays them out; a click makes one current.
+    const uint32_t current = ui.env_index % envs.count;
+    const uint32_t first = current / envs.show * envs.show, last = std::min(first + envs.show, envs.count);
+    const auto cols = static_cast<uint32_t>(std::ceil(std::sqrt(static_cast<float>(envs.show))));
+    for (uint32_t e = first; e < last; ++e) {
+        if ((e - first) % cols != 0u) ImGui::SameLine(0.0f, 4.0f * s);
+        const bool on = e == current;
+        if (on) ImGui::PushStyleColor(ImGuiCol_Button, theme::Alpha(theme::kAccent, 0.45f));
+        if (ImGui::Button(Fmt("%u##env%u", e, e).c_str(), ImVec2(40.0f * s, 0.0f)))
+            Queue("view.envs", Args({{"current", json::Value::Int(e)}}));
+        if (on) ImGui::PopStyleColor();
+    }
+    if (envs.count <= envs.show) return;
+    const uint32_t pages = (envs.count + envs.show - 1u) / envs.show, page = first / envs.show;
+    ImGui::BeginDisabled(page == 0u);
+    if (ImGui::ArrowButton("##env_prev", ImGuiDir_Left))
+        Queue("view.envs", Args({{"current", json::Value::Int(first - envs.show)}}));
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::Text(Tr("Page %u / %u"), page + 1u, pages);
+    ImGui::SameLine();
+    ImGui::BeginDisabled(page + 1u == pages);
+    if (ImGui::ArrowButton("##env_next", ImGuiDir_Right))
+        Queue("view.envs", Args({{"current", json::Value::Int(first + envs.show)}}));
+    ImGui::EndDisabled();
 }
 
 void ImGuiLayer::DrawViewTools(const ImVec2& vmin, const ImVec2& vmax) {

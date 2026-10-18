@@ -1777,6 +1777,7 @@ struct PresentRenderer::Impl {
     // One view's draws, framebuffer rect and SceneUbo.
     struct PreparedView {
         std::vector<InstanceDraw> draws;
+        std::vector<InstanceDraw> env_draws;  // env_instances, rows after the instances
         SceneViewport rect;
         SceneUbo ubo{};
     };
@@ -1798,15 +1799,12 @@ struct PresentRenderer::Impl {
         // scene camera); skip the per-vertex sweep when a camera is supplied.
         const bool needs_aabb = !options.use_camera_override && world.CameraCount() == 0u;
         const uint32_t instance_total = static_cast<uint32_t>(world.instances.size());
-        for (uint32_t inst_idx = 0; inst_idx < instance_total; ++inst_idx) {
-            const RenderInstance& inst = world.instances[inst_idx];
-            if (inst.mesh_id == kNoId || inst.mesh_id >= world.meshes.Count()) continue;
-            const MeshGeometry& geo = world.meshes.Geometry(inst.mesh_id);
-            if (geo.Empty()) continue;
+        const auto make_draw = [&](const RenderInstance& inst, uint32_t row, InstanceDraw& draw) {
+            if (inst.mesh_id == kNoId || inst.mesh_id >= world.meshes.Count()) return false;
+            if (world.meshes.Geometry(inst.mesh_id).Empty()) return false;
             const MeshCacheEntry& cached = mesh_cache[inst.mesh_id];
-            if (cached.index_count == 0u) continue;  // not cached (defensive)
-            InstanceDraw draw;
-            draw.instance_row = inst_idx;
+            if (cached.index_count == 0u) return false;  // not cached (defensive)
+            draw.instance_row = row;
             draw.model = TransformToMatrix(inst.world_xform);
             draw.pos = cached.pos.buffer;
             draw.nrm = cached.nrm.buffer;
@@ -1829,7 +1827,14 @@ struct PresentRenderer::Impl {
                 draw.emissive[2] = mat.emissive[2];
             }
             ApplyViewMode(options.view_mode, has_material ? inst.render_material_id : kNoId, draw);
+            return true;
+        };
+        for (uint32_t inst_idx = 0; inst_idx < instance_total; ++inst_idx) {
+            const RenderInstance& inst = world.instances[inst_idx];
+            InstanceDraw draw;
+            if (!make_draw(inst, inst_idx, draw)) continue;
             if (needs_aabb) {
+                const MeshGeometry& geo = world.meshes.Geometry(inst.mesh_id);
                 for (size_t v = 0; v + 2 < geo.positions.size(); v += 3) {
                     const math::Vec3 local{geo.positions[v], geo.positions[v + 1], geo.positions[v + 2]};
                     const math::Vec3 wp = inst.world_xform.TransformPoint(local);
@@ -1840,6 +1845,11 @@ struct PresentRenderer::Impl {
                 }
             }
             view.draws.push_back(std::move(draw));
+        }
+        for (size_t j = 0; j < world.env_instances.size(); ++j) {
+            InstanceDraw draw;
+            if (make_draw(world.env_instances[j], instance_total + static_cast<uint32_t>(j), draw))
+                view.env_draws.push_back(std::move(draw));
         }
 
         const ResolvedCamera cam = ResolveCamera(world, options, aabb_min, aabb_max, has_geometry);
@@ -1883,9 +1893,9 @@ struct PresentRenderer::Impl {
     // pass, and the id pass writes each instance's kId* texel, skipping unpickable ones.
     enum class DrawPass : uint8_t { Scene, SeeThrough, Id };
 
-    void RecordDraws(VkCommandBuffer cmd, const PreparedView& view, VkPipeline pipe, VkPipelineLayout layout,
-                     VkDescriptorSet ubo_set, const PresentInterop* pose, const std::vector<uint8_t>& flags,
-                     DrawPass pass) {
+    void RecordDraws(VkCommandBuffer cmd, const PreparedView& view, const std::vector<InstanceDraw>& draws,
+                     VkPipeline pipe, VkPipelineLayout layout, VkDescriptorSet ubo_set, const PresentInterop* pose,
+                     const std::vector<uint8_t>& flags, DrawPass pass) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0u, 1u, &ubo_set, 0u, nullptr);
         if (pose != nullptr) {
@@ -1893,7 +1903,7 @@ struct PresentRenderer::Impl {
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1u, 1u, &slot_set, 0u, nullptr);
         }
         SetViewport(cmd, view.rect);
-        for (const InstanceDraw& draw : view.draws) {
+        for (const InstanceDraw& draw : draws) {
             const uint8_t f = draw.instance_row < flags.size() ? flags[draw.instance_row] : uint8_t{0};
             const bool see_through = (f & kInstanceSeeThrough) != 0;
             if (pass == DrawPass::Id ? (f & kInstanceUnpickable) != 0 : see_through != (pass == DrawPass::SeeThrough))
@@ -1944,11 +1954,15 @@ struct PresentRenderer::Impl {
         for (size_t i = 0; i < views.size(); ++i) {
             if (views[i].rect.Empty()) continue;
             if (pose != nullptr) {
-                RecordDraws(cmd, views[i], id_instanced_pipeline, instanced_pipeline_layout, sets[i], pose, flags,
-                            DrawPass::Id);
+                RecordDraws(cmd, views[i], views[i].draws, id_instanced_pipeline, instanced_pipeline_layout, sets[i],
+                            pose, flags, DrawPass::Id);
             } else {
-                RecordDraws(cmd, views[i], id_pipeline, pipeline_layout, sets[i], nullptr, flags, DrawPass::Id);
+                RecordDraws(cmd, views[i], views[i].draws, id_pipeline, pipeline_layout, sets[i], nullptr, flags,
+                            DrawPass::Id);
             }
+            if (!views[i].env_draws.empty())
+                RecordDraws(cmd, views[i], views[i].env_draws, id_pipeline, pipeline_layout, sets[i], nullptr, flags,
+                            DrawPass::Id);
         }
         vkCmdEndRenderPass(cmd);
     }
@@ -2117,18 +2131,21 @@ struct PresentRenderer::Impl {
             if (view.rect.Empty()) continue;
             const bool wire = views[i].view_mode == ViewMode::Wireframe;
             if (pose != nullptr) {
-                RecordDraws(cmd, view, wire ? wire_instanced_pipeline : instanced_pipeline,
+                RecordDraws(cmd, view, view.draws, wire ? wire_instanced_pipeline : instanced_pipeline,
                             instanced_pipeline_layout, sets[i], pose, options.instance_flags, DrawPass::Scene);
             } else {
-                RecordDraws(cmd, view, wire ? wire_pipeline : pipeline, pipeline_layout, sets[i], nullptr,
+                RecordDraws(cmd, view, view.draws, wire ? wire_pipeline : pipeline, pipeline_layout, sets[i], nullptr,
                             options.instance_flags, DrawPass::Scene);
             }
+            if (!view.env_draws.empty())
+                RecordDraws(cmd, view, view.env_draws, wire ? wire_pipeline : pipeline, pipeline_layout, sets[i],
+                            nullptr, options.instance_flags, DrawPass::Scene);
             if (see_through && pose != nullptr) {
-                RecordDraws(cmd, view, ghost_instanced_pipeline, instanced_pipeline_layout, sets[i], pose,
+                RecordDraws(cmd, view, view.draws, ghost_instanced_pipeline, instanced_pipeline_layout, sets[i], pose,
                             options.instance_flags, DrawPass::SeeThrough);
             } else if (see_through) {
-                RecordDraws(cmd, view, ghost_pipeline, pipeline_layout, sets[i], nullptr, options.instance_flags,
-                            DrawPass::SeeThrough);
+                RecordDraws(cmd, view, view.draws, ghost_pipeline, pipeline_layout, sets[i], nullptr,
+                            options.instance_flags, DrawPass::SeeThrough);
             }
             draw_overlay(world.ghost_instances, ghost_pipeline, sets[i]);
             draw_overlay(world.debug_instances, debug_pipeline, sets[i]);
@@ -2272,7 +2289,7 @@ struct PresentRenderer::Impl {
         const uint32_t* ids = static_cast<const uint32_t*>(mapped);
         const uint32_t center = ids[(h / 2u) * w + w / 2u] & kIdMask;
         if (center != 0u) result.center = center - 1u;
-        std::vector<char> seen(world.instances.size(), 0);
+        std::vector<char> seen(world.instances.size() + world.env_instances.size(), 0);
         for (size_t i = 0; i < static_cast<size_t>(w) * h; ++i) {
             const uint32_t id = ids[i] & kIdMask;
             if (id == 0u || seen[id - 1u] != 0) continue;

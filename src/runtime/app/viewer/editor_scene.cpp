@@ -27,6 +27,25 @@ void BindWorld(EditorScene& es) {
     es.sim = std::make_unique<EditorSim>(std::move(layout), std::move(render_world), es.scene);
 }
 
+// Saves the document to the cache, rebuilds the world from that file and binds the result.
+template <typename Rebuild>
+bool RebuildFromDocument(EditorScene& es, SceneCache& cache, Rebuild rebuild) {
+    try {
+        const std::string file = cache.NextFile();
+        scene::nks::Save(es.scene, file);
+        const nuka_result_t result = rebuild(file.c_str());
+        if (result != NUKA_RESULT_OK) {
+            std::fprintf(stderr, "[nuka_editor] rebuild refused: %s\n", nuka_result_message(result));
+            return false;
+        }
+        BindWorld(es);
+        return true;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[nuka_editor] rebuild failed: %s\n", e.what());
+        return false;
+    }
+}
+
 }  // namespace
 
 SceneCache::SceneCache()
@@ -61,20 +80,13 @@ std::unique_ptr<EditorScene> AttachEditorScene(nuka_world_handle world, const st
 }
 
 bool RecookEditorScene(EditorScene& es, SceneCache& cache) {
-    try {
-        const std::string file = cache.NextFile();
-        scene::nks::Save(es.scene, file);
-        const nuka_result_t result = nuka_world_rebuild_from_scene(es.world, file.c_str(), 0u);
-        if (result != NUKA_RESULT_OK) {
-            std::fprintf(stderr, "[nuka_editor] rebuild refused: %s\n", nuka_result_message(result));
-            return false;
-        }
-        BindWorld(es);
-        return true;
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "[nuka_editor] rebuild failed: %s\n", e.what());
-        return false;
-    }
+    return RebuildFromDocument(es, cache,
+                               [&](const char* file) { return nuka_world_rebuild_from_scene(es.world, file, 0u); });
+}
+
+bool ResizeEditorEnvs(EditorScene& es, SceneCache& cache, uint32_t envs) {
+    return RebuildFromDocument(es, cache,
+                               [&](const char* file) { return nuka_world_rebuild_with_envs(es.world, file, envs); });
 }
 
 bool ResetWorldPhysics(nuka_world_handle world, const std::vector<float>& rest_targets) {

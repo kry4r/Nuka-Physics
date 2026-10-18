@@ -107,6 +107,8 @@ constexpr float kClickSlop = 4.0f;
 constexpr float kGrabHz = 3.0f;
 // The viewport draws a plain held force as an arrow this long [m].
 constexpr float kForceArrow = 0.3f;
+// The most environments sim.envs builds.
+constexpr uint32_t kMaxEnvs = 4096u;
 // The RT preview renders the viewport scaled down to this many pixels on its long side.
 constexpr float kRtMaxSide = 1920.0f;
 // A gizmo move's locked orientation weighs this much against its position, so a short chain
@@ -1015,6 +1017,15 @@ struct EditorHost::State : DocumentHost {
     uint64_t Generation() const;
     void SyncScripts();
     void SeedDriveTargets();
+    // The current environment's drive targets into the drive editor; the worker must be parked.
+    void LoadDriveTargets();
+    // The environments the grid draws beside `current`: the rest of its page of `show` cells.
+    std::vector<uint32_t> OtherShownEnvs(uint32_t current) const;
+    // Where environment `env` draws relative to `current`, which stays at world coordinates.
+    math::Vec3 EnvOffset(uint32_t env, uint32_t current) const;
+    // Makes `env` current; on the same page the camera follows its cell, so the view holds still.
+    void SwitchEnv(uint32_t env);
+    json::Value EnvsJson() const;
     // Each link's longest visual edge, from its meshes' bounds in its frame.
     void SizeLinks();
     void BindWorker(uint64_t tick = 0u, double sim_time = 0.0);
@@ -1221,6 +1232,9 @@ struct EditorHost::State : DocumentHost {
     // What the worker was last told, so changes become commands.
     bool sent_playing_ = false;
     uint32_t sent_env_ = 0u;
+    std::vector<uint32_t> sent_shown_;
+    uint32_t picked_env_ = 0u;       // the environment PickBox's centre hit lies in
+    float env_auto_spacing_ = 1.0f;  // grid cells sized from the moving instances at bind time
     bool sent_colliders_ = false;
     bool sent_contacts_ = false;
     float sent_speed_ = 1.0f;
@@ -1653,12 +1667,69 @@ void EditorHost::State::SeedDriveTargets() {
     SizeLinks();
     robot.floating = std::any_of(layout.links.begin(), layout.links.end(),
                                  [](const nuka_link_binding_t& l) { return l.is_floating != 0u; });
+    LoadDriveTargets();
+}
+
+void EditorHost::State::LoadDriveTargets() {
+    const WorldLayout& layout = loaded_->Layout();
     const uint32_t links = layout.links_per_env;
     if (links == 0u) return;
+    const size_t env = ui_state_.env_index % layout.env_count;
     ui_state_.drive_targets.assign(links, 0.0f);
     ui_state_.drive_dirty.assign(links, 0u);
     nuka_world_download_field(world_, NUKA_FIELD_DRIVE_TARGET, ui_state_.drive_targets.data(),
-                              links * sizeof(float), 0u);
+                              links * sizeof(float), env * links * sizeof(float));
+}
+
+std::vector<uint32_t> EditorHost::State::OtherShownEnvs(uint32_t current) const {
+    const EnvView& v = ui_state_.envs;
+    const uint32_t first = current / v.show * v.show, last = std::min(first + v.show, v.count);
+    std::vector<uint32_t> out;
+    for (uint32_t e = first; e < last; ++e)
+        if (e != current) out.push_back(e);
+    return out;
+}
+
+math::Vec3 EditorHost::State::EnvOffset(uint32_t env, uint32_t current) const {
+    const EnvView& v = ui_state_.envs;
+    const auto cols = static_cast<uint32_t>(std::ceil(std::sqrt(static_cast<float>(v.show))));
+    const float s = v.spacing > 0.0f ? v.spacing : env_auto_spacing_;
+    const auto cell = [&](uint32_t e) {
+        const uint32_t r = e % v.show;
+        return math::Vec3{static_cast<float>(r % cols) * s, -static_cast<float>(r / cols) * s, 0.0f};
+    };
+    return cell(env) - cell(current);
+}
+
+void EditorHost::State::SwitchEnv(uint32_t env) {
+    const EnvView& v = ui_state_.envs;
+    const uint32_t current = ui_state_.env_index % v.count;
+    env %= v.count;
+    if (env == current) return;
+    if (env / v.show == current / v.show)
+        camera_.SetView(camera_.ResolvedTarget() - EnvOffset(env, current), camera_.Distance(), camera_.Yaw(),
+                        camera_.Pitch());
+    ui_state_.env_index = env;
+    PushTransport();
+    worker_.Exclusive([this] { LoadDriveTargets(); });
+}
+
+json::Value EditorHost::State::EnvsJson() const {
+    const EnvView& v = ui_state_.envs;
+    const uint32_t current = ui_state_.env_index % v.count;
+    // The current page's cells with the offset each draws at; the current one's is zero.
+    json::Value cells = json::Value::Array();
+    std::vector<uint32_t> page = OtherShownEnvs(current);
+    page.insert(std::lower_bound(page.begin(), page.end(), current), current);
+    for (const uint32_t e : page)
+        cells.PushBack(Object({{"env", json::Value::Int(e)}, {"offset", Vec3Json(EnvOffset(e, current))}}));
+    return Object({{"count", json::Value::Int(v.count)},
+                   {"current", json::Value::Int(current)},
+                   {"show", json::Value::Int(v.show)},
+                   {"spacing", json::Value::Float(v.spacing > 0.0f ? v.spacing : env_auto_spacing_)},
+                   {"auto_spacing", json::Value::Bool(v.spacing <= 0.0f)},
+                   {"cells", std::move(cells)},
+                   {"copies", json::Value::Int(static_cast<int64_t>(loaded_ ? loaded_->sim->EnvCopies().size() : 0u))}});
 }
 
 void EditorHost::State::SizeLinks() {
@@ -1750,7 +1821,14 @@ void EditorHost::State::BindWorker(uint64_t tick, double sim_time) {
     binding.rest_targets = loaded_->rest_targets;
     binding.controller = policy_ctrl_.get();
     binding.scatter = scatter_.get();
+    EnvView& envs = ui_state_.envs;
+    envs.count = layout.env_count;
+    envs.show = std::min(envs.show, envs.count);
+    math::Vec3 lo, hi;
+    SceneAabb(rw, /*movable_only=*/true, &lo, &hi);
+    env_auto_spacing_ = std::max(1.0f, 1.5f * std::max(hi.x - lo.x, hi.y - lo.y));
     binding.env = ui_state_.env_index % layout.env_count;
+    binding.shown = OtherShownEnvs(binding.env);
     binding.dt = opt_.dt;
     binding.speed = ui_state_.speed;
     binding.colliders = ui_state_.show_colliders;
@@ -1759,6 +1837,7 @@ void EditorHost::State::BindWorker(uint64_t tick, double sim_time) {
     binding.sim_time = sim_time;
     sent_playing_ = false;
     sent_env_ = binding.env;
+    sent_shown_ = binding.shown;
     sent_speed_ = binding.speed;
     sent_colliders_ = binding.colliders;
     sent_contacts_ = binding.contacts;
@@ -1783,6 +1862,8 @@ void EditorHost::State::ApplySnapshot(const Snapshot& snap) {
     if (shown_ == nullptr) return;
     loaded_->sim->ApplyPoses(snap.link_poses, snap.body_poses);
     loaded_->sim->ApplyGhost(snap.ghost_links, snap.ghost_bodies);
+    loaded_->sim->ClearEnvs();
+    for (const PoseSample& e : snap.envs) loaded_->sim->AddEnv(e.env, e.links, e.bodies, EnvOffset(e.env, snap.env));
     if (!snap.particles.empty()) loaded_->sim->ApplyParticles(snap.particles, snap.heat, ui_state_.solver.alert);
     ui_state_.robot.live = snap.joints;
     ui_state_.robot.link_poses = snap.link_poses;
@@ -2051,11 +2132,15 @@ void EditorHost::State::PushTransport() {
         sent_playing_ = ui_state_.playing;
     }
     const uint32_t env = ui_state_.env_index % loaded_->Layout().env_count;
-    if (env != sent_env_) {
-        TickCommand cmd = TickCommand::Param(ParamKind::DisplayEnv, {});
+    std::vector<uint32_t> shown = OtherShownEnvs(env);
+    if (env != sent_env_ || shown != sent_shown_) {
+        std::vector<float> values;
+        for (const uint32_t e : shown) values.push_back(static_cast<float>(e));
+        TickCommand cmd = TickCommand::Param(ParamKind::DisplayEnv, std::move(values));
         cmd.env = env;
         worker_.Push(std::move(cmd));
         sent_env_ = env;
+        sent_shown_ = std::move(shown);
     }
     if (ui_state_.show_colliders != sent_colliders_ || ui_state_.show_contacts != sent_contacts_) {
         worker_.Push(TickCommand::Param(ParamKind::Overlay, {ui_state_.show_colliders ? 1.0f : 0.0f,
@@ -2325,6 +2410,17 @@ render::PickResult EditorHost::State::PickBox(const CameraController& camera, fl
     const bool pinned = PinPose(&slot, &interop);
     render::PickResult pick = present_->Pick(ShownWorld(), ViewOptions(camera), region, pinned ? &interop : nullptr);
     if (pinned) worker_.Slots().Release(slot);
+    // Another environment's copy picks its source instance there; boxes keep the current one's.
+    const auto rows = static_cast<uint32_t>(ShownWorld().instances.size());
+    picked_env_ = ui_state_.env_index % ui_state_.envs.count;
+    if (pick.center != ~0u && pick.center >= rows) {
+        const EditorSim::EnvCopy& copy = loaded_->sim->EnvCopies()[pick.center - rows];
+        picked_env_ = copy.env;
+        pick.center = copy.instance;
+    }
+    pick.instances.erase(std::remove_if(pick.instances.begin(), pick.instances.end(),
+                                        [rows](uint32_t i) { return i >= rows; }),
+                         pick.instances.end());
     return pick;
 }
 
@@ -4119,7 +4215,7 @@ void EditorHost::State::RefreshProperties() {
 }
 
 // A click picks the body the id pass shows under the pointer, seeing through locked nodes;
-// Shift adds or drops it.
+// Shift adds or drops it. One on another environment's copy makes that environment current.
 void EditorHost::State::PickSelect(const CameraController& camera, float x, float y) {
     const render::PickResult pick = PickBox(camera, x, y, x, y);
     const bool shift = ImGui::GetIO().KeyShift;
@@ -4127,6 +4223,7 @@ void EditorHost::State::PickSelect(const CameraController& camera, float x, floa
         if (!shift) Queue("scene.select", json::Value::Object(), "viewport");
         return;
     }
+    SwitchEnv(picked_env_);
     Queue("scene.select",
           Object({{"path", json::Value::Str(CarrierPath(pick.center))}, {"mode", json::Value::Str(shift ? "toggle" : "replace")}}),
           "viewport");
@@ -4342,6 +4439,28 @@ void EditorHost::State::RegisterSimActions() {
                       ui_state_.speed = static_cast<float>(NumArg(args, "value", 1.0));
                       PushTransport();
                       return Ok(Object({{"speed", json::Value::Float(ui_state_.speed)}}));
+                  }});
+    // {count} rebuilds the world with that many environments, all from the scene's initial state at
+    // tick 0; loads and edits keep the count. Without it, the grid as view.envs reports it.
+    actions_.Add({"sim.envs", "Environments", "sim", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      const double count = NumArg(args, "count", ui_state_.envs.count);
+                      if (count < 1.0 || count > kMaxEnvs)
+                          return ActionResult::Fail("count: 1 to " + std::to_string(kMaxEnvs) + " environments");
+                      const auto n = static_cast<uint32_t>(count);
+                      if (n == ui_state_.envs.count) return Ok(EnvsJson());
+                      bool ok = false;
+                      worker_.Exclusive([&] {
+                          entity_drag_.Cancel();
+                          present_->WaitIdle();
+                          ok = ResizeEditorEnvs(*loaded_, cache_, n);
+                          if (!ok) return;
+                          ui_state_.env_index %= n;
+                          OnRebound(0u, 0.0);
+                          doc_.AddBranch(TimelineBranch{0u, Generation(), std::to_string(n) + " environments"});
+                      });
+                      if (!ok) return ActionResult::Fail("the world refused " + std::to_string(n) + " environments");
+                      return Ok(EnvsJson());
                   }});
     // A viewport tool toggles against Select; `on` sets it.
     const auto set_tool = [this](ViewportTool tool, const json::Value& args) {
@@ -4634,7 +4753,8 @@ void EditorHost::State::RegisterViewActions() {
                                         {"cameras", StrList(ui_state_.scene_cameras)},
                                         {"panes", std::move(panes)}}));
                   }});
-    // What the viewport shows at x, y: fractions of its width and height from the top left.
+    // What the viewport shows at x, y: fractions of its width and height from the top left; `select`
+    // clicks there, making the environment it hits current and selecting the body.
     actions_.Add({"view.pick", "Pick", "view", "", ShortcutScope::Global, has_scene, {},
                   [this](const json::Value& args) {
                       const SceneViewportRect& rect = ui_.Viewport();
@@ -4644,10 +4764,54 @@ void EditorHost::State::RegisterViewActions() {
                       const uint32_t hit = PickBox(camera_, x, y, x, y).center;
                       if (hit == ~0u)
                           return Ok(Object({{"path", json::Value::Null()}, {"node", json::Value::Null()},
-                                            {"instance", json::Value::Int(-1)}}));
+                                            {"instance", json::Value::Int(-1)}, {"env", json::Value::Null()}}));
+                      const uint32_t env = picked_env_;
+                      if (BoolArg(args, "select", false)) {
+                          SwitchEnv(env);
+                          const ActionResult selected =
+                              RunAction("scene.select", Object({{"path", json::Value::Str(CarrierPath(hit))}}), "view");
+                          if (!selected.ok) return selected;
+                      }
                       return Ok(Object({{"path", json::Value::Str(CarrierPath(hit))},
                                         {"node", json::Value::Str(PathOfEntity(ShownWorld().instances[hit].entity))},
-                                        {"instance", json::Value::Int(hit)}}));
+                                        {"instance", json::Value::Int(hit)},
+                                        {"env", json::Value::Int(env)}}));
+                  }});
+    // The environment grid: `show` cells of the current environment's page (up to 16), `current`
+    // makes one current, `spacing` sets the metres between cells (0 sizes them from the robot).
+    actions_.Add({"view.envs", "Environment Grid", "view", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      EnvView& v = ui_state_.envs;
+                      const double show = NumArg(args, "show", v.show);
+                      if (show < 1.0 || show > kMaxGridEnvs)
+                          return ActionResult::Fail("show: 1 to " + std::to_string(kMaxGridEnvs) + " environments");
+                      const double current = NumArg(args, "current", ui_state_.env_index % v.count);
+                      if (current < 0.0 || current >= v.count)
+                          return ActionResult::Fail("current: 0 to " + std::to_string(v.count - 1u));
+                      const double spacing = NumArg(args, "spacing", v.spacing);
+                      if (spacing < 0.0) return ActionResult::Fail("spacing: 0 or more metres");
+                      v.show = std::min(static_cast<uint32_t>(show), v.count);
+                      v.spacing = static_cast<float>(spacing);
+                      SwitchEnv(static_cast<uint32_t>(current));
+                      PushTransport();
+                      return Ok(EnvsJson());
+                  }});
+    // The active pane's orbit camera: `target`, `distance` and `yaw`, `pitch` in degrees, each kept when left out.
+    actions_.Add({"view.camera", "Camera", "view", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value& args) {
+                      math::Vec3 target = camera_.ResolvedTarget();
+                      Vec3Arg(args, "target", &target);
+                      const double distance = NumArg(args, "distance", camera_.Distance());
+                      if (distance <= 0.0) return ActionResult::Fail("distance: more than 0 metres");
+                      const double yaw = NumArg(args, "yaw", camera_.Yaw() * 180.0f / kPi);
+                      const double pitch = NumArg(args, "pitch", camera_.Pitch() * 180.0f / kPi);
+                      camera_.SetView(target, static_cast<float>(distance), static_cast<float>(yaw) * kPi / 180.0f,
+                                      static_cast<float>(pitch) * kPi / 180.0f);
+                      return Ok(Object({{"target", Vec3Json(camera_.ResolvedTarget())},
+                                        {"eye", Vec3Json(camera_.ResolvedEye())},
+                                        {"distance", json::Value::Float(camera_.Distance())},
+                                        {"yaw", json::Value::Float(camera_.Yaw() * 180.0f / kPi)},
+                                        {"pitch", json::Value::Float(camera_.Pitch() * 180.0f / kPi)}}));
                   }});
     // Selects what the viewport shows inside x0, y0 to x1, y1 in the same fractions; add keeps the selection.
     actions_.Add({"view.select_rect", "Box Select", "view", "", ShortcutScope::Global, has_scene, {},
@@ -5852,7 +6016,8 @@ void EditorHost::State::Frame(bool step_physics) {
     if (hover_due_) {
         hover_due_ = false;
         const uint32_t hit = PickBox(render_camera, hover_x_, hover_y_, hover_x_, hover_y_).center;
-        hovered_path_ = hit == ~0u ? std::string() : CarrierPath(hit);
+        const bool here = picked_env_ == ui_state_.env_index % ui_state_.envs.count;
+        hovered_path_ = hit == ~0u || !here ? std::string() : CarrierPath(hit);
     }
     ui_state_.robot.hovered = hovered_path_.empty() ? -1 : FindLink(hovered_path_);
 

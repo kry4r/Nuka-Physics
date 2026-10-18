@@ -48,6 +48,9 @@ std::unique_ptr<EditorScene> AttachEditorScene(nuka_world_handle world, const st
 // (logged) when the world refused it, leaving world and binding unchanged.
 bool RecookEditorScene(EditorScene& es, SceneCache& cache);
 
+// The same rebuild with `envs` environments, every one from the scene's initial state.
+bool ResizeEditorEnvs(EditorScene& es, SceneCache& cache, uint32_t envs);
+
 // Restores the initial physical state and the drive targets captured at bind time.
 bool ResetWorldPhysics(nuka_world_handle world, const std::vector<float>& rest_targets);
 

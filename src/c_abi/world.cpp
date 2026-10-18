@@ -1396,6 +1396,19 @@ nuka_result_t nuka_world_rebuild_from_scene(nuka_world_handle world, const char*
     }
 }
 
+nuka_result_t nuka_world_rebuild_with_envs(nuka_world_handle world, const char* scene_path,
+                                           uint32_t env_count) {
+    if (env_count == 0u) return NUKA_RESULT_INVALID_ARG;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    const uint32_t previous = record->recipe.desc.env_count;
+    record->recipe.desc.env_count = env_count;
+    const nuka_result_t result = nuka_world_rebuild_from_scene(world, scene_path, NUKA_REBUILD_INITIAL_STATE);
+    record->recipe.desc.env_count = result == NUKA_RESULT_OK ? env_count : previous;
+    record->env_count = record->recipe.desc.env_count;
+    return result;
+}
+
 nuka_result_t nuka_world_get_generation(nuka_world_handle world, uint64_t* out_generation) {
     if (out_generation == nullptr) return NUKA_RESULT_INVALID_ARG;
     auto* record = nuka::c_abi::WorldTable().Get(world);

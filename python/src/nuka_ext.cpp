@@ -624,12 +624,14 @@ public:
         const uint32_t flags = migrate_state ? 0u : static_cast<uint32_t>(NUKA_REBUILD_INITIAL_STATE);
         check(unlocked([&] { return nuka_world_rebuild_from_scene(h_, path.c_str(), flags); }),
               "nuka_world_rebuild_from_scene");
-        refresh_counts();
-        if (leases_.count(previous) != 0u &&
-            PyErr_WarnEx(PyExc_RuntimeWarning,
-                         "views taken before rebuild_from_scene are stale; take new ones with view(field)",
-                         1) != 0)
-            throw nb::python_error();
+        rebuilt(previous);
+    }
+
+    void rebuild_with_envs(const std::string& path, uint32_t env_count) {
+        const uint64_t previous = generation();
+        check(unlocked([&] { return nuka_world_rebuild_with_envs(h_, path.c_str(), env_count); }),
+              "nuka_world_rebuild_with_envs");
+        rebuilt(previous);
     }
 
     void forward_kinematics() {
@@ -924,7 +926,10 @@ public:
         return nb::cast(nb::ndarray<nb::numpy, float>(out, 1, shape, owner));
     }
 
-    uint32_t env_count() const { return env_count_; }
+    uint32_t env_count() const {
+        sync_counts();
+        return env_count_;
+    }
     uint32_t base_link_count() const {
         sync_counts();
         return base_link_count_;
@@ -1122,15 +1127,26 @@ private:
         refresh_counts();
     }
 
+    void rebuilt(uint64_t previous) {
+        refresh_counts();
+        if (leases_.count(previous) != 0u &&
+            PyErr_WarnEx(PyExc_RuntimeWarning, "views taken before a rebuild are stale; take new ones with view(field)",
+                         1) != 0)
+            throw nb::python_error();
+    }
+
     // A borrowed world's owner may rebuild it in place, so the counts follow its generation.
     void sync_counts() const {
         if (generation() != counts_generation_) refresh_counts();
     }
 
-    // Per-env link and particle counts, read from the JOINT_POSITION and PARTICLE_POSITION
-    // views; a world without articulations or particles reads 0.
+    // The env count, then per-env link and particle counts read from the JOINT_POSITION and
+    // PARTICLE_POSITION views; a world without articulations or particles reads 0.
     void refresh_counts() const {
         counts_generation_ = generation();
+        nuka_world_resource_info_t info{};
+        check(nuka_world_get_resource_info(h_, &info), "nuka_world_get_resource_info");
+        env_count_ = info.env_count;
         nuka_buffer_view_t view{};
         base_link_count_ = env_count_ > 0u && nuka_world_get_buffer_view(
                                                   h_, NUKA_FIELD_JOINT_POSITION, &view) == NUKA_RESULT_OK
@@ -1144,7 +1160,7 @@ private:
 
     nuka_world_handle h_ = nullptr;
     bool owned_ = true;
-    uint32_t env_count_ = 0u;
+    mutable uint32_t env_count_ = 0u;
     mutable uint32_t base_link_count_ = 0u;
     float dt_ = 0.0f;
     // Per-env particle count (0 for a particle-free world), so a caller can reshape the field.
@@ -2459,6 +2475,9 @@ NB_MODULE(_nuka_ext, m) {
              "Recook the world in place from a scene file with its creation options. Body and "
              "joint state carry over by unique body name unless migrate_state is False. Earlier "
              "views keep valid storage but are stale; worlds with sensors or observations refuse it.")
+        .def("rebuild_with_envs", &World::rebuild_with_envs, nb::arg("path"), nb::arg("env_count"),
+             "Recook the world in place from a scene file's initial state with env_count environments; "
+             "later rebuilds keep the count. Earlier views go stale as with rebuild_from_scene.")
         .def("forward_kinematics", &World::forward_kinematics,
              "Recompute link and body poses from joint state and base poses without stepping.")
         .def("solve_ik", &World::solve_ik, nb::arg("targets"), nb::arg("root") = nb::none(), nb::arg("env") = 0u,

@@ -385,4 +385,22 @@ void EditorSim::ApplyGhost(const std::vector<math::Transform>& links,
     }
 }
 
+void EditorSim::ClearEnvs() {
+    render_world_.env_instances.clear();
+    env_copies_.clear();
+}
+
+void EditorSim::AddEnv(uint32_t env, const std::vector<math::Transform>& links,
+                       const std::vector<math::Transform>& bodies, const math::Vec3& offset) {
+    math::Transform pose;
+    for (size_t i = 0; i < render_world_.instances.size(); ++i) {
+        const render::RenderInstance& inst = render_world_.instances[i];
+        if (!ResolvePose(inst.pose_source, links, bodies, &pose)) continue;
+        render::RenderInstance& copy = render_world_.env_instances.emplace_back(inst);
+        copy.world_xform = pose * inst.cached_visual_local;
+        copy.world_xform.position += offset;
+        env_copies_.push_back({env, static_cast<uint32_t>(i)});
+    }
+}
+
 }  // namespace nuka::runtime::app::viewer

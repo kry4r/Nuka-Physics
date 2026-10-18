@@ -84,7 +84,8 @@ struct PresentInterop {
     uint64_t ready_value = 0u;
 };
 
-// The world instances an id pass saw in a framebuffer region of the scene viewport.
+// The world instances an id pass saw in a framebuffer region of the scene viewport; rows past
+// `instances` are `env_instances` copies.
 struct PickResult {
     uint32_t center = ~0u;               // the instance under the region's centre, or ~0u
     std::vector<uint32_t> instances;     // every instance in the region, ascending
