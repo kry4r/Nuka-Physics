@@ -88,6 +88,7 @@ const PanelSpec kPanels[] = {{"stage", "Stage", icon::kStage},       {"property"
                              {"solver", "Solver", icon::kPlot},      {"timeline", "Timeline", icon::kTimeline},
                              {"camera", "Camera", icon::kCamera},
                              {"joints", "Joints", icon::kJoint},
+                             {"poses", "Poses", icon::kRobot},
                              {"script", "Script", icon::kScript},    {"console", "Console", icon::kConsole},
                              {"nui", "UI Inspector", icon::kInspector}};
 
@@ -101,7 +102,7 @@ const LayoutPreset kLayouts[] = {
     {"authoring", "Authoring", {"stage", "file"}, {"property", "camera"},
      {"assets", "console", "script", "stats", "timeline"}},
     {"debug", "Debug", {"stage"}, {"solver", "debug", "stats", "property"}, {"console", "timeline", "script", "assets"}},
-    {"robot", "Robot", {"stage"}, {"joints", "property"}, {"console", "timeline", "stats", "assets"}},
+    {"robot", "Robot", {"stage"}, {"joints", "poses", "property"}, {"console", "timeline", "stats", "assets"}},
     {"data", "Data", {"file", "stage"}, {"stats", "camera", "property"}, {"assets", "console", "script", "timeline"}},
     {"training", "Training", {"stats", "stage"}, {"joints", "camera"}, {"console", "script", "assets", "timeline"}},
 };
@@ -159,7 +160,9 @@ const std::vector<MenuSpec>& Menus() {
              {"sim", "solver", "timeline"},
              {"sim.toggle_play", "sim.step", "sim.reset", "-", "timeline.fork", "timeline.ghost", "timeline.clear", "-",
               "tool.perturb", "tool.pin", "-", "solver.telemetry", "solver.heatmap", "solver.locate"}},
-            {"Robot", {"robot"}, {"robot.fix_base", "robot.drive", "robot.watch"}},
+            {"Robot",
+             {"robot"},
+             {"robot.fix_base", "robot.drive", "robot.watch", "-", "robot.pose_capture", "robot.poses_save", "robot.poses_load"}},
             {"Tools",
              {"script", "tools"},
              {"script.new", "script.open", "script.save", "-", "script.run", "script.stop", "script.toggle_rerun", "-",
@@ -422,6 +425,7 @@ const std::vector<ImGuiLayer::BuiltinExtension>& ImGuiLayer::Builtins() {
         {"nuka.timeline", "Timeline", "Seek, replay and fork the run, and compare branches with a ghost.", {"timeline"}},
         {"nuka.camera", "Camera", "Camera pose, framing and controls.", {"camera"}},
         {"nuka.joints", "Joints", "Joint states, drive targets and gains, the fixed base and keyboard teleop.", {"joints"}},
+        {"nuka.poses", "Poses", "Named joint poses: blend to one, start from it, import and export.", {"poses"}},
         {"nuka.script", "Script", "The Python script editor and the console.", {"script", "console"}},
         {"nuka.ui_inspector", "UI Inspector", "The nui component tree, for extension authors.", {"nui"}},
     };
@@ -433,8 +437,8 @@ void ImGuiLayer::AddBuiltinPanel(const std::string& panel_id) {
     const Builder builders[] = {&ImGuiLayer::BuildStage,  &ImGuiLayer::BuildProperties, &ImGuiLayer::BuildFile,
                                 &ImGuiLayer::BuildAssets, &ImGuiLayer::BuildStats,      &ImGuiLayer::BuildDebug,
                                 &ImGuiLayer::BuildSolver, &ImGuiLayer::BuildTimeline,   &ImGuiLayer::BuildCamera,
-                                &ImGuiLayer::BuildJoints, &ImGuiLayer::BuildScript,     &ImGuiLayer::BuildConsole,
-                                &ImGuiLayer::BuildInspector};
+                                &ImGuiLayer::BuildJoints, &ImGuiLayer::BuildPoses,      &ImGuiLayer::BuildScript,
+                                &ImGuiLayer::BuildConsole, &ImGuiLayer::BuildInspector};
     const size_t i = static_cast<size_t>(
         std::find_if(std::begin(kPanels), std::end(kPanels), [&](const PanelSpec& p) { return panel_id == p.id; }) -
         std::begin(kPanels));
@@ -553,7 +557,8 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
     registry.Decorate("tool.perturb", icon::kGrab, false);
     registry.Decorate("tool.pin", icon::kPin, false);
     for (const auto& [id, glyph] : {std::pair{"robot.fix_base", icon::kStatic}, std::pair{"robot.drive", icon::kDrive},
-                                    std::pair{"robot.watch", icon::kPlot}})
+                                    std::pair{"robot.watch", icon::kPlot}, std::pair{"robot.pose_capture", icon::kAdd},
+                                    std::pair{"robot.poses_save", icon::kSave}, std::pair{"robot.poses_load", icon::kOpen}})
         registry.Decorate(id, glyph, false);
     const std::pair<const char*, const char*> script_icons[] = {
         {"script.new", icon::kNew},   {"script.open", icon::kOpen},     {"script.save", icon::kSave},
@@ -568,7 +573,8 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
                            "solver.records", "solver.set_iterations", "window.restore", "window.state", "timeline.status",
                            "timeline.seek", "timeline.branch", "timeline.rename", "timeline.configure", "timeline.hash",
                            "sim.perturb", "sim.grab_particle", "sim.release", "sim.loads", "view.layout", "view.view",
-                           "view.views", "robot.joints", "robot.set_targets", "robot.samples"})
+                           "view.views", "robot.joints", "robot.set_targets", "robot.samples", "robot.poses",
+                           "robot.pose_apply", "robot.pose_initial", "robot.pose_rename", "robot.pose_remove"})
         registry.Decorate(id, "", true);
     registry.Rebind("file.open", "Ctrl+O");
     registry.Rebind("file.save", "Ctrl+S");

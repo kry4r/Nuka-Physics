@@ -778,6 +778,34 @@ bool ReadBookmarks(const std::string& path, std::vector<CameraBookmark>* out) {
     return true;
 }
 
+json::Value PoseJson(const JointPose& p) {
+    json::Value joints = json::Value::Object();
+    for (const auto& [name, q] : p.joints) joints.Set(name, json::Value::Float(q));
+    return Object({{"name", json::Value::Str(p.name)}, {"joints", std::move(joints)}});
+}
+
+// {"poses": [{name, joints: {joint: position}}]}, positions in rad or m.
+json::Value PosesJson(const std::vector<JointPose>& poses) {
+    json::Value list = json::Value::Array();
+    for (const JointPose& p : poses) list.PushBack(PoseJson(p));
+    return Object({{"poses", std::move(list)}});
+}
+
+// The poses a file holds; false when it cannot be read.
+bool ReadPoses(const std::string& path, std::vector<JointPose>* out) {
+    std::string text;
+    if (!ReadEntireFile(path, &text)) return false;
+    const json::Value doc = json::Value::Parse(text);
+    std::vector<JointPose> poses;
+    for (const json::Value& p : doc.At("poses").Elements()) {
+        JointPose& pose = poses.emplace_back();
+        pose.name = p.At("name").AsString();
+        for (const auto& [name, q] : p.At("joints").Items()) pose.joints.emplace_back(name, q.AsFloat());
+    }
+    *out = std::move(poses);
+    return true;
+}
+
 // The most recent samples of one frame timing.
 struct SampleWindow {
     std::vector<double> values;
@@ -831,6 +859,7 @@ struct EditorHost::State : DocumentHost {
     void RegisterSolverActions();
     void RegisterTimelineActions();
     void RegisterRobotActions();
+    void RegisterPoseActions();
     json::Value TimelineStatus();
     // What a recording must match to load: the document, the world's counts and step, and the
     // names of the link and body rows its poses fill.
@@ -901,6 +930,10 @@ struct EditorHost::State : DocumentHost {
     CameraBookmark* FindBookmark(const std::string& name);
     // Shows the bookmarks' names and, with `save`, writes them to the document's file.
     void SyncBookmarks(bool save);
+    // The document's pose file in the profile; empty while untitled.
+    std::string PoseFile() const;
+    JointPose* FindPose(const std::string& name);
+    void SavePoses();
     // A load on the link or free body `inst` draws, acting at the world point `at` with a spring of
     // `gain` times the default toward it; false for an instance no dynamics move.
     bool BodyLoad(const render::RenderInstance& inst, const math::Vec3& at, float gain, Perturbation* out) const;
@@ -2010,6 +2043,28 @@ void EditorHost::State::SyncBookmarks(bool save) {
     std::ofstream(Utf8Path(file), std::ios::binary | std::ios::trunc) << BookmarksJson(bookmarks_).Dump(2);
 }
 
+std::string EditorHost::State::PoseFile() const {
+    return doc_path_.empty() ? std::string() : PathText(profile_->Dir() / "poses" / (Hex(Fnv1a(doc_path_)) + ".json"));
+}
+
+JointPose* EditorHost::State::FindPose(const std::string& name) {
+    std::vector<JointPose>& poses = ui_state_.robot.poses;
+    const auto it = std::find_if(poses.begin(), poses.end(), [&](const JointPose& p) { return p.name == name; });
+    return it == poses.end() ? nullptr : &*it;
+}
+
+void EditorHost::State::SavePoses() {
+    const std::string file = PoseFile();
+    const std::vector<JointPose>& poses = ui_state_.robot.poses;
+    if (file.empty()) return;
+    if (poses.empty()) {
+        fs::remove(Utf8Path(file));
+        return;
+    }
+    fs::create_directories(Utf8Path(file).parent_path());
+    std::ofstream(Utf8Path(file), std::ios::binary | std::ios::trunc) << PosesJson(poses).Dump(2);
+}
+
 const std::vector<std::string>& EditorHost::State::InstancePaths() {
     const render::RenderWorld& w = ShownWorld();
     if (instance_paths_.size() != w.InstanceCount() || instance_paths_version_ != ui_state_.scene_version) {
@@ -2437,6 +2492,7 @@ ActionResult EditorHost::State::SaveScene(const std::string& path) {
     std::snprintf(ui_state_.save_path, sizeof(ui_state_.save_path), "%s", doc_path_.c_str());
     profile_->TouchRecent(doc_path_);
     SyncBookmarks(true);
+    SavePoses();
     start_stale_ = true;
     assets_stale_ = true;
     // The recent list shows the viewport as it was saved.
@@ -2465,6 +2521,8 @@ ActionResult EditorHost::State::OpenDocument(const std::string& file, const std:
         opt_.cams_path.clear();
     }
     SyncBookmarks(false);
+    ui_state_.robot.poses.clear();
+    if (!doc_path_.empty()) ReadPoses(PoseFile(), &ui_state_.robot.poses);
     start_stale_ = true;
     assets_stale_ = true;
     Emit(stdout, "[nuka_editor] opened " + file + "\n");
@@ -2665,6 +2723,136 @@ void EditorHost::State::RegisterRobotActions() {
                       for (const std::string& root : v.roots)
                           txn.ops.push_back(EditOp{root, "static", json::Value(), json::Value::Bool(on)});
                       return SubmitTxn(txn);
+                  }});
+    RegisterPoseActions();
+}
+
+void EditorHost::State::RegisterPoseActions() {
+    const auto has_joints = [this] { return loaded_ != nullptr && !ui_state_.robot.joints.empty(); };
+    const auto has_poses = [this] { return loaded_ != nullptr && !ui_state_.robot.poses.empty(); };
+    actions_.Add({"robot.poses", "Joint Poses", "robot", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value&) { return Ok(PosesJson(ui_state_.robot.poses).At("poses")); }});
+    // Keeps the shown environment's joint positions as `name`, replacing a pose of that name;
+    // without one it is "Pose N".
+    actions_.Add({"robot.pose_capture", "Capture Pose", "robot", "", ShortcutScope::Global, has_joints, {},
+                  [this](const json::Value& args) {
+                      RobotView& v = ui_state_.robot;
+                      std::string name = StrArg(args, "name");
+                      for (size_t n = v.poses.size() + 1u; name.empty(); ++n)
+                          if (FindPose(Format("Pose %zu", n)) == nullptr) name = Format("Pose %zu", n);
+                      JointPose pose{name, {}};
+                      for (const RobotJoint& j : v.joints)
+                          pose.joints.emplace_back(j.name, j.link < v.live.q.size() ? v.live.q[j.link] : 0.0f);
+                      JointPose* p = FindPose(name);
+                      if (p == nullptr) p = &v.poses.emplace_back();
+                      *p = std::move(pose);
+                      SavePoses();
+                      return Ok(PoseJson(*p));
+                  }});
+    // Blends the shown environment's targets to `name` over `duration` simulated seconds, 0 at
+    // once; the robot's joints the pose lacks keep their targets.
+    actions_.Add({"robot.pose_apply", "Apply Pose", "robot", "", ShortcutScope::Global, has_joints, {},
+                  [this](const json::Value& args) {
+                      const RobotView& v = ui_state_.robot;
+                      const std::string name = StrArg(args, "name");
+                      const JointPose* p = FindPose(name);
+                      if (p == nullptr) return ActionResult::Fail("no pose '" + name + "'");
+                      const double duration = NumArg(args, "duration", 0.0);
+                      if (!(duration >= 0.0)) return ActionResult::Fail("duration must be at least 0");
+                      std::vector<float> ramp;
+                      std::vector<std::string> missing, unknown;
+                      for (const RobotJoint& j : v.joints) {
+                          const auto it = std::find_if(p->joints.begin(), p->joints.end(),
+                                                       [&](const auto& e) { return e.first == j.name; });
+                          if (it == p->joints.end()) {
+                              missing.push_back(j.name);
+                              continue;
+                          }
+                          ramp.insert(ramp.end(), {static_cast<float>(j.link), 0.0f, it->second});
+                          ui_state_.drive_targets[j.link] = it->second;
+                      }
+                      for (const auto& [joint, q] : p->joints)
+                          if (FindJoint(v.joints, joint) < 0) unknown.push_back(joint);
+                      if (ramp.empty()) return ActionResult::Fail("pose '" + name + "' names none of the robot's joints");
+                      const size_t set = ramp.size() / 3u;
+                      TickCommand cmd = TickCommand::Param(ParamKind::TargetRamp, std::move(ramp));
+                      cmd.index = static_cast<uint32_t>(std::lround(duration / static_cast<double>(opt_.dt)));
+                      worker_.Push(cmd);
+                      return Ok(Object({{"name", json::Value::Str(name)},
+                                        {"set", json::Value::Int(static_cast<int64_t>(set))},
+                                        {"missing", StrList(missing)},
+                                        {"unknown", StrList(unknown)},
+                                        {"steps", json::Value::Int(cmd.index)}}));
+                  }});
+    // Writes `name` into its joints' initial positions as one undoable edit; sim.reset starts there.
+    actions_.Add({"robot.pose_initial", "Set Pose as Initial", "robot", "", ShortcutScope::Global, has_joints, {},
+                  [this](const json::Value& args) {
+                      const RobotView& v = ui_state_.robot;
+                      const std::string name = StrArg(args, "name");
+                      const JointPose* p = FindPose(name);
+                      if (p == nullptr) return ActionResult::Fail("no pose '" + name + "'");
+                      EditTxn txn{"Initial Pose " + name, {}};
+                      for (const auto& [joint, q] : p->joints) {
+                          const int j = FindJoint(v.joints, joint);
+                          if (j >= 0)
+                              txn.ops.push_back(EditOp{v.joints[static_cast<size_t>(j)].path, "initial_position", json::Value(),
+                                                       json::Value::Float(q)});
+                      }
+                      if (txn.ops.empty()) return ActionResult::Fail("pose '" + name + "' names none of the robot's joints");
+                      return SubmitTxn(txn);
+                  }});
+    actions_.Add({"robot.pose_rename", "Rename Pose", "robot", "", ShortcutScope::Global, has_poses, {},
+                  [this](const json::Value& args) {
+                      const std::string name = StrArg(args, "name"), to = StrArg(args, "to");
+                      JointPose* p = FindPose(name);
+                      if (p == nullptr) return ActionResult::Fail("no pose '" + name + "'");
+                      if (to.empty() || (to != name && FindPose(to) != nullptr))
+                          return ActionResult::Fail("the new name is empty or taken");
+                      p->name = to;
+                      SavePoses();
+                      return Ok(Object({{"name", json::Value::Str(to)}}));
+                  }});
+    actions_.Add({"robot.pose_remove", "Remove Pose", "robot", "", ShortcutScope::Global, has_poses, {},
+                  [this](const json::Value& args) {
+                      std::vector<JointPose>& poses = ui_state_.robot.poses;
+                      const std::string name = StrArg(args, "name");
+                      const JointPose* p = FindPose(name);
+                      if (p == nullptr) return ActionResult::Fail("no pose '" + name + "'");
+                      poses.erase(poses.begin() + (p - poses.data()));
+                      SavePoses();
+                      return Ok(Object({{"count", json::Value::Int(static_cast<int64_t>(poses.size()))}}));
+                  }});
+    // Writes the poses as {"poses": [...]}; the dialog asks without `path`.
+    actions_.Add({"robot.poses_save", "Export Poses...", "robot", "", ShortcutScope::Global, has_poses, {},
+                  [this](const json::Value& args) {
+                      std::string path = StrArg(args, "path");
+                      if (path.empty()) path = SaveFileDialog(nui::Tr("Export Poses"), nui::Tr("Joint poses"), "*.json", "poses.json");
+                      if (path.empty()) return ActionResult::Fail("no pose file chosen");
+                      std::ofstream out(Utf8Path(path), std::ios::binary | std::ios::trunc);
+                      out << PosesJson(ui_state_.robot.poses).Dump(2);
+                      if (!out) return ActionResult::Fail("cannot write " + path);
+                      return Ok(Object({{"path", json::Value::Str(path)},
+                                        {"count", json::Value::Int(static_cast<int64_t>(ui_state_.robot.poses.size()))}}));
+                  }});
+    // Adds a file's poses, replacing those of the same name.
+    actions_.Add({"robot.poses_load", "Import Poses...", "robot", "", ShortcutScope::Global,
+                  [this] { return loaded_ != nullptr; }, {},
+                  [this](const json::Value& args) {
+                      std::string path = StrArg(args, "path");
+                      if (path.empty()) path = OpenFileDialog(nui::Tr("Import Poses"), nui::Tr("Joint poses"), "*.json");
+                      if (path.empty()) return ActionResult::Fail("no pose file chosen");
+                      std::vector<JointPose> read;
+                      if (!ReadPoses(path, &read)) return ActionResult::Fail("cannot read " + path);
+                      const size_t added = read.size();
+                      for (JointPose& p : read) {
+                          JointPose* have = FindPose(p.name);
+                          if (have != nullptr) *have = std::move(p);
+                          else ui_state_.robot.poses.push_back(std::move(p));
+                      }
+                      SavePoses();
+                      return Ok(Object({{"path", json::Value::Str(path)},
+                                        {"read", json::Value::Int(static_cast<int64_t>(added))},
+                                        {"count", json::Value::Int(static_cast<int64_t>(ui_state_.robot.poses.size()))}}));
                   }});
 }
 

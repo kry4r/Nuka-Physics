@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <deque>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace nuka::runtime::app::viewer {
@@ -40,6 +41,12 @@ struct RobotJoint {
     float force_limit = 0.0f;  // 0 is unlimited
 };
 
+// Named joint positions in rad or m; applying one moves only the joints it names.
+struct JointPose {
+    std::string name;
+    std::vector<std::pair<std::string, float>> joints;
+};
+
 struct RobotView {
     std::vector<RobotJoint> joints;  // in link order
     std::vector<std::string> roots;  // the articulation roots' nodes
@@ -53,6 +60,8 @@ struct RobotView {
     int plotted = -1;  // the joint the plot showed last frame; plotting a new one starts the watch
     std::string filter;
     float drive_kp = 100.0f;  // the gain Position drive converts with
+    std::vector<JointPose> poses;  // the document's pose library
+    float pose_blend = 0.5f;       // the simulated seconds a click on a pose blends over
 };
 
 }  // namespace nuka::runtime::app::viewer

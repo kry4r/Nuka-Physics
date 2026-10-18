@@ -206,6 +206,7 @@ uint64_t PhysicsWorker::Bind(WorkerBinding binding) {
     accum_ = 0.0;
     clock_reset_ = true;
     perturbs_.clear();
+    ramp_ = TargetRamp{};
     timeline_value_ = 0u;
     last_mirror_ = WorkerClock::time_point{};
     telemetry_ = WorkerTelemetry{};
@@ -236,6 +237,7 @@ void PhysicsWorker::Unbind() {
     playing_ = false;
     step_budget_ = 0u;
     perturbs_.clear();
+    ramp_ = TargetRamp{};
     branches_.clear();
 }
 
@@ -368,6 +370,7 @@ bool PhysicsWorker::ApplyCommands(std::vector<TickCommand>& cmds) {
         } else if (!Superseded(cmds, i)) {
             if (cmd.kind == CommandKind::EditApply || cmd.kind == CommandKind::Teleport) cmd.env = bind_.env;
             cmd.perturb.env = bind_.env;
+            if (cmd.kind == CommandKind::ParamSet && cmd.param == ParamKind::TargetRamp) StampRamp(cmd);
             if (Recorded(cmd)) Record(cmd);
             publish = (cmd.kind == CommandKind::ScriptCall ? ApplyScript(cmd) : Apply(cmd)) || publish;
         }
@@ -454,6 +457,9 @@ bool PhysicsWorker::Apply(const TickCommand& cmd) {
                     ++joint_session_;
                     return false;
                 }
+                case ParamKind::TargetRamp:
+                    StartRamp(cmd, tick_);
+                    return true;
             }
             return false;
         case CommandKind::Perturb:
@@ -492,6 +498,7 @@ bool PhysicsWorker::Apply(const TickCommand& cmd) {
                     playing_ = false;
                     step_budget_ = 0u;
                     perturbs_.clear();
+                    ramp_ = TargetRamp{};
                     last_mirror_ = WorkerClock::time_point{};
                     Report(cmd.seq, scripts_->DispatchReset());
                     ResetHistory();
@@ -603,6 +610,7 @@ bool PhysicsWorker::StepOnce() {
         key_due_ = false;
     }
     WritePerturbations();
+    if (!ramp_.values.empty()) WriteRamp();
     if (bind_.controller != nullptr) bind_.controller->OnStep(bind_.world, bind_.env);
     const bool healthy = nuka_world_step(bind_.world) == NUKA_RESULT_OK;
     SetTick(tick_ + 1u);
@@ -691,6 +699,36 @@ void PhysicsWorker::WritePerturbations() {
                         "upload body torque");
         }
     }
+}
+
+// A ramp starts from the shown environment's targets as they are when it lands.
+void PhysicsWorker::StampRamp(TickCommand& cmd) {
+    cmd.env = bind_.env;
+    const size_t row = static_cast<size_t>(cmd.env) * bind_.layout.links_per_env;
+    for (size_t i = 0; i + 2u < cmd.values.size(); i += 3u)
+        cmd.values[i + 1u] =
+            DownloadRow<float>(bind_.world, NUKA_FIELD_DRIVE_TARGET, row + static_cast<size_t>(cmd.values[i]));
+}
+
+void PhysicsWorker::StartRamp(const TickCommand& cmd, uint64_t start) {
+    ramp_ = TargetRamp{start, cmd.index, cmd.env, cmd.values};
+    if (ramp_.steps == 0u) WriteRamp();
+}
+
+// The targets for the step from the current tick, a share (tick - start + 1) / steps of the way;
+// the last step's write ends the ramp.
+void PhysicsWorker::WriteRamp() {
+    const float alpha = ramp_.steps == 0u ? 1.0f
+                                          : std::min(1.0f, static_cast<float>(tick_ + 1u - ramp_.start) /
+                                                               static_cast<float>(ramp_.steps));
+    const size_t row = static_cast<size_t>(ramp_.env) * bind_.layout.links_per_env;
+    for (size_t i = 0; i + 2u < ramp_.values.size(); i += 3u) {
+        const float target = ramp_.values[i + 1u] + alpha * (ramp_.values[i + 2u] - ramp_.values[i + 1u]);
+        CheckResult(nuka_world_upload_field(bind_.world, NUKA_FIELD_DRIVE_TARGET, &target, sizeof(float),
+                                            (row + static_cast<size_t>(ramp_.values[i])) * sizeof(float)),
+                    "upload drive target");
+    }
+    if (alpha >= 1.0f) ramp_ = TargetRamp{};
 }
 
 void PhysicsWorker::DispatchTick() {

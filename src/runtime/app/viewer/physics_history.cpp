@@ -167,7 +167,7 @@ bool PhysicsWorker::Recorded(const TickCommand& cmd) {
         case CommandKind::ParamSet:
             return cmd.param == ParamKind::Field || cmd.param == ParamKind::HoldGains ||
                    cmd.param == ParamKind::ControllerCommand || cmd.param == ParamKind::Registry ||
-                   cmd.param == ParamKind::Iterations;
+                   cmd.param == ParamKind::Iterations || cmd.param == ParamKind::TargetRamp;
         default:
             return false;
     }
@@ -277,7 +277,20 @@ void PhysicsWorker::Restore(const Keyframe& key) {
     sim_time_ = key.sim_time;
     cursor_ = key.log_pos;
     last_mirror_ = WorkerClock::time_point{};
+    ResumeRamp();
     ApplyLogged();
+}
+
+// The newest ramp the log applied before the playhead, when it still has steps to write.
+void PhysicsWorker::ResumeRamp() {
+    ramp_ = TargetRamp{};
+    const std::vector<LoggedInput>& log = Current().log;
+    for (size_t i = cursor_; i-- > 0u;) {
+        const TickCommand& c = log[i].cmd;
+        if (c.kind != CommandKind::ParamSet || c.param != ParamKind::TargetRamp) continue;
+        if (log[i].tick + c.index > tick_) ramp_ = TargetRamp{log[i].tick, c.index, c.env, c.values};
+        return;
+    }
 }
 
 // The current branch's inputs up to the playhead, stopping at log position `limit`.

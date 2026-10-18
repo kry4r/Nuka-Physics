@@ -457,6 +457,7 @@ private:
     void BuildTimeline(nui::VStack& root);
     void BuildCamera(nui::VStack& root);
     void BuildJoints(nui::VStack& root);
+    void BuildPoses(nui::VStack& root);
     void BuildScript(nui::VStack& root);
     void BuildConsole(nui::VStack& root);
     // The script tab bar with its keys, completions, disk-change bar and close prompt.
@@ -549,6 +550,7 @@ private:
     int render_size_[2] = {1920, 1080};
     int render_spp_ = 64;
     char bookmark_name_[128] = {0};  // the bookmark rename field
+    char pose_name_[128] = {0};      // the pose rename field
 
     bool palette_open_ = false;
     bool palette_focus_ = false;

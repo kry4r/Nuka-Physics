@@ -1,9 +1,10 @@
 // The Joints panel: each moving joint's limits, value, drive target and effort, the selected
-// joint's curves, drive conversion, the fixed base and keyboard teleop.
+// joint's curves, drive conversion, the fixed base and keyboard teleop; and the Poses panel.
 
 #include "runtime/app/viewer/imgui_layer.hpp"
 
 #include "imgui.h"
+#include "imgui_internal.h"
 #include "implot.h"
 
 #include "render/imgui/nuka_imgui.hpp"
@@ -13,6 +14,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -246,6 +248,64 @@ void ImGuiLayer::BuildJoints(nui::VStack& root) {
         const float* c = frame_.ui->teleop_cmd;
         return Fmt("cmd  vx %.2f  vy %.2f  wyaw %.2f", c[0], c[1], c[2]);
     };
+}
+
+void ImGuiLayer::BuildPoses(nui::VStack& root) {
+    ViewerUiState& ui = *frame_.ui;
+    const auto robot = [this]() -> RobotView& { return frame_.ui->robot; };
+
+    auto& hero = root.Add<nui::HStack>();
+    auto& count = hero.Add<nui::Label>(std::string(), Tone::Accent, TextStyle::Hero);
+    count.text_fn = [robot] { return Fmt(Tr("%zu POSES"), robot().poses.size()); };
+    hero.Add<nui::Spacer>();
+    hero.Add<nui::IconButton>(icon::kAdd, "Capture Pose").Action("robot.pose_capture");
+    auto& grid = root.Add<nui::PropertyGrid>();
+    auto& blend = grid.Add<nui::FloatField>("Blend time", nui::Ref(&ui.robot.pose_blend), 0.05f, 0.0f, 10.0f);
+    blend.unit = "s";
+    blend.format = "%.2f";
+    root.Add<nui::Label>("No poses", Tone::Dim).visible_if = [robot] { return robot().poses.empty(); };
+
+    // One row per pose: clicking blends the targets to it, the context menu holds the rest.
+    root.Add<nui::Custom>([this] {
+        RobotView& v = frame_.ui->robot;
+        const float s = nui::Scale();
+        for (size_t i = 0; i < v.poses.size(); ++i) {
+            const JointPose& p = v.poses[i];
+            const json::Value name = json::Value::Str(p.name);
+            ImGui::PushID(static_cast<int>(i));
+            const std::string label = Iconed(icon::kRobot, p.name.c_str());
+            if (ImGui::Selectable(label.c_str(), false))
+                Queue("robot.pose_apply", Args({{"name", name}, {"duration", json::Value::Float(v.pose_blend)}}));
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort))
+                ImGui::SetTooltip(Tr("Click to blend over %.2f s"), static_cast<double>(v.pose_blend));
+            const std::string joints = Fmt(Tr("%zu joints"), p.joints.size());
+            const ImVec2 end = ImGui::GetItemRectMax();
+            ImGui::GetWindowDrawList()->AddText(
+                ImVec2(end.x - ImGui::CalcTextSize(joints.c_str()).x - theme::kSpace * s, ImGui::GetItemRectMin().y),
+                U32(theme::kFgDim), joints.c_str());
+            if (ImGui::BeginPopupContextItem("##pose_menu")) {
+                if (ImGui::IsWindowAppearing()) std::snprintf(pose_name_, sizeof(pose_name_), "%s", p.name.c_str());
+                if (ImGui::MenuItemEx(Tr("Apply Instantly"), icon::kRun)) Queue("robot.pose_apply", Args({{"name", name}}));
+                if (ImGui::MenuItemEx(Tr("Set as Initial"), icon::kHome)) Queue("robot.pose_initial", Args({{"name", name}}));
+                if (ImGui::MenuItemEx(Tr("Copy as JSON"), icon::kCopy)) {
+                    json::Value values = json::Value::Object();
+                    for (const auto& [joint, q] : p.joints) values.Set(joint, json::Value::Float(q));
+                    ImGui::SetClipboardText(Args({{"name", name}, {"joints", values}}).Dump(2).c_str());
+                }
+                ImGui::Separator();
+                ImGui::SetNextItemWidth(160.0f * s);
+                const bool enter = ImGui::InputText("##name", pose_name_, sizeof(pose_name_), ImGuiInputTextFlags_EnterReturnsTrue);
+                ImGui::SameLine();
+                if ((ImGui::SmallButton(Tr("Rename")) || enter) && pose_name_[0] != '\0') {
+                    Queue("robot.pose_rename", Args({{"name", name}, {"to", json::Value::Str(pose_name_)}}));
+                    ImGui::CloseCurrentPopup();
+                }
+                if (ImGui::MenuItemEx(Tr("Remove"), icon::kTrash)) Queue("robot.pose_remove", Args({{"name", name}}));
+                ImGui::EndPopup();
+            }
+            ImGui::PopID();
+        }
+    });
 }
 
 }  // namespace nuka::runtime::app::viewer

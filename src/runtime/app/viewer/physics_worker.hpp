@@ -37,7 +37,7 @@ using WorkerClock = std::chrono::steady_clock;
 enum class CommandKind : uint8_t { EditApply, Teleport, ParamSet, Perturb, Transport, ScriptCall, Timeline, Beauty };
 enum class ParamKind : uint8_t {
     Field, HoldGains, ControllerCommand, DisplayEnv, ScatterRows, Overlay, Registry, Telemetry, Iterations, Heatmap,
-    JointWatch
+    JointWatch, TargetRamp
 };
 enum class TransportOp : uint8_t { Play, Pause, Step, Speed, Reset };
 enum class TimelineOp : uint8_t { Seek, Fork, Branch, Rename, Ghost, Configure, Clear };
@@ -72,10 +72,11 @@ struct TickCommand {
     ParamKind param = ParamKind::Field;   // ParamSet
     nuka_state_field_t field = NUKA_FIELD_DRIVE_TARGET;
     size_t offset = 0u;                   // bytes into the field
-    uint32_t index = 0u;                  // Registry parameter
+    uint32_t index = 0u;                  // Registry parameter; TargetRamp: its length in steps
     uint32_t element = 0u;                // Registry element
     // Field values, gains (kp, kd), command, overlay flags, registry value, telemetry (mask, alert),
-    // sweep budget, heatmap or joint watch flag, ghost flag or the keyframe interval and budget [MB].
+    // sweep budget, heatmap or joint watch flag, ghost flag, the keyframe interval and budget [MB],
+    // or a target ramp's (link, from, to) triples; the worker stamps `from`.
     std::vector<float> values;
     uint32_t env = 0u;                    // DisplayEnv; the worker stamps pose writes with the shown one
     std::vector<ScatterRow> rows;         // ScatterRows
@@ -329,6 +330,9 @@ private:
     double Advance();
     bool StepOnce();
     void WritePerturbations();
+    void StampRamp(TickCommand& cmd);
+    void StartRamp(const TickCommand& cmd, uint64_t start);
+    void WriteRamp();
     void SampleJoints();
     void ReadTelemetry();
     void Publish();
@@ -349,6 +353,7 @@ private:
     void KeyHead();
     void SeekTo(uint64_t target);
     void Restore(const Keyframe& key);
+    void ResumeRamp();
     void ApplyLogged(size_t limit = ~size_t(0));
     bool Matches(nuka_checkpoint_handle state);
     void ApplyTimeline(const TickCommand& cmd);
@@ -392,6 +397,15 @@ private:
     bool clock_reset_ = true;
     WorkerClock::time_point last_{};
     std::vector<Perturbation> perturbs_;
+    // A pose blend of the shown environment's drive targets, (link, from, to) triples, over
+    // `steps` steps from tick `start`; empty `values` is none.
+    struct TargetRamp {
+        uint64_t start = 0u;
+        uint32_t steps = 0u;
+        uint32_t env = 0u;
+        std::vector<float> values;
+    };
+    TargetRamp ramp_;
     uint64_t timeline_value_ = 0u;
     uint64_t sequence_ = 0u;
     WorkerClock::time_point last_publish_{};

@@ -20,7 +20,8 @@ constexpr uint32_t kNoParam = ~0u;
 
 bool IsStructural(const std::string& field) {
     return field == "spawn" || field == "delete" || field == "reparent" || field == "script" || field == "import" ||
-           field == "collision" || field == "static" || field == "pin" || field == "drive";
+           field == "collision" || field == "static" || field == "pin" || field == "drive" ||
+           field == "initial_position";
 }
 
 json::Value Floats(const float* v, size_t n) {
@@ -221,7 +222,8 @@ bool EditorDocument::ApplyOp(const EditOp& op, EditOp* done, EditOp* inverse, Op
     const scene::EntityId e = EntityAt(op.target);
     const bool needs_node = !op.target.empty() || op.field == "transform" || op.field == "material" ||
                             op.field == "name" || op.field == "delete" || op.field == "reparent" ||
-                            op.field == "static" || op.field == "pin" || op.field == "drive";
+                            op.field == "static" || op.field == "pin" || op.field == "drive" ||
+                            op.field == "initial_position";
     if (needs_node && e == scene::kInvalidEntity) {
         *error = "no node at '" + op.target + "'";
         return false;
@@ -336,6 +338,20 @@ bool EditorDocument::ApplyOp(const EditOp& op, EditOp* done, EditOp* inverse, Op
         scene::ActuatorRecord& a = es_->scene.GetActuatorMut(act);
         a.type = type;
         if (const json::Value* kp = op.after.Find("kp")) a.gain = kp->AsFloat();
+        out->rebuild = true;
+    } else if (op.field == "initial_position") {
+        // The joint's position at reset, in rad or m; the target is its child link.
+        const auto it = records_.body.find(e);
+        scene::JointId joint = scene::kInvalidJoint;
+        for (const scene::JointRecord& j : es_->scene.Joints())
+            if (it != records_.body.end() && j.child_body == it->second) joint = j.id;
+        if (joint == scene::kInvalidJoint) {
+            *error = "'" + op.target + "' is no joint's child link";
+            return false;
+        }
+        scene::JointRecord& j = es_->scene.GetJointMut(joint);
+        done->before = json::Value::Float(j.initial_position);
+        j.initial_position = op.after.AsFloat();
         out->rebuild = true;
     } else if (op.field == "pin") {
         const auto it = records_.media.find(e);
