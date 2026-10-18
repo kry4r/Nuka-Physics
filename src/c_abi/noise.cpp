@@ -239,13 +239,15 @@ nuka_result_t ApplyPerEpisodeRandomization(
 
     // --- gravity.z: nominal + offset (one world scalar; env 0's sample) ------
     // Gravity is a single world property -> the SAME offset applies to all envs
-    // (it cannot be per-env); the step options carry it.
+    // (it cannot be per-env); the live world and the step options take it.
     {
         const noise::SampledRandomization sampled =
             noise::SampleEpisodeRandomization(cfg, 0u);
-        record.step_options.gravity.z =
-            record.dr_nominal_gravity_z + sampled.gravity_z_offset;
-        (void)sampled;
+        nuka::math::Vec3 gravity = record.step_options.gravity;
+        gravity.z = record.dr_nominal_gravity_z + sampled.gravity_z_offset;
+        const nuka::phi::Status status = record.world->SetGravity(gravity);
+        if (status != nuka::phi::Status::Ok) return nuka::c_abi::MapStatusToResult(status);
+        record.step_options.gravity = gravity;
     }
 
     cudaStreamSynchronize(stream);

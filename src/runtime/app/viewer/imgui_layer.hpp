@@ -11,6 +11,7 @@
 #include "runtime/app/viewer/nui/nui.hpp"
 #include "runtime/app/viewer/policy_view.hpp"
 #include "runtime/app/viewer/property_schema.hpp"
+#include "runtime/app/viewer/randomize_view.hpp"
 #include "runtime/app/viewer/robot_view.hpp"
 #include "runtime/app/viewer/scene_viewport.hpp"
 #include "runtime/app/viewer/script_tabs.hpp"
@@ -303,6 +304,7 @@ struct ViewerUiState {
     DemoView demos;
     ClipView clips;
     SensorView sensors;
+    RandomizeView randomize;
 
     // Queued for the next frame top, so recording the UI never changes the world.
     std::vector<ActionCall> actions;
@@ -485,6 +487,9 @@ private:
     void DrawSensorReading(const SensorItem* shown);
     // Draws the reading as an image again when it changes, with depth and range in false color.
     void UpdateSensorTexture();
+    // Render jitters, physics ranges and parameter ranges, each edit applied on release.
+    void BuildRandomize(nui::VStack& root);
+    void DrawRandomizePanel();
     void BuildScript(nui::VStack& root);
     void BuildConsole(nui::VStack& root);
     // The script tab bar with its keys, completions, disk-change bar and close prompt.
@@ -612,6 +617,9 @@ private:
     SensorItem sensor_edit_;
     int sensor_edit_index_ = -1;
     uint64_t sensor_edit_version_ = ~0ull;
+    // The Randomize panel's copy of the settings, taken again when they change.
+    RandomizeConfig randomize_edit_;
+    uint64_t randomize_edit_version_ = ~0ull;
     char sensor_name_[128] = {0};
     float tuner_gains_[3] = {};      // the tuner's kp, damping and force limit fields
     int tuner_active_ = -1;          // the field being dragged, which keeps its own value

@@ -1359,9 +1359,11 @@ nuka_result_t nuka_world_rebuild_from_scene(nuka_world_handle world, const char*
         const uint32_t vel_iters = record->velocity_iterations_set
                                        ? current.VelocityIterations()
                                        : record->recipe.solver_vel_iters;
+        // A randomized gravity rebuilds from its nominal value, as masses and armature do.
+        nuka::math::Vec3 gravity = record->step_options.gravity;
+        if (record->dr_baseline_captured) gravity.z = record->dr_nominal_gravity_z;
         std::unique_ptr<nuka::nk::World> rebuilt;
-        result = nuka::c_abi::BuildWorld(cooked, record->recipe, record->device,
-                                         record->step_options.gravity, vel_iters, &rebuilt);
+        result = nuka::c_abi::BuildWorld(cooked, record->recipe, record->device, gravity, vel_iters, &rebuilt);
         if (result != NUKA_RESULT_OK) return result;
 
         const bool initial = (flags & NUKA_REBUILD_INITIAL_STATE) != 0u;
@@ -1382,6 +1384,7 @@ nuka_result_t nuka_world_rebuild_from_scene(nuka_world_handle world, const char*
         }
         record->beauty.reset();
         nuka::c_abi::InstallScene(*record, std::move(rebuilt), std::move(cooked), std::move(scene));
+        record->step_options.gravity = gravity;
         record->dr_baseline_captured = false;
         record->dr_nominal_link_mass.clear();
         record->dr_nominal_joint_armature.clear();

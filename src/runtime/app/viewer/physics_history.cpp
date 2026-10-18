@@ -174,7 +174,7 @@ bool PhysicsWorker::Recorded(const TickCommand& cmd) {
             return cmd.param == ParamKind::Field || cmd.param == ParamKind::HoldGains ||
                    cmd.param == ParamKind::ControllerCommand || cmd.param == ParamKind::Registry ||
                    cmd.param == ParamKind::Iterations || cmd.param == ParamKind::TargetRamp ||
-                   cmd.param == ParamKind::TargetTrack;
+                   cmd.param == ParamKind::TargetTrack || cmd.param == ParamKind::Randomize;
         default:
             return false;
     }

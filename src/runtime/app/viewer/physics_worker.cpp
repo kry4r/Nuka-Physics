@@ -1,7 +1,9 @@
 #include "runtime/app/viewer/physics_worker.hpp"
 
+#include "nuka/nuka_noise.h"
 #include "nuka/nuka_state_sensor.h"
 #include "runtime/app/viewer/editor_scene.hpp"
+#include "runtime/app/viewer/randomize_view.hpp"
 #include "runtime/app/viewer/robot_tools.hpp"
 
 #include <algorithm>
@@ -30,6 +32,14 @@ bool Capped(const nuka_telemetry_record_t& r) { return (r.flags & NUKA_TELEMETRY
 double Ms(WorkerClock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); }
 
 math::Vec3 Vec(const float v[3]) { return math::Vec3{v[0], v[1], v[2]}; }
+
+// A uniform draw in [0, 1) for element `element` of registry parameter `param` under `seed`.
+float Draw(uint32_t seed, uint32_t param, uint32_t element) {
+    uint64_t z = (static_cast<uint64_t>(seed) << 32u | param) * 0x9E3779B97F4A7C15ull + element;
+    z = (z ^ (z >> 30u)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27u)) * 0x94D049BB133111EBull;
+    return static_cast<float>((z ^ (z >> 31u)) >> 40u) * (1.0f / 16777216.0f);
+}
 
 // Whether two perturbations hold the same particle, link or body.
 bool SameTarget(const Perturbation& a, const Perturbation& b) {
@@ -257,6 +267,7 @@ uint64_t PhysicsWorker::Bind(WorkerBinding binding) {
     track_ = TargetTrack{};
     command_ = {};
     axes_.clear();
+    param_nominal_.clear();
     demo_envs_.clear();
     timeline_value_ = 0u;
     last_mirror_ = WorkerClock::time_point{};
@@ -496,6 +507,9 @@ bool PhysicsWorker::Apply(const TickCommand& cmd) {
                     last_mirror_ = WorkerClock::time_point{};
                     return true;
                 case ParamKind::Registry: {
+                    // A written value is the one later draws scale.
+                    if (const auto it = param_nominal_.find(cmd.index); it != param_nominal_.end())
+                        it->second[cmd.element] = cmd.values[0];
                     // A refused write reports without pausing; the transport keeps running.
                     TickResult r;
                     r.seq = cmd.seq;
@@ -552,6 +566,9 @@ bool PhysicsWorker::Apply(const TickCommand& cmd) {
                 case ParamKind::TeleopAxes:
                     axes_ = cmd.values;
                     return false;
+                case ParamKind::Randomize:
+                    Randomize(cmd);
+                    return true;
             }
             return false;
         case CommandKind::Perturb:
@@ -956,6 +973,63 @@ void PhysicsWorker::SolveIk(const TickCommand& cmd) {
     std::lock_guard<std::mutex> lock(ik_mu_);
     ik_ = std::move(report);
     ik_ready_ = true;
+}
+
+// `values` holds a render flag and the jitters, a physics flag and the (lo, hi) ranges, then a
+// (param, count, lo, hi) quadruple per registry parameter drawn. A flag is 0 where the world has
+// nothing to randomize, 1 to return to nominal values and 2 to draw with seed `index`.
+void PhysicsWorker::Randomize(const TickCommand& cmd) {
+    const std::vector<float>& v = cmd.values;
+    if (v[0] > 0.0f) {
+        const float* j = v.data() + 1;
+        const nuka_render_dr_desc_t render{j[0], j[1], j[2], j[3], j[4], j[5], j[6], cmd.index, v[0] > 1.0f ? 1 : 0};
+        CheckResult(nuka_world_set_render_randomization(bind_.world, &render), "nuka_world_set_render_randomization");
+    }
+    const size_t at = 1u + kJitterCount;
+    if (v[at] > 0.0f) {
+        // Nominal values are a draw of unit factors and zero offsets.
+        const bool draw = v[at] > 1.0f;
+        const float* r = v.data() + at + 1u;
+        nuka_domain_randomization_desc_t physics{};
+        physics.mass_mul_lo = draw ? r[0] : 1.0f;
+        physics.mass_mul_hi = draw ? r[1] : 1.0f;
+        physics.friction_mul_lo = physics.friction_mul_hi = 1.0f;
+        physics.armature_off_lo = draw ? r[2] : 0.0f;
+        physics.armature_off_hi = draw ? r[3] : 0.0f;
+        physics.gravity_off_lo = draw ? r[4] : 0.0f;
+        physics.gravity_off_hi = draw ? r[5] : 0.0f;
+        physics.seed = cmd.index;
+        physics.enabled = 1;
+        CheckResult(nuka_world_set_domain_randomization(bind_.world, &physics), "nuka_world_set_domain_randomization");
+        CheckResult(nuka_world_apply_domain_randomization(bind_.world), "nuka_world_apply_domain_randomization");
+    }
+    // Elements without a scene record, such as a root link's joint, take no value.
+    const auto write = [&](uint32_t param, uint32_t element, double value) {
+        const nuka_result_t result = nuka_world_set_param(bind_.world, param, element, value);
+        if (result != NUKA_RESULT_NOT_SUPPORTED) CheckResult(result, "nuka_world_set_param");
+    };
+    std::map<uint32_t, std::array<float, 3>> drawn;
+    for (size_t i = at + 1u + 2u * kRangeCount; i + 4u <= v.size(); i += 4u)
+        drawn[static_cast<uint32_t>(v[i])] = {v[i + 1u], v[i + 2u], v[i + 3u]};
+    // A parameter drawn before and not now returns to its nominal values.
+    for (auto it = param_nominal_.begin(); it != param_nominal_.end();) {
+        if (drawn.count(it->first) != 0u) {
+            ++it;
+            continue;
+        }
+        for (uint32_t e = 0; e < it->second.size(); ++e) write(it->first, e, it->second[e]);
+        it = param_nominal_.erase(it);
+    }
+    for (const auto& [param, range] : drawn) {
+        std::vector<double>& nominal = param_nominal_[param];
+        if (nominal.empty()) {
+            nominal.resize(static_cast<size_t>(range[0]));
+            for (uint32_t e = 0; e < nominal.size(); ++e)
+                CheckResult(nuka_world_get_param(bind_.world, param, e, &nominal[e]), "nuka_world_get_param");
+        }
+        for (uint32_t e = 0; e < nominal.size(); ++e)
+            write(param, e, nominal[e] * (range[1] + (range[2] - range[1]) * Draw(cmd.index, param, e)));
+    }
 }
 
 void PhysicsWorker::DispatchTick() {

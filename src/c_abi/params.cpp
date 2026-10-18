@@ -162,7 +162,11 @@ nuka_result_t SetParam(WorldRecord& record, Param p, uint32_t element, double va
         nuka::math::Vec3 gravity = world.Gravity();
         gravity.z = f;
         const Status status = world.SetGravity(gravity);
-        if (status == Status::Ok) record.step_options.gravity = gravity;
+        // A written gravity is also the value later randomization draws around.
+        if (status == Status::Ok) {
+            record.step_options.gravity = gravity;
+            record.dr_nominal_gravity_z = f;
+        }
         return nuka::c_abi::MapStatusToResult(status);
     }
     if (p == Param::VelocityIterations) {

@@ -41,7 +41,7 @@ enum class CommandKind : uint8_t {
 };
 enum class ParamKind : uint8_t {
     Field, HoldGains, ControllerCommand, DisplayEnv, ScatterRows, Overlay, Registry, Telemetry, Iterations, Heatmap,
-    JointWatch, TargetRamp, TargetTrack, TeleopAxes
+    JointWatch, TargetRamp, TargetTrack, TeleopAxes, Randomize
 };
 enum class TransportOp : uint8_t { Play, Pause, Step, Speed, Reset };
 enum class TimelineOp : uint8_t { Seek, Fork, Branch, Rename, Ghost, Configure, Clear };
@@ -77,14 +77,15 @@ struct TickCommand {
     nuka_state_field_t field = NUKA_FIELD_DRIVE_TARGET;
     size_t offset = 0u;                   // bytes into the field; TargetTrack: 1 repeats its rows
     // Registry parameter; TargetRamp: its length in steps; TargetTrack: its rows; GainTest: the link.
-    // SensorRead: the camera, lidar or state sensor among its kind.
+    // SensorRead: the camera, lidar or state sensor among its kind; Randomize: the seed.
     uint32_t index = 0u;
     // Registry element; TargetTrack: the links of a row; SensorRead: a nuka_sensor_channel_t or kStatePlane.
     uint32_t element = 0u;
     // Field values, gains (kp, kd), command, overlay flags, registry value, telemetry (mask, alert),
     // sweep budget, heatmap or joint watch flag, ghost flag, the keyframe interval and budget [MB],
     // a target ramp's (link, from, to) triples, the worker stamping `from`, a target track's links
-    // then its rows, the teleop axes, or a gain test's (sine, amplitude, frequency, duration).
+    // then its rows, the teleop axes, a gain test's (sine, amplitude, frequency, duration), or a
+    // randomization as PhysicsWorker::Randomize reads it.
     std::vector<float> values;
     // DisplayEnv, TargetTrack, SensorRead; the worker stamps pose writes with the shown one.
     uint32_t env = 0u;
@@ -400,6 +401,7 @@ private:
     void SampleDemo();
     void RunGainTest(const TickCommand& cmd);
     void SolveIk(const TickCommand& cmd);
+    void Randomize(const TickCommand& cmd);
     void SampleJoints();
     void ReadTelemetry();
     void Publish();
@@ -490,6 +492,8 @@ private:
     // The controller command and teleop axes in force, which demonstrations record.
     std::array<float, 3> command_{};
     std::vector<float> axes_;
+    // Each registry parameter a randomization scales: its elements' values before any draw.
+    std::map<uint32_t, std::vector<double>> param_nominal_;
     std::vector<uint32_t> demo_envs_;
     std::vector<uint32_t> demo_roots_;
     std::vector<DemoSample> demo_;

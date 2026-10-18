@@ -27,6 +27,7 @@
 #include "runtime/app/viewer/editor_import.hpp"
 #include "runtime/app/viewer/editor_instance.hpp"
 #include "runtime/app/viewer/editor_profile.hpp"
+#include "runtime/app/viewer/editor_randomize.hpp"
 #include "runtime/app/viewer/editor_scene.hpp"
 #include "runtime/app/viewer/editor_sensors.hpp"
 #include "runtime/app/viewer/entity_drag.hpp"
@@ -947,6 +948,7 @@ struct EditorHost::State : DocumentHost {
     void RegisterIkActions();
     void RegisterOverlayActions();
     void RegisterSensorActions();
+    void RegisterRandomizeActions();
     // Drops sensor `index` in one undo step and clears its selection.
     ActionResult RemoveSensor(int index);
     void RegisterTeleopActions();
@@ -1030,6 +1032,14 @@ struct EditorHost::State : DocumentHost {
     // The document's clip file in the profile; empty while untitled.
     std::string ClipFile() const;
     void SaveClips();
+    // The document's randomization file in the profile; empty while untitled.
+    std::string RandomizeFile() const;
+    void SaveRandomize();
+    // Sends the randomization in force to the worker as one logged input.
+    void PushRandomize();
+    json::Value RandomizeJson() const;
+    // The last push drew masses, armature and gravity, which the next one returns to nominal values.
+    bool physics_drawn_ = false;
     int FindClip(const std::string& name) const;
     // The clip `args` names as `clip`, else the edited one; -1 with `error` saying why when none.
     int ClipArg(const json::Value& args, std::string* error) const;
@@ -1942,8 +1952,21 @@ void EditorHost::State::BindWorker(uint64_t tick, double sim_time) {
         if (infos[i].scene_field[0] == '\0')
             CheckResult(nuka_world_get_param(world_, i, 0u, &values[i]), "nuka_world_get_param");
     doc_.SetParams(std::move(infos), std::move(values));
+    RandomizeView& randomize = ui_state_.randomize;
+    randomize.param_keys.clear();
+    randomize.param_units.clear();
+    for (const nuka_param_info_t& info : doc_.Params()) {
+        if (!RandomizableParam(info)) continue;
+        randomize.param_keys.emplace_back(info.key);
+        randomize.param_units.emplace_back(info.unit);
+    }
 
     const WorldLayout& layout = loaded_->Layout();
+    const std::vector<scene::SensorDesc>& sensors = loaded_->scene.Sensors();
+    randomize.camera = std::any_of(sensors.begin(), sensors.end(), [](const scene::SensorDesc& s) {
+        return RenderSensor(s.type) && !LidarSensor(s.type);
+    });
+    randomize.articulated = layout.articulations_per_env > 0u;
     WorkerBinding binding;
     binding.world = world_;
     binding.layout = layout;
@@ -1983,6 +2006,12 @@ void EditorHost::State::BindWorker(uint64_t tick, double sim_time) {
     ui_state_.clips.left = 0u;
     teleop_command_sent_.reset();
     bound_epoch_ = worker_.Bind(std::move(binding));
+    // The new binding starts from nominal values and draws again from the same seed.
+    physics_drawn_ = false;
+    if (randomize.config.Active())
+        PushRandomize();
+    else
+        randomize.drawn = false;
     ui_state_.robot.ik.pending = 0u;
     ui_state_.robot.ik.link = -1;
     ik_drag_ = false;
@@ -2910,6 +2939,54 @@ void EditorHost::State::SaveClips() {
     std::ofstream(Utf8Path(file), std::ios::binary | std::ios::trunc) << ClipsJson(clips).Dump(2);
 }
 
+std::string EditorHost::State::RandomizeFile() const {
+    return doc_path_.empty() ? std::string() : PathText(profile_->Dir() / "dr" / (Hex(Fnv1a(doc_path_)) + ".json"));
+}
+
+// A document left at the default settings keeps no file.
+void EditorHost::State::SaveRandomize() {
+    const std::string file = RandomizeFile();
+    const std::string text = RandomizeToJson(ui_state_.randomize.config).Dump(2);
+    if (file.empty()) return;
+    if (text == RandomizeToJson(RandomizeConfig{}).Dump(2)) {
+        fs::remove(Utf8Path(file));
+        return;
+    }
+    fs::create_directories(Utf8Path(file).parent_path());
+    std::ofstream(Utf8Path(file), std::ios::binary | std::ios::trunc) << text;
+}
+
+// A flag per kind leaves it be (0), returns it to nominal values (1) or draws it (2).
+void EditorHost::State::PushRandomize() {
+    RandomizeView& r = ui_state_.randomize;
+    const RandomizeConfig& c = r.config;
+    std::vector<float> values;
+    values.push_back(r.camera ? (c.render ? 2.0f : 1.0f) : 0.0f);
+    values.insert(values.end(), c.jitter.begin(), c.jitter.end());
+    values.push_back(r.articulated && c.physics ? 2.0f : physics_drawn_ ? 1.0f : 0.0f);
+    values.insert(values.end(), c.range.begin(), c.range.end());
+    const std::vector<nuka_param_info_t>& infos = doc_.Params();
+    for (const ParamRange& p : c.params)
+        for (size_t i = 0; i < infos.size(); ++i)
+            if (p.on && p.key == infos[i].key)
+                values.insert(values.end(), {static_cast<float>(i), static_cast<float>(infos[i].count), p.lo, p.hi});
+    TickCommand cmd = TickCommand::Param(ParamKind::Randomize, std::move(values));
+    cmd.index = c.seed;
+    worker_.Push(std::move(cmd));
+    r.drawn = c.Active();
+    physics_drawn_ = r.articulated && c.physics;
+}
+
+json::Value EditorHost::State::RandomizeJson() const {
+    const RandomizeView& r = ui_state_.randomize;
+    json::Value v = RandomizeToJson(r.config);
+    v.Set("camera", json::Value::Bool(r.camera));
+    v.Set("articulated", json::Value::Bool(r.articulated));
+    v.Set("drawn", json::Value::Bool(r.drawn));
+    v.Set("keys", StrList(r.param_keys));
+    return v;
+}
+
 int EditorHost::State::FindClip(const std::string& name) const {
     const std::vector<Clip>& clips = ui_state_.clips.clips;
     const auto it = std::find_if(clips.begin(), clips.end(), [&](const Clip& c) { return c.name == name; });
@@ -3503,6 +3580,7 @@ ActionResult EditorHost::State::SaveScene(const std::string& path) {
     SyncBookmarks(true);
     SavePoses();
     SaveClips();
+    SaveRandomize();
     start_stale_ = true;
     assets_stale_ = true;
     // The recent list shows the viewport as it was saved.
@@ -3519,6 +3597,8 @@ ActionResult EditorHost::State::SaveScene(const std::string& path) {
 // Loads `file` as the document that saves to `doc_path`; an empty one stays untitled.
 ActionResult EditorHost::State::OpenDocument(const std::string& file, const std::string& doc_path) {
     std::snprintf(ui_state_.load_path, sizeof(ui_state_.load_path), "%s", file.c_str());
+    RandomizeView& randomize = ui_state_.randomize;
+    randomize.config = RandomizeConfig{};
     worker_.Exclusive([&] { ApplyLoad(file); });
     if (!ui_state_.load_error.empty()) return ActionResult::Fail(ui_state_.load_error);
     doc_path_ = doc_path.empty() ? std::string() : NormalPath(doc_path);
@@ -3544,6 +3624,13 @@ ActionResult EditorHost::State::OpenDocument(const std::string& file, const std:
     clip_undo_.clear();
     clip_redo_.clear();
     SyncClipView();
+    std::string text;
+    std::string error;
+    if (!doc_path_.empty() && ReadEntireFile(RandomizeFile(), &text) &&
+        !RandomizeFromJson(json::Value::Parse(text), randomize.param_keys, &randomize.config, &error))
+        Emit(stderr, "[nuka_editor] " + RandomizeFile() + ": " + error + "\n");
+    ++randomize.version;
+    if (randomize.config.Active()) PushRandomize();
     start_stale_ = true;
     assets_stale_ = true;
     Emit(stdout, "[nuka_editor] opened " + file + "\n");
@@ -3642,6 +3729,7 @@ void EditorHost::State::RegisterActions() {
     RegisterTimelineActions();
     RegisterRobotActions();
     RegisterSensorActions();
+    RegisterRandomizeActions();
     RegisterScriptActions();
     ui_.RegisterActions(actions_);
 }
@@ -4605,6 +4693,41 @@ void EditorHost::State::RegisterOverlayActions() {
                   }});
 }
 
+void EditorHost::State::RegisterRandomizeActions() {
+    const auto has_scene = [this] { return loaded_ != nullptr; };
+    actions_.Add({"dr.get", "Randomization", "sim", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value&) { return Ok(RandomizeJson()); }, "", true});
+    // Merges `args` in the shape dr.get reports and draws again when anything randomizes or did.
+    actions_.Add({"dr.set", "Set Randomization", "sim", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      RandomizeView& r = ui_state_.randomize;
+                      RandomizeConfig next = r.config;
+                      std::string error;
+                      if (!RandomizeFromJson(args, r.param_keys, &next, &error)) return ActionResult::Fail(error);
+                      if (next.render && !r.config.render && !r.camera)
+                          return ActionResult::Fail("render randomization needs a camera sensor");
+                      if (next.physics && !r.config.physics && !r.articulated)
+                          return ActionResult::Fail("physics randomization needs an articulated body");
+                      r.config = std::move(next);
+                      if (r.config.Active() || r.drawn) PushRandomize();
+                      SaveRandomize();
+                      ++r.version;
+                      return Ok(RandomizeJson());
+                  },
+                  "", true});
+    // Draws with `seed`, else the next one.
+    actions_.Add({"dr.sample", "Resample Randomization", "sim", "", ShortcutScope::Global,
+                  [this] { return loaded_ != nullptr && ui_state_.randomize.config.Active(); }, {},
+                  [this](const json::Value& args) {
+                      RandomizeConfig& c = ui_state_.randomize.config;
+                      c.seed = static_cast<uint32_t>(NumArg(args, "seed", c.seed + 1.0));
+                      PushRandomize();
+                      SaveRandomize();
+                      ++ui_state_.randomize.version;
+                      return Ok(Object({{"seed", json::Value::Int(c.seed)}}));
+                  }});
+}
+
 void EditorHost::State::RegisterSensorActions() {
     const auto has_scene = [this] { return loaded_ != nullptr; };
     // `index` or `sensor` (a name) picks a sensor, else the selected one; -1 when none matches.
@@ -5199,6 +5322,9 @@ void EditorHost::State::RegisterFileActions() {
                       DropAutosave();
                       doc_path_.clear();
                       ui_state_.save_path[0] = '\0';
+                      ui_state_.randomize.config = RandomizeConfig{};
+                      ui_state_.randomize.drawn = false;
+                      ++ui_state_.randomize.version;
                       return Ok();
                   }});
     actions_.Add({"file.recover", "Recover Autosave", "file", "", ShortcutScope::Global, owns_world, {},
@@ -6075,6 +6201,14 @@ void EditorHost::State::RegisterSimActions() {
                       }
                       reset_seq_ = transport_seq_ = worker_.Push(TickCommand::Transport(TransportOp::Reset));
                       reset_framing_ = true;
+                      // A reset draws again, with the next seed unless the draw stays.
+                      RandomizeView& r = ui_state_.randomize;
+                      if (r.config.Active()) {
+                          if (r.config.reset_draws) ++r.config.seed;
+                          PushRandomize();
+                          SaveRandomize();
+                          ++r.version;
+                      }
                       // The new history logs the command from its first tick.
                       teleop_command_sent_.reset();
                       ui_state_.playing = sent_playing_ = false;
