@@ -1,6 +1,8 @@
 #pragma once
 // The robot workflow's joint state as the physics thread samples it and the Joints panel shows it.
 
+#include "math/transform.hpp"
+
 #include <cstdint>
 #include <cstddef>
 #include <deque>
@@ -42,6 +44,7 @@ struct RobotJoint {
     float kp = 0.0f;           // a position drive's gain
     float force_limit = 0.0f;  // 0 is unlimited
     float damping = 0.0f;      // the joint's own
+    float initial = 0.0f;      // the authored initial position, where Reset puts the target
 };
 
 // A link of the shown environment's articulations.
@@ -51,6 +54,12 @@ struct RobotLink {
     std::string joint;  // the incoming joint, empty at a root
     std::string type;   // the incoming joint's type, "root" at a root
     float mass = 0.0f;
+    math::Transform inertial;    // the principal inertia frame in the link's frame
+    math::Vec3 inertia;          // the principal moments [kg·m²]
+    math::Transform frame;       // the incoming joint's frame in the link's frame
+    math::Transform zero_frame;  // that frame at q = 0, in the parent link's frame
+    math::Vec3 axis{0.0f, 0.0f, 1.0f};  // the joint's axis in its frame
+    float size = 0.0f;           // the longest edge of the link's visual bounds [m]
 };
 
 // Named joint positions in rad or m; applying one moves only the joints it names.
@@ -152,12 +161,36 @@ struct IkState {
     std::string error;
 };
 
+// The robot overlays the viewport draws over the shown environment's links.
+struct RobotOverlays {
+    bool on = false;
+    bool frames = true;       // each link's axes
+    bool axes = true;         // joint axes with their limits
+    bool com = true;          // each link's and the robot's centre of mass
+    bool inertia = false;     // equivalent uniform boxes
+    bool translucent = true;  // the robot's meshes while the overlays show
+};
+
+// The Measure tool's two ends: a link's origin or centre of mass, a joint's origin, or the ground
+// below the first end; it follows the links as they move.
+struct MeasureEnd {
+    enum class Kind : uint8_t { None, Link, Joint, Ground };
+    Kind kind = Kind::None;
+    int link = -1;  // by index into the links; a joint end names its child link
+};
+
+struct Measure {
+    bool com = false;  // a link end takes its centre of mass, else its origin
+    MeasureEnd a, b;
+};
+
 struct RobotView {
     std::vector<RobotJoint> joints;  // in link order
     std::vector<RobotLink> links;    // in link order
     std::vector<std::string> roots;  // the articulation roots' nodes
     bool floating = false;           // some root is a free base
     JointFrame live;
+    std::vector<math::Transform> link_poses;  // the shown environment's, in link order
     bool watch = false;  // the physics thread samples every step
     uint64_t session = 0u;
     uint64_t first = 0u;  // the number of history.front() in the worker's count
@@ -171,6 +204,11 @@ struct RobotView {
     GainTuner tuner;
     Assembler assembler;
     IkState ik;
+    RobotOverlays overlays;
+    Measure measure;
+    bool radians = false;  // revolute joints show radians, else degrees
+    int dragging = -1;     // the joint whose target the panel drags, by index into `joints`
+    int hovered = -1;      // the link under the pointer, by index into the links
 };
 
 }  // namespace nuka::runtime::app::viewer

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
 #include <initializer_list>
 #include <limits>
 #include <utility>
@@ -40,7 +41,14 @@ void DownloadLinks(nuka_world_handle world, nuka_state_field_t field, const Worl
 
 float At(const std::vector<float>& v, uint32_t i) { return i < v.size() ? v[i] : 0.0f; }
 
+json::Value Vec3Json(const math::Vec3& p) {
+    json::Value a = json::Value::Array();
+    for (const float c : {p.x, p.y, p.z}) a.PushBack(json::Value::Float(c));
+    return a;
+}
+
 constexpr double kPi = 3.14159265358979323846;
+constexpr float kDegrees = 57.2957795f;
 
 // Step figures against the settled value, the mean of the last tenth of the samples.
 void FitStep(const GainTrace& t, GainMetrics* m) {
@@ -135,6 +143,17 @@ const char* JointTypeName(scene::JointType type) {
     return "";
 }
 
+float JointShown(const RobotJoint& j, float v, bool radians) { return j.prismatic || radians ? v : v * kDegrees; }
+
+const char* JointUnit(const RobotJoint& j, bool radians) { return j.prismatic ? " m" : radians ? " rad" : "\xC2\xB0"; }
+
+std::string JointText(const RobotJoint& j, float v, bool radians) {
+    char text[48];
+    std::snprintf(text, sizeof(text), j.prismatic || radians ? "%+.3f%s" : "%+.1f%s",
+                  static_cast<double>(JointShown(j, v, radians)), JointUnit(j, radians));
+    return text;
+}
+
 bool ParseJointType(const std::string& name, scene::JointType* out) {
     for (const auto& [t, n] : kJointTypes) {
         if (name == n) {
@@ -167,6 +186,7 @@ std::vector<RobotJoint> RobotJoints(const scene::SceneIR& scene, const WorldLayo
             r.force_limit = a.force_limit;
         }
         r.damping = j->damping;
+        r.initial = j->initial_position;
         joints.push_back(std::move(r));
     }
     return joints;
@@ -186,26 +206,80 @@ std::vector<RobotLink> RobotLinks(const scene::SceneIR& scene, const WorldLayout
     for (uint32_t l = 0; l < layout.links_per_env; ++l) {
         const nuka_link_binding_t& link = layout.links[l];
         RobotLink& r = links[l];
+        const scene::RigidBodyRecord& body = scene.GetBody(link.body_index);
         r.path = path_of(scene.EntityOfBody(link.body_index));
-        r.mass = scene.GetBody(link.body_index).mass;
+        r.mass = body.mass;
+        r.inertial = body.inertial_transform;
+        r.inertia = body.inertia;
         r.type = "root";
         const scene::JointRecord* j = link.is_root != 0u ? nullptr : IncomingJoint(scene, link.body_index);
         if (j == nullptr) continue;
         r.joint = j->name;
         r.type = JointTypeName(j->type);
+        r.frame = j->child_frame;
+        r.zero_frame = j->parent_frame;
+        r.axis = j->axis;
         for (uint32_t p = 0; p < layout.links_per_env; ++p)
             if (layout.links[p].body_index == j->parent_body) r.parent = static_cast<int>(p);
     }
     return links;
 }
 
-json::Value LinkJson(const RobotLink& link, const std::vector<RobotLink>& links) {
+math::Vec3 LinkCom(const RobotLink& link, const math::Transform& pose) {
+    return pose.TransformPoint(link.inertial.position);
+}
+
+bool RobotCom(const RobotView& v, math::Vec3* com, float* mass) {
+    math::Vec3 sum = math::Vec3::Zero();
+    *mass = 0.0f;
+    for (size_t l = 0; l < std::min(v.links.size(), v.link_poses.size()); ++l) {
+        sum += LinkCom(v.links[l], v.link_poses[l]) * v.links[l].mass;
+        *mass += v.links[l].mass;
+    }
+    if (!(*mass > 0.0f)) return false;
+    *com = sum / *mass;
+    return true;
+}
+
+bool InertiaBox(const RobotLink& link, math::Vec3* edges) {
+    const math::Vec3& i = link.inertia;
+    const float squares[3] = {i.y + i.z - i.x, i.z + i.x - i.y, i.x + i.y - i.z};
+    if (!(link.mass > 0.0f) || std::any_of(squares, squares + 3, [](float s) { return !(s > 0.0f); })) return false;
+    *edges = math::Vec3{std::sqrt(6.0f * squares[0] / link.mass), std::sqrt(6.0f * squares[1] / link.mass),
+                        std::sqrt(6.0f * squares[2] / link.mass)};
+    return true;
+}
+
+bool MeasurePoint(const RobotView& v, const MeasureEnd& e, math::Vec3* out) {
+    if ((e.kind != MeasureEnd::Kind::Link && e.kind != MeasureEnd::Kind::Joint) ||
+        static_cast<size_t>(e.link) >= std::min(v.links.size(), v.link_poses.size()))
+        return false;
+    const RobotLink& link = v.links[static_cast<size_t>(e.link)];
+    const math::Transform& pose = v.link_poses[static_cast<size_t>(e.link)];
+    *out = e.kind == MeasureEnd::Kind::Joint ? (pose * link.frame).position
+           : v.measure.com                   ? LinkCom(link, pose)
+                                             : pose.position;
+    return true;
+}
+
+bool MeasureEnds(const RobotView& v, math::Vec3* from, math::Vec3* to) {
+    if (!MeasurePoint(v, v.measure.a, from)) return false;
+    if (v.measure.b.kind != MeasureEnd::Kind::Ground) return MeasurePoint(v, v.measure.b, to);
+    *to = math::Vec3{from->x, from->y, 0.0f};
+    return true;
+}
+
+json::Value LinkJson(const RobotLink& link, const std::vector<RobotLink>& links, const math::Transform* pose) {
     json::Value v = json::Value::Object();
     v.Set("path", json::Value::Str(link.path));
     v.Set("parent", json::Value::Str(link.parent < 0 ? std::string() : links[static_cast<size_t>(link.parent)].path));
     v.Set("joint", json::Value::Str(link.joint));
     v.Set("type", json::Value::Str(link.type));
     v.Set("mass", json::Value::Float(link.mass));
+    if (pose == nullptr) return v;
+    const math::Vec3 com = LinkCom(link, *pose);
+    v.Set("origin", Vec3Json(pose->position));
+    v.Set("com", Vec3Json(com));
     return v;
 }
 

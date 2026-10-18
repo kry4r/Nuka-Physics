@@ -38,10 +38,6 @@ constexpr float kPi = 3.14159265f;
 constexpr double kCurveSeconds = 5.0;
 constexpr int kTableRows = 12;
 
-// Revolute joints show degrees, prismatic ones meters.
-float Shown(const RobotJoint& j, float v) { return j.prismatic ? v : v * kDegrees; }
-const char* Unit(const RobotJoint& j) { return j.prismatic ? " m" : "\xC2\xB0"; }
-
 float At(const std::vector<float>& v, uint32_t i) { return i < v.size() ? v[i] : 0.0f; }
 
 // What a joint's bar spans: its limits, else half a turn either way or a meter.
@@ -76,10 +72,6 @@ void LimitBar(const RobotJoint& j, float q, float target, ImVec2 a, ImVec2 b) {
     const float tx = x(target), ty = y1 + 2.0f * s;
     dl->AddTriangleFilled(ImVec2(tx, ty), ImVec2(tx - 4.0f * s, ty + 5.0f * s), ImVec2(tx + 4.0f * s, ty + 5.0f * s),
                           U32(theme::kInfo));
-}
-
-std::string Value(const RobotJoint& j, float v) {
-    return Fmt(j.prismatic ? "%+.3f%s" : "%+.1f%s", static_cast<double>(Shown(j, v)), Unit(j));
 }
 
 ImPlotSpec Line(const ImVec4& color, float weight) {
@@ -119,12 +111,23 @@ void ImGuiLayer::BuildJoints(nui::VStack& root) {
     const auto robot = [this]() -> RobotView& { return frame_.ui->robot; };
 
     auto& hero = root.Add<nui::HStack>();
+    hero.wrap = true;
     auto& count = hero.Add<nui::Label>(std::string(), Tone::Accent, TextStyle::Hero);
     count.text_fn = [robot] { return Fmt(Tr("%zu JOINTS"), robot().joints.size()); };
     auto& base = hero.Add<nui::Badge>();
     base.text_fn = [robot] { return std::string(Tr(robot().floating ? "floating base" : "fixed base")); };
     base.tone_fn = [robot] { return robot().floating ? Tone::Info : Tone::Dim; };
+    auto& mass = hero.Add<nui::Badge>();
+    mass.text_fn = [robot] {
+        float kg = 0.0f;
+        for (const RobotLink& l : robot().links) kg += l.mass;
+        return Fmt("%.2f kg", static_cast<double>(kg));
+    };
+    mass.tone_fn = [] { return Tone::Dim; };
     hero.Add<nui::Spacer>();
+    auto& overlays = hero.Add<nui::IconButton>(icon::kOverlays, "Robot Overlays");
+    overlays.on_click = [this, robot] { Queue("view.robot_overlays", Args({{"on", json::Value::Bool(!robot().overlays.on)}})); };
+    overlays.checked_fn = [robot] { return robot().overlays.on; };
     auto& tuner = hero.Add<nui::IconButton>(icon::kWaves, "Gain Tuner").Action("robot.gain_tuner");
     tuner.checked_fn = [robot] { return robot().tuner.open; };
     auto& assembler = hero.Add<nui::IconButton>(icon::kPlug, "Robot Assembler").Action("robot.assembler");
@@ -135,9 +138,13 @@ void ImGuiLayer::BuildJoints(nui::VStack& root) {
     root.Add<nui::Label>("No moving joints", Tone::Dim).visible_if = [robot] { return robot().joints.empty(); };
 
     auto& tools = root.Add<nui::HStack>();
+    tools.wrap = true;
     tools.Add<nui::ToggleButton>("Fixed Base").Action("robot.fix_base");
     auto& convert = tools.Add<nui::Button>("Position Drive", icon::kDrive).Action("robot.drive");
     convert.tooltip = "Makes every joint a position drive with the gain below, in one undoable edit.";
+    auto& reset = tools.Add<nui::Button>("Reset", icon::kReset).Action("robot.reset_targets");
+    reset.tooltip = "Puts every joint's target back at its initial position.";
+    tools.Add<nui::ToggleButton>("Radians").Action("robot.radians");
     tools.visible_if = [robot] { return !robot().joints.empty(); };
     auto& grid = root.Add<nui::PropertyGrid>();
     auto& kp = grid.Add<nui::FloatField>("Drive kp", nui::Ref(&ui.robot.drive_kp), 1.0f, 0.0f, 100000.0f);
@@ -159,6 +166,7 @@ void ImGuiLayer::BuildJoints(nui::VStack& root) {
     root.Add<nui::Custom>([this] {
         ViewerUiState& u = *frame_.ui;
         RobotView& v = u.robot;
+        v.dragging = -1;
         if (v.joints.empty() || u.drive_targets.size() != u.drive_dirty.size()) return;
         const float s = nui::Scale();
         const std::string needle = Lower(v.filter);
@@ -184,14 +192,16 @@ void ImGuiLayer::BuildJoints(nui::VStack& root) {
                                                 : Fmt(Tr("%s actuator"), Tr(j.drive.c_str()));
                     const std::string limit = j.force_limit > 0.0f ? Fmt(Tr("limit %.1f"), static_cast<double>(j.force_limit))
                                                                    : std::string(Tr("no force limit"));
-                    const std::string speed = Fmt(j.prismatic ? Tr("velocity %+.3f m/s") : Tr("velocity %+.1f\xC2\xB0/s"),
-                                                  static_cast<double>(Shown(j, At(v.live.qd, j.link))));
+                    const char* velocity = j.prismatic ? Tr("velocity %+.3f m/s")
+                                           : v.radians ? Tr("velocity %+.3f rad/s")
+                                                       : Tr("velocity %+.1f\xC2\xB0/s");
+                    const std::string speed = Fmt(velocity, static_cast<double>(JointShown(j, At(v.live.qd, j.link), v.radians)));
                     ImGui::SetTooltip("%s\n%s  \xC2\xB7  %s\n%s", j.path.c_str(), drive.c_str(), limit.c_str(), speed.c_str());
                 }
                 ImDrawList* dl = ImGui::GetWindowDrawList();
                 const float ty = p.y + pad * 0.5f, effort = At(v.live.effort, j.link);
                 const std::string force = Fmt(j.prismatic ? "%.1f N" : "%.1f N\xC2\xB7m", static_cast<double>(effort));
-                const std::string value = Value(j, q);
+                const std::string value = JointText(j, q, v.radians);
                 const float fx = p.x + w - pad - ImGui::CalcTextSize(force.c_str()).x;
                 const float vx = fx - 2.0f * pad - ImGui::CalcTextSize(value.c_str()).x;
                 dl->AddText(ImVec2(fx, ty), U32(At(v.live.saturated, j.link) != 0.0f ? theme::kWarn : theme::kFgDim),
@@ -209,9 +219,10 @@ void ImGuiLayer::BuildJoints(nui::VStack& root) {
                     Range(j, &lo, &hi);
                     target = lo + std::clamp((ImGui::GetIO().MousePos.x - a.x) / (b.x - a.x), 0.0f, 1.0f) * (hi - lo);
                     u.drive_dirty[j.link] = 1u;
+                    v.dragging = static_cast<int>(i);
                 }
                 if (ImGui::IsItemHovered() || ImGui::IsItemActive())
-                    ImGui::SetTooltip(Tr("target %s"), Value(j, target).c_str());
+                    ImGui::SetTooltip(Tr("target %s"), JointText(j, target, v.radians).c_str());
                 LimitBar(j, q, target, a, b);
                 ImGui::PopID();
             }
@@ -234,8 +245,8 @@ void ImGuiLayer::BuildJoints(nui::VStack& root) {
         for (const JointSample& sample : v.history) {
             if (sample.time < end - kCurveSeconds || j.link >= sample.q.size()) continue;
             t.push_back(static_cast<float>(sample.time));
-            q.push_back(Shown(j, sample.q[j.link]));
-            target.push_back(Shown(j, sample.target[j.link]));
+            q.push_back(JointShown(j, sample.q[j.link], v.radians));
+            target.push_back(JointShown(j, sample.target[j.link], v.radians));
             effort.push_back(sample.effort[j.link]);
         }
         nui::draw::SectionHeader(j.name.c_str());
@@ -247,7 +258,8 @@ void ImGuiLayer::BuildJoints(nui::VStack& root) {
         ImPlot::PushStyleVar(ImPlotStyleVar_PlotPadding, ImVec2(theme::kSpace * s, theme::kSpace * s));
         if (ImPlot::BeginPlot("##joint_curve", ImVec2(-FLT_MIN, 170.0f * s),
                               ImPlotFlags_NoMenus | ImPlotFlags_NoBoxSelect | ImPlotFlags_NoFrame)) {
-            ImPlot::SetupAxes(Tr("s"), j.prismatic ? "m" : "\xC2\xB0", ImPlotAxisFlags_AutoFit, ImPlotAxisFlags_AutoFit);
+            ImPlot::SetupAxes(Tr("s"), j.prismatic ? "m" : v.radians ? "rad" : "\xC2\xB0", ImPlotAxisFlags_AutoFit,
+                              ImPlotAxisFlags_AutoFit);
             ImPlot::SetupAxis(ImAxis_Y2, j.prismatic ? "N" : "N\xC2\xB7m", ImPlotAxisFlags_AuxDefault | ImPlotAxisFlags_AutoFit);
             ImPlot::SetupLegend(ImPlotLocation_North,
                                 ImPlotLegendFlags_NoButtons | ImPlotLegendFlags_Outside | ImPlotLegendFlags_Horizontal);
@@ -431,10 +443,11 @@ void ImGuiLayer::DrawGainTuner() {
             ImGui::SameLine();
             if (ImGui::RadioButton(Tr("Sine test"), g.sine)) g.sine = true;
             TunerLabel("Amplitude");
-            float amplitude = Shown(joint, g.amplitude);
-            if (ImGui::DragFloat("##amplitude", &amplitude, joint.prismatic ? 0.001f : 0.1f, 0.0f, 0.0f,
-                                 joint.prismatic ? "%.3f m" : "%.1f\xC2\xB0"))
-                g.amplitude = joint.prismatic ? amplitude : amplitude / kDegrees;
+            const bool linear = joint.prismatic || v.radians;
+            float amplitude = JointShown(joint, g.amplitude, v.radians);
+            if (ImGui::DragFloat("##amplitude", &amplitude, linear ? 0.001f : 0.1f, 0.0f, 0.0f,
+                                 joint.prismatic ? "%.3f m" : v.radians ? "%.3f rad" : "%.1f\xC2\xB0"))
+                g.amplitude = linear ? amplitude : amplitude / kDegrees;
             if (g.sine) {
                 TunerLabel("Frequency");
                 ImGui::DragFloat("##frequency", &g.frequency, 0.05f, 0.05f, 50.0f, "%.2f Hz", ImGuiSliderFlags_AlwaysClamp);

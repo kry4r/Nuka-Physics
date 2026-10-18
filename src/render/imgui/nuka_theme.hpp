@@ -192,5 +192,7 @@ inline constexpr const char kViewSingle[] = "\xEE\x91\x9E";  // square
 inline constexpr const char kViewSplit[] = "\xEE\xA1\xB0";   // square-split-horizontal
 inline constexpr const char kViewQuad[] = "\xEE\x91\xA4";    // squares-four
 inline constexpr const char kMaximize[] = "\xEE\x87\x90";    // corners-out
+inline constexpr const char kRuler[] = "\xEE\x9A\xB8";
+inline constexpr const char kOverlays[] = "\xEE\xB1\xBC";    // cube-transparent
 
 }  // namespace nuka::render::imgui::icon

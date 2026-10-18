@@ -432,6 +432,7 @@ if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)
         runtime/app/viewer/editor_actions.cpp
         runtime/app/viewer/file_dialog.cpp
         runtime/app/viewer/imgui_layer.cpp
+        runtime/app/viewer/robot_hud.cpp
         runtime/app/viewer/robot_panel.cpp
         runtime/app/viewer/scene_panels.cpp
         runtime/app/viewer/script_tabs.cpp

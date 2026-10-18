@@ -21,6 +21,10 @@ bool ParseActuatorType(const std::string& name, scene::ActuatorType* out);
 const char* JointTypeName(scene::JointType type);
 // False for a name other than fixed, revolute, prismatic, spherical or free.
 bool ParseJointType(const std::string& name, scene::JointType* out);
+// A joint value as the panels read it: prismatic joints in m, revolute ones in degrees or radians.
+float JointShown(const RobotJoint& j, float v, bool radians);
+const char* JointUnit(const RobotJoint& j, bool radians);
+std::string JointText(const RobotJoint& j, float v, bool radians);
 
 // The revolute and prismatic joints of one environment's links, in link order.
 std::vector<RobotJoint> RobotJoints(const scene::SceneIR& scene, const WorldLayout& layout,
@@ -31,7 +35,19 @@ std::vector<std::string> RobotRoots(const scene::SceneIR& scene, const WorldLayo
 // One environment's articulation links, in link order.
 std::vector<RobotLink> RobotLinks(const scene::SceneIR& scene, const WorldLayout& layout,
                                   const std::function<std::string(scene::EntityId)>& path_of);
-scene::json::Value LinkJson(const RobotLink& link, const std::vector<RobotLink>& links);
+// A link's centre of mass in the world at `pose`.
+math::Vec3 LinkCom(const RobotLink& link, const math::Transform& pose);
+// The shown environment's centre of mass and mass; false without mass.
+bool RobotCom(const RobotView& v, math::Vec3* com, float* mass);
+// The edges of the uniform box with a link's mass and principal moments, in its inertia frame;
+// false when the moments break the triangle inequality.
+bool InertiaBox(const RobotLink& link, math::Vec3* edges);
+// Where a link or joint end of the Measure tool is now; false for another end or a stale link.
+bool MeasurePoint(const RobotView& v, const MeasureEnd& e, math::Vec3* out);
+// Where the Measure tool's ends are now; false until both resolve.
+bool MeasureEnds(const RobotView& v, math::Vec3* from, math::Vec3* to);
+// A link's entry; a `pose` adds its world origin and centre of mass.
+scene::json::Value LinkJson(const RobotLink& link, const std::vector<RobotLink>& links, const math::Transform* pose);
 // The joint named `name`, or -1.
 int FindJoint(const std::vector<RobotJoint>& joints, const std::string& name);
 

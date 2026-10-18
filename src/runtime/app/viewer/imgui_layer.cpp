@@ -159,11 +159,12 @@ const std::vector<MenuSpec>& Menus() {
             {"Simulation",
              {"sim", "solver", "timeline"},
              {"sim.toggle_play", "sim.step", "sim.reset", "-", "timeline.fork", "timeline.ghost", "timeline.clear", "-",
-              "tool.perturb", "tool.pin", "-", "solver.telemetry", "solver.heatmap", "solver.locate"}},
+              "tool.perturb", "tool.pin", "tool.measure", "tool.measure_clear", "-", "solver.telemetry", "solver.heatmap",
+              "solver.locate"}},
             {"Robot",
              {"robot"},
-             {"robot.fix_base", "robot.drive", "robot.watch", "robot.gain_tuner", "robot.assembler", "-", "robot.pose_capture",
-              "robot.poses_save", "robot.poses_load"}},
+             {"robot.fix_base", "robot.drive", "robot.reset_targets", "robot.radians", "robot.watch", "robot.gain_tuner",
+              "robot.assembler", "-", "robot.pose_capture", "robot.poses_save", "robot.poses_load"}},
             {"Tools",
              {"script", "tools"},
              {"script.new", "script.open", "script.save", "-", "script.run", "script.stop", "script.toggle_rerun", "-",
@@ -495,6 +496,23 @@ void ImGuiLayer::CameraMatrices(const CameraController& camera, float* view, flo
     ProjMatrixGL(camera.fov_degrees * 3.14159265358979323846f / 180.0f, viewport_.Aspect(), 0.05f, 500.0f, proj);
 }
 
+ViewProjector ImGuiLayer::Projector(const ImVec2& vmin, const ImVec2& vmax) const {
+    ViewProjector p{};
+    CameraMatrices(*frame_.camera, p.view, p.proj);
+    p.vmin = vmin;
+    p.vmax = vmax;
+    return p;
+}
+
+bool ViewProjector::operator()(const math::Vec3& p, ImVec2* out) const {
+    float e[4], c[4];
+    for (int r = 0; r < 4; ++r) e[r] = view[r] * p.x + view[4 + r] * p.y + view[8 + r] * p.z + view[12 + r];
+    for (int r = 0; r < 4; ++r) c[r] = proj[r] * e[0] + proj[4 + r] * e[1] + proj[8 + r] * e[2] + proj[12 + r] * e[3];
+    if (c[3] <= 1.0e-6f) return false;
+    *out = ImVec2(vmin.x + (c[0] / c[3] * 0.5f + 0.5f) * (vmax.x - vmin.x), vmin.y + (0.5f - c[1] / c[3] * 0.5f) * (vmax.y - vmin.y));
+    return true;
+}
+
 void ImGuiLayer::Queue(const std::string& id, json::Value args) {
     frame_.ui->actions.push_back(ActionCall{id, std::move(args), "ui"});
 }
@@ -557,12 +575,15 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
         registry.Decorate(id, glyph, false);
     registry.Decorate("tool.perturb", icon::kGrab, false);
     registry.Decorate("tool.pin", icon::kPin, false);
+    registry.Decorate("tool.measure", icon::kRuler, false);
+    registry.Decorate("tool.measure_clear", icon::kTrash, false);
     registry.Decorate("tool.ik", icon::kJoint, false);
     for (const auto& [id, glyph] : {std::pair{"robot.fix_base", icon::kStatic}, std::pair{"robot.drive", icon::kDrive},
                                     std::pair{"robot.watch", icon::kPlot}, std::pair{"robot.pose_capture", icon::kAdd},
                                     std::pair{"robot.poses_save", icon::kSave}, std::pair{"robot.poses_load", icon::kOpen},
                                     std::pair{"robot.gain_tuner", icon::kWaves}, std::pair{"robot.gain_test", icon::kRun},
-                                    std::pair{"robot.gain_clear", icon::kTrash}, std::pair{"robot.assembler", icon::kPlug}})
+                                    std::pair{"robot.gain_clear", icon::kTrash}, std::pair{"robot.assembler", icon::kPlug},
+                                    std::pair{"robot.reset_targets", icon::kReset}})
         registry.Decorate(id, glyph, false);
     const std::pair<const char*, const char*> script_icons[] = {
         {"script.new", icon::kNew},   {"script.open", icon::kOpen},     {"script.save", icon::kSave},
@@ -580,7 +601,7 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
                            "view.views", "robot.joints", "robot.set_targets", "robot.samples", "robot.poses",
                            "robot.pose_apply", "robot.pose_initial", "robot.pose_rename", "robot.pose_remove",
                            "robot.gain_status", "robot.gain_runs", "robot.links", "robot.asset_links", "robot.attach",
-                           "robot.attach_asset", "robot.ik", "robot.ik_settings"})
+                           "robot.attach_asset", "robot.ik", "robot.ik_settings", "view.robot_overlays"})
         registry.Decorate(id, "", true);
     registry.Rebind("file.open", "Ctrl+O");
     registry.Rebind("file.save", "Ctrl+S");
@@ -1454,6 +1475,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
             // Below the pane header when there is one.
             draw::ViewportFrame(vmin, vmax, hud, pane_count > 1u ? ImGui::GetFrameHeight() + 8.0f * nui::Scale() : 0.0f);
             DrawSolverHud(vmin, vmax);
+            DrawRobotHud(vmin, vmax);
             DrawPerturbHud(vmin, vmax);
             DrawViewTools(vmin, vmax);
             DrawBookmarkBar(vmin, vmax);
@@ -1616,6 +1638,25 @@ void ImGuiLayer::DrawMenuBar() {
                 for (size_t i = 0; i < std::size(kSpeeds); ++i)
                     if (ImGui::MenuItem(kSpeedLabels[i], nullptr, std::fabs(frame_.ui->speed - kSpeeds[i]) < 1e-3f))
                         Queue("sim.speed", Args({{"value", json::Value::Float(kSpeeds[i])}}));
+                ImGui::EndMenu();
+            }
+            any = true;
+        }
+        if (menu.title == "View") {
+            const RobotOverlays& o = frame_.ui->robot.overlays;
+            ImGui::Separator();
+            if (ImGui::BeginMenuEx(Tr("Robot Overlays"), icon::kOverlays)) {
+                const auto item = [this](const char* label, const char* key, bool on) {
+                    if (ImGui::MenuItem(Tr(label), nullptr, on)) Queue("view.robot_overlays", Args({{key, json::Value::Bool(!on)}}));
+                };
+                item("Show Overlays", "on", o.on);
+                ImGui::Separator();
+                item("Link Frames", "frames", o.frames);
+                item("Joint Axes", "axes", o.axes);
+                item("Center of Mass", "com", o.com);
+                item("Inertia Boxes", "inertia", o.inertia);
+                ImGui::Separator();
+                item("Translucent Meshes", "translucent", o.translucent);
                 ImGui::EndMenu();
             }
             any = true;
@@ -1784,6 +1825,16 @@ void ImGuiLayer::DrawToolbar() {
             ImGui::EndPopup();
         }
         action("tool.pin", icon::kPin, ui.tool == ViewportTool::Pin);
+        if (toggle("##measure", icon::kRuler, ui.tool == ViewportTool::Measure, Tr("Measure (right-click for the end point)")))
+            Queue("tool.measure");
+        if (ImGui::BeginPopupContextItem("##measure_at")) {
+            for (const auto& [label, at] : {std::pair{"Link origin", "origin"}, std::pair{"Center of mass", "com"}})
+                if (ImGui::MenuItem(Tr(label), nullptr, ui.robot.measure.com == (std::string(at) == "com")))
+                    Queue("tool.measure", Args({{"at", json::Value::Str(at)}, {"on", json::Value::Bool(true)}}));
+            ImGui::Separator();
+            MenuAction("tool.measure_clear");
+            ImGui::EndPopup();
+        }
         const float limit = ImGui::GetCursorScreenPos().x + 12.0f * s;
 
         // The language switch holds the right edge and the status chips line up to its left;
@@ -2366,17 +2417,8 @@ void ImGuiLayer::DrawPerturbHud(const ImVec2& vmin, const ImVec2& vmax) {
     const IkState& ik = ui.robot.ik;
     const bool missed = ik.link >= 0 && ik.missed;
     if (ui.held.empty() && !missed) return;
-    float view_m[16], proj[16];
-    CameraMatrices(*frame_.camera, view_m, proj);
-    const auto project = [&](const float p[3], ImVec2* out) {
-        float e[4], c[4];
-        for (int r = 0; r < 4; ++r) e[r] = view_m[r] * p[0] + view_m[4 + r] * p[1] + view_m[8 + r] * p[2] + view_m[12 + r];
-        for (int r = 0; r < 4; ++r) c[r] = proj[r] * e[0] + proj[4 + r] * e[1] + proj[8 + r] * e[2] + proj[12 + r] * e[3];
-        if (c[3] <= 1.0e-6f) return false;
-        *out = ImVec2(vmin.x + (c[0] / c[3] * 0.5f + 0.5f) * (vmax.x - vmin.x),
-                      vmin.y + (0.5f - c[1] / c[3] * 0.5f) * (vmax.y - vmin.y));
-        return true;
-    };
+    const ViewProjector projector = Projector(vmin, vmax);
+    const auto project = [&](const float p[3], ImVec2* out) { return projector(math::Vec3{p[0], p[1], p[2]}, out); };
     ImDrawList* list = ImGui::GetBackgroundDrawList();
     list->PushClipRect(vmin, vmax, true);
     const float s = nui::Scale();
@@ -2404,13 +2446,7 @@ void ImGuiLayer::DrawPerturbHud(const ImVec2& vmin, const ImVec2& vmax) {
     ImVec2 a, t;
     if (missed && project(ik.at, &a) && project(ik.target, &t)) {
         const ImU32 warn = U32(theme::kWarn);
-        const float dx = t.x - a.x, dy = t.y - a.y, length = std::sqrt(dx * dx + dy * dy);
-        const float dash = 6.0f * s;
-        for (float d = 0.0f; d < length; d += 2.0f * dash) {
-            const float e = std::min(d + dash, length);
-            list->AddLine(ImVec2(a.x + dx * d / length, a.y + dy * d / length),
-                          ImVec2(a.x + dx * e / length, a.y + dy * e / length), warn, 1.5f * s);
-        }
+        DashedLine(list, a, t, warn, 6.0f * s, 1.5f * s);
         list->AddCircle(t, 5.0f * s, warn, 16, 1.5f * s);
         list->AddCircleFilled(a, 2.5f * s, warn);
     }

@@ -4,6 +4,7 @@
 #include "imgui.h"
 #include "scene/format/json.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cfloat>
 #include <cmath>
@@ -43,6 +44,16 @@ inline std::string Upper(std::string_view text) {
 }
 
 inline std::string Iconed(const char* glyph, const char* text) { return std::string(glyph) + "  " + text; }
+
+// Dashes `dash` long with gaps as long from `a` to `b`.
+inline void DashedLine(ImDrawList* list, const ImVec2& a, const ImVec2& b, ImU32 color, float dash, float width) {
+    const float dx = b.x - a.x, dy = b.y - a.y, length = std::sqrt(dx * dx + dy * dy);
+    for (float d = 0.0f; d < length; d += 2.0f * dash) {
+        const float e = std::min(d + dash, length);
+        list->AddLine(ImVec2(a.x + dx * d / length, a.y + dy * d / length), ImVec2(a.x + dx * e / length, a.y + dy * e / length),
+                      color, width);
+    }
+}
 
 // The whole-pixel text top that centres `font`'s capitals at `px` on the height `mid`.
 inline float CapTop(ImFont* font, float px, float mid) {

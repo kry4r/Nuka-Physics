@@ -115,6 +115,8 @@ constexpr float kIkLockWeight = 0.1f;
 // A gizmo IK solve this far from its goal draws the miss.
 constexpr float kIkMissMm = 1.0f;
 constexpr float kIkMissDeg = 0.5f;
+// A Measure click this many pixels from a drawn joint origin takes the joint.
+constexpr float kJointPickPixels = 8.0f;
 
 struct LaunchOptions {
     std::string scene_path;
@@ -898,6 +900,7 @@ struct EditorHost::State : DocumentHost {
     void RegisterGainActions();
     void RegisterAssemblyActions();
     void RegisterIkActions();
+    void RegisterOverlayActions();
     json::Value TimelineStatus();
     // What a recording must match to load: the document, the world's counts and step, and the
     // names of the link and body rows its poses fill.
@@ -980,6 +983,11 @@ struct EditorHost::State : DocumentHost {
     void DragGrab(const CameraController& camera, float x, float y);
     void ReleaseGrab();
     void PinAt(const CameraController& camera, float x, float y);
+    // The Measure tool's click: the joint origin nearest the pointer or the link under it becomes the
+    // next end; a second click on nothing measures down to the ground.
+    void MeasureAt(const CameraController& camera, float x, float y);
+    // The measurement between the tool's ends, null while they do not resolve.
+    json::Value MeasureJson() const;
     const render::RenderWorld& ShownWorld() const { return loaded_ ? loaded_->sim->GetRenderWorld() : empty_world_; }
 
     void Frame(bool step_physics);
@@ -1007,6 +1015,8 @@ struct EditorHost::State : DocumentHost {
     uint64_t Generation() const;
     void SyncScripts();
     void SeedDriveTargets();
+    // Each link's longest visual edge, from its meshes' bounds in its frame.
+    void SizeLinks();
     void BindWorker(uint64_t tick = 0u, double sim_time = 0.0);
     void DropPublisher();
     void ApplySnapshot(const Snapshot& snap);
@@ -1640,6 +1650,7 @@ void EditorHost::State::SeedDriveTargets() {
     robot.joints = RobotJoints(loaded_->scene, layout, path_of);
     robot.links = RobotLinks(loaded_->scene, layout, path_of);
     robot.roots = RobotRoots(loaded_->scene, layout, path_of);
+    SizeLinks();
     robot.floating = std::any_of(layout.links.begin(), layout.links.end(),
                                  [](const nuka_link_binding_t& l) { return l.is_floating != 0u; });
     const uint32_t links = layout.links_per_env;
@@ -1648,6 +1659,26 @@ void EditorHost::State::SeedDriveTargets() {
     ui_state_.drive_dirty.assign(links, 0u);
     nuka_world_download_field(world_, NUKA_FIELD_DRIVE_TARGET, ui_state_.drive_targets.data(),
                               links * sizeof(float), 0u);
+}
+
+void EditorHost::State::SizeLinks() {
+    std::vector<RobotLink>& links = ui_state_.robot.links;
+    const render::RenderWorld& w = loaded_->sim->GetRenderWorld();
+    const float fmax = std::numeric_limits<float>::max();
+    std::vector<math::Vec3> lo(links.size(), math::Vec3{fmax, fmax, fmax}), hi(links.size(), math::Vec3{-fmax, -fmax, -fmax});
+    for (const render::RenderInstance& inst : w.instances) {
+        const uint32_t l = inst.pose_source.row;
+        if (inst.pose_source.kind != render::PoseSource::Kind::Link || l >= links.size() || inst.mesh_id == render::kNoId)
+            continue;
+        const std::vector<float>& p = w.meshes.Geometry(inst.mesh_id).positions;
+        for (size_t v = 0; v + 2u < p.size(); v += 3u) {
+            const math::Vec3 x = inst.cached_visual_local.TransformPoint(math::Vec3{p[v], p[v + 1u], p[v + 2u]});
+            lo[l] = math::Vec3{std::min(lo[l].x, x.x), std::min(lo[l].y, x.y), std::min(lo[l].z, x.z)};
+            hi[l] = math::Vec3{std::max(hi[l].x, x.x), std::max(hi[l].y, x.y), std::max(hi[l].z, x.z)};
+        }
+    }
+    for (size_t l = 0; l < links.size(); ++l)
+        links[l].size = lo[l].x > hi[l].x ? 0.0f : std::max({hi[l].x - lo[l].x, hi[l].y - lo[l].y, hi[l].z - lo[l].z});
 }
 
 // Drops the zero-copy pose path; the GPU must be idle.
@@ -1754,6 +1785,7 @@ void EditorHost::State::ApplySnapshot(const Snapshot& snap) {
     loaded_->sim->ApplyGhost(snap.ghost_links, snap.ghost_bodies);
     if (!snap.particles.empty()) loaded_->sim->ApplyParticles(snap.particles, snap.heat, ui_state_.solver.alert);
     ui_state_.robot.live = snap.joints;
+    ui_state_.robot.link_poses = snap.link_poses;
     // A spring draws as a band to its target, a plain force as an arrow along it.
     for (const Perturbation& p : snap.perturbs) {
         math::Vec3 at = p.target, target = p.target;
@@ -1822,6 +1854,7 @@ void EditorHost::State::SyncJoints() {
         joints_revision_ = doc_.Revision();
         v.joints = RobotJoints(loaded_->scene, loaded_->Layout(), [this](scene::EntityId e) { return PathOfEntity(e); });
         v.links = RobotLinks(loaded_->scene, loaded_->Layout(), [this](scene::EntityId e) { return PathOfEntity(e); });
+        SizeLinks();
     }
     std::vector<JointSample> fresh;
     uint64_t session = 0u;
@@ -2263,11 +2296,16 @@ std::vector<uint8_t> EditorHost::State::InstanceFlags() {
     const std::vector<std::string> selected = SelectionPaths();
     const std::vector<std::string> hovered =
         hovered_path_.empty() ? std::vector<std::string>{} : std::vector<std::string>{hovered_path_};
+    // The overlays see through the robot's meshes.
+    const RobotOverlays& o = ui_state_.robot.overlays;
+    const std::vector<render::RenderInstance>& instances = ShownWorld().instances;
     std::vector<uint8_t> flags(paths.size(), 0u);
     for (size_t i = 0; i < paths.size(); ++i) {
         if (UnderAny(paths[i], selected)) flags[i] |= render::kInstanceSelected;
         if (UnderAny(paths[i], hovered)) flags[i] |= render::kInstanceHovered;
         if (UnderAny(paths[i], ui_state_.locked)) flags[i] |= render::kInstanceUnpickable;
+        if (o.on && o.translucent && instances[i].pose_source.kind == render::PoseSource::Kind::Link)
+            flags[i] |= render::kInstanceSeeThrough;
     }
     return flags;
 }
@@ -2840,6 +2878,25 @@ void EditorHost::State::RegisterRobotActions() {
                       PushEdits();
                       return Ok(Object({{"set", json::Value::Int(static_cast<int64_t>(writes.size()))}}));
                   }});
+    // Puts every joint's target back at its initial position.
+    actions_.Add({"robot.reset_targets", "Reset Joint Targets", "robot", "", ShortcutScope::Global, has_joints, {},
+                  [this](const json::Value&) {
+                      const std::vector<RobotJoint>& joints = ui_state_.robot.joints;
+                      for (const RobotJoint& j : joints) {
+                          ui_state_.drive_targets[j.link] = j.initial;
+                          ui_state_.drive_dirty[j.link] = 1u;
+                      }
+                      PushEdits();
+                      return Ok(Object({{"set", json::Value::Int(static_cast<int64_t>(joints.size()))}}));
+                  }});
+    // Revolute joints read in radians while on, else degrees; without `on` it toggles.
+    actions_.Add({"robot.radians", "Radians", "robot", "", ShortcutScope::Global, {},
+                  [this] { return ui_state_.robot.radians; },
+                  [this](const json::Value& args) {
+                      bool& radians = ui_state_.robot.radians;
+                      radians = BoolArg(args, "on", !radians);
+                      return Ok(Object({{"on", json::Value::Bool(radians)}}));
+                  }});
     // While on, every step samples the shown environment's joints for robot.samples and the curves.
     actions_.Add({"robot.watch", "Watch Joints", "robot", "", ShortcutScope::Global, has_joints,
                   [this] { return ui_state_.robot.watch; },
@@ -2913,6 +2970,7 @@ void EditorHost::State::RegisterRobotActions() {
     RegisterGainActions();
     RegisterAssemblyActions();
     RegisterIkActions();
+    RegisterOverlayActions();
 }
 
 void EditorHost::State::RegisterIkActions() {
@@ -3004,6 +3062,23 @@ void EditorHost::State::RegisterIkActions() {
                   }});
 }
 
+void EditorHost::State::RegisterOverlayActions() {
+    // Each switch given sets it; the result holds them all.
+    actions_.Add({"view.robot_overlays", "Robot Overlays", "view", "", ShortcutScope::Global, {},
+                  [this] { return ui_state_.robot.overlays.on; },
+                  [this](const json::Value& args) {
+                      RobotOverlays& o = ui_state_.robot.overlays;
+                      json::Value v = json::Value::Object();
+                      for (const auto& [key, flag] : std::initializer_list<std::pair<const char*, bool*>>{
+                               {"on", &o.on}, {"frames", &o.frames}, {"axes", &o.axes}, {"com", &o.com},
+                               {"inertia", &o.inertia}, {"translucent", &o.translucent}}) {
+                          *flag = BoolArg(args, key, *flag);
+                          v.Set(key, json::Value::Bool(*flag));
+                      }
+                      return Ok(std::move(v));
+                  }});
+}
+
 void EditorHost::State::RegisterGainActions() {
     const auto has_joints = [this] { return loaded_ != nullptr && !ui_state_.robot.joints.empty(); };
     // Drives one joint's target through a step or sine from where it is, in a copy of the world the
@@ -3086,9 +3161,18 @@ void EditorHost::State::RegisterAssemblyActions() {
     actions_.Add({"robot.links", "Robot Links", "robot", "", ShortcutScope::Global, {}, {},
                   [this](const json::Value&) {
                       const RobotView& v = ui_state_.robot;
+                      const bool posed = v.link_poses.size() == v.links.size();
                       json::Value links = json::Value::Array();
-                      for (const RobotLink& l : v.links) links.PushBack(LinkJson(l, v.links));
-                      return Ok(Object({{"links", std::move(links)}}));
+                      for (size_t l = 0; l < v.links.size(); ++l)
+                          links.PushBack(LinkJson(v.links[l], v.links, posed ? &v.link_poses[l] : nullptr));
+                      float mass = 0.0f, weighed = 0.0f;
+                      for (const RobotLink& l : v.links) mass += l.mass;
+                      math::Vec3 com;
+                      const bool massive = posed && RobotCom(v, &com, &weighed);
+                      return Ok(Object({{"links", std::move(links)},
+                                        {"mass", json::Value::Float(mass)},
+                                        {"com", massive ? Vec3Json(com) : json::Value::Null()},
+                                        {"dof", json::Value::Int(static_cast<int64_t>(v.joints.size()))}}));
                   }});
     // An asset's links, its roots first, which the Assembler offers as mounts; without `path` it asks.
     actions_.Add({"robot.asset_links", "Choose Asset to Attach...", "robot", "", ShortcutScope::Global, has_scene, {},
@@ -4167,6 +4251,58 @@ void EditorHost::State::PinAt(const CameraController& camera, float x, float y) 
     Queue("edit.apply", TxnToJson(txn), "viewport");
 }
 
+void EditorHost::State::MeasureAt(const CameraController& camera, float x, float y) {
+    RobotView& v = ui_state_.robot;
+    Measure& m = v.measure;
+    const SceneViewportRect& rect = ui_.Viewport();
+    const float lx = rect.LocalX(x), ly = rect.LocalY(y);
+    const Ray ray = camera.ScreenRay(lx, ly, rect.pixels.width, rect.pixels.height);
+    // A joint origin takes the click within a few pixels of it, as the ray's slope off the pointer.
+    float best = (camera.ScreenRay(lx + kJointPickPixels, ly, rect.pixels.width, rect.pixels.height).dir - ray.dir).Length();
+    MeasureEnd end;
+    const size_t joints = v.overlays.on && v.overlays.axes ? std::min(v.links.size(), v.link_poses.size()) : 0u;
+    for (size_t l = 0; l < joints; ++l) {
+        if (v.links[l].parent < 0) continue;
+        const math::Vec3 p = (v.link_poses[l] * v.links[l].frame).position - ray.origin;
+        const float t = p.Dot(ray.dir);
+        if (t <= 0.0f || (p - ray.dir * t).Length() / t >= best) continue;
+        best = (p - ray.dir * t).Length() / t;
+        end = MeasureEnd{MeasureEnd::Kind::Joint, static_cast<int>(l)};
+    }
+    const render::RenderWorld& w = loaded_->sim->GetRenderWorld();
+    if (end.kind == MeasureEnd::Kind::None) {
+        const uint32_t hit = PickInstance(ray, w, [&](const render::RenderInstance& inst) {
+            return inst.pose_source.kind == render::PoseSource::Kind::Link && inst.pose_source.row < v.links.size();
+        });
+        if (hit != ~0u) end = MeasureEnd{MeasureEnd::Kind::Link, static_cast<int>(w.instances[hit].pose_source.row)};
+    }
+    if (m.a.kind == MeasureEnd::Kind::None || m.b.kind != MeasureEnd::Kind::None) {
+        m.a = end;
+        m.b = MeasureEnd{};
+        return;
+    }
+    m.b = end.kind == MeasureEnd::Kind::None ? MeasureEnd{MeasureEnd::Kind::Ground, -1} : end;
+}
+
+json::Value EditorHost::State::MeasureJson() const {
+    const RobotView& v = ui_state_.robot;
+    math::Vec3 from, to;
+    if (!MeasureEnds(v, &from, &to)) return Object({{"distance", json::Value::Null()}});
+    const auto name = [&](const MeasureEnd& e) {
+        const RobotLink& link = v.links[static_cast<size_t>(std::max(e.link, 0))];
+        return e.kind == MeasureEnd::Kind::Ground ? std::string("ground")
+               : e.kind == MeasureEnd::Kind::Joint ? link.joint
+                                                   : link.path;
+    };
+    return Object({{"distance", json::Value::Float((to - from).Length())},
+                   {"delta", Vec3Json(to - from)},
+                   {"from", Vec3Json(from)},
+                   {"to", Vec3Json(to)},
+                   {"a", json::Value::Str(name(v.measure.a))},
+                   {"b", json::Value::Str(name(v.measure.b))},
+                   {"at", json::Value::Str(v.measure.com ? "com" : "origin")}});
+}
+
 void EditorHost::State::RegisterSimActions() {
     const auto has_scene = [this] { return loaded_ != nullptr; };
     const auto set_playing = [this](bool playing) {
@@ -4211,7 +4347,7 @@ void EditorHost::State::RegisterSimActions() {
     const auto set_tool = [this](ViewportTool tool, const json::Value& args) {
         ui_state_.tool = BoolArg(args, "on", ui_state_.tool != tool) ? tool : ViewportTool::Select;
         if (grab_) ReleaseGrab();
-        const char* names[] = {"select", "perturb", "pin"};
+        const char* names[] = {"select", "perturb", "pin", "measure"};
         return Ok(Object({{"tool", json::Value::Str(names[static_cast<int>(ui_state_.tool)])}}));
     };
     actions_.Add({"tool.perturb", "Perturb", "sim", "", ShortcutScope::Global, {},
@@ -4220,6 +4356,39 @@ void EditorHost::State::RegisterSimActions() {
     actions_.Add({"tool.pin", "Pin", "sim", "", ShortcutScope::Global, {},
                   [this] { return ui_state_.tool == ViewportTool::Pin; },
                   [set_tool](const json::Value& args) { return set_tool(ViewportTool::Pin, args); }});
+    // `a` and `b` set the Measure tool's ends (a link's node path, a joint's name, or "ground" for b)
+    // and return the measurement; `at` takes link ends at their origin or com. Else it is the tool.
+    actions_.Add({"tool.measure", "Measure", "sim", "", ShortcutScope::Global, {},
+                  [this] { return ui_state_.tool == ViewportTool::Measure; },
+                  [this, set_tool](const json::Value& args) {
+                      Measure& m = ui_state_.robot.measure;
+                      const std::string at = StrArg(args, "at", m.com ? "com" : "origin");
+                      if (at != "origin" && at != "com") return ActionResult::Fail("at is origin or com");
+                      m.com = at == "com";
+                      if (args.Find("a") == nullptr) return set_tool(ViewportTool::Measure, args);
+                      const std::vector<RobotLink>& links = ui_state_.robot.links;
+                      const auto end = [&](const std::string& name, MeasureEnd* out) {
+                          *out = name == "ground" ? MeasureEnd{MeasureEnd::Kind::Ground, -1} : MeasureEnd{};
+                          for (size_t l = 0; l < links.size(); ++l) {
+                              if (links[l].path == name) *out = MeasureEnd{MeasureEnd::Kind::Link, static_cast<int>(l)};
+                              if (!links[l].joint.empty() && links[l].joint == name)
+                                  *out = MeasureEnd{MeasureEnd::Kind::Joint, static_cast<int>(l)};
+                          }
+                          return out->kind != MeasureEnd::Kind::None;
+                      };
+                      MeasureEnd a, b;
+                      const std::string an = StrArg(args, "a"), bn = StrArg(args, "b", "ground");
+                      if (an == "ground" || !end(an, &a)) return ActionResult::Fail("no link or joint '" + an + "'");
+                      if (!end(bn, &b)) return ActionResult::Fail("no link or joint '" + bn + "'");
+                      m.a = a;
+                      m.b = b;
+                      return Ok(MeasureJson());
+                  }});
+    actions_.Add({"tool.measure_clear", "Clear Measurement", "sim", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value&) {
+                      ui_state_.robot.measure.a = ui_state_.robot.measure.b = MeasureEnd{};
+                      return Ok();
+                  }});
     // A world force and torque at a world point (the COM by default), plus a spring toward `target`;
     // no load and no target releases the body.
     actions_.Add({"sim.perturb", "Perturb Body", "sim", "", ShortcutScope::Global, has_scene, {},
@@ -5651,10 +5820,10 @@ void EditorHost::State::Frame(bool step_physics) {
             ui_state_.select_box_to[0] = mouse_x;
             ui_state_.select_box_to[1] = mouse_y;
         }
-        // A free pointer over the viewport hovers the body under it with the Select tool.
+        // A free pointer over the viewport hovers the body under it with the Select and Measure tools.
         if (ev.type == window::WindowEvent::Type::MouseMove) {
-            hover_due_ = loaded_ && ui_state_.tool == ViewportTool::Select && !over_ui && !scene_ctrl &&
-                         !ui_state_.select_box && !ImGui::IsAnyMouseDown();
+            hover_due_ = loaded_ && (ui_state_.tool == ViewportTool::Select || ui_state_.tool == ViewportTool::Measure) &&
+                         !over_ui && !scene_ctrl && !ui_state_.select_box && !ImGui::IsAnyMouseDown();
             hover_x_ = mouse_x;
             hover_y_ = mouse_y;
             if (!hover_due_) hovered_path_.clear();
@@ -5671,6 +5840,7 @@ void EditorHost::State::Frame(bool step_physics) {
             } else if (click_armed_) {
                 click_armed_ = false;
                 if (ui_state_.tool == ViewportTool::Pin) PinAt(render_camera, mouse_x, mouse_y);
+                else if (ui_state_.tool == ViewportTool::Measure) MeasureAt(render_camera, mouse_x, mouse_y);
                 else PickSelect(render_camera, mouse_x, mouse_y);
             }
         } else if (click_armed_ && ev.type == window::WindowEvent::Type::MouseMove &&
@@ -5684,6 +5854,7 @@ void EditorHost::State::Frame(bool step_physics) {
         const uint32_t hit = PickBox(render_camera, hover_x_, hover_y_, hover_x_, hover_y_).center;
         hovered_path_ = hit == ~0u ? std::string() : CarrierPath(hit);
     }
+    ui_state_.robot.hovered = hovered_path_.empty() ? -1 : FindLink(hovered_path_);
 
     ApplyInspectorEdits();
 

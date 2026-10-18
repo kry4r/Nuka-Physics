@@ -53,6 +53,8 @@ constexpr uint32_t   kFramesInFlight = 2u;
 constexpr uint32_t   kIdSelected = 0x80000000u, kIdHovered = 0x40000000u, kIdMask = 0x3FFFFFFFu;
 // The Residual and Contact views' clay albedo.
 constexpr float      kClay = 0.72f;
+// A see-through instance's opacity over its material's.
+constexpr float      kSeeThroughOpacity = 0.35f;
 
 void CheckVk(VkResult result, const char* operation) {
     if (result != VK_SUCCESS) {
@@ -476,6 +478,7 @@ struct PresentRenderer::Impl {
     VkPipeline            instanced_pipeline = VK_NULL_HANDLE;
     VkPipeline            wire_instanced_pipeline = VK_NULL_HANDLE;
     VkPipeline            id_instanced_pipeline = VK_NULL_HANDLE;
+    VkPipeline            ghost_instanced_pipeline = VK_NULL_HANDLE;  // see-through instances
     VkDescriptorSetLayout ssbo_set_layout = VK_NULL_HANDLE;  // borrowed (not owned)
 
     // Per-frame-in-flight SceneUbo buffer + descriptor set (one per frame so the
@@ -1335,13 +1338,18 @@ struct PresentRenderer::Impl {
         spec.polygon = WirePolygon();
         wire_instanced_pipeline = MakePipeline(spec, "vkCreateGraphicsPipelines(present-instanced-wire)");
         spec.polygon = VK_POLYGON_MODE_FILL;
+        PipelineSpec ghost = spec;
+        ghost.cull = VK_CULL_MODE_BACK_BIT;
+        ghost.depth_write = false;
+        ghost.blend = true;
+        ghost_instanced_pipeline = MakePipeline(ghost, "vkCreateGraphicsPipelines(present-instanced-ghost)");
         spec.frag = id_frag_module;
         spec.pass = id_pass;
         id_instanced_pipeline = MakePipeline(spec, "vkCreateGraphicsPipelines(present-instanced-id)");
     }
 
     void DestroyInstancedPipelines() {
-        DestroyPipelines({&instanced_pipeline, &wire_instanced_pipeline, &id_instanced_pipeline});
+        DestroyPipelines({&instanced_pipeline, &wire_instanced_pipeline, &id_instanced_pipeline, &ghost_instanced_pipeline});
         vkDestroyPipelineLayout(device, instanced_pipeline_layout, nullptr);
         instanced_pipeline_layout = VK_NULL_HANDLE;
     }
@@ -1871,10 +1879,13 @@ struct PresentRenderer::Impl {
         vkCmdSetScissor(cmd, 0u, 1u, &scissor);
     }
 
-    // Records a view's draws with `pipe`; with `flags` it is the id pass, which writes each
-    // instance's kId* texel into the push block's last vec4 and skips unpickable ones.
+    // What a RecordDraws call draws: the scene leaves see-through instances to their own blended
+    // pass, and the id pass writes each instance's kId* texel, skipping unpickable ones.
+    enum class DrawPass : uint8_t { Scene, SeeThrough, Id };
+
     void RecordDraws(VkCommandBuffer cmd, const PreparedView& view, VkPipeline pipe, VkPipelineLayout layout,
-                     VkDescriptorSet ubo_set, const PresentInterop* pose, const std::vector<uint8_t>* flags) {
+                     VkDescriptorSet ubo_set, const PresentInterop* pose, const std::vector<uint8_t>& flags,
+                     DrawPass pass) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0u, 1u, &ubo_set, 0u, nullptr);
         if (pose != nullptr) {
@@ -1883,6 +1894,10 @@ struct PresentRenderer::Impl {
         }
         SetViewport(cmd, view.rect);
         for (const InstanceDraw& draw : view.draws) {
+            const uint8_t f = draw.instance_row < flags.size() ? flags[draw.instance_row] : uint8_t{0};
+            const bool see_through = (f & kInstanceSeeThrough) != 0;
+            if (pass == DrawPass::Id ? (f & kInstanceUnpickable) != 0 : see_through != (pass == DrawPass::SeeThrough))
+                continue;
             PushBlock push{};
             // On the instanced path the model matrix comes from the SSBO (the shader
             // ignores push.model); we still fill it harmlessly. Material always rides
@@ -1890,12 +1905,11 @@ struct PresentRenderer::Impl {
             std::memcpy(push.model, draw.model.m.data(), sizeof(push.model));
             std::memcpy(push.base_color, draw.base_color, sizeof(push.base_color));
             push.mr[0] = draw.metallic; push.mr[1] = draw.roughness;
-            push.mr[2] = draw.opacity;  push.mr[3] = 0.0f;
+            push.mr[2] = pass == DrawPass::SeeThrough ? draw.opacity * kSeeThroughOpacity : draw.opacity;
+            push.mr[3] = 0.0f;
             push.emissive[0] = draw.emissive[0]; push.emissive[1] = draw.emissive[1];
             push.emissive[2] = draw.emissive[2]; push.emissive[3] = draw.shade;
-            if (flags != nullptr) {
-                const uint8_t f = draw.instance_row < flags->size() ? (*flags)[draw.instance_row] : uint8_t{0};
-                if ((f & kInstanceUnpickable) != 0) continue;
+            if (pass == DrawPass::Id) {
                 const uint32_t id = (draw.instance_row + 1u) | ((f & kInstanceSelected) != 0 ? kIdSelected : 0u) |
                                     ((f & kInstanceHovered) != 0 ? kIdHovered : 0u);
                 std::memcpy(push.ground_shadow, &id, sizeof(id));
@@ -1930,9 +1944,10 @@ struct PresentRenderer::Impl {
         for (size_t i = 0; i < views.size(); ++i) {
             if (views[i].rect.Empty()) continue;
             if (pose != nullptr) {
-                RecordDraws(cmd, views[i], id_instanced_pipeline, instanced_pipeline_layout, sets[i], pose, &flags);
+                RecordDraws(cmd, views[i], id_instanced_pipeline, instanced_pipeline_layout, sets[i], pose, flags,
+                            DrawPass::Id);
             } else {
-                RecordDraws(cmd, views[i], id_pipeline, pipeline_layout, sets[i], nullptr, &flags);
+                RecordDraws(cmd, views[i], id_pipeline, pipeline_layout, sets[i], nullptr, flags, DrawPass::Id);
             }
         }
         vkCmdEndRenderPass(cmd);
@@ -2041,6 +2056,8 @@ struct PresentRenderer::Impl {
         // The id pass feeds the selection outline and runs only while something is marked.
         const bool outline = !shot.Empty() && Marked(options.instance_flags);
         if (outline) RecordIdPass(cmd, prepared, sets, options.instance_flags, pose);
+        const bool see_through = std::any_of(options.instance_flags.begin(), options.instance_flags.end(),
+                                             [](uint8_t f) { return (f & kInstanceSeeThrough) != 0; });
 
         std::array<VkClearValue, 2> clears{};
         clears[0].color = {{static_cast<float>(options.background.r) / 255.0f,
@@ -2101,9 +2118,17 @@ struct PresentRenderer::Impl {
             const bool wire = views[i].view_mode == ViewMode::Wireframe;
             if (pose != nullptr) {
                 RecordDraws(cmd, view, wire ? wire_instanced_pipeline : instanced_pipeline,
-                            instanced_pipeline_layout, sets[i], pose, nullptr);
+                            instanced_pipeline_layout, sets[i], pose, options.instance_flags, DrawPass::Scene);
             } else {
-                RecordDraws(cmd, view, wire ? wire_pipeline : pipeline, pipeline_layout, sets[i], nullptr, nullptr);
+                RecordDraws(cmd, view, wire ? wire_pipeline : pipeline, pipeline_layout, sets[i], nullptr,
+                            options.instance_flags, DrawPass::Scene);
+            }
+            if (see_through && pose != nullptr) {
+                RecordDraws(cmd, view, ghost_instanced_pipeline, instanced_pipeline_layout, sets[i], pose,
+                            options.instance_flags, DrawPass::SeeThrough);
+            } else if (see_through) {
+                RecordDraws(cmd, view, ghost_pipeline, pipeline_layout, sets[i], nullptr, options.instance_flags,
+                            DrawPass::SeeThrough);
             }
             draw_overlay(world.ghost_instances, ghost_pipeline, sets[i]);
             draw_overlay(world.debug_instances, debug_pipeline, sets[i]);

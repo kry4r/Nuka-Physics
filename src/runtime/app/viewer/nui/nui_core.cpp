@@ -425,6 +425,7 @@ void VStack::DrawSelf() {
 void HStack::SetProps(const json::Value& props) {
     Node::SetProps(props);
     Read(props, "spacing", spacing);
+    Read(props, "wrap", wrap);
 }
 
 // Fill children share what the others left over last frame.
@@ -441,15 +442,19 @@ void HStack::DrawSelf() {
     const float share = fills > 0
         ? std::max(1.0f, (ImGui::GetContentRegionAvail().x - fixed - gap * static_cast<float>(count - 1)) / static_cast<float>(fills))
         : 0.0f;
+    const float right = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
     ImGui::BeginGroup();
     ImGui::AlignTextToFramePadding();
     bool first = true;
+    float end = 0.0f;
     for (const auto& child : children_) {
         if (!child->Shown()) continue;
-        if (!first) ImGui::SameLine(0.0f, gap);
+        const float w = child->rect_max.x - child->rect_min.x;
+        if (!first && !(wrap && child->width >= 0.0f && end + gap + w > right)) ImGui::SameLine(0.0f, gap);
         first = false;
         child->assigned_width = child->width < 0.0f ? share : 0.0f;
         child->Draw();
+        end = child->rect_max.x;
     }
     ImGui::EndGroup();
 }

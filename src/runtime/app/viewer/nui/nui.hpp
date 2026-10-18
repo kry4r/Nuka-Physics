@@ -232,6 +232,7 @@ public:
     const char* Kind() const override { return "hstack"; }
     void SetProps(const json::Value& props) override;
     float spacing = -1.0f;
+    bool wrap = false;  // a fixed child that would cross the right edge starts a new line
 
 protected:
     void DrawSelf() override;

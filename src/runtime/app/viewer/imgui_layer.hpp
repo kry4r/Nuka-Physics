@@ -190,8 +190,17 @@ struct TitleBar {
     std::vector<std::pair<float, float>> drag;  // x spans of the bar that move the window
 };
 
-// The viewport pointer: select and move, pull on bodies and cloth, or pin them in place.
-enum class ViewportTool : uint8_t { Select, Perturb, Pin };
+// The viewport pointer: select and move, pull on bodies and cloth, pin them in place, or measure
+// between robot links.
+enum class ViewportTool : uint8_t { Select, Perturb, Pin, Measure };
+
+// World points to window pixels over the active pane; false behind the camera.
+struct ViewProjector {
+    float view[16];
+    float proj[16];
+    ImVec2 vmin, vmax;
+    bool operator()(const math::Vec3& p, ImVec2* out) const;
+};
 
 // The viewport's shadings in render::ViewMode order, as view.mode and the mode menu name them.
 struct ViewModeInfo {
@@ -491,6 +500,9 @@ private:
     // Each held load's pull from its grab point toward its target, and an IK drag's miss as a dashed
     // line from the link to its goal.
     void DrawPerturbHud(const ImVec2& vmin, const ImVec2& vmax);
+    // The robot overlays, the Measure tool's line and the hovered link's tooltip.
+    void DrawRobotHud(const ImVec2& vmin, const ImVec2& vmax);
+    ViewProjector Projector(const ImVec2& vmin, const ImVec2& vmax) const;
     // The viewport's top-right tools (RT preview, Render, layout, shading) and the box of a box selection.
     void DrawViewTools(const ImVec2& vmin, const ImVec2& vmax);
     // The RT preview, Render and layout buttons on one line.
