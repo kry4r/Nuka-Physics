@@ -19,6 +19,7 @@
 #include "runtime/app/viewer/sensor_view.hpp"
 #include "runtime/app/viewer/teleop_view.hpp"
 #include "runtime/app/viewer/timeline_view.hpp"
+#include "runtime/app/viewer/train_view.hpp"
 #include "scene/ecs/entity.hpp"
 
 #include <array>
@@ -308,6 +309,7 @@ struct ViewerUiState {
     RandomizeView randomize;
     LabelView labels;
     DatasetView dataset;
+    TrainView train;
 
     // Queued for the next frame top, so recording the UI never changes the world.
     std::vector<ActionCall> actions;
@@ -544,6 +546,8 @@ private:
     void DrawRobotHud(const ImVec2& vmin, const ImVec2& vmax);
     // Camera frustums, lidar fans, state sensors' axes and their names; the selected one brightest.
     void DrawSensorHud(const ImVec2& vmin, const ImVec2& vmax);
+    // A watched training run's velocity arrows above its robots, and its plate `hud_top` lower than the chips.
+    void DrawTrainHud(const ImVec2& vmin, const ImVec2& vmax, float hud_top);
     // The selected sensor's fields in Properties; each finished edit is one sensor.set.
     void DrawSensorInspector();
     // A sensor row's popup body: rename it or remove it.

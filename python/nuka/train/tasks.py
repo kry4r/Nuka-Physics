@@ -50,6 +50,8 @@ class TaskSpec:
     robot: Dict[str, int]
     # The physics timestep the task trains at and its policy runs at, in seconds.
     dt: float
+    # The metres apart a viewer spreads the environments, which overlap; 0 when each has its own place.
+    spacing: float = 0.0
     build: Callable[[dict, str, str], dict] = field(repr=False, default=None)
     check: Callable[[dict, dict], list] = field(repr=False, default=None)
 
@@ -59,7 +61,7 @@ class TaskSpec:
         file = Path(sys.modules[module].__file__).resolve()
         root = file.parents[module.count(".") + (file.name == "__init__.py")]
         return {"name": self.name, "title": self.title, "env": self.env, "robot": dict(self.robot), "dt": self.dt,
-                "module": module, "root": str(root),
+                "spacing": self.spacing, "module": module, "root": str(root),
                 "groups": [{"key": g.key, "title": g.title, "params": [asdict(p) for p in g.params]}
                            for g in self.groups]}
 
@@ -229,4 +231,4 @@ def register(spec: TaskSpec) -> None:
 
 
 register(TaskSpec(name="go2_velocity", title="Go2 velocity tracking", env="nuka_go2", groups=_go2_groups(),
-                  robot={"links": 13, "joints": 12}, dt=0.005, build=_go2_build, check=_go2_check))
+                  robot={"links": 13, "joints": 12}, dt=0.005, spacing=1.0, build=_go2_build, check=_go2_check))

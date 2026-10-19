@@ -37,7 +37,8 @@ namespace nuka::runtime::app::viewer {
 using WorkerClock = std::chrono::steady_clock;
 
 enum class CommandKind : uint8_t {
-    EditApply, Teleport, ParamSet, Perturb, Transport, ScriptCall, Timeline, Beauty, GainTest, IkSolve, SensorRead
+    EditApply, Teleport, ParamSet, Perturb, Transport, ScriptCall, Timeline, Beauty, GainTest, IkSolve, SensorRead,
+    Observe
 };
 enum class ParamKind : uint8_t {
     Field, HoldGains, ControllerCommand, DisplayEnv, ScatterRows, Overlay, Registry, Telemetry, Iterations, Heatmap,
@@ -77,15 +78,16 @@ struct TickCommand {
     nuka_state_field_t field = NUKA_FIELD_DRIVE_TARGET;
     size_t offset = 0u;                   // bytes into the field; TargetTrack: 1 repeats its rows
     // Registry parameter; TargetRamp: its length in steps; TargetTrack: its rows; GainTest: the link.
-    // SensorRead: the camera, lidar or state sensor among its kind; Randomize: the seed.
+    // SensorRead: the camera, lidar or state sensor among its kind; Randomize: the seed; Observe: the
+    // environments.
     uint32_t index = 0u;
     // Registry element; TargetTrack: the links of a row; SensorRead: a nuka_sensor_channel_t or kStatePlane.
     uint32_t element = 0u;
     // Field values, gains (kp, kd), command, overlay flags, registry value, telemetry (mask, alert),
     // sweep budget, heatmap or joint watch flag, ghost flag, the keyframe interval and budget [MB],
     // a target ramp's (link, from, to) triples, the worker stamping `from`, a target track's links
-    // then its rows, the teleop axes, a gain test's (sine, amplitude, frequency, duration), or a
-    // randomization as PhysicsWorker::Randomize reads it.
+    // then its rows, the teleop axes, a gain test's (sine, amplitude, frequency, duration), a
+    // randomization as PhysicsWorker::Randomize reads it, or what PhysicsWorker::Observe writes.
     std::vector<float> values;
     // DisplayEnv, TargetTrack, SensorRead; the worker stamps pose writes with the shown one.
     uint32_t env = 0u;
@@ -403,6 +405,7 @@ private:
     void RunGainTest(const TickCommand& cmd);
     void SolveIk(const TickCommand& cmd);
     void Randomize(const TickCommand& cmd);
+    void Observe(const TickCommand& cmd);
     void SampleJoints();
     void ReadTelemetry();
     void Publish();

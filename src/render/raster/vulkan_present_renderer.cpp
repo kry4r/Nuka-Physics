@@ -1612,6 +1612,7 @@ struct PresentRenderer::Impl {
         // The debug overlay's proxy meshes live in the same library; upload them too.
         // Empty when overlays are off -> the non-overlay cache is unchanged.
         for (const RenderInstance& inst : world.debug_instances) consider(inst);
+        for (const RenderInstance& inst : world.extra_instances) consider(inst);
         const bool shrink = mesh_cache.size() > mesh_count;
         if (rebuild.empty() && !shrink) return;
 
@@ -2140,6 +2141,7 @@ struct PresentRenderer::Impl {
             if (!view.env_draws.empty())
                 RecordDraws(cmd, view, view.env_draws, wire ? wire_pipeline : pipeline, pipeline_layout, sets[i],
                             nullptr, options.instance_flags, DrawPass::Scene);
+            draw_overlay(world.extra_instances, wire ? wire_pipeline : pipeline, sets[i]);
             if (see_through && pose != nullptr) {
                 RecordDraws(cmd, view, view.draws, ghost_instanced_pipeline, instanced_pipeline_layout, sets[i], pose,
                             options.instance_flags, DrawPass::SeeThrough);

@@ -663,6 +663,9 @@ bool PhysicsWorker::Apply(const TickCommand& cmd) {
             sensor_ready_ = true;
             return false;
         }
+        case CommandKind::Observe:
+            Observe(cmd);
+            return true;
     }
     return false;
 }
@@ -1030,6 +1033,36 @@ void PhysicsWorker::Randomize(const TickCommand& cmd) {
         for (uint32_t e = 0; e < nominal.size(); ++e)
             write(param, e, nominal[e] * (range[1] + (range[2] - range[1]) * Draw(cmd.index, param, e)));
     }
+}
+
+// Holds environments 0 to `index` - 1 still at a training run's link, body and base poses, then joint
+// positions, from `values`. Without values the observation ends, and history starts from what it left.
+void PhysicsWorker::Observe(const TickCommand& cmd) {
+    if (cmd.values.empty()) {
+        ResetHistory();
+        return;
+    }
+    const WorldLayout& l = bind_.layout;
+    const size_t links = size_t{cmd.index} * l.links_per_env, bodies = size_t{cmd.index} * l.bodies_per_env;
+    const size_t bases = size_t{cmd.index} * l.articulations_per_env;
+    const float* at = cmd.values.data();
+    const auto write = [&](nuka_state_field_t field, const float* data, size_t floats) {
+        if (floats != 0u)
+            CheckResult(nuka_world_upload_field(bind_.world, field, data, floats * sizeof(float), 0u),
+                        "upload an observed field");
+    };
+    for (const auto& [field, floats] : {std::pair{NUKA_FIELD_ARTICULATION_LINK_POSE, links * 7u},
+                                        std::pair{NUKA_FIELD_RIGID_BODY_TRANSFORM, bodies * 7u},
+                                        std::pair{NUKA_FIELD_BASE_POSE, bases * 7u},
+                                        std::pair{NUKA_FIELD_JOINT_POSITION, links}}) {
+        write(field, at, floats);
+        at += floats;
+    }
+    const std::vector<float> zero(std::max(links * 6u, bodies * 3u), 0.0f);
+    write(NUKA_FIELD_JOINT_VELOCITY, zero.data(), links);
+    write(NUKA_FIELD_LINK_VELOCITY, zero.data(), links * 6u);
+    write(NUKA_FIELD_BODY_LINEAR_VELOCITY, zero.data(), bodies * 3u);
+    write(NUKA_FIELD_BODY_ANGULAR_VELOCITY, zero.data(), bodies * 3u);
 }
 
 void PhysicsWorker::DispatchTick() {

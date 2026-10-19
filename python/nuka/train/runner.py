@@ -3,7 +3,8 @@
 The folder holds `job.json`: {task, module, root, config, scene, name}, plus `checkpoint` to start
 from one. The run writes `status.json` (rewritten whole), `metrics.jsonl` (a row per epoch),
 `checkpoints.jsonl` (a row per save), `log.txt`, `nn/*.pth` and `policies/*.nkml`. A `stop` file
-ends the run after the current epoch, with a final checkpoint.
+ends the run after the current epoch, with a final checkpoint. While it trains, status.json's
+`observe` is the port viewers watch it through (see observe.py).
 """
 
 from __future__ import annotations
@@ -48,10 +49,10 @@ class Run:
     def __init__(self, folder: Path, job: dict, config: dict):
         self.folder = folder
         self.status = {"state": "starting", "pid": os.getpid(), "task": job["task"], "name": job["name"],
-                       "epoch": 0, "max_epochs": config["run"]["max_epochs"], "frames": 0, "fps": None,
-                       "reward": None, "length": None, "best_reward": None, "checkpoints": 0,
-                       "last_policy": None, "started": time.time(), "updated": None, "ended": None,
-                       "error": None}
+                       "envs": config["run"]["num_envs"], "epoch": 0, "max_epochs": config["run"]["max_epochs"],
+                       "frames": 0, "fps": None, "reward": None, "length": None, "best_reward": None,
+                       "checkpoints": 0, "last_policy": None, "observe": None, "started": time.time(),
+                       "updated": None, "ended": None, "error": None}
 
     def update(self, **fields) -> None:
         self.status.update(fields, updated=time.time())
@@ -117,7 +118,7 @@ def run(job_path: str) -> int:
 
         from .observer import TrainObserver
 
-        observer = TrainObserver(report)
+        observer = TrainObserver(report, job["scene"], task.spacing)
         runner = Runner(algo_observer=observer)
         runner.load_config(params)
         args = {"train": True, "play": False}
@@ -128,7 +129,7 @@ def run(job_path: str) -> int:
         observer.algo.vec_env.close()
     except BaseException as exc:
         traceback.print_exc()
-        report.update(state="failed", error=f"{type(exc).__name__}: {exc}", ended=time.time())
+        report.update(state="failed", error=f"{type(exc).__name__}: {exc}", observe=None, ended=time.time())
         return 1
-    report.update(state="stopped" if report.stop_requested() else "finished", ended=time.time())
+    report.update(state="stopped" if report.stop_requested() else "finished", observe=None, ended=time.time())
     return 0

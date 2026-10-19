@@ -198,6 +198,10 @@ class NukaGymEnv:
 
     # -- gym API ------------------------------------------------------------
     @property
+    def world(self) -> "nuka.World":
+        return self._world
+
+    @property
     def action_dim(self) -> int:
         return G.GO2_ACTION_DIM
 

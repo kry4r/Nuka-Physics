@@ -1566,7 +1566,9 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
             DrawRtImage(vmin, vmax);
             if (pane_count > 1u) DrawPaneHeaders(cmin, cmax, pane, gap);
             std::vector<std::string> hud = {Fmt(Tr("FOV %.0f\xC2\xB0"), camera.fov_degrees),
-                                            Tr(ui_state.playing ? "LIVE" : "PAUSED"),
+                                            Tr(ui_state.train.observing ? "OBSERVING"
+                                               : ui_state.playing       ? "LIVE"
+                                                                        : "PAUSED"),
                                             Fmt(Tr("TICK %llu"), static_cast<unsigned long long>(stats.sim_ticks))};
             const RtView& rt = ui_state.rt;
             if (rt.on)
@@ -1576,11 +1578,13 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
                 if (p.index == ui_state.active_view && !p.camera.empty())
                     hud.insert(hud.begin(), Iconed(icon::kCameraNode, p.camera.substr(p.camera.rfind('/') + 1u).c_str()));
             // Below the pane header when there is one.
-            draw::ViewportFrame(vmin, vmax, hud, pane_count > 1u ? ImGui::GetFrameHeight() + 8.0f * nui::Scale() : 0.0f);
+            const float hud_top = pane_count > 1u ? ImGui::GetFrameHeight() + 8.0f * nui::Scale() : 0.0f;
+            draw::ViewportFrame(vmin, vmax, hud, hud_top);
             DrawSolverHud(vmin, vmax);
             DrawRobotHud(vmin, vmax);
             DrawSensorHud(vmin, vmax);
             DrawPerturbHud(vmin, vmax);
+            DrawTrainHud(vmin, vmax, hud_top);
             DrawViewTools(vmin, vmax);
             DrawBookmarkBar(vmin, vmax);
         } else if (!ui_state.start.shown) {

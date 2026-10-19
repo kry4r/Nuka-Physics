@@ -41,6 +41,7 @@
 #include "runtime/app/viewer/robot_tools.hpp"
 #include "runtime/app/viewer/script_host.hpp"
 #include "runtime/app/viewer/teleop.hpp"
+#include "runtime/app/viewer/train_observe.hpp"
 #include "runtime/inference/go2_policy_controller.hpp"
 #include "scene/format/json.hpp"
 #include "scene/format/nks.hpp"
@@ -966,6 +967,8 @@ struct EditorHost::State : DocumentHost {
     void Reselect(const std::vector<std::string>& paths);
     ActionResult SubmitTxn(const EditTxn& txn);
     ActionResult StepHistory(bool redo);
+    // FNV-1a of the document saved as NKS at `file`, then of the archive beside it.
+    uint64_t SavedSceneHash(const std::string& file);
     uint64_t DocumentHash();
     json::Value DocumentState();
 
@@ -1003,6 +1006,13 @@ struct EditorHost::State : DocumentHost {
     fs::path TrainRunsDir() const;
     // The run `name` names, else the one started last, else the newest; empty when there is none.
     fs::path TrainRunDir(const json::Value& args) const;
+    // Watches the run in `dir` through its first `envs` environments; the world holds still at its frames.
+    ActionResult StartObserve(const fs::path& dir, uint32_t envs, bool follow);
+    // Stops watching, saying `why` when it is not empty; history starts again from the last frame shown.
+    void EndObserve(const std::string& why);
+    // Shows the watched run's newest frame, its arrows and its progress; ends when the run or the world goes.
+    void StepObserve();
+    json::Value ObserveJson() const;
     // Drops sensor `index` in one undo step and clears its selection.
     ActionResult RemoveSensor(int index);
     void RegisterTeleopActions();
@@ -1174,6 +1184,8 @@ struct EditorHost::State : DocumentHost {
     std::vector<uint32_t> OtherShownEnvs(uint32_t current) const;
     // Where environment `env` draws relative to `current`, which stays at world coordinates.
     math::Vec3 EnvOffset(uint32_t env, uint32_t current) const;
+    // The grid's cell size: the one set, else a watched run's, else one sized from the moving instances.
+    float GridSpacing() const;
     // Makes `env` current; on the same page the camera follows its cell, so the view holds still.
     void SwitchEnv(uint32_t env);
     json::Value EnvsJson() const;
@@ -1280,6 +1292,18 @@ struct EditorHost::State : DocumentHost {
         uint32_t pid = 0u;
     };
     std::optional<TrainRun> train_run_;
+    // The run the viewport watches and the layout its frames were asked for.
+    struct Observing {
+        std::unique_ptr<TrainObserve> link;
+        fs::path dir;
+        uint32_t envs = 0u, links = 0u, bodies = 0u, articulations = 0u;
+        float spacing = 0.0f;  // the run's: 0 when its environments stand apart already
+        ObserveFrame frame;
+        uint64_t frames = 0u;
+        Clock::time_point status_due{};
+        const EditorSim* sim = nullptr;  // the binding drawing the run's terrain
+    };
+    std::optional<Observing> observe_;
     std::unique_ptr<EditorScene> loaded_;
     bool attach_pending_ = false;
     EntityDrag entity_drag_;
@@ -1912,13 +1936,20 @@ std::vector<uint32_t> EditorHost::State::OtherShownEnvs(uint32_t current) const 
 
 math::Vec3 EditorHost::State::EnvOffset(uint32_t env, uint32_t current) const {
     const EnvView& v = ui_state_.envs;
+    // A watched run whose environments stand apart already draws them where it has them.
+    if (observe_ && observe_->spacing == 0.0f) return math::Vec3{};
     const auto cols = static_cast<uint32_t>(std::ceil(std::sqrt(static_cast<float>(v.show))));
-    const float s = v.spacing > 0.0f ? v.spacing : env_auto_spacing_;
+    const float s = GridSpacing();
     const auto cell = [&](uint32_t e) {
         const uint32_t r = e % v.show;
         return math::Vec3{static_cast<float>(r % cols) * s, -static_cast<float>(r / cols) * s, 0.0f};
     };
     return cell(env) - cell(current);
+}
+
+float EditorHost::State::GridSpacing() const {
+    const float spacing = ui_state_.envs.spacing;
+    return spacing > 0.0f ? spacing : observe_ ? observe_->spacing : env_auto_spacing_;
 }
 
 void EditorHost::State::SwitchEnv(uint32_t env) {
@@ -1946,7 +1977,7 @@ json::Value EditorHost::State::EnvsJson() const {
     return Object({{"count", json::Value::Int(v.count)},
                    {"current", json::Value::Int(current)},
                    {"show", json::Value::Int(v.show)},
-                   {"spacing", json::Value::Float(v.spacing > 0.0f ? v.spacing : env_auto_spacing_)},
+                   {"spacing", json::Value::Float(GridSpacing())},
                    {"auto_spacing", json::Value::Bool(v.spacing <= 0.0f)},
                    {"cells", std::move(cells)},
                    {"copies", json::Value::Int(static_cast<int64_t>(loaded_ ? loaded_->sim->EnvCopies().size() : 0u))}});
@@ -5443,6 +5474,201 @@ void EditorHost::State::RegisterTrainActions() {
                       if (!played.ok) return played;
                       return Ok(Object({{"policy", json::Value::Str(policy)}, {"status", loaded.value}}));
                   }});
+    // `on: true` watches run `name` (else the one started last): the world holds its first `envs` (16)
+    // environments at the run's frames under arrows of their commanded and actual velocity, and `follow`
+    // keeps the camera on the current one. `on: false` stops; without `on` it reports, `follow` changing.
+    actions_.Add({"train.observe", "Observe Training", "train", "", ShortcutScope::Global, has_scene,
+                  [this] { return observe_.has_value(); },
+                  [this, no_run](const json::Value& args) {
+                      const json::Value* on = args.Find("on");
+                      if (on == nullptr) {
+                          if (observe_ && args.Find("follow") != nullptr)
+                              ui_state_.train.follow = BoolArg(args, "follow", false);
+                          return Ok(ObserveJson());
+                      }
+                      if (!on->AsBool()) {
+                          if (!observe_) return ActionResult::Fail("not observing a run");
+                          EndObserve(std::string());
+                          return Ok(ObserveJson());
+                      }
+                      const fs::path dir = TrainRunDir(args);
+                      if (dir.empty()) return no_run(args);
+                      const double envs = NumArg(args, "envs", 16.0);
+                      if (envs < 1.0 || envs > kMaxGridEnvs)
+                          return ActionResult::Fail("envs: 1 to " + std::to_string(kMaxGridEnvs) + " environments");
+                      return StartObserve(dir, static_cast<uint32_t>(envs), BoolArg(args, "follow", false));
+                  }});
+}
+
+ActionResult EditorHost::State::StartObserve(const fs::path& dir, uint32_t envs, bool follow) {
+    const std::string name = PathText(dir.filename());
+    const json::Value status = RunStatus(dir, train_run_ && train_run_->dir == dir ? train_run_->pid : 0u);
+    const json::Value* port = status.Find("observe");
+    if (!status.At("alive").AsBool() || port == nullptr || port->IsNull())
+        return ActionResult::Fail("run '" + name + "' serves no observation");
+    if (observe_) EndObserve(std::string());
+    const WorldLayout& l = loaded_->Layout();
+    const uint32_t links = l.links_per_env, bodies = l.bodies_per_env, articulations = l.articulations_per_env;
+    // Saved under the run's file name, so the scene names its archive as the run's does.
+    const json::Value hello = Object({{"proto", json::Value::Str("nuka.observe.v1")},
+                                      {"scene", json::Value::Str(Hex(SavedSceneHash(cache_.File("scene.nks"))))},
+                                      {"layout", Object({{"links", json::Value::Int(links)},
+                                                         {"bodies", json::Value::Int(bodies)},
+                                                         {"articulations", json::Value::Int(articulations)}})},
+                                      {"envs", json::Value::Int(envs)}});
+    std::unique_ptr<TrainObserve> link;
+    try {
+        link = std::make_unique<TrainObserve>(static_cast<uint16_t>(port->AsInt()), hello);
+    } catch (const std::exception& e) {
+        return ActionResult::Fail(e.what());
+    }
+    const json::Value& answer = link->Answer();
+    const uint32_t shown = std::min(envs, static_cast<uint32_t>(answer.At("envs").AsInt()));
+    const auto run_envs = static_cast<uint32_t>(answer.At("run_envs").AsInt());
+    const auto spacing = static_cast<float>(answer.At("spacing").AsDouble());
+    ui_state_.playing = false;
+    PushTransport();
+    if (shown != ui_state_.envs.count) {
+        const json::Value count = Object({{"count", json::Value::Int(shown)}});
+        ActionResult resized = actions_.Run("sim.envs", count, "train.observe", frame_index_);
+        if (!resized.ok) return resized;
+    }
+    const json::Value show = Object({{"show", json::Value::Int(shown)}});
+    ActionResult grid = actions_.Run("view.envs", show, "train.observe", frame_index_);
+    if (!grid.ok) return grid;
+    observe_ = Observing{std::move(link), dir, shown, links, bodies, articulations, spacing};
+    TrainView& t = ui_state_.train;
+    t = TrainView{};
+    t.observing = true;
+    t.follow = follow;
+    t.run = name;
+    t.envs = shown;
+    t.run_envs = run_envs;
+    return Ok(ObserveJson());
+}
+
+void EditorHost::State::EndObserve(const std::string& why) {
+    observe_.reset();
+    ui_state_.train = TrainView{};
+    if (loaded_) {
+        TickCommand cmd;
+        cmd.kind = CommandKind::Observe;
+        worker_.Push(std::move(cmd));
+        loaded_->sim->SetArrows({});
+        loaded_->sim->SetTerrain(loaded_->terrain);
+    }
+    if (!why.empty()) ui_.Nui().Toast(nui::Level::Info, Format(nui::Tr("Stopped observing: %s"), why.c_str()));
+}
+
+void EditorHost::State::StepObserve() {
+    if (!observe_) return;
+    Observing& o = *observe_;
+    if (!loaded_) return EndObserve(nui::Tr("the scene closed"));
+    const WorldLayout& l = loaded_->Layout();
+    if (l.links_per_env != o.links || l.bodies_per_env != o.bodies || l.articulations_per_env != o.articulations ||
+        ui_state_.envs.count != o.envs)
+        return EndObserve(nui::Tr("the world changed"));
+    if (!o.link->Connected()) return EndObserve(nui::Tr("the run ended"));
+    // The run's terrain replaces the scene's on every binding it is shown on.
+    if (o.sim != loaded_->sim.get()) {
+        o.sim = loaded_->sim.get();
+        if (terrain::IsValid(o.link->Terrain())) loaded_->sim->SetTerrain(o.link->Terrain());
+    }
+    if (o.link->Read(&o.frame)) {
+        ++o.frames;
+        TickCommand cmd;
+        cmd.kind = CommandKind::Observe;
+        cmd.index = o.envs;
+        // The frame holds more environments than are shown; each array's first ones are theirs.
+        const auto take = [&](const std::vector<float>& from, size_t per_env) {
+            cmd.values.insert(cmd.values.end(), from.begin(), from.begin() + static_cast<ptrdiff_t>(per_env * o.envs));
+        };
+        take(o.frame.links, size_t{o.links} * 7u);
+        take(o.frame.bodies, size_t{o.bodies} * 7u);
+        take(o.frame.bases, size_t{o.articulations} * 7u);
+        take(o.frame.joints, o.links);
+        worker_.Push(std::move(cmd));
+    }
+    TrainView& t = ui_state_.train;
+    t.frames = o.frames;
+    t.steps = o.frame.steps;
+    const Clock::time_point now = Clock::now();
+    if (now >= o.status_due) {
+        o.status_due = now + std::chrono::milliseconds(500);
+        const json::Value status = RunStatus(o.dir, 0u);
+        const auto number = [&](const char* key) {
+            const json::Value& v = status.At(key);
+            return v.IsNull() ? 0.0 : v.AsDouble();
+        };
+        t.epoch = static_cast<int64_t>(number("epoch"));
+        t.max_epochs = static_cast<int64_t>(number("max_epochs"));
+        t.fps = number("fps");
+        t.has_reward = !status.At("reward").IsNull();
+        t.reward = number("reward");
+    }
+    t.arrows.clear();
+    if (o.frames == 0u) return;
+    // Isaac Lab's height of the arrows over a robot's base, the measured arrow's rise over the command's,
+    // and the share of the way the camera closes per frame.
+    constexpr float kArrowLift = 0.5f, kArrowGap = 0.09f, kFollowShare = 0.1f;
+    const uint32_t current = ui_state_.env_index % ui_state_.envs.count;
+    t.current = current;
+    const auto base = [&](uint32_t e) {
+        const float* p = o.frame.bases.data() + size_t{e} * o.articulations * 7u;
+        return math::Vec3{p[0], p[1], p[2]};
+    };
+    std::vector<EditorSim::Arrow> arrows;
+    for (uint32_t e = 0; e < o.envs; ++e) {
+        const math::Vec3 at = base(e) + EnvOffset(e, current) + math::Vec3{0.0f, 0.0f, kArrowLift};
+        TrainArrow arrow;
+        arrow.at[0] = at.x;
+        arrow.at[1] = at.y;
+        arrow.at[2] = at.z;
+        std::copy_n(o.frame.command.data() + size_t{e} * 3u, 3, arrow.command);
+        std::copy_n(o.frame.velocity.data() + size_t{e} * 3u, 3, arrow.velocity);
+        t.arrows.push_back(arrow);
+        arrows.push_back({at, {arrow.command[0], arrow.command[1], 0.0f}, true});
+        arrows.push_back({at + math::Vec3{0.0f, 0.0f, kArrowGap}, {arrow.velocity[0], arrow.velocity[1], 0.0f}, false});
+    }
+    loaded_->sim->SetArrows(arrows);
+    if (!t.follow) return;
+    const math::Vec3 from = camera_.ResolvedTarget();
+    camera_.SetView(from + (base(current) - from) * kFollowShare, camera_.Distance(), camera_.Yaw(), camera_.Pitch());
+}
+
+json::Value EditorHost::State::ObserveJson() const {
+    if (!observe_) return Object({{"on", json::Value::Bool(false)}});
+    const Observing& o = *observe_;
+    const TrainView& t = ui_state_.train;
+    const auto triple = [](const float v[3]) {
+        json::Value out = json::Value::Array();
+        for (int k = 0; k < 3; ++k) out.PushBack(json::Value::Float(v[k]));
+        return out;
+    };
+    json::Value arrows = json::Value::Array();
+    for (const TrainArrow& a : t.arrows)
+        arrows.PushBack(
+            Object({{"at", triple(a.at)}, {"command", triple(a.command)}, {"velocity", triple(a.velocity)}}));
+    const terrain::HeightField& grid = o.link->Terrain();
+    const json::Value ground = terrain::IsValid(grid) ? Object({{"nrow", json::Value::Int(grid.nrow)},
+                                                                {"ncol", json::Value::Int(grid.ncol)},
+                                                                {"cell_x", json::Value::Float(grid.cell_x)},
+                                                                {"cell_y", json::Value::Float(grid.cell_y)}})
+                                                      : json::Value::Null();
+    return Object({{"on", json::Value::Bool(true)},
+                   {"name", json::Value::Str(t.run)},
+                   {"envs", json::Value::Int(o.envs)},
+                   {"run_envs", json::Value::Int(t.run_envs)},
+                   {"frames", json::Value::Int(static_cast<int64_t>(o.frames))},
+                   {"sequence", json::Value::Int(static_cast<int64_t>(o.frame.sequence))},
+                   {"steps", json::Value::Int(static_cast<int64_t>(o.frame.steps))},
+                   {"spacing", json::Value::Float(o.spacing)},
+                   {"follow", json::Value::Bool(t.follow)},
+                   {"epoch", json::Value::Int(t.epoch)},
+                   {"max_epochs", json::Value::Int(t.max_epochs)},
+                   {"reward", t.has_reward ? json::Value::Float(t.reward) : json::Value::Null()},
+                   {"terrain", ground},
+                   {"arrows", std::move(arrows)}});
 }
 
 void EditorHost::State::RegisterSensorActions() {
@@ -6915,6 +7141,8 @@ json::Value EditorHost::State::MeasureJson() const {
 void EditorHost::State::RegisterSimActions() {
     const auto has_scene = [this] { return loaded_ != nullptr; };
     const auto set_playing = [this](bool playing) {
+        // Playing takes the world over from a watched run, from the last frame it showed.
+        if (playing && observe_) EndObserve(std::string());
         ui_state_.playing = playing;
         PushTransport();
         return Ok(Object({{"playing", json::Value::Bool(playing)}}));
@@ -7931,10 +8159,8 @@ void EditorHost::State::RegisterTimelineActions() {
                   }});
 }
 
-// FNV-1a of the document saved as NKS: equal documents hash equal.
-uint64_t EditorHost::State::DocumentHash() {
-    if (!loaded_) return 0u;
-    const std::string file = cache_.File("document.nks");
+// Equal documents saved under the same file name hash equal: the scene names its archive.
+uint64_t EditorHost::State::SavedSceneHash(const std::string& file) {
     scene::nks::Save(loaded_->scene, file);
     std::string nks;
     std::string archive;
@@ -7942,6 +8168,8 @@ uint64_t EditorHost::State::DocumentHash() {
     ReadEntireFile(file.substr(0, file.size() - 4u) + ".nka", &archive);
     return Fnv1a(archive, Fnv1a(nks));
 }
+
+uint64_t EditorHost::State::DocumentHash() { return loaded_ ? SavedSceneHash(cache_.File("document.nks")) : 0u; }
 
 json::Value EditorHost::State::DocumentState() {
     char hash[17];
@@ -8358,6 +8586,7 @@ void EditorHost::State::Frame(bool step_physics) {
     ui_.Nui().DispatchEvents();
     // Queued loads and edits land at a tick boundary, before this frame takes a render-world reference.
     RunQueuedActions();
+    StepObserve();
 
     // The script runs on the physics side at its next tick boundary.
     if (!opt_.run_script_path.empty() && !script_ran_) {

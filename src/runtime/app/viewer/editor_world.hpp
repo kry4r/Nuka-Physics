@@ -114,6 +114,12 @@ public:
         uint32_t env;
         uint32_t instance;
     };
+    // A velocity arrow from `at` along the planar `velocity`, in the command or the measured colour.
+    struct Arrow {
+        math::Vec3 at;
+        math::Vec3 velocity;
+        bool command;
+    };
 
     EditorSim(WorldLayout layout, render::RenderWorld render_world, const scene::SceneIR& scene);
 
@@ -129,6 +135,10 @@ public:
     // Rebuilds the particle surfaces from one environment's particles; per-particle residuals
     // colour them as a heatmap, an empty `heat` draws their materials.
     void ApplyParticles(const std::vector<math::Vec3>& positions, const std::vector<float>& heat, float alert);
+    // Draws a terrain surface under the scene; an invalid grid removes it.
+    void SetTerrain(const terrain::HeightField& terrain);
+    // Replaces the velocity arrows.
+    void SetArrows(const std::vector<Arrow>& arrows);
 
     // Edits queue live teleports; the frame hands them to the physics thread.
     void QueuePoseWrite(const PoseWrite& write) { pose_writes_.push_back(write); }
@@ -154,6 +164,10 @@ private:
     std::vector<Surface> surfaces_;
     uint32_t heat_material_ = render::kNoId;
     uint32_t ghost_material_ = render::kNoId;
+    uint32_t terrain_material_ = render::kNoId;
+    uint32_t arrow_materials_[2]{render::kNoId, render::kNoId};  // measured, command
+    uint32_t terrain_mesh_ = render::kNoId;
+    bool terrain_shown_ = false;  // the terrain leads extra_instances
     std::vector<EnvCopy> env_copies_;
     std::vector<PoseWrite> pose_writes_;
     uint64_t static_revision_ = 0u;

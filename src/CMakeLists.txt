@@ -445,6 +445,7 @@ if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)
         runtime/app/viewer/sensor_panel.cpp
         runtime/app/viewer/solver_panel.cpp
         runtime/app/viewer/timeline_panel.cpp
+        runtime/app/viewer/training_panel.cpp
         runtime/app/viewer/nui/nui_capi.cpp
         runtime/app/viewer/nui/nui_core.cpp
         runtime/app/viewer/nui/nui_data.cpp
@@ -1289,6 +1290,7 @@ if(CMAKE_CUDA_COMPILER)
             runtime/app/viewer/editor_profile.cpp
             runtime/app/viewer/editor_instance.cpp
             runtime/app/viewer/teleop_devices.cpp
+            runtime/app/viewer/train_observe.cpp
         )
         add_dependencies(nuka_editor nuka_render_shaders)
         set_target_properties(nuka_editor PROPERTIES
@@ -1312,6 +1314,9 @@ if(CMAKE_CUDA_COMPILER)
                 nuka_stb
                 Vulkan::Vulkan
         )
+        if(WIN32)
+            target_link_libraries(nuka_editor PRIVATE ws2_32)
+        endif()
         if(NOT WIN32)
             file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/nuka_editor.map" "{ global: nuka_editor_*; local: *; };\n")
             target_link_options(nuka_editor PRIVATE

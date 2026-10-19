@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+
 from rl_games.common.algo_observer import AlgoObserver
 
 # The scalars rl_games writes before it reports an epoch, by the name a metrics row gives them.
@@ -28,12 +30,15 @@ class TrainObserver(AlgoObserver):
     """Reports to a runner.Run: `epoch(row)` after each epoch, `saved(path, algo)` after each save.
 
     When the run asks to stop, the epoch that just ended becomes the last; rl_games then saves a
-    final checkpoint and returns.
+    final checkpoint and returns. On Windows, viewers can watch the env's first environments
+    through an observe.Server.
     """
 
-    def __init__(self, run):
+    def __init__(self, run, scene: str, spacing: float):
         super().__init__()
         self.run = run
+        self.scene = scene
+        self.spacing = spacing
 
     def after_init(self, algo):
         self.algo = algo
@@ -45,7 +50,21 @@ class TrainObserver(AlgoObserver):
             self.run.saved(fn + ".pth", algo)
 
         algo.save = saved
-        self.run.update(state="running", max_epochs=int(algo.max_epochs))
+        fields = {"state": "running", "max_epochs": int(algo.max_epochs)}
+        if sys.platform == "win32":
+            from .observe import Server
+
+            server = Server(algo.vec_env.env, self.scene, self.spacing)
+            step = algo.vec_env.step
+
+            def stepped(actions):
+                out = step(actions)
+                server.step()
+                return out
+
+            algo.vec_env.step = stepped
+            fields["observe"] = server.port
+        self.run.update(**fields)
 
     def after_clear_stats(self):
         pass

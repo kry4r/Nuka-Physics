@@ -298,6 +298,10 @@ struct RenderWorld {
     // by the raster present pass only; empty while one environment is shown.
     std::vector<RenderInstance>        env_instances;
 
+    // Editor markers such as a terrain surface and velocity arrows, drawn opaque and lit by the
+    // raster present pass only; never picked.
+    std::vector<RenderInstance>        extra_instances;
+
     MeshLibrary                        meshes;
     std::vector<scene::RenderMaterial> materials;  // indexed by render_material_id
     std::vector<RenderCamera>          cameras;

@@ -926,6 +926,27 @@ public:
         return nb::cast(nb::ndarray<nb::numpy, float>(out, 1, shape, owner));
     }
 
+    // The cooked terrain grid as (placement, values): values is an (nrow, ncol) float32 array of
+    // normalized heights; None without a terrain.
+    nb::object terrain() {
+        nuka_terrain_info_t info{};
+        if (nuka_world_get_terrain(h_, &info, nullptr, 0u) != NUKA_RESULT_OK) return nb::none();
+        const size_t n = static_cast<size_t>(info.nrow) * info.ncol;
+        float* values = new float[n];
+        nb::capsule owner(values, [](void* p) noexcept { delete[] static_cast<float*>(p); });
+        check(nuka_world_get_terrain(h_, &info, values, n), "nuka_world_get_terrain");
+        nb::dict placement;
+        placement["nrow"] = info.nrow;
+        placement["ncol"] = info.ncol;
+        placement["cell_x"] = info.cell_x;
+        placement["cell_y"] = info.cell_y;
+        placement["origin"] = nb::make_tuple(info.origin[0], info.origin[1], info.origin[2]);
+        placement["base_z"] = info.base_z;
+        placement["scale_z"] = info.scale_z;
+        size_t shape[2] = {info.nrow, info.ncol};
+        return nb::make_tuple(placement, nb::ndarray<nb::numpy, float>(values, 2, shape, owner));
+    }
+
     uint32_t env_count() const {
         sync_counts();
         return env_count_;
@@ -3375,7 +3396,11 @@ NB_MODULE(_nuka_ext, m) {
              "Batched terrain height over the world's COOKED heightfield grid (the "
              "ONE full-relief source obs/spawn/render and physics share, sampled "
              "bilinearly). xs/ys: (n,) float32 CPU world columns. Returns (n,) numpy "
-             "float32 absolute surface z. No cooked heightfield -> all 0.");
+             "float32 absolute surface z. No cooked heightfield -> all 0.")
+        .def("terrain", &World::terrain,
+             "The cooked terrain grid as (placement, values): placement holds nrow, ncol, cell_x, "
+             "cell_y, origin, base_z and scale_z, and values is an (nrow, ncol) float32 array of "
+             "normalized heights, world z = base_z + value * scale_z. None without a terrain.");
 
     nb::class_<Recorder>(m, "Recorder")
         .def_static("create", &Recorder::create, nb::arg("device"),

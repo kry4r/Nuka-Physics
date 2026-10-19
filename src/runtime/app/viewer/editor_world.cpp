@@ -16,6 +16,13 @@ namespace {
 static_assert(sizeof(math::Transform) == 7u * sizeof(float), "pose wire layout");
 static_assert(sizeof(math::Vec3) == 3u * sizeof(float), "velocity wire layout");
 
+// Arrow radii and head length in metres; metres of arrow per m/s, the longest arrow and the slowest
+// speed drawn. Lengths snap to a step so the mesh library keeps few arrows.
+constexpr float kArrowShaft = 0.03f, kArrowHead = 0.075f, kArrowHeadLength = 0.15f;
+constexpr float kArrowPerSpeed = 0.45f, kArrowMax = 1.0f, kArrowMinSpeed = 0.01f, kArrowStep = 0.02f;
+// The terrain checker's square and the lift that keeps the surface over a coplanar floor.
+constexpr float kCheckerSquare = 1.0f, kTerrainLift = 0.004f;
+
 uint32_t RowsPerEnv(nuka_world_handle world, nuka_state_field_t field, uint32_t env_count) {
     nuka_buffer_view_t view{};
     if (nuka_world_get_buffer_view(world, field, &view) != NUKA_RESULT_OK) return 0u;
@@ -38,6 +45,87 @@ const ParticleSurfaceBinding* SurfaceOf(const WorldLayout& layout, uint32_t part
     for (const ParticleSurfaceBinding& s : layout.surfaces)
         if (std::find(s.triangles.begin(), s.triangles.end(), particle) != s.triangles.end()) return &s;
     return nullptr;
+}
+
+// A smooth-shaded arrow along +X from the origin: a capped shaft and a cone head.
+render::MeshGeometry ArrowMesh(float length, float shaft, float head, float head_length) {
+    constexpr uint32_t kSides = 16u;
+    render::MeshGeometry g;
+    // A ring of radius r at x; its normals blend the axis (nx) with the outward radial (nr).
+    auto ring = [&](float x, float r, float nx, float nr) {
+        const uint32_t first = g.VertexCount();
+        for (uint32_t i = 0; i < kSides; ++i) {
+            const float a = 6.2831853f * static_cast<float>(i) / static_cast<float>(kSides);
+            const float c = std::cos(a), s = std::sin(a);
+            g.positions.insert(g.positions.end(), {x, r * c, r * s});
+            g.normals.insert(g.normals.end(), {nx, nr * c, nr * s});
+        }
+        return first;
+    };
+    auto band = [&](uint32_t a, uint32_t b) {
+        for (uint32_t i = 0; i < kSides; ++i) {
+            const uint32_t j = (i + 1u) % kSides;
+            g.indices.insert(g.indices.end(), {a + i, b + i, b + j, a + i, b + j, a + j});
+        }
+    };
+    const float neck = length - head_length;
+    const float slant = std::sqrt(head * head + head_length * head_length);
+    const uint32_t cap = ring(0.0f, shaft, -1.0f, 0.0f);
+    const uint32_t center = g.VertexCount();
+    g.positions.insert(g.positions.end(), {0.0f, 0.0f, 0.0f});
+    g.normals.insert(g.normals.end(), {-1.0f, 0.0f, 0.0f});
+    for (uint32_t i = 0; i < kSides; ++i) g.indices.insert(g.indices.end(), {center, cap + (i + 1u) % kSides, cap + i});
+    band(ring(0.0f, shaft, 0.0f, 1.0f), ring(neck, shaft, 0.0f, 1.0f));
+    band(ring(neck, shaft, -1.0f, 0.0f), ring(neck, head, -1.0f, 0.0f));
+    band(ring(neck, head, head / slant, head_length / slant), ring(length, 0.0f, head / slant, head_length / slant));
+    return g;
+}
+
+// The terrain surface: a quad per cell with its own corners so each cell takes one checker shade,
+// lit by smooth normals from central differences and brightened with height.
+render::MeshGeometry TerrainMesh(const terrain::HeightField& hf) {
+    constexpr float kShades[2][3] = {{0.43f, 0.46f, 0.51f}, {0.31f, 0.34f, 0.38f}};
+    constexpr int kCorners[4][2] = {{0, 0}, {0, 1}, {1, 1}, {1, 0}};
+    const int rows = static_cast<int>(hf.nrow), cols = static_cast<int>(hf.ncol);
+    auto value = [&](int r, int c) {
+        return hf.values[static_cast<size_t>(std::clamp(r, 0, rows - 1)) * hf.ncol + std::clamp(c, 0, cols - 1)];
+    };
+    auto normal = [&](int r, int c) {
+        const float run_x = static_cast<float>(std::min(c + 1, cols - 1) - std::max(c - 1, 0)) * hf.cell_x;
+        const float run_y = static_cast<float>(std::min(r + 1, rows - 1) - std::max(r - 1, 0)) * hf.cell_y;
+        const float dx = (value(r, c + 1) - value(r, c - 1)) * hf.scale_z / run_x;
+        const float dy = (value(r + 1, c) - value(r - 1, c)) * hf.scale_z / run_y;
+        return math::Vec3{-dx, -dy, 1.0f}.Normalized();
+    };
+    render::MeshGeometry g;
+    const size_t cells = static_cast<size_t>(rows - 1) * static_cast<size_t>(cols - 1);
+    g.positions.reserve(cells * 12u);
+    g.normals.reserve(cells * 12u);
+    g.colors.reserve(cells * 12u);
+    g.indices.reserve(cells * 6u);
+    for (int r = 0; r + 1 < rows; ++r) {
+        for (int c = 0; c + 1 < cols; ++c) {
+            const float mid_x = hf.origin.x + (static_cast<float>(c) + 0.5f) * hf.cell_x;
+            const float mid_y = hf.origin.y + (static_cast<float>(r) + 0.5f) * hf.cell_y;
+            const int square = static_cast<int>(std::floor(mid_x / kCheckerSquare)) +
+                               static_cast<int>(std::floor(mid_y / kCheckerSquare));
+            const float* shade = kShades[square & 1];
+            const uint32_t first = g.VertexCount();
+            for (const auto& corner : kCorners) {
+                const int vr = r + corner[0], vc = c + corner[1];
+                const float v = value(vr, vc);
+                const math::Vec3 n = normal(vr, vc);
+                const float lift = 0.9f + 0.25f * v;
+                g.positions.insert(g.positions.end(), {hf.origin.x + static_cast<float>(vc) * hf.cell_x,
+                                                       hf.origin.y + static_cast<float>(vr) * hf.cell_y,
+                                                       hf.base_z + v * hf.scale_z + kTerrainLift});
+                g.normals.insert(g.normals.end(), {n.x, n.y, n.z});
+                g.colors.insert(g.colors.end(), {shade[0] * lift, shade[1] * lift, shade[2] * lift});
+            }
+            g.indices.insert(g.indices.end(), {first, first + 1u, first + 2u, first, first + 2u, first + 3u});
+        }
+    }
+    return g;
 }
 
 }  // namespace
@@ -324,6 +412,24 @@ EditorSim::EditorSim(WorldLayout layout, render::RenderWorld render_world, const
     ghost.opacity = 0.35f;
     ghost_material_ = render_world_.MaterialCount();
     render_world_.materials.push_back(ghost);
+    // The terrain's checker rides its vertex colours over a matte white.
+    scene::RenderMaterial ground;
+    ground.base_color[0] = ground.base_color[1] = ground.base_color[2] = 1.0f;
+    ground.roughness = 0.9f;
+    terrain_material_ = render_world_.MaterialCount();
+    render_world_.materials.push_back(ground);
+    // Arrows: the measured velocity in the shell's info blue and the command in its ok green, faintly lit.
+    constexpr float kArrowColors[2][3] = {{0.20f, 0.55f, 0.95f}, {0.18f, 0.80f, 0.36f}};
+    for (int k = 0; k < 2; ++k) {
+        scene::RenderMaterial arrow;
+        for (int c = 0; c < 3; ++c) {
+            arrow.base_color[c] = kArrowColors[k][c];
+            arrow.emissive[c] = 0.2f * kArrowColors[k][c];
+        }
+        arrow.roughness = 0.35f;
+        arrow_materials_[k] = render_world_.MaterialCount();
+        render_world_.materials.push_back(arrow);
+    }
     for (const ParticleSurfaceBinding& s : layout_.surfaces) {
         render::RenderInstance inst;
         inst.entity = scene.EntityOfMedia(s.info.medium);
@@ -358,6 +464,39 @@ void EditorSim::ApplyParticles(const std::vector<math::Vec3>& positions, const s
         }
         render_world_.meshes.ReplaceGeometry(s.mesh, std::move(geo));
         render_world_.instances[s.instance].render_material_id = heated ? heat_material_ : s.material;
+    }
+}
+
+void EditorSim::SetTerrain(const terrain::HeightField& terrain) {
+    std::vector<render::RenderInstance>& extra = render_world_.extra_instances;
+    if (terrain_shown_) extra.erase(extra.begin());
+    terrain_shown_ = terrain::IsValid(terrain);
+    if (!terrain_shown_) return;
+    if (terrain_mesh_ == render::kNoId)
+        terrain_mesh_ = render_world_.meshes.AppendGeometry({}, render::MeshSource::PrimitiveFallback);
+    render_world_.meshes.ReplaceGeometry(terrain_mesh_, TerrainMesh(terrain));
+    render::RenderInstance inst;
+    inst.mesh_id = terrain_mesh_;
+    inst.render_material_id = terrain_material_;
+    extra.insert(extra.begin(), inst);
+}
+
+void EditorSim::SetArrows(const std::vector<Arrow>& arrows) {
+    std::vector<render::RenderInstance>& extra = render_world_.extra_instances;
+    extra.resize(terrain_shown_ ? 1u : 0u);
+    for (const Arrow& a : arrows) {
+        const float speed = std::hypot(a.velocity.x, a.velocity.y);
+        if (speed < kArrowMinSpeed) continue;
+        const long steps = std::max(1L, std::lround(std::min(speed * kArrowPerSpeed, kArrowMax) / kArrowStep));
+        const float length = static_cast<float>(steps) * kArrowStep;
+        render::RenderInstance& inst = extra.emplace_back();
+        inst.mesh_id = render_world_.meshes.InternPrimitive("marker:arrow:" + std::to_string(steps), [&] {
+            return ArrowMesh(length, kArrowShaft, kArrowHead, std::min(kArrowHeadLength, 0.5f * length));
+        });
+        inst.render_material_id = arrow_materials_[a.command ? 1 : 0];
+        inst.world_xform.position = a.at;
+        inst.world_xform.rotation =
+            math::Quat::FromAxisAngle(math::Vec3::UnitZ(), std::atan2(a.velocity.y, a.velocity.x));
     }
 }
 

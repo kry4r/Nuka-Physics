@@ -25,6 +25,7 @@ void BindWorld(EditorScene& es) {
                                               es.rest_targets.size() * sizeof(float), 0u),
                     "download drive targets");
     es.sim = std::make_unique<EditorSim>(std::move(layout), std::move(render_world), es.scene);
+    es.sim->SetTerrain(es.terrain);
 }
 
 // Saves the document to the cache, rebuilds the world from that file and binds the result.
