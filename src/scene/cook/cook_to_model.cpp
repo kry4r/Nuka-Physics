@@ -39,7 +39,7 @@
 
 #include "collision/shape_kind.hpp"  // nuka::collision::ShapeKind (R2: one enum)
 #include "scene/terrain/heightfield.hpp"  // HeightField (the cooked grid source)
-#include "scene/terrain/heightfield_loaders.hpp"  // parametric/image grid fill
+#include "scene/terrain/terrain_field.hpp"  // TerrainRecord -> HeightField
 #include "nk/model/contact_capacity.hpp"
 #include "nk/solve/nk_row.hpp"
 #include "runtime/articulation/articulation_cooker.hpp"
@@ -1222,31 +1222,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
     // Terrain bake (gated on a TerrainRecord -> terrain-free scenes stay byte-
     // identical): build the HeightField, bake via the shared helper, retain it.
     if (!scene.Terrain().empty()) {
-        const TerrainRecord& tr = scene.Terrain().front();
-        ::nuka::terrain::HeightField hf;
-        if (!tr.image_path.empty()) {
-            std::string err;
-            if (!::nuka::terrain::LoadHeightFieldFromImage(
-                    tr.image_path, tr.image_radius_x, tr.image_radius_y,
-                    tr.image_elevation_z, tr.base_z, tr.origin, hf, err)) {
-                throw std::runtime_error("CookToModel: terrain image load failed: " + err);
-            }
-        } else {
-            ::nuka::terrain::TerrainGenConfig cfg;
-            cfg.nrow = tr.nrow;            cfg.ncol = tr.ncol;
-            cfg.cell_x = tr.cell;         cfg.cell_y = tr.cell;
-            cfg.origin = tr.origin;       cfg.base_z = tr.base_z;
-            cfg.grade_x = tr.grade_x;     cfg.grade_y = tr.grade_y;
-            cfg.ring_rise = tr.ring_rise; cfg.ring_width = tr.ring_width;
-            cfg.ring_platform = tr.ring_platform; cfg.ring_count = tr.ring_count;
-            cfg.bump_height = tr.bump_height;     cfg.bump_cell = tr.bump_cell;
-            cfg.feature_cell = tr.feature_cell;   cfg.feature_margin = tr.feature_margin;
-            cfg.feature_seed = tr.feature_seed;
-            cfg.curric_levels = tr.curric_levels; cfg.curric_types = tr.curric_types;
-            if (!::nuka::terrain::GenerateHeightField(cfg, hf)) {
-                throw std::runtime_error("CookToModel: degenerate terrain config");
-            }
-        }
+        ::nuka::terrain::HeightField hf = ::nuka::terrain::TerrainField(scene.Terrain().front());
         CookTerrainIntoModel(model, hf, cap.bodies_per_env);
         result.terrain = std::move(hf);
     }

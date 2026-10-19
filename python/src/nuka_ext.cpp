@@ -76,6 +76,22 @@ nuka_result_t unlocked(Call&& call) {
     return call();
 }
 
+// Runs a USD export into a report buffer far larger than any scene writes; the warnings come back one per item.
+template <typename Export>
+std::vector<std::string> usd_warnings(Export&& export_usd, const char* what) {
+    std::string report(1u << 20, '\0');
+    size_t length = 0u;
+    check(unlocked([&] { return export_usd(report.data(), report.size(), &length); }), what);
+    report.resize(std::min(length, report.size() - 1u));
+    std::vector<std::string> lines;
+    for (size_t start = 0, end = 0; start < report.size(); start = end + 1u) {
+        end = report.find('\n', start);
+        if (end == std::string::npos) end = report.size();
+        lines.push_back(report.substr(start, end - start));
+    }
+    return lines;
+}
+
 // Raised when a field view outlives the world generation it aliases.
 struct StaleViewError : std::runtime_error {
     using std::runtime_error::runtime_error;
@@ -610,6 +626,12 @@ public:
     void export_scene(const std::string& path) {
         check(unlocked([&] { return nuka_world_export_scene(h_, path.c_str()); }),
               "nuka_world_export_scene");
+    }
+
+    std::vector<std::string> export_usd(const std::string& path) {
+        return usd_warnings([&](char* report, size_t cap, size_t* length) {
+            return nuka_world_export_usd(h_, path.c_str(), report, cap, length);
+        }, "nuka_world_export_usd");
     }
 
     std::string asset_root() const {
@@ -1608,6 +1630,12 @@ public:
         check(nuka_scene_save(h_, nks_path.c_str()), "nuka_scene_save");
     }
 
+    std::vector<std::string> export_usd(const std::string& path) {
+        return usd_warnings([&](char* report, size_t cap, size_t* length) {
+            return nuka_scene_export_usd(h_, path.c_str(), report, cap, length);
+        }, "nuka_scene_export_usd");
+    }
+
     void destroy() {
         if (h_ != nullptr) {
             nuka_scene_destroy(h_);
@@ -2549,6 +2577,9 @@ NB_MODULE(_nuka_ext, m) {
                      "Starts at 1 and increments on every rebuild_from_scene.")
         .def("export_scene", &World::export_scene, nb::arg("path"),
              "Write the world's current scene as NKS; meshes go to the sibling .nka file.")
+        .def("export_usd", &World::export_usd, nb::arg("path"),
+             "Write the world's scene as UsdPhysics (.usda, .usdc, .usd or .usdz) with its images beside it; "
+             "returns the warnings for what USD could not carry.")
         .def_prop_ro("asset_root", &World::asset_root,
                      "Directory relative scene assets resolve against; empty for built scenes.")
         .def("rebuild_from_scene", &World::rebuild_from_scene, nb::arg("path"),
@@ -3489,6 +3520,9 @@ NB_MODULE(_nuka_ext, m) {
              "not Ready.")
         .def("save", &Scene::save, nb::arg("nks_path"),
              "Save the scene to `nks_path` (+ a sibling <base>.nka).")
+        .def("export_usd", &Scene::export_usd, nb::arg("path"),
+             "Write the scene as UsdPhysics (.usda, .usdc, .usd or .usdz) with its images beside it; "
+             "returns the warnings for what USD could not carry.")
         .def("destroy", &Scene::destroy, "Destroy the scene handle.")
         .def("__enter__", [](Scene& s) -> Scene& { return s; }, nb::rv_policy::reference)
         .def("__exit__",

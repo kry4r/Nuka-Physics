@@ -153,6 +153,11 @@ nuka_result_t nuka_scene_settle(nuka_scene_handle scene,
 // INTERNAL / PARSE_ERROR on a write failure.
 nuka_result_t nuka_scene_save(nuka_scene_handle scene, const char* nks_path);
 
+// Writes the scene as UsdPhysics, like nuka_world_export_usd: the format follows the extension and
+// `report` (may be NULL) takes one warning per line, cut to cap with a NUL; *out_len is its full length.
+nuka_result_t nuka_scene_export_usd(nuka_scene_handle scene, const char* usd_path, char* report, size_t cap,
+                                    size_t* out_len);
+
 // ---------------------------------------------------------------------------
 // Built-scene authoring: program a SceneIR (rigid primitives + media records)
 // and cook it through the SAME CookSceneToModel a file scene uses. This is the

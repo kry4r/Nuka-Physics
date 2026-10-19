@@ -10,6 +10,7 @@
 #include <SDL3/SDL_video.h>
 
 #include "nuka/nuka_scene.h"
+#include "import/usd_exporter.hpp"
 #include "render/imgui/nuka_imgui.hpp"
 #include "render/raster/interop_transform_ssbo.hpp"
 #include "render/raster/vulkan_present_renderer.hpp"
@@ -6730,6 +6731,49 @@ void EditorHost::State::RegisterFileActions() {
                       return Ok(Object({{"path", json::Value::Str(path)},
                                         {"packed", json::Value::Int(packed)},
                                         {"missing", std::move(missing)}}));
+                  }});
+    // Writes the scene, or the Stage node `node` with what hangs from it, as UsdPhysics in the format the path's
+    // extension names. `warnings` lists what USD could not carry; they go to the Console too.
+    actions_.Add({"file.export_usd", "Export USD...", "file", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      const std::string node = StrArg(args, "node");
+                      const std::string units = StrArg(args, "light_units", "isaac");
+                      if (units != "isaac" && units != "nits" && units != "raw")
+                          return ActionResult::Fail("light_units is isaac, nits or raw, not '" + units + "'");
+                      std::string path = StrArg(args, "path");
+                      if (path.empty()) {
+                          const std::string stem = !node.empty()       ? node.substr(node.rfind('/') + 1)
+                                                   : doc_path_.empty() ? std::string("untitled")
+                                                                       : PathText(Utf8Path(doc_path_).stem());
+                          path = SaveFileDialog(nui::Tr("Export USD"), nui::Tr("USD stages"),
+                                                "*.usd;*.usda;*.usdc;*.usdz", (stem + ".usd").c_str());
+                      }
+                      if (path.empty()) return ActionResult::Fail("no export path chosen");
+                      path = NormalPath(path);
+                      import::UsdExportOptions options;
+                      options.node = node;
+                      options.light_units = units == "nits"  ? import::UsdLightUnits::Nits
+                                            : units == "raw" ? import::UsdLightUnits::Raw
+                                                             : import::UsdLightUnits::Isaac;
+                      fs::create_directories(Utf8Path(path).parent_path());
+                      const import::UsdExportResult result = import::ExportUsd(loaded_->scene, path, options);
+                      json::Value warnings = json::Value::Array();
+                      std::string console;
+                      for (const import::UsdDiagnostic& d : result.diagnostics) {
+                          console += "USD export: " + d.code + " <" + d.prim + "> " + d.message + "\n";
+                          warnings.PushBack(Object({{"code", json::Value::Str(d.code)},
+                                                    {"prim", json::Value::Str(d.prim)},
+                                                    {"message", json::Value::Str(d.message)}}));
+                      }
+                      ConsoleAppend(console);
+                      const size_t count = result.diagnostics.size();
+                      if (count == 0u)
+                          ui_.Nui().Toast(nui::Level::Ok, Format(nui::Tr("Exported %s"), FileName(path).c_str()));
+                      else
+                          ui_.Nui().Toast(nui::Level::Warn, Format(nui::Tr("Exported %s with %zu warnings, listed in "
+                                                                           "the Console"),
+                                                                   FileName(path).c_str(), count));
+                      return Ok(Object({{"path", json::Value::Str(path)}, {"warnings", std::move(warnings)}}));
                   }});
 }
 

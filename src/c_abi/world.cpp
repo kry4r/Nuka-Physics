@@ -15,6 +15,7 @@
 #include "import/mjcf_importer.hpp"
 #include "import/urdf_importer.hpp"
 #include "import/usd_importer.hpp"
+#include "import/usd_exporter.hpp"
 #include "math/transform.hpp"       // M10 co-residence: replica placement transform
 #include "scene/scene_compose.hpp"  // M10 co-residence: compose K replicas pre-cook
 #include "scene/scene_ir.hpp"
@@ -548,6 +549,30 @@ nuka_result_t CreateWorld(DeviceRecord* device, WorldRecipe recipe, nuka::scene:
     InstallScene(*record, std::move(world), std::move(cooked), std::move(scene));
     *out = WorldTable().Insert(std::move(record));
     return *out == nullptr ? NUKA_RESULT_INTERNAL : NUKA_RESULT_OK;
+}
+
+nuka_result_t ExportSceneUsd(const nuka::scene::SceneIR& scene, const char* usd_path, char* report, size_t cap,
+                             size_t* out_len) {
+    try {
+        const nuka::import::UsdExportResult result = nuka::import::ExportUsd(scene, usd_path);
+        std::string text;
+        for (const nuka::import::UsdDiagnostic& d : result.diagnostics) {
+            text += d.code + " <" + d.prim + "> " + d.message + "\n";
+        }
+        if (out_len != nullptr) *out_len = text.size();
+        if (report != nullptr && cap > 0u) {
+            const size_t copied = std::min(text.size(), cap - 1u);
+            std::memcpy(report, text.data(), copied);
+            report[copied] = '\0';
+        }
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
 }
 
 }  // namespace nuka::c_abi
@@ -1320,6 +1345,16 @@ nuka_result_t nuka_world_export_scene(nuka_world_handle world, const char* nks_p
     } catch (...) {
         return NUKA_RESULT_INTERNAL;
     }
+}
+
+nuka_result_t nuka_world_export_usd(nuka_world_handle world, const char* usd_path, char* report, size_t cap,
+                                    size_t* out_len) {
+    if (out_len != nullptr) *out_len = 0u;
+    if (usd_path == nullptr || usd_path[0] == '\0') return NUKA_RESULT_INVALID_ARG;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->scene) return NUKA_RESULT_NOT_SUPPORTED;
+    return nuka::c_abi::ExportSceneUsd(*record->scene, usd_path, report, cap, out_len);
 }
 
 nuka_result_t nuka_world_get_asset_root(nuka_world_handle world, char* out, size_t cap,

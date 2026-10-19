@@ -584,4 +584,13 @@ nuka_result_t nuka_scene_save(nuka_scene_handle scene, const char* nks_path) {
     }
 }
 
+nuka_result_t nuka_scene_export_usd(nuka_scene_handle scene, const char* usd_path, char* report, size_t cap,
+                                    size_t* out_len) {
+    if (out_len != nullptr) *out_len = 0u;
+    if (usd_path == nullptr || usd_path[0] == '\0') return NUKA_RESULT_INVALID_ARG;
+    SceneRecord* r = SceneTable().Get(scene);
+    if (r == nullptr || !r->scene) return NUKA_RESULT_NULL_HANDLE;
+    return nuka::c_abi::ExportSceneUsd(*r->scene, usd_path, report, cap, out_len);
+}
+
 }  // extern "C"

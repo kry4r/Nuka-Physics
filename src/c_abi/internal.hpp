@@ -294,6 +294,10 @@ WorldRecipe MakeWorldRecipe(const nuka_world_desc_t& desc);
 nuka_result_t CreateWorld(DeviceRecord* device, WorldRecipe recipe, nuka::scene::SceneIR&& scene,
                           std::string scene_dir, nuka_world_handle* out);
 
+// Writes `scene` as UsdPhysics at `usd_path`; `report` takes its warnings one per line (world.cpp).
+nuka_result_t ExportSceneUsd(const nuka::scene::SceneIR& scene, const char* usd_path, char* report, size_t cap,
+                             size_t* out_len);
+
 // The scene's cameras share one nonzero image size and its lidars one nonempty fan (sensor.cpp).
 bool SceneSensorShapesAgree(const nuka::scene::SceneIR& scene);
 // Replaces the record's sensors with the scene's authored cameras and lidars (defined in

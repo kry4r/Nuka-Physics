@@ -271,13 +271,30 @@ struct Placement {
     pxr::GfMatrix3d residual{1.0};
 };
 
+// The unit direction of the first of `tries` that has not collapsed to zero.
+pxr::GfVec3d FirstDirection(std::initializer_list<pxr::GfVec3d> tries) {
+    for (const pxr::GfVec3d& v : tries) {
+        if (v.GetLength() > 1e-10) {
+            return v.GetNormalized();
+        }
+    }
+    return pxr::GfVec3d::XAxis();
+}
+
+// The world axis least along the unit `x`, made orthogonal to it.
+pxr::GfVec3d Across(const pxr::GfVec3d& x) {
+    const pxr::GfVec3d a(std::abs(x[0]), std::abs(x[1]), std::abs(x[2]));
+    pxr::GfVec3d axis(0.0);
+    axis[a[0] <= a[1] && a[0] <= a[2] ? 0 : a[1] <= a[2] ? 1 : 2] = 1.0;
+    return axis - pxr::GfDot(axis, x) * x;
+}
+
 Placement Place(const pxr::GfMatrix4d& m) {
-    // Gram-Schmidt leaves an orthonormal frame untouched, so rotation-only authoring stays exact.
-    pxr::GfVec3d x(m[0][0], m[0][1], m[0][2]);
-    pxr::GfVec3d y(m[1][0], m[1][1], m[1][2]);
-    x.Normalize();
-    y -= pxr::GfDot(y, x) * x;
-    y.Normalize();
+    // Gram-Schmidt leaves an orthonormal frame untouched, so rotation-only authoring stays exact. An axis scaled
+    // to zero is rebuilt from the others, so a flat box keeps the frame it was written in.
+    const pxr::GfVec3d r0(m[0][0], m[0][1], m[0][2]), r1(m[1][0], m[1][1], m[1][2]), r2(m[2][0], m[2][1], m[2][2]);
+    const pxr::GfVec3d x = FirstDirection({r0, pxr::GfCross(r1, r2), Across(FirstDirection({r1, r2}))});
+    const pxr::GfVec3d y = FirstDirection({r1 - pxr::GfDot(r1, x) * x, pxr::GfCross(r2, x), Across(x)});
     const pxr::GfVec3d z = pxr::GfCross(x, y);
     pxr::GfMatrix4d rotation(1.0);
     rotation.SetRow3(0, x);
@@ -408,11 +425,24 @@ struct PrimData {
     }
 };
 
+// The names of the Xforms above `prim` that stand for Nuka scene groups (nuka:group), each followed by '/', so
+// records keep the group path ExportUsd wrote them under.
+std::string GroupPrefix(const pxr::UsdPrim& prim) {
+    std::string prefix;
+    for (pxr::UsdPrim up = prim.GetParent(); up && !up.IsPseudoRoot(); up = up.GetParent()) {
+        bool group = false;
+        if (Read(up, "nuka:group", group) && group) {
+            prefix.insert(0, up.GetName().GetString() + "/");
+        }
+    }
+    return prefix;
+}
+
 PrimData ReadPrim(const pxr::UsdPrim& prim, pxr::UsdGeomXformCache& xforms, const StageUnits& units) {
     PrimData d;
     d.prim = prim;
     d.type = prim.GetTypeName().GetString();
-    d.name = prim.GetName().GetString();
+    d.name = GroupPrefix(prim) + prim.GetName().GetString();
     d.path = prim.GetPath().GetString();
     d.parent_path = prim.GetParent().GetPath().GetString();
     for (const pxr::TfToken& api : prim.GetAppliedSchemas()) {
@@ -446,8 +476,14 @@ PrimData ReadPrim(const pxr::UsdPrim& prim, pxr::UsdGeomXformCache& xforms, cons
     ReadValue(prim, "inputs:angle", d.light_angle);
     d.has_focal_length = Read(prim, "focalLength", d.focal_length);
     Read(prim, "verticalAperture", d.vertical_aperture);
+    // UsdGeomCamera's clippingRange wins over the split attributes older Nuka scenes author.
     Read(prim, "clippingRange:min", d.near_clip);
     Read(prim, "clippingRange:max", d.far_clip);
+    pxr::GfVec2f clipping;
+    if (Read(prim, "clippingRange", clipping)) {
+        d.near_clip = clipping[0];
+        d.far_clip = clipping[1];
+    }
     ReadTarget(prim, "nuka:joint", d.joint_path);
     ReadTarget(prim, "nuka:body", d.body_path);
     Read(prim, "nuka:type", d.nuka_type);
@@ -1070,6 +1106,7 @@ private:
     std::unordered_map<std::string, scene::MaterialId> material_at_;     // by Material prim path
     std::unordered_map<scene::MaterialId, MaterialInfo> material_info_;
     std::unordered_map<std::string, scene::MaterialId> color_materials_; // displayColor materials by name
+    std::unordered_set<std::string> material_names_;                     // record names taken so far
     bool dome_ = false;                                                   // a DomeLight set the environment
     scene::BodyId world_body_ = scene::kInvalidBody;
     scene::BodyId next_body_ = 0;
@@ -1353,7 +1390,13 @@ scene::MaterialId SceneBuilder::MaterialFor(const pxr::UsdPrim& material, scene:
         return found->second;
     }
     MaterialInfo info;
-    const scene::MaterialId id = scene.AddMaterial(ReadMaterial(material, info));
+    scene::MaterialRecord record = ReadMaterial(material, info);
+    // Material prims of one name in different scopes stay apart, suffixed _1, _2 as ExportUsd writes them.
+    const std::string base = record.name;
+    for (int k = 1; !material_names_.insert(record.name).second; ++k) {
+        record.name = base + "_" + std::to_string(k);
+    }
+    const scene::MaterialId id = scene.AddMaterial(std::move(record));
     material_at_[path] = id;
     material_info_[id] = std::move(info);
     return id;
@@ -1364,7 +1407,7 @@ scene::MaterialId SceneBuilder::MaterialFor(const pxr::UsdPrim& material, scene:
 scene::MaterialRecord SceneBuilder::ReadMaterial(const pxr::UsdPrim& prim, MaterialInfo& info) const {
     const std::string path = prim.GetPath().GetString();
     scene::MaterialRecord record;
-    record.name = prim.GetName().GetString();
+    record.name = GroupPrefix(prim) + prim.GetName().GetString();
     const pxr::UsdShadeMaterial material(prim);
     pxr::UsdShadeShader surface = material.ComputeSurfaceSource();
     if (!surface) {
@@ -1388,6 +1431,7 @@ scene::MaterialRecord SceneBuilder::ReadMaterial(const pxr::UsdPrim& prim, Mater
         Read(prim, "inputs:roughness", record.roughness);
         Read(prim, "inputs:metallic", record.metallic);
     }
+    Read(prim, "nuka:triplanar", record.triplanar);
     Read(prim, "physics:dynamicFriction", record.friction_mu);
     Read(prim, "physics:density", info.density);
     double restitution = 0.0;
@@ -1704,6 +1748,7 @@ scene::MaterialId SceneBuilder::ColorMaterial(scene::MaterialRecord record, scen
     MaterialInfo info = from == scene::kInvalidMaterial ? MaterialInfo{} : material_info_.at(from);
     info.display_color = false;
     const std::string name = record.name;
+    material_names_.insert(name);
     const scene::MaterialId id = scene.AddMaterial(std::move(record));
     color_materials_[name] = id;
     material_info_[id] = std::move(info);
@@ -2098,6 +2143,13 @@ scene::BodyId SceneBuilder::WorldBody(scene::SceneIR& scene) {
 // Mass properties of a moving body: MassAPI values where authored, the colliders' volume otherwise.
 void SceneBuilder::SetMass(const Body& body, scene::RigidBodyRecord& record) const {
     const PrimData& prim = prims_[body.prim];
+    bool massless = false;
+    // ExportUsd marks a body that has neither mass nor colliders (a URDF sensor link), which UsdPhysics cannot hold.
+    if (Read(prim.prim, "nuka:massless", massless) && massless) {
+        record.mass = 0.0f;
+        record.inertia = math::Vec3{0.0f, 0.0f, 0.0f};
+        return;
+    }
     const double density_unit = units_.kilograms / (units_.meters * units_.meters * units_.meters);
     double body_density = 0.0;
     Read(prim.prim, "physics:density", body_density);
@@ -2299,7 +2351,9 @@ void SceneBuilder::AddDrive(const Joint& joint, scene::SceneIR& scene) {
     if (std::isfinite(max_force) && max_force > 0.0) {
         actuator.force_limit = F(max_force * units_.kilograms * length);
     }
-    if (stiffness > 0.0 && damping > 0.0) {
+    const double scale = units_.kilograms * length * per_unit;
+    const double implied = 2.0 * std::sqrt(stiffness * scale);
+    if (stiffness > 0.0 && damping > 0.0 && std::abs(damping * scale - implied) > 1e-4 * std::max(1.0, implied)) {
         Warn("USD_DRIVE_DAMPING_IGNORED", prim, "position drives damp at 2*sqrt(stiffness); the authored "
              "damping of " + std::to_string(damping) + " is not represented");
     }
@@ -2424,10 +2478,13 @@ scene::SceneIR SceneBuilder::Build() {
         }
     }
 
-    // A RigidBodyAPI prim is a body unless it is disabled; a disabled or kinematic body stays put.
+    // A RigidBodyAPI prim is a body unless it is disabled; a disabled or kinematic body stays put. An Xform
+    // marked nuka:staticBody, which the exporter writes for static colliders, is a static body too.
     for (size_t i = 0; i < prims_.size(); ++i) {
         const PrimData& prim = prims_[i];
-        if (!prim.HasApi("PhysicsRigidBodyAPI")) {
+        bool static_body = false;
+        Read(prim.prim, "nuka:staticBody", static_body);
+        if (!prim.HasApi("PhysicsRigidBodyAPI") && !static_body) {
             continue;
         }
         bool enabled = true, kinematic = false;
@@ -2436,7 +2493,7 @@ scene::SceneIR SceneBuilder::Build() {
         Body body;
         body.prim = i;
         body.frame = Place(prim.world).pose;
-        body.is_static = kinematic || !enabled;
+        body.is_static = static_body || kinematic || !enabled;
         body_at_[prim.path] = static_cast<int>(bodies_.size());
         bodies_.push_back(body);
     }
@@ -2533,6 +2590,10 @@ scene::SceneIR SceneBuilder::Build() {
             sensor.type = SensorTypeFromToken(prim.nuka_type);
             sensor.mount = scene::MountFrame::Body;
             sensor.mount_index = IdOf(body_it->second);
+            const auto joint_it = joint_ids_.find(prim.joint_path);
+            if (joint_it != joint_ids_.end()) {
+                sensor.joint_id = joint_it->second;
+            }
             sensor.local_offset = math::Transform{offset, LocalRotation(prim)};
             sensor.sample_rate_hz = prim.sample_rate_hz;
             // Render-sensor payloads: a lidar/range fan + range, or a depth image

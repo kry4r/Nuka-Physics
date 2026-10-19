@@ -391,6 +391,10 @@ nuka_result_t nuka_world_state_hash(nuka_world_handle world, uint64_t* out_hash)
 
 // Writes the world's retained scene as NKS (meshes go to the sibling .nka file).
 nuka_result_t nuka_world_export_scene(nuka_world_handle world, const char* nks_path);
+// Writes the retained scene as UsdPhysics (usda, usdc/.usd or usdz by extension), images copied beside it.
+// `report` (may be NULL) takes one warning per line, cut to cap with a NUL; *out_len is its full length.
+nuka_result_t nuka_world_export_usd(nuka_world_handle world, const char* usd_path, char* report, size_t cap,
+                                    size_t* out_len);
 // Directory the scene's relative render assets resolve against; empty for built scenes.
 // NULL out queries *out_len (length without NUL); cap must hold the NUL.
 nuka_result_t nuka_world_get_asset_root(nuka_world_handle world, char* out, size_t cap,

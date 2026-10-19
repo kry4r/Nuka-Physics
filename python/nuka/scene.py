@@ -150,6 +150,11 @@ class Scene:
         """Save the scene to ``nks_path`` (+ a sibling ``<base>.nka``)."""
         self._ext.save(str(nks_path))
 
+    def export_usd(self, path: str) -> list:
+        """Write the scene as UsdPhysics (``.usda``, ``.usdc``, ``.usd`` or ``.usdz``) with its images beside
+        it; returns the warnings for what USD could not carry, one string each."""
+        return self._ext.export_usd(str(path))
+
     def destroy(self) -> None:
         self._ext.destroy()
 

@@ -114,7 +114,9 @@ std::string SaveFileDialog(const char* title, const char* filter_label,
     ofn.lpstrFile = path;
     ofn.nMaxFile = MAX_PATH;
     ofn.lpstrTitle = wtitle.empty() ? nullptr : wtitle.c_str();
-    ofn.lpstrDefExt = L"nks";
+    // A name typed without an extension takes the first pattern's.
+    const std::wstring wext = wglob.rfind(L"*.", 0) == 0 ? wglob.substr(2, wglob.find(L';') - 2) : std::wstring();
+    ofn.lpstrDefExt = wext.empty() || wext == L"*" ? nullptr : wext.c_str();
     ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR | OFN_EXPLORER;
     if (GetSaveFileNameW(&ofn)) {
         return Narrow(path);

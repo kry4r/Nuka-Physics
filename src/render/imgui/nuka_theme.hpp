@@ -154,6 +154,7 @@ inline constexpr const char kPower[] = "\xEE\x8F\x9A";
 inline constexpr const char kProhibit[] = "\xEE\x8F\x9E";
 inline constexpr const char kPlug[] = "\xEE\xA5\x86";
 inline constexpr const char kPackage[] = "\xEE\x8E\x90";
+inline constexpr const char kExport[] = "\xEE\xAB\xB0";
 inline constexpr const char kCode[] = "\xEE\x86\xBC";
 inline constexpr const char kFilePy[] = "\xEE\xAC\xAC";
 inline constexpr const char kFileCpp[] = "\xEE\xAC\xAE";

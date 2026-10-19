@@ -87,6 +87,11 @@ add_library(nuka_scene STATIC
     scene/asset/asset_bytes.cpp
     scene/asset/asset_cache.cpp
     scene/format/json.cpp
+    # The general heightfield: the parametric grid generators + the self-written grayscale image
+    # loader, the ONE source the cook, obs/render and the USD exporter share.
+    scene/terrain/heightfield_loaders.cpp
+    scene/terrain/image_grayscale.cpp
+    scene/terrain/terrain_field.cpp
 )
 set_target_properties(nuka_scene PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -483,6 +488,7 @@ add_library(nuka_import STATIC
     import/geom_inertia.cpp
     import/usd_stage_adapter.cpp
     import/usd_importer.cpp
+    import/usd_exporter.cpp
     import/mesh_file_loader.cpp
     import/gltf_mesh_loader.cpp
     import/dae_mesh_loader.cpp
@@ -506,8 +512,10 @@ target_link_libraries(nuka_import
         nuka_cgltf
         usd
         usdGeom
+        usdLux
         usdPhysics
         usdShade
+        usdUtils
         ar
         sdf
         tf
@@ -808,10 +816,6 @@ if(CMAKE_CUDA_COMPILER)
         scene/cook/cook_to_model.cpp
         scene/cook/settle.cpp
         scene/cook/placement.cpp
-        # The general heightfield: the parametric grid generators + the self-written
-        # grayscale image loader, the ONE source the cook + obs/render share.
-        scene/terrain/heightfield_loaders.cpp
-        scene/terrain/image_grayscale.cpp
         # L1-c: union_cook.cpp (CookSceneToUnionTemplate — the .nks h1_cup_table
         # -> UnionSceneTemplate cook) was DELETED with the UnionCsr path. The one
         # general cook is cook_to_model.cpp (CookSceneToModel -> PairDriven).
