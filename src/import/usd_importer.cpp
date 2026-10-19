@@ -4,6 +4,7 @@
 
 #include "import/usd_importer.hpp"
 
+#include "import/cooker/convex_decomposition.hpp"
 #include "import/geom_inertia.hpp"
 #include "import/usd_stage_adapter.hpp"
 #include "math/quat.hpp"
@@ -375,6 +376,7 @@ struct PrimData {
     bool left_handed = false;            // Mesh orientation leftHanded: clockwise faces
     std::string approximation;           // MeshCollisionAPI physics:approximation
     int max_hulls = 0;                   // physxConvexDecompositionCollision:maxConvexHulls
+    int hull_vertex_limit = 64;          // physxConvexHullCollision:hullVertexLimit
     std::string decompose_mode;          // nuka:decompose token
     int decompose_max_pieces = 32;       // nuka:decompose:max_pieces
     bool has_initial_position = false;
@@ -452,6 +454,7 @@ PrimData ReadPrim(const pxr::UsdPrim& prim, pxr::UsdGeomXformCache& xforms, cons
     d.left_handed = ReadValue(prim, "orientation", orientation) && orientation == pxr::UsdGeomTokens->leftHanded;
     Read(prim, "physics:approximation", d.approximation);
     Read(prim, "physxConvexDecompositionCollision:maxConvexHulls", d.max_hulls);
+    Read(prim, "physxConvexHullCollision:hullVertexLimit", d.hull_vertex_limit);
     Read(prim, "nuka:decompose", d.decompose_mode);
     Read(prim, "nuka:decompose:max_pieces", d.decompose_max_pieces);
     d.has_initial_position = Read(prim, "nuka:initialPosition", d.initial_position);
@@ -1010,6 +1013,8 @@ private:
     scene::MaterialRecord ReadMaterial(const pxr::UsdPrim& prim, MaterialInfo& info) const;
     void ReadPreviewSurface(const pxr::UsdShadeShader& surface, const std::string& material,
                             scene::MaterialRecord& record, MaterialInfo& info) const;
+    void ReadOmniPbr(const pxr::UsdShadeShader& surface, const std::string& material,
+                     scene::MaterialRecord& record, MaterialInfo& info) const;
     bool TextureOf(const pxr::UsdAttribute& source, const char* input, const std::string& material, Texture& out,
                    MaterialInfo& info) const;
     std::string TexturePath(const pxr::SdfAssetPath& file, const std::string& material) const;
@@ -1019,6 +1024,7 @@ private:
     double MaterialDensity(scene::MaterialId id) const;
     void AddGprim(size_t index, scene::SceneIR& scene);
     bool SizePrimitive(const PrimData& prim, const Placement& placement, scene::CollisionShapeRecord& shape) const;
+    void ReadContact(const PrimData& prim, scene::CollisionShapeRecord& shape) const;
     void AddMeshCollider(size_t index, int owner, scene::CollisionShapeRecord shape, const Placement& placement,
                          bool flip, scene::SceneIR& scene);
     void AddMeshVisual(size_t index, int owner, scene::CollisionShapeRecord shape, const Placement& placement,
@@ -1031,6 +1037,7 @@ private:
     void SetMass(const Body& body, scene::RigidBodyRecord& record) const;
     void AddJoints(scene::SceneIR& scene);
     void AddDrive(const Joint& joint, scene::SceneIR& scene);
+    void AddMjcActuator(const PrimData& prim, scene::SceneIR& scene) const;
     void AddDome(const PrimData& prim, scene::SceneIR& scene);
     scene::BodyId WorldBody(scene::SceneIR& scene);
     Pose FrameOf(int body) const { return body < 0 ? Pose{} : bodies_[static_cast<size_t>(body)].frame; }
@@ -1346,9 +1353,21 @@ scene::MaterialRecord SceneBuilder::ReadMaterial(const pxr::UsdPrim& prim, Mater
     const std::string path = prim.GetPath().GetString();
     scene::MaterialRecord record;
     record.name = prim.GetName().GetString();
-    const pxr::UsdShadeShader surface = pxr::UsdShadeMaterial(prim).ComputeSurfaceSource();
+    const pxr::UsdShadeMaterial material(prim);
+    pxr::UsdShadeShader surface = material.ComputeSurfaceSource();
+    if (!surface) {
+        surface = material.ComputeSurfaceSource(pxr::TfToken("mdl"));
+    }
+    pxr::SdfAssetPath mdl;
     if (surface && ShaderIdOf(surface.GetPrim()) == "UsdPreviewSurface") {
         ReadPreviewSurface(surface, path, record, info);
+    } else if (surface && surface.GetSourceAsset(&mdl, pxr::TfToken("mdl"))) {
+        if (std::filesystem::path(mdl.GetAssetPath()).filename() == "OmniPBR.mdl") {
+            ReadOmniPbr(surface, path, record, info);
+        } else {
+            Warn("USD_MATERIAL_MDL_UNSUPPORTED", path, "MDL material '" + mdl.GetAssetPath() +
+                 "' is not supported; the material keeps default values");
+        }
     } else {
         if (!Read(prim, "inputs:color", record.base_color) && !Read(prim, "inputs:diffuseColor", record.base_color)) {
             Read(prim, "color", record.base_color);
@@ -1438,6 +1457,102 @@ void SceneBuilder::ReadPreviewSurface(const pxr::UsdShadeShader& surface, const 
     }
     record.triplanar = record.albedo_map.empty() && record.roughness_map.empty() && record.metallic_map.empty() &&
                        record.normal_map.empty() && record.emissive_map.empty();
+}
+
+// OmniPBR.mdl parameters, unauthored ones at NVIDIA's documented defaults; a map that replaces a value
+// leaves the value at 1, a multiplier.
+void SceneBuilder::ReadOmniPbr(const pxr::UsdShadeShader& surface, const std::string& material,
+                               scene::MaterialRecord& record, MaterialInfo& info) const {
+    const auto read = [&](const char* name, auto& value) {
+        return ReadSource(SourceOf(surface.GetInput(pxr::TfToken(name))), value);
+    };
+    const auto map = [&](const char* name) {
+        pxr::SdfAssetPath file;
+        read(name, file);
+        return TexturePath(file, material);
+    };
+    math::Vec3 constant{0.2f, 0.2f, 0.2f}, tint{1.0f, 1.0f, 1.0f};
+    float brightness = 1.0f;
+    read("diffuse_color_constant", constant);
+    read("diffuse_tint", tint);
+    read("albedo_brightness", brightness);
+    record.albedo_map = map("diffuse_texture");
+    const math::Vec3 albedo =
+        record.albedo_map.empty() ? math::Vec3{constant.x * tint.x, constant.y * tint.y, constant.z * tint.z} : tint;
+    record.base_color = albedo * brightness;
+
+    // Roughness and metallic blend a constant toward a map by an influence; with ORM on, the map is ORM's G or B.
+    bool orm = false;
+    read("enable_ORM_texture", orm);
+    const auto scalar = [&](const char* name, float& value, const char* texture, uint32_t orm_channel,
+                            std::string& path, uint32_t& channel) {
+        read((std::string(name) + "_constant").c_str(), value);
+        float influence = 0.0f;
+        read((std::string(name) + "_texture_influence").c_str(), influence);
+        if (influence <= 0.0f) {
+            return;
+        }
+        const std::string file = map(orm ? "ORM_texture" : texture);
+        if (file.empty()) {
+            return;
+        }
+        if (influence != 1.0f) {
+            Warn("USD_TEXTURE_INFLUENCE", material, std::string(name) + "_texture_influence " +
+                 std::to_string(influence) + " is read as 1; the map replaces the constant");
+        }
+        path = file;
+        channel = orm ? orm_channel : 0u;
+        value = 1.0f;
+    };
+    record.roughness = 0.5f;
+    scalar("reflection_roughness", record.roughness, "reflectionroughness_texture", 1u, record.roughness_map,
+           record.roughness_channel);
+    record.metallic = 0.0f;
+    scalar("metallic", record.metallic, "metallic_texture", 2u, record.metallic_map, record.metallic_channel);
+    record.normal_map = map("normalmap_texture");
+
+    // Emission is in Kit units, like the lights.
+    bool emission = false;
+    read("enable_emission", emission);
+    if (emission) {
+        math::Vec3 color{1.0f, 1.0f, 0.1f};
+        float intensity = 1.0f;
+        read("emissive_color", color);
+        read("emissive_intensity", intensity);
+        record.emissive_map = map("emissive_color_texture");
+        const float scale = intensity * kUsdLuxToNuka;
+        record.emissive = record.emissive_map.empty() ? color * scale : math::Vec3{scale, scale, scale};
+    }
+    bool opacity = false, opacity_texture = false;
+    read("enable_opacity", opacity);
+    read("enable_opacity_texture", opacity_texture);
+    if (opacity) {
+        read("opacity_constant", record.alpha);
+        if (opacity_texture) {
+            Warn("USD_MATERIAL_INPUT_UNSUPPORTED", material, "a textured opacity is not supported; "
+                 "opacity_constant is used");
+        }
+    }
+
+    // A larger texture_scale draws the texture larger: OmniPBR divides the UVs by it.
+    pxr::GfVec2f scale(1.0f), translate(0.0f);
+    float rotate = 0.0f;
+    read("texture_scale", scale);
+    read("texture_translate", translate);
+    read("texture_rotate", rotate);
+    if (scale[0] != scale[1] || translate != pxr::GfVec2f(0.0f) || rotate != 0.0f) {
+        Warn("USD_TEXTURE_TRANSFORM", material, "only a uniform texture_scale is kept from the OmniPBR UV "
+             "transform");
+    }
+    record.uv_scale = 1.0f / scale[0];
+    bool project = false;
+    read("project_uvw", project);
+    const bool textured = !record.albedo_map.empty() || !record.roughness_map.empty() ||
+                          !record.metallic_map.empty() || !record.normal_map.empty() || !record.emissive_map.empty();
+    record.triplanar = project || !textured;
+    if (textured && !project) {
+        info.uv_set = "st";
+    }
 }
 
 // The UsdUVTexture channel `source` names, with the UV set its st reads and a uniform UsdTransform2d scale.
@@ -1638,6 +1753,7 @@ void SceneBuilder::AddGprim(size_t index, scene::SceneIR& scene) {
         return;
     }
     if (collider) {
+        ReadContact(prim, shape);
         shape.material_id = ColliderMaterial(prim, drawn, scene);
     } else {
         shape.contype = 0;
@@ -1685,6 +1801,35 @@ bool SceneBuilder::SizePrimitive(const PrimData& prim, const Placement& placemen
     return true;
 }
 
+// MjcCollisionAPI contact parameters, copied as the MJCF importer copies a geom's.
+void SceneBuilder::ReadContact(const PrimData& prim, scene::CollisionShapeRecord& shape) const {
+    int condim = 0;
+    if (Read(prim.prim, "mjc:condim", condim)) {
+        shape.condim = static_cast<uint8_t>(condim);
+    }
+    Read(prim.prim, "mjc:group", shape.collision_group);
+    Read(prim.prim, "mjc:priority", shape.priority);
+    Read(prim.prim, "mjc:solmix", shape.solmix);
+    double length = 0.0;
+    if (Read(prim.prim, "mjc:margin", length)) {
+        shape.margin = F(length * units_.meters);
+    }
+    if (Read(prim.prim, "mjc:gap", length)) {
+        shape.gap = F(length * units_.meters);
+    }
+    pxr::VtArray<double> values;
+    if (Read(prim.prim, "mjc:solref", values)) {
+        for (size_t k = 0; k < std::min<size_t>(values.size(), 2u); ++k) {
+            shape.solref[k] = F(values[k]);
+        }
+    }
+    if (Read(prim.prim, "mjc:solimp", values)) {
+        for (size_t k = 0; k < std::min<size_t>(values.size(), 5u); ++k) {
+            shape.solimp[k] = F(values[k]);
+        }
+    }
+}
+
 // A mesh collider as its MeshCollisionAPI approximation asks; nuka:decompose wins over the approximation.
 void SceneBuilder::AddMeshCollider(size_t index, int owner, scene::CollisionShapeRecord shape,
                                    const Placement& placement, bool flip, scene::SceneIR& scene) {
@@ -1709,7 +1854,17 @@ void SceneBuilder::AddMeshCollider(size_t index, int owner, scene::CollisionShap
     }
     const std::string& approximation = prim.approximation;
     if (approximation == "convexHull") {
-        shape.type = scene::ShapeType::ConvexHull;
+        // PhysX cooks the hull of the points, so a concave source mesh collides as its hull.
+        cooker::ConvexPiece hull = cooker::ComputeConvexHull(
+            shape.mesh_vertices.data(), static_cast<uint32_t>(shape.mesh_vertices.size() / 3u),
+            static_cast<uint32_t>(prim.hull_vertex_limit));
+        if (hull.volume > 0.0f) {
+            shape.type = scene::ShapeType::ConvexHull;
+            shape.mesh_vertices = std::move(hull.vertices);
+            shape.mesh_indices = std::move(hull.indices);
+        } else {
+            Warn("USD_HULL_DEGENERATE", prim, "the mesh's points span no volume; it collides as a triangle mesh");
+        }
     } else if (approximation == "convexDecomposition") {
         if (prim.decompose_mode.empty()) {
             shape.decompose_mode = scene::DecomposeMode::Force;
@@ -1749,6 +1904,7 @@ void SceneBuilder::AddMeshCollider(size_t index, int owner, scene::CollisionShap
         Warn("USD_APPROXIMATION_UNSUPPORTED", prim, "collision approximation '" + approximation +
              "' is not supported; the mesh collides as authored");
     }
+    ReadContact(prim, shape);
     shape.material_id = ColliderMaterial(prim, false, scene);
     Push(index, owner, std::move(shape));
 }
@@ -2069,6 +2225,24 @@ void SceneBuilder::AddJoints(scene::SceneIR& scene) {
                    Read(prim.prim, "state:" + joint.drive + ":physics:position", state)) {
             record.initial_position = F(state * (joint.angular ? kDegToRad : units_.meters) - joint.rest);
         }
+        // Passive dynamics, MuJoCo's attributes first; armature and damping scale as inertia, friction as force.
+        const double inertia = units_.kilograms * (joint.angular ? units_.meters * units_.meters : 1.0);
+        const double force = units_.kilograms * units_.meters * (joint.angular ? units_.meters : 1.0);
+        double armature = 0.0, friction = 0.0, damping = 0.0, velocity = 0.0;
+        if (Read(prim.prim, "mjc:armature", armature) || Read(prim.prim, "newton:armature", armature) ||
+            Read(prim.prim, "physxJoint:armature", armature)) {
+            record.armature = F(armature * inertia);
+        }
+        if (Read(prim.prim, "mjc:frictionloss", friction) || Read(prim.prim, "newton:friction", friction)) {
+            record.frictionloss = F(friction * force);
+        }
+        if (Read(prim.prim, "mjc:damping", damping)) {
+            record.damping = F(damping * inertia);
+        }
+        if (Read(prim.prim, "physxJoint:maxJointVelocity", velocity)) {
+            Warn("USD_JOINT_VELOCITY_LIMIT", prim, "joint velocity limits are not represented; the limit of " +
+                 std::to_string(velocity) + " is dropped");
+        }
         joint.id = scene.AddJoint(std::move(record));
         joint_ids_[prim.path] = joint.id;
     }
@@ -2116,6 +2290,77 @@ void SceneBuilder::AddDrive(const Joint& joint, scene::SceneIR& scene) {
     }
     if (Lowercase(type) == "acceleration") {
         Warn("USD_DRIVE_ACCELERATION", prim, "an acceleration drive is imported as a force drive");
+    }
+    scene.AddActuator(std::move(actuator));
+}
+
+// A MuJoCo actuator on a joint: a motor, a position servo (gain kp, affine bias (0, -kp, b2)) or a velocity
+// servo (gain kv, bias (0, 0, -kv)). The joint feels gear^2 times the servo gain.
+void SceneBuilder::AddMjcActuator(const PrimData& prim, scene::SceneIR& scene) const {
+    const auto params = [&](const char* name, double first) {
+        std::vector<double> values(10, 0.0);
+        values[0] = first;
+        pxr::VtArray<double> authored;
+        if (Read(prim.prim, name, authored)) {
+            std::copy_n(authored.begin(), std::min<size_t>(authored.size(), values.size()), values.begin());
+        }
+        return values;
+    };
+    const std::vector<double> gear = params("mjc:gear", 1.0);
+    const std::vector<double> gain = params("mjc:gainPrm", 1.0);
+    const std::vector<double> bias = params("mjc:biasPrm", 0.0);
+    std::string target, gain_type = "fixed", bias_type = "none", dyn_type = "none";
+    ReadTarget(prim.prim, "mjc:target", target);
+    Read(prim.prim, "mjc:gainType", gain_type);
+    Read(prim.prim, "mjc:biasType", bias_type);
+    Read(prim.prim, "mjc:dynType", dyn_type);
+    const auto at = prim_at_.find(target);
+    const auto joint = at == prim_at_.end() ? joints_.end() : std::find_if(joints_.begin(), joints_.end(),
+        [&](const Joint& j) { return j.prim == at->second && j.id != scene::kInvalidJoint; });
+
+    scene::ActuatorType type = scene::ActuatorType::Motor;
+    double value = gear[0] * gain[0];
+    bool supported = joint != joints_.end() && dyn_type == "none" && gain_type == "fixed";
+    if (bias_type == "affine" && bias[0] == 0.0 && bias[1] < 0.0 && gain[0] == -bias[1]) {
+        type = scene::ActuatorType::Position;
+        value = gear[0] * gear[0] * gain[0];
+    } else if (bias_type == "affine" && bias[0] == 0.0 && bias[1] == 0.0 && bias[2] < 0.0 && gain[0] == -bias[2]) {
+        type = scene::ActuatorType::Velocity;
+        value = gear[0] * gear[0] * gain[0];
+    } else if (bias_type != "none") {
+        supported = false;
+    }
+    if (!supported) {
+        Warn("USD_MJC_ACTUATOR_UNSUPPORTED", prim, "only motors and position or velocity servos on a joint, with "
+             "dynType none and gainType fixed, are imported; the actuator is left out");
+        return;
+    }
+    if (type == scene::ActuatorType::Position && bias[2] != 0.0) {
+        Warn("USD_DRIVE_DAMPING_IGNORED", prim, "position drives damp at 2*sqrt(stiffness); the authored "
+             "damping term " + std::to_string(bias[2]) + " is not represented");
+    }
+
+    // MuJoCo limits a range when its flag is "true", or "auto" with the range authored.
+    const auto range = [&](const pxr::UsdPrim& on, const std::string& base, const char* flag) {
+        std::string limited = "auto";
+        Read(on, flag, limited);
+        double lo = 0.0, hi = 0.0;
+        const bool has_lo = Read(on, base + ":min", lo);
+        const bool has_hi = Read(on, base + ":max", hi);
+        const bool on_range = limited == "true" || (limited == "auto" && (has_lo || has_hi));
+        return on_range ? std::max(std::abs(lo), std::abs(hi)) : kInf;
+    };
+    const double limit = std::min(std::abs(gear[0]) * range(prim.prim, "mjc:forceRange", "mjc:forceLimited"),
+        range(prims_[joint->prim].prim, "mjc:actuatorfrcrange", "mjc:actuatorfrclimited"));
+    const double length = joint->angular ? units_.meters * units_.meters : 1.0;
+    const double torque = units_.kilograms * units_.meters * (joint->angular ? units_.meters : 1.0);
+    scene::ActuatorRecord actuator;
+    actuator.name = prim.name;
+    actuator.joint_id = joint->id;
+    actuator.type = type;
+    actuator.gain = F(value * (type == scene::ActuatorType::Motor ? torque : units_.kilograms * length));
+    if (std::isfinite(limit) && limit > 0.0) {
+        actuator.force_limit = F(limit * torque);
     }
     scene.AddActuator(std::move(actuator));
 }
@@ -2234,6 +2479,8 @@ scene::SceneIR SceneBuilder::Build() {
                     AddDrive(joint, scene);
                 }
             }
+        } else if (prim.type == "MjcActuator") {
+            AddMjcActuator(prim, scene);
         } else if (prim.type == "NukaActuator") {
             const auto joint_it = joint_ids_.find(prim.joint_path);
             if (joint_it == joint_ids_.end()) {

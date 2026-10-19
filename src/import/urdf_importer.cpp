@@ -615,9 +615,6 @@ void ValidateUrdf(Element* robot, UrdfImportResult& result) {
                          "Expected finite numeric value(s): " + key);
                 continue;
             }
-            if (Listed(key, "ixy ixz iyz") && values[0] != 0.0)
-                Diagnose(result, e, UrdfDiagnosticKind::Unsupported, "URDF_FULL_INERTIA_UNSUPPORTED",
-                         "Nonzero inertia cross terms are not represented");
             if (Listed(key, "value ixx iyy izz radius length size") &&
                 std::any_of(values.begin(), values.end(), [](double v) { return static_cast<float>(v) <= 0.0f; }))
                 Diagnose(result, e, UrdfDiagnosticKind::Invalid, "URDF_POSITIVE_VALUE_REQUIRED",

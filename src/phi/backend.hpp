@@ -193,5 +193,7 @@ void           ResetActiveBackend(Backend*);  // clear if it is the active one.
 
 BufferType*    BackendDeviceBufferType(Backend*);
 BufferType*    BackendHostBufferType(Backend*);
+// Raises the device's per-thread stack limit to at least `bytes`; it is never lowered.
+Status         BackendReserveThreadStack(Backend*, uint64_t bytes);
 
 } // namespace nuka::phi

@@ -226,6 +226,12 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
     }
     creation_status_ = model_.capacities.Validate(&creation_error_);
     if (creation_status_ != phi::Status::Ok) return;
+    creation_status_ = phi::BackendReserveThreadStack(
+        backend, phi::ArticulationThreadStackBytes(model_.capacities.dofs_per_env));
+    if (creation_status_ != phi::Status::Ok) {
+        creation_error_ = "thread stack reservation failed";
+        return;
+    }
 
     // Model uploads, state transfers and physics share the backend execution queue.
     phi::BufferType* bt = phi::BackendDeviceBufferType(backend);

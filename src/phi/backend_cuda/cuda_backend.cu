@@ -634,6 +634,14 @@ BufferType* BackendHostBufferType(Backend* b) {
     return reinterpret_cast<BufferType*>(&reinterpret_cast<CudaBackend*>(b)->host_bt);
 }
 
+Status BackendReserveThreadStack(Backend* b, uint64_t bytes) {
+    auto status = cudaSetDevice(reinterpret_cast<CudaBackend*>(b)->device_id);
+    size_t current = 0;
+    if (status == cudaSuccess) status = cudaDeviceGetLimit(&current, cudaLimitStackSize);
+    if (status == cudaSuccess && current < bytes) status = cudaDeviceSetLimit(cudaLimitStackSize, bytes);
+    return CudaStatus(status);
+}
+
 // ---------------------------------------------------------------------------
 // Explicit registration entry point (the static-lib self-registration de-risk).
 // Called from registry.cpp::InitBestDevice() under NUKA_PHI2_WITH_CUDA so the

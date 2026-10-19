@@ -31,8 +31,8 @@ target_include_directories(nuka_math
 # LEAF library: DecomposeMesh() takes only raw pointers + its own POD structs,
 # so it carries no scene/runtime types and can be linked PUBLIC by nuka_scene
 # (whose CookScene invokes it) without creating a dependency cycle. The
-# importers (nuka_import, which depends on nuka_scene) only parse the
-# nuka:decompose attribute; they do NOT link nuka_cooker directly.
+# importers (nuka_import, which depends on nuka_scene) reach it through
+# nuka_scene; the USD importer cooks convexHull approximations with it.
 #
 # nuka_set_warnings is intentionally NOT applied: the vendored single-header
 # V-HACD implementation is compiled into convex_decomposition.cpp and does not

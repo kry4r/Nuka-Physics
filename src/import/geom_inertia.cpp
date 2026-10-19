@@ -56,7 +56,8 @@ MassProperties MeshMassProperties(const scene::CollisionShapeRecord& shape) {
 } // namespace
 
 MassProperties ShapeMassProperties(const scene::CollisionShapeRecord& shape) {
-    if (shape.type == scene::ShapeType::TriMesh) return MeshMassProperties(shape);
+    if (shape.type == scene::ShapeType::TriMesh || shape.type == scene::ShapeType::ConvexHull)
+        return MeshMassProperties(shape);
     MassProperties out;
     const double r = shape.radius, h = shape.half_height;
     const math::Vec3 e = shape.half_extents;

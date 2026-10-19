@@ -229,6 +229,8 @@ uint64_t LbvhSortScratchBytes(uint32_t env_count, uint32_t bodies_per_env);
 uint64_t ContactCacheScratchBytes(uint32_t point_count, uint32_t env_count);
 uint64_t OgcOrderScratchBytes(uint32_t slot_capacity, uint32_t env_count);
 uint64_t ContactIndexScratchBytes(uint32_t row_count, uint32_t env_count);
+// Per-thread stack the articulated row kernels need: their scratch rows are sized by the DOF count.
+uint64_t ArticulationThreadStackBytes(uint32_t max_dof);
 
 // All MPM operations share one physical interval and environment-private grid.
 // Prediction owns grid initialization; commit alone advances particles and history.

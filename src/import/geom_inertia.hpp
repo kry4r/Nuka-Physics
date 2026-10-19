@@ -14,7 +14,7 @@ struct MassProperties {
     double inertia[3][3] = {};
 };
 
-// Closed forms for the primitives; a TriMesh integrates its closed surface. Planes carry no volume.
+// Closed forms for the primitives; a TriMesh or ConvexHull integrates its closed surface. Planes carry no volume.
 MassProperties ShapeMassProperties(const scene::CollisionShapeRecord& shape);
 
 // A body's shapes summed about its origin.

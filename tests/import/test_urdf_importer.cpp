@@ -10,6 +10,7 @@
 #include <fstream>
 #include <chrono>
 #include <cmath>
+#include <algorithm>
 
 TEST(UrdfImporter, LoadsMinimalBodyAndJoint) {
     const auto scene = nuka::import::LoadUrdf("tests/data/minimal_arm.urdf");
@@ -147,8 +148,7 @@ TEST_F(UrdfStrict, RejectsLossAndInvalidInputAtSourceLine) {
         {"type=\"revolute\"", "type=\"planar\"", "URDF_JOINT_UNSUPPORTED"},
         {"type=\"revolute\"", "type=\"fixed revolute\"", "URDF_JOINT_UNSUPPORTED"},
         {"lower=\"-3.14\"", "", "URDF_LIMIT_DEFAULT_UNREPRESENTED"},
-        {"ixy=\"0\"", "ixy=\"0.02\"", "URDF_FULL_INERTIA_UNSUPPORTED"},
-        {"<box size=\"0.2 0.2 0.2\"/>", "<cylinder radius=\"0.2\" length=\"0.2\"/>", "URDF_ELEMENT_UNSUPPORTED"},
+        {"<box size=\"0.2 0.2 0.2\"/>", "<cone radius=\"0.2\" length=\"0.2\"/>", "URDF_ELEMENT_UNSUPPORTED"},
         {"<axis xyz=\"0 0 1\"/>", "<axis xyz=\"0 0 0\"/>", "URDF_AXIS_INVALID"},
         {"<axis xyz=\"0 0 1\"/>", "<axis xyz=\"nan 0 1\"/>", "URDF_NUMBER_INVALID"},
         {"<axis xyz=\"0 0 1\"/>", "<axis xyz=\"2 0 0\"/>", "URDF_AXIS_INVALID"},
@@ -182,6 +182,17 @@ TEST_F(UrdfStrict, RejectsLossAndInvalidInputAtSourceLine) {
         }
         EXPECT_TRUE(found);
     }
+}
+
+TEST_F(UrdfStrict, FullInertiaImportsAsPrincipalMoments) {
+    auto xml = Source();
+    Replace(xml, "ixy=\"0\"", "ixy=\"0.02\"");
+    auto result = nuka::import::ImportUrdf(Write(xml));
+    ASSERT_TRUE(result.StrictSuccess());
+    const auto& inertia = result.scene->GetBody(0).inertia;
+    EXPECT_NEAR(std::min({inertia.x, inertia.y, inertia.z}), 0.08f, 1e-6f);
+    EXPECT_NEAR(std::max({inertia.x, inertia.y, inertia.z}), 0.12f, 1e-6f);
+    EXPECT_NEAR(inertia.x + inertia.y + inertia.z, 0.3f, 1e-6f);
 }
 
 TEST_F(UrdfStrict, LegacyProfileReportsLossAndPreservesOutput) {
