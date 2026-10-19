@@ -11,12 +11,12 @@
 
 struct nuka_editor_t : nuka::runtime::app::viewer::EditorHost {
     using EditorHost::EditorHost;
-    std::string reply_;  // the text the last text-returning call handed out
 };
 
 namespace {
 
 thread_local std::string create_error;  // why this thread's last nuka_editor_create failed
+thread_local std::string reply;         // the text this thread's last text-returning call handed out
 
 template <class Fn>
 nuka_result_t Guard(Fn&& fn) {
@@ -92,9 +92,8 @@ nuka_result_t nuka_editor_run_action(nuka_editor_handle editor, const char* id, 
     if (id == nullptr || out_json == nullptr) return NUKA_RESULT_INVALID_ARG;
     bool ok = false;
     const nuka_result_t result = Guard([&] {
-        editor->reply_ = editor->RunAction(id, args_json != nullptr ? args_json : "", source != nullptr ? source : "api",
-                                           &ok);
-        *out_json = editor->reply_.c_str();
+        reply = editor->RunAction(id, args_json != nullptr ? args_json : "", source != nullptr ? source : "api", &ok);
+        *out_json = reply.c_str();
     });
     return result != NUKA_RESULT_OK ? result : ok ? NUKA_RESULT_OK : NUKA_RESULT_INVALID_ARG;
 }
@@ -103,8 +102,8 @@ nuka_result_t nuka_editor_actions(nuka_editor_handle editor, const char** out_js
     if (editor == nullptr) return NUKA_RESULT_NULL_HANDLE;
     if (out_json == nullptr) return NUKA_RESULT_INVALID_ARG;
     return Guard([&] {
-        editor->reply_ = editor->Actions();
-        *out_json = editor->reply_.c_str();
+        reply = editor->Actions();
+        *out_json = reply.c_str();
     });
 }
 
@@ -112,8 +111,8 @@ nuka_result_t nuka_editor_action_log(nuka_editor_handle editor, uint64_t since, 
     if (editor == nullptr) return NUKA_RESULT_NULL_HANDLE;
     if (out_json == nullptr) return NUKA_RESULT_INVALID_ARG;
     return Guard([&] {
-        editor->reply_ = editor->ActionLog(since);
-        *out_json = editor->reply_.c_str();
+        reply = editor->ActionLog(since);
+        *out_json = reply.c_str();
     });
 }
 
@@ -121,8 +120,8 @@ nuka_result_t nuka_editor_document_state(nuka_editor_handle editor, const char**
     if (editor == nullptr) return NUKA_RESULT_NULL_HANDLE;
     if (out_json == nullptr) return NUKA_RESULT_INVALID_ARG;
     return Guard([&] {
-        editor->reply_ = editor->DocumentState();
-        *out_json = editor->reply_.c_str();
+        reply = editor->DocumentState();
+        *out_json = reply.c_str();
     });
 }
 

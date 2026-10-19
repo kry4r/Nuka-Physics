@@ -1,0 +1,12 @@
+{
+  "name": "rpc",
+  "launch": [],
+  "steps": [
+    {"frames": 10},
+    {"action": "file.open", "args": {"path": "${scenario_dir}/../../examples/assets/nuka_lab/stage.nks"}},
+    {"frames": 30},
+    {"python": "import json, os, subprocess, sys, time\nfolder = os.path.dirname(app.rpc.file)\ninfo = json.load(open(app.rpc.file))\nassert info['pid'] == os.getpid() and len(info['key']) == 64 and info['protocol'] == 'nuka.rpc.v1', info\nout = r'${out}/rpc_client.json'\nenv = dict(os.environ, PYTHONPATH=os.pathsep.join(p for p in sys.path if p))\np = subprocess.Popen([sys.executable, r'${scenario_dir}/rpc_client.py', os.path.dirname(folder), str(os.getpid()), out], env=env)\ndeadline = time.monotonic() + 120.0\nwhile p.poll() is None:\n    assert time.monotonic() < deadline, 'the client still runs'\n    app.update(True)\nassert p.returncode == 0, p.returncode\nr = json.load(open(out))\nprint('RPC', r)\nassert r['listed'] == [os.getpid()], r\nassert r['hello']['client'] == 'smoke' and r['hello']['document']['path'].endswith('stage.nks'), r\nassert r['actions'] > 200 and r['has_spawn'] and r['revised'] and r['source'] == 'agent:smoke', r\nassert 'no.such_action' in r['bad_action'] and 'no_such_op' in r['bad_op'] and 'missing' in r['missing_arg'], r\nassert r['shot']['width'] > 0 and r['shot']['height'] > 0 and r['shot']['png'] > 1000, r\nassert r['wait'] and r['console'] and r['crossed'] == 0 and r['bad_key'] == 'refused', r\ndeadline = time.monotonic() + 10.0\nwhile app.rpc.sessions():\n    assert time.monotonic() < deadline, app.rpc.sessions()\n    app.update(True)\nlog = [e for e in app.actions.log(0) if e['source'].startswith('agent:')]\nassert {e['source'] for e in log} >= {'agent:smoke', 'agent:smoke-tick'}, log[-3:]"},
+    {"screenshot": "00_after_rpc"},
+    {"python": "import os\nf = app.rpc.file\napp.rpc.close()\nassert not os.path.exists(f), f"}
+  ]
+}

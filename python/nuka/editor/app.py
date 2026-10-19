@@ -21,6 +21,7 @@ import nuka
 
 from . import scripting
 from .extension import ExtensionLoader
+from .rpc import RpcServer
 from .ui import UI, ScriptInterrupted, _capture
 
 _DEFAULT_DT = 1.0 / 240.0
@@ -88,14 +89,15 @@ class ScriptRunner:
         console line by line as it runs; returns (failed, text)."""
         name = filename or "<console>"
         ns = self._console
-        self._bind(ns)
-        ns["sel"] = self._app.document()["selection"]
         if echo:
             code = textwrap.dedent(code)
         # Tracebacks quote the text that ran, saved or not.
         linecache.cache[name] = (len(code), None, code.splitlines(True), name)
 
+        # The document waits for a UI frame, so it is read where the time budget can interrupt it.
         def body():
+            self._bind(ns)
+            ns["sel"] = self._app.document()["selection"]
             tree = ast.parse(code, name, "exec")
             last = tree.body.pop() if echo and tree.body and isinstance(tree.body[-1], ast.Expr) else None
             if filename and not filename.startswith("<"):
@@ -216,6 +218,16 @@ def relaunch_command() -> List[str]:
 def forward(args: Sequence[str]) -> bool:
     """Hand the scene in args to the editor already open on the same profile; False when none is."""
     return _ext().forward(list(args))
+
+
+def profile_dir(args: Sequence[str]) -> str:
+    """The editor's user folder, as the editor library picks it."""
+    if "--profile" in args[:-1]:
+        return args[list(args).index("--profile") + 1]
+    if os.name == "nt":
+        return os.path.join(os.environ["APPDATA"], "Nuka", "editor")
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.environ["HOME"], ".config")
+    return os.path.join(base, "nuka", "editor")
 
 
 class Actions:
@@ -443,6 +455,8 @@ class EditorApp:
         self.demos = Demos(self)
         self.clips = Clips(self)
         self.ui = UI(weakref.proxy(self))
+        # Other programs on this machine (nuka.editor.connect, the MCP server) reach the editor here.
+        self.rpc = RpcServer(weakref.proxy(self), os.path.join(profile_dir(argv), "rpc"))
         atexit.register(self.close)
 
     @property
@@ -537,6 +551,7 @@ class EditorApp:
         if self._native is None:
             return
         atexit.unregister(self.close)
+        self.rpc.close()
         if self._borrowed is not None:
             self._borrowed.destroy()  # detaches only: the editor owns that world
             self._borrowed = None

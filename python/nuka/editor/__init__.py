@@ -34,12 +34,14 @@ import site
 import sys
 from typing import Optional, Sequence
 
-from .app import ActionError, Actions, EditorApp, EditorStartupError, HeadlessApp, ScriptRunner, forward
+from .app import ActionError, Actions, EditorApp, EditorStartupError, HeadlessApp, ScriptRunner, forward, profile_dir
 from .extension import Context, Extension
+from .remote import RemoteEditor, RemoteError, connect, editors, spawn
 from .ui import UI, Node, ScriptInterrupted
 
 __all__ = ["ActionError", "Actions", "Context", "EditorApp", "EditorStartupError", "Extension", "HeadlessApp", "Node",
-           "ScriptInterrupted", "ScriptRunner", "UI", "add_launcher_args", "launch", "main"]
+           "RemoteEditor", "RemoteError", "ScriptInterrupted", "ScriptRunner", "UI", "add_launcher_args", "connect",
+           "editors", "launch", "main", "spawn"]
 
 
 def add_launcher_args(parser: argparse.ArgumentParser) -> None:
@@ -56,16 +58,6 @@ def launch(args: Optional[Sequence[str]] = None, *, world=None, scene: Optional[
     if headless:
         return HeadlessApp(world=world, scene=scene, dt=dt)
     return EditorApp(args or (), world=world, scene=scene, dt=dt)
-
-
-def _profile_dir(args: Sequence[str]) -> str:
-    """The editor's user folder, as the editor library picks it."""
-    if "--profile" in args[:-1]:
-        return args[list(args).index("--profile") + 1]
-    if os.name == "nt":
-        return os.path.join(os.environ["APPDATA"], "Nuka", "editor")
-    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.environ["HOME"], ".config")
-    return os.path.join(base, "nuka", "editor")
 
 
 def _site_dir(env: str) -> str:
@@ -94,7 +86,7 @@ def _use_python_env(args: Sequence[str]) -> tuple:
     if not getattr(sys, "frozen", False):
         return f"{version}  {sys.executable}", True
     env = None
-    settings = os.path.join(_profile_dir(args), "settings.toml")
+    settings = os.path.join(profile_dir(args), "settings.toml")
     if os.path.exists(settings):
         import tomllib
         with open(settings, "rb") as f:

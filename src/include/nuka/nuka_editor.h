@@ -93,7 +93,7 @@ NUKA_EDITOR_API float nuka_editor_dt(nuka_editor_handle editor);
 NUKA_EDITOR_API void nuka_editor_console_append(nuka_editor_handle editor, const char* text);
 
 // Every editor command is an action ("edit.apply", "sim.play", ...) with JSON args (NULL: none).
-// The reply {"ok","value","error"} lives until the next text-returning call; INVALID_ARG if not ok.
+// The reply {"ok","value","error"} lives until the calling thread's next text-returning call; INVALID_ARG if not ok.
 NUKA_EDITOR_API nuka_result_t nuka_editor_run_action(nuka_editor_handle editor, const char* id,
                                                      const char* args_json, const char* source,
                                                      const char** out_json);
