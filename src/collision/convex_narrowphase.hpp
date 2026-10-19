@@ -211,6 +211,15 @@ NUKA_CVX_HD inline Vec3 SupportCapsule(const amf::PrimParams& c, Vec3 dir) {
     return seg + amf::Norm(dir, Vec3::UnitX()) * c.radius;
 }
 
+// Cylinder support along local Z: the cap by sign(dir.axis) plus r along dir's radial part
+// (local X when dir is axial).
+NUKA_CVX_HD inline Vec3 SupportCylinder(const amf::PrimParams& c, Vec3 dir) {
+    const Vec3 axis = c.frame.cz;
+    const float d = axis.Dot(dir);
+    const Vec3 cap = c.frame.t + axis * (d >= 0.0f ? c.half_height : -c.half_height);
+    return cap + amf::Norm(dir - axis * d, c.frame.cx) * c.radius;
+}
+
 // Triangle-prism support (G2, the general-heightfield per-cell collider). The
 // first 3 `verts` of the ConvexHullView are the triangle (mesh-local); the prism
 // is the triangle extruded `extrude` along the hull's LOCAL -Z to make it SOLID.
@@ -254,7 +263,7 @@ NUKA_CVX_HD inline Vec3 SupportTrianglePrism(const ConvexHullView& h, Vec3 dir,
 // TrianglePrism (G2) reuses the `hull` payload (its first 3 verts + frame +
 // extrude); it is a hull-like side (HasFace() == true) for the face-clip.
 enum class SupportKind : uint8_t {
-    Hull = 0, Box = 1, Sphere = 2, Capsule = 3, TrianglePrism = 4
+    Hull = 0, Box = 1, Sphere = 2, Capsule = 3, TrianglePrism = 4, Cylinder = 5
 };
 
 struct SupportProxy {
@@ -269,6 +278,7 @@ struct SupportProxy {
             case SupportKind::Sphere: if (out_idx) *out_idx = 0u; return SupportSphere(*prim, dir);
             case SupportKind::Capsule:if (out_idx) *out_idx = 0u; return SupportCapsule(*prim, dir);
             case SupportKind::TrianglePrism: return SupportTrianglePrism(*hull, dir, out_idx);
+            case SupportKind::Cylinder: if (out_idx) *out_idx = 0u; return SupportCylinder(*prim, dir);
         }
         if (out_idx) *out_idx = 0u;
         return Vec3::Zero();
@@ -767,8 +777,9 @@ struct ConvexWorkspace {
     EpaWorkspace epa;
     FacePoly reference;
     FacePoly incident;
+    FacePoly clipped;
     amf::ClipPoly polygon;
-    amf::ManifoldPointCand candidates[amf::kClipMax];
+    amf::ManifoldPointCand candidates[amf::kSpreadMax];
 };
 
 // Gather the supporting-vertex set of a HULL along world dir.
@@ -1360,6 +1371,17 @@ NUKA_CVX_HD inline float ProxyRadius(const SupportProxy& p) {
 // capsule endpoint, so it never enters the EPA shallow/deep torque band.
 NUKA_CVX_HD inline bool InflatedPointConvex(const SupportProxy& other, Vec3 q, float r,
                                             Vec3* pos, Vec3* nrm, float* pen) {
+    // CYLINDER: the exact distance field, inside and outside.
+    if (other.kind == SupportKind::Cylinder) {
+        const amf::PrimFrame& f = other.prim->frame;
+        const auto s = QueryPrimitiveSurface(kShapeCylinder,
+            {other.prim->radius, other.prim->half_height, 0.0f}, f.WorldToLocal(q));
+        const float p = r - s.distance;
+        if (p <= 0.0f) return false;
+        *nrm = f.DirLocalToWorld(s.normal);
+        *pos = f.LocalToWorld(s.point); *pen = p;
+        return true;
+    }
     // BOX: exact OBB clamp (outside) / shallowest face exit (inside). No GJK, so the
     // inside/outside decision is robust (a point-proxy boolean GJK is fragile here).
     if (other.kind == SupportKind::Box) {
@@ -1461,10 +1483,225 @@ NUKA_CVX_HD inline bool CapsuleConvex(const SupportProxy& cap,
 }
 
 // ---------------------------------------------------------------------------
+// CYLINDER x CONVEX (box/hull/cylinder/heightfield prism).
+// ---------------------------------------------------------------------------
+// The normal is the shrunk cores' GJK direction (EPA only once the cores overlap); the better aligned
+// facing feature (cap octagon, side segment, rim point, or box/hull/prism face) clips the other one.
+using amf::kCylinderCapCos;
+inline constexpr float kCylinderSideSin = 0.31f;      // side segment when |axis . n| is below
+inline constexpr float kCylinderParallelSin = 0.05f;  // two side segments count as parallel
+
+// A cylinder's feature along world dir. Returns the cap alignment, or -1 for a segment or point.
+NUKA_CVX_HD inline float GatherCylinderFeature(const amf::PrimParams& c, Vec3 dir, FacePoly& fp) {
+    const Vec3 axis = c.frame.cz;
+    const float d = axis.Dot(dir);
+    const float ad = d < 0.0f ? -d : d;
+    const Vec3 cap = c.frame.t + axis * (d >= 0.0f ? c.half_height : -c.half_height);
+    if (ad >= kCylinderCapCos) {
+        for (int k = 0; k < 8; ++k) {
+            fp.v[k] = cap + amf::CylinderRimDir(c.frame, k) * c.radius;
+            fp.idx[k] = static_cast<uint32_t>(k);
+        }
+        fp.count = 8;
+        return ad;
+    }
+    const Vec3 radial = amf::Norm(dir - axis * d, c.frame.cx) * c.radius;
+    if (ad <= kCylinderSideSin) {
+        fp.v[0] = c.frame.t + axis * c.half_height + radial;
+        fp.v[1] = c.frame.t - axis * c.half_height + radial;
+        fp.idx[0] = 0u; fp.idx[1] = 1u;
+        fp.count = 2;
+        return -1.0f;
+    }
+    fp.v[0] = cap + radial; fp.idx[0] = 0u;
+    fp.count = 1;
+    return -1.0f;
+}
+
+// Any proxy's feature along world dir: polygon (>= 3), segment (2) or point (1). Returns how well
+// a polygon faces dir (|face normal . dir|), or -1 when the feature cannot be a reference face.
+NUKA_CVX_HD inline float GatherFeature(const SupportProxy& p, Vec3 dir, FacePoly& fp) {
+    if (p.kind == SupportKind::Cylinder) return GatherCylinderFeature(*p.prim, dir, fp);
+    if (p.kind == SupportKind::Box) {
+        fp = GatherBoxFace(*p.prim, dir);
+        float best = 0.0f;
+        for (int k = 0; k < 3; ++k) {
+            const float d = p.prim->frame.Axis(k).Dot(dir);
+            const float ad = d < 0.0f ? -d : d;
+            if (ad > best) best = ad;
+        }
+        return best;
+    }
+    if (p.kind == SupportKind::Hull || p.kind == SupportKind::TrianglePrism) {
+        fp = GatherHullFace(*p.hull, dir, 1.0e-3f);
+        OrderFaceCCW(fp, dir);
+        return fp.count >= 3 ? 1.0f : -1.0f;
+    }
+    fp.v[0] = p.Support(dir, nullptr); fp.idx[0] = 0u;
+    fp.count = 1;
+    return -1.0f;
+}
+
+// Clip `inc` (polygon, segment or point; overwritten) to the side planes of the reference polygon
+// and keep what lies below it along its outward normal n. `extra` is one more point to test.
+NUKA_CVX_HD inline int ClipToReference(const FacePoly& ref, FacePoly& inc, Vec3 n, FacePoly& scratch,
+                                       const Vec3* extra, amf::ManifoldPointCand* cand) {
+    Vec3 c{0.0f, 0.0f, 0.0f};
+    for (int i = 0; i < ref.count; ++i) c += ref.v[i];
+    c = c / static_cast<float>(ref.count);
+    const bool segment = inc.count == 2;
+    const Vec3 p0 = inc.v[0], p1 = inc.v[1];
+    float t0 = 0.0f, t1 = 1.0f;
+    bool extra_in = extra != nullptr;
+    FacePoly* poly = &inc;
+    FacePoly* next = &scratch;
+    for (int i = 0; i < ref.count; ++i) {
+        const Vec3 base = ref.v[i];
+        Vec3 side = (ref.v[(i + 1) % ref.count] - base).Cross(n);
+        if ((c - base).Dot(side) > 0.0f) side = -side;
+        if (extra_in && (*extra - base).Dot(side) > 0.0f) extra_in = false;
+        if (segment) {
+            const float d0 = (p0 - base).Dot(side), d1 = (p1 - base).Dot(side);
+            if (d0 > 0.0f && d1 > 0.0f) { t0 = 1.0f; t1 = 0.0f; }
+            else if (d0 > 0.0f) { const float t = d0 / (d0 - d1); if (t > t0) t0 = t; }
+            else if (d1 > 0.0f) { const float t = d0 / (d0 - d1); if (t < t1) t1 = t; }
+            continue;
+        }
+        next->count = 0;
+        for (int k = 0; k < poly->count; ++k) {
+            const Vec3 cur = poly->v[k], nxt = poly->v[(k + 1) % poly->count];
+            const float dc = (cur - base).Dot(side), dn = (nxt - base).Dot(side);
+            if (dc <= 0.0f && next->count < kFaceMax) {
+                next->v[next->count] = cur; next->idx[next->count] = poly->idx[k]; ++next->count;
+            }
+            if ((dc <= 0.0f) != (dn <= 0.0f) && next->count < kFaceMax) {
+                next->v[next->count] = cur + (nxt - cur) * (dc / (dc - dn));
+                next->idx[next->count] = poly->idx[k]; ++next->count;
+            }
+        }
+        FacePoly* const done = poly; poly = next; next = done;
+    }
+    if (segment) {
+        poly->count = t0 <= t1 ? 2 : 0;
+        poly->v[0] = p0 + (p1 - p0) * t0;
+        poly->v[1] = p0 + (p1 - p0) * t1;
+    }
+    int ncand = 0;
+    for (int k = 0; k <= poly->count; ++k) {
+        if (k == poly->count && !extra_in) break;
+        const Vec3 p = k < poly->count ? poly->v[k] : *extra;
+        const float depth = (c - p).Dot(n);
+        if (depth < 0.0f) continue;
+        cand[ncand].position = p + n * (depth * 0.5f);
+        cand[ncand].penetration = depth;
+        cand[ncand].feature = static_cast<uint32_t>(k);
+        ++ncand;
+    }
+    return ncand;
+}
+
+// Two nearly parallel side segments meet along their overlap; its two ends become contacts.
+NUKA_CVX_HD inline int ParallelSegments(const FacePoly& a, const FacePoly& b, Vec3 u,
+                                        amf::ManifoldPointCand* cand) {
+    const Vec3 ea = a.v[1] - a.v[0], eb = b.v[1] - b.v[0];
+    const float la = ea.Dot(ea), lb = eb.Dot(eb);
+    const Vec3 x = ea.Cross(eb);
+    if (!(la > 1.0e-20f && lb > 1.0e-20f) ||
+        x.Dot(x) > kCylinderParallelSin * kCylinderParallelSin * la * lb) return 0;
+    float s0 = (b.v[0] - a.v[0]).Dot(ea) / la, s1 = (b.v[1] - a.v[0]).Dot(ea) / la;
+    if (s0 > s1) { const float t = s0; s0 = s1; s1 = t; }
+    if (s0 < 0.0f) s0 = 0.0f;
+    if (s1 > 1.0f) s1 = 1.0f;
+    if (s0 > s1) return 0;
+    int ncand = 0;
+    for (int k = 0; k < 2; ++k) {
+        const Vec3 pa = a.v[0] + ea * (k == 0 ? s0 : s1);
+        float tb = (pa - b.v[0]).Dot(eb) / lb;
+        tb = tb < 0.0f ? 0.0f : (tb > 1.0f ? 1.0f : tb);
+        const Vec3 pb = b.v[0] + eb * tb;
+        const float depth = (pa - pb).Dot(u);
+        if (depth < 0.0f) continue;
+        cand[ncand].position = (pa + pb) * 0.5f;
+        cand[ncand].penetration = depth;
+        cand[ncand].feature = static_cast<uint32_t>(k);
+        ++ncand;
+    }
+    return ncand;
+}
+
+// The proxy GJK-distance runs on: a cylinder shrunk by half its smaller extent, others unchanged.
+NUKA_CVX_HD inline SupportProxy CylinderCore(const SupportProxy& p, amf::PrimParams* core) {
+    if (p.kind != SupportKind::Cylinder) return p;
+    *core = *p.prim;
+    const float m = 0.5f * (core->radius < core->half_height ? core->radius : core->half_height);
+    core->radius -= m;
+    core->half_height -= m;
+    SupportProxy shrunk = p;
+    shrunk.prim = core;
+    return shrunk;
+}
+
+// Cylinder x box/hull/cylinder/prism manifold; normal = separation dir for A.
+NUKA_CVX_HD inline void CylinderConvex(const SupportProxy& A, const SupportProxy& B,
+                                       ContactManifold* out, ConvexWorkspace& workspace) {
+    out->Clear();
+    const GjkResult gjk = GjkIntersect(A, B);
+    if (!gjk.intersect) return;
+    amf::PrimParams core_a, core_b;
+    const SupportProxy ca = CylinderCore(A, &core_a);
+    const SupportProxy cb = CylinderCore(B, &core_b);
+    Vec3 u{0.0f, 0.0f, 0.0f};  // from A toward B
+    bool apart = false;
+    if (!GjkIntersect(ca, cb).intersect) {
+        const ProxyDist d = ClosestBetweenProxies(ca, cb);
+        apart = d.dist > 1.0e-6f;
+        if (apart) u = (d.wb - d.wa) / d.dist;
+    }
+    if (!apart) {
+        const EpaResult epa = EpaExpand(A, B, gjk, workspace.epa);
+        if (!epa.ok || epa.depth <= 0.0f) return;
+        u = epa.normal;
+    }
+    FacePoly& fa = workspace.reference;
+    FacePoly& fb = workspace.incident;
+    const float align_a = GatherFeature(A, u, fa);
+    const float align_b = GatherFeature(B, -u, fb);
+    const bool ref_a = fa.count >= 3 && align_a >= kCylinderCapCos;
+    const bool ref_b = fb.count >= 3 && align_b >= kCylinderCapCos;
+    amf::ManifoldPointCand* cand = workspace.candidates;
+    int ncand = 0;
+    if (ref_a || ref_b) {
+        const bool a_is_ref = ref_a && (!ref_b || align_a >= align_b);
+        const Vec3 n = a_is_ref ? u : -u;
+        const SupportProxy& inc_proxy = a_is_ref ? B : A;
+        FacePoly& inc = a_is_ref ? fb : fa;
+        // A cap octagon misses the true deepest rim point unless it is tested too.
+        const Vec3 deepest = inc_proxy.Support(-n, nullptr);
+        const bool cap = inc_proxy.kind == SupportKind::Cylinder && inc.count >= 3;
+        ncand = ClipToReference(a_is_ref ? fa : fb, inc, n, workspace.clipped,
+                                cap ? &deepest : nullptr, cand);
+    } else if (fa.count == 2 && fb.count == 2) {
+        ncand = ParallelSegments(fa, fb, u, cand);
+    }
+    if (ncand == 0) {
+        const Vec3 sa = A.Support(u, nullptr), sb = B.Support(-u, nullptr);
+        const float depth = (sa - sb).Dot(u);
+        if (depth <= 0.0f) return;
+        ContactPoint pt;
+        pt.position = (sa + sb) * 0.5f;
+        pt.normal = -u; pt.penetration = depth; pt.stable_key = 0ull;
+        out->AddPoint(pt);
+        return;
+    }
+    amf::ReduceAndEmitSpread(cand, ncand, -u, out);
+}
+
+// ---------------------------------------------------------------------------
 // TOP-LEVEL: convex narrowphase for two proxies. normal = sep dir for A.
 // ---------------------------------------------------------------------------
 // A capsule side vs a box/hull takes the robust closest-feature path (CapsuleConvex,
-// handled at all depths); every other convex pair takes the boolean-GJK -> EPA path.
+// handled at all depths); a cylinder takes CylinderConvex; every other convex pair takes the
+// boolean-GJK -> EPA path.
 // TrianglePrism (heightfield) is intentionally NOT rerouted -- capsule x heightfield
 // keeps the EPA path (its own contact regime), unchanged.
 NUKA_CVX_HD inline void ConvexNarrowphase(const SupportProxy& A,
@@ -1473,10 +1710,13 @@ NUKA_CVX_HD inline void ConvexNarrowphase(const SupportProxy& A,
     out->Clear();
     const bool a_cap = A.kind == SupportKind::Capsule;
     const bool b_cap = B.kind == SupportKind::Capsule;
-    const bool a_poly = A.kind == SupportKind::Box || A.kind == SupportKind::Hull;
-    const bool b_poly = B.kind == SupportKind::Box || B.kind == SupportKind::Hull;
+    const bool a_cyl = A.kind == SupportKind::Cylinder;
+    const bool b_cyl = B.kind == SupportKind::Cylinder;
+    const bool a_poly = A.kind == SupportKind::Box || A.kind == SupportKind::Hull || a_cyl;
+    const bool b_poly = B.kind == SupportKind::Box || B.kind == SupportKind::Hull || b_cyl;
     if (a_cap && b_poly) { if (CapsuleConvex(A, B, true, out)) return; }
     else if (b_cap && a_poly) { if (CapsuleConvex(B, A, false, out)) return; }
+    if (a_cyl || b_cyl) { CylinderConvex(A, B, out, workspace); return; }
     const GjkResult gjk = GjkIntersect(A, B);
     if (!gjk.intersect) return;  // separated -> no contact
     const EpaResult epa = EpaExpand(A, B, gjk, workspace.epa);

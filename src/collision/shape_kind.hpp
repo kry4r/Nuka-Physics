@@ -13,9 +13,8 @@
 // (kind stored as the u32 bit-pattern of shape_table[row*8 + 0]) and the broad/
 // narrowphase already dispatch on: Sphere=0, Capsule=1, Box=2, Plane=3,
 // ConvexHull=4, SdfMesh=5 — they mirror scene::CollisionShapeComponent::Kind /
-// scene::ShapeType. Heightfield(6) + TrianglePrism(7) are APPENDED for the
-// general-heightfield collidable (the per-cell midphase prism); they are inert
-// in Phase 0 (no cook emits them yet — H2/H3 are later phases).
+// scene::ShapeType. Heightfield(6) and Cylinder(7) follow; the per-cell heightfield
+// prism is a support kind only and never appears in the shape table.
 //
 // Plain `enum` (not `enum class`) with an explicit u32 underlying type so the
 // device kernels can compare it directly against the u32 unpacked from the
@@ -34,8 +33,8 @@ enum ShapeKind : uint32_t {
     kShapePlane       = 3u,
     kShapeConvexHull  = 4u,
     kShapeSdfMesh     = 5u,
-    kShapeHeightfield = 6u,   // general heightfield collidable (H1; inert Phase 0)
-    kShapeTrianglePrism = 7u, // per-cell midphase prism (G2/H3; inert Phase 0)
+    kShapeHeightfield = 6u,
+    kShapeCylinder    = 7u,   // flat caps along local Z; params (radius, half_height)
 };
 
 #if defined(__CUDACC__)
@@ -69,11 +68,13 @@ NUKA_COLLISION_HD inline bool HasAnalyticManifold(uint32_t a, uint32_t b) {
     if (a > b) { const uint32_t t = a; a = b; b = t; }
     return (a == kShapeSphere && (b == kShapeSphere || b == kShapeCapsule || b == kShapeBox || b == kShapePlane)) ||
            (a == kShapeCapsule && (b == kShapeCapsule || b == kShapePlane)) ||
-           (a == kShapeBox && (b == kShapeBox || b == kShapePlane));
+           (a == kShapeBox && (b == kShapeBox || b == kShapePlane)) ||
+           (b == kShapeCylinder && (a == kShapeSphere || a == kShapePlane));
 }
 
 NUKA_COLLISION_HD inline bool IsConvexShape(uint32_t kind) {
-    return kind == kShapeSphere || kind == kShapeCapsule || kind == kShapeBox || kind == kShapeConvexHull;
+    return kind == kShapeSphere || kind == kShapeCapsule || kind == kShapeBox || kind == kShapeConvexHull ||
+           kind == kShapeCylinder;
 }
 
 }  // namespace nuka::collision

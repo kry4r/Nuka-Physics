@@ -38,7 +38,8 @@ _MEDIA_KIND = {"cloth": _nuka.MEDIA_CLOTH, "soft_tet": _nuka.MEDIA_SOFT_TET,
                "cable": _nuka.MEDIA_CABLE}
 _MEDIA_METHOD = {"mlsmpm": _nuka.MEDIA_METHOD_MLSMPM, "vbd": _nuka.MEDIA_METHOD_VBD}
 _PRIMITIVE = {"plane": _nuka.PRIMITIVE_PLANE, "box": _nuka.PRIMITIVE_BOX,
-              "sphere": _nuka.PRIMITIVE_SPHERE, "capsule": _nuka.PRIMITIVE_CAPSULE}
+              "sphere": _nuka.PRIMITIVE_SPHERE, "capsule": _nuka.PRIMITIVE_CAPSULE,
+              "cylinder": _nuka.PRIMITIVE_CYLINDER}
 _DEFAULT_MEDIA_MATERIAL = {"cloth": _materials.Cloth.VBD,
                            "soft_tet": _materials.Soft.MPM,
                            "fluid": _materials.Fluid.MPM,
@@ -123,8 +124,8 @@ class Environment:
 
 _MEDIA_MORPHS = (_morphs.Grid, _morphs.TetSphere, _morphs.FluidBox,
                  _morphs.GranularBed, _morphs.Cable)
-_RIGID_MORPHS = (_morphs.Box, _morphs.Sphere, _morphs.Capsule, _morphs.Plane,
-                 _morphs.Ground)
+_RIGID_MORPHS = (_morphs.Box, _morphs.Sphere, _morphs.Capsule, _morphs.Cylinder,
+                 _morphs.Plane, _morphs.Ground)
 
 
 class Scene:

@@ -194,8 +194,11 @@ scene::ShapeType MjcfGeomType(const char* type_str) {
     if (t == "sphere") {
         return scene::ShapeType::Sphere;
     }
-    if (t == "capsule" || t == "cylinder") {
+    if (t == "capsule") {
         return scene::ShapeType::Capsule;
+    }
+    if (t == "cylinder") {
+        return scene::ShapeType::Cylinder;
     }
     if (t == "box") {
         return scene::ShapeType::Box;
@@ -767,27 +770,25 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
                 shape.half_extents = sz;
             } else if (shape.type == scene::ShapeType::Sphere) {
                 shape.radius = sz.x;
-            } else if (shape.type == scene::ShapeType::Capsule) {
+            } else if (shape.type == scene::ShapeType::Capsule || shape.type == scene::ShapeType::Cylinder) {
                 shape.radius = sz.x;
                 if (sz.y > 0.0f) {
                     shape.half_height = sz.y;
                 }
             }
         }
-        const char* resolved_type = geom->Attribute("type");
-        if (!resolved_type && gd.has_type) resolved_type = gd.type.c_str();
-        shape.flat_capped = resolved_type && std::string(resolved_type) == "cylinder";
         if (!frame.fromto.empty()) {
             float points[6];
+            const bool axial = shape.type == scene::ShapeType::Capsule || shape.type == scene::ShapeType::Cylinder;
             if (ParseFloatList(frame.fromto.c_str(), points, 6) != 6 ||
-                (shape.type != scene::ShapeType::Capsule && shape.type != scene::ShapeType::Box))
+                (!axial && shape.type != scene::ShapeType::Box))
                 throw std::runtime_error("MJCF: invalid geom fromto");
             const math::Vec3 a{points[0], points[1], points[2]};
             const math::Vec3 b{points[3], points[4], points[5]};
             shape.local_transform.position = (a + b) * 0.5f;
             shape.local_transform.rotation = FrameZRotation(b - a);
             const float half_length = (b - a).Length() * 0.5f;
-            if (shape.type == scene::ShapeType::Capsule) shape.half_height = half_length;
+            if (axial) shape.half_height = half_length;
             else shape.half_extents.z = half_length;
         }
 

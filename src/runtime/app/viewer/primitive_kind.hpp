@@ -10,8 +10,8 @@
 
 namespace nuka::runtime::app::viewer {
 
-// A spawnable primitive body kind. Box/Sphere/Capsule spawn as DYNAMIC movable
+// A spawnable primitive body kind. Box/Sphere/Capsule/Cylinder spawn as DYNAMIC movable
 // bodies; Plane spawns as a static ground-like (massless) body.
-enum class PrimitiveKind : uint8_t { Box, Sphere, Capsule, Plane };
+enum class PrimitiveKind : uint8_t { Box, Sphere, Capsule, Plane, Cylinder };
 
 }  // namespace nuka::runtime::app::viewer

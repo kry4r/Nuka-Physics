@@ -66,10 +66,10 @@ enum class NarrowphaseTier : uint8_t {
 };
 inline constexpr uint32_t kNarrowphaseTierCount = 3u;
 
-// ShapeType is a dense uint8 enum [Sphere..HeightField]; the table is keyed by
+// ShapeType is a dense uint8 enum [Sphere..Cylinder]; the table is keyed by
 // its underlying value. Keep this count in lockstep with scene::ShapeType.
 inline constexpr uint32_t kShapeTypeCount =
-    static_cast<uint32_t>(ShapeType::HeightField) + 1u;  // 7 in v0.8
+    static_cast<uint32_t>(ShapeType::Cylinder) + 1u;
 
 // ---------------------------------------------------------------------------
 // ShapeProxyView -- the per-shape geometry view a narrowphase handler reads.
@@ -422,6 +422,8 @@ inline cvx::SupportProxy MakeConvexProxy(ShapeType t, const void* geom,
             p.kind = cvx::SupportKind::Sphere; p.prim = &prim; break;
         case ShapeType::Capsule:
             p.kind = cvx::SupportKind::Capsule; p.prim = &prim; break;
+        case ShapeType::Cylinder:
+            p.kind = cvx::SupportKind::Cylinder; p.prim = &prim; break;
         case ShapeType::Plane:
             // Plane never goes through GJK; this branch is unreached (the handler
             // detects Plane first). Map to Box as a benign default.
@@ -702,6 +704,13 @@ constexpr NarrowphaseTable MakeNarrowphaseTable() {
     t.fns[kCap][kBox][kCvx]   = &NarrowphaseConvex;   // capsule x box (both orders)
     t.fns[kBox][kCap][kCvx]   = &NarrowphaseConvex;
     t.fns[kCap][kCap][kCvx]   = &NarrowphaseConvex;   // capsule x capsule
+
+    // Cylinder x box/hull/sphere/capsule/cylinder: the generic convex handler (CylinderConvex).
+    const uint32_t kCyl = static_cast<uint32_t>(ShapeType::Cylinder);
+    for (const uint32_t other : {kBox, kHull, kSph, kCap, kCyl}) {
+        t.fns[kCyl][other][kCvx] = &NarrowphaseConvex;
+        t.fns[other][kCyl][kCvx] = &NarrowphaseConvex;
+    }
 
     // DEFERRED in the Convex tier WITH a NAMED CONSUMER:
     //   TriMesh x * / HeightField x * -> KEEP the Convex stub. v0.8 grasp consumes

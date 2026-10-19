@@ -164,13 +164,15 @@ nuka_result_t nuka_scene_save(nuka_scene_handle scene, const char* nks_path);
 // imports a file cooks byte-identically to nuka_world_create_from_scene.
 // ---------------------------------------------------------------------------
 
-// BOX: half-extents xyz; SPHERE: radius; CAPSULE: radius and segment half-length on local Z.
+// BOX: half-extents xyz; SPHERE: radius; CAPSULE: radius and segment half-length on local Z;
+// CYLINDER: radius and the half-length from the center to each flat cap on local Z.
 // PLANE: static half-space local z <= 0, no dimensions. Pose uses metres and quaternion wxyz.
 typedef enum nuka_primitive_kind_t {
-    NUKA_PRIMITIVE_PLANE   = 0,
-    NUKA_PRIMITIVE_BOX     = 1,
-    NUKA_PRIMITIVE_SPHERE  = 2,
-    NUKA_PRIMITIVE_CAPSULE = 3
+    NUKA_PRIMITIVE_PLANE    = 0,
+    NUKA_PRIMITIVE_BOX      = 1,
+    NUKA_PRIMITIVE_SPHERE   = 2,
+    NUKA_PRIMITIVE_CAPSULE  = 3,
+    NUKA_PRIMITIVE_CYLINDER = 4
 } nuka_primitive_kind_t;
 
 typedef struct nuka_rigid_primitive_desc_t {
@@ -360,13 +362,13 @@ nuka_result_t nuka_scene_add_rigid_primitive(nuka_scene_handle scene,
                                              const nuka_rigid_primitive_desc_t* desc);
 
 // A collision shape attached to an EXISTING body node (addressed by derived tree
-// path). `kind` is BOX/SPHERE/CAPSULE (PLANE is invalid here); dims by kind as in
+// path). `kind` is BOX/SPHERE/CAPSULE/CYLINDER (PLANE is invalid here); dims by kind as in
 // nuka_rigid_primitive_desc_t. pos[3]/quat[4] are the shape's LOCAL pose in the
 // target body frame (all-zero quat => identity). friction < 0 inherits the
 // material default. contype/conaffinity default 1 (a colliding geom); 0/0 makes a
 // visual-only geom.
 typedef struct nuka_collision_shape_desc_t {
-    uint32_t kind;         // nuka_primitive_kind_t (BOX/SPHERE/CAPSULE).
+    uint32_t kind;         // nuka_primitive_kind_t (BOX/SPHERE/CAPSULE/CYLINDER).
     float    dims[3];      // half-extents / radius / (radius,half_height) by kind.
     float    pos[3];       // local position in the target body frame.
     float    quat[4];      // local orientation (w,x,y,z); all-zero => identity.

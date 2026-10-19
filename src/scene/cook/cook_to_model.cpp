@@ -354,6 +354,36 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         math::Vec3 extents{};
     };
     std::vector<MeshBinding> mesh_bindings(blob.convex_geometry.Count());
+    // Appends a primitive's cooked surface (BVH + edges) and binds it to `body`.
+    const auto bind_surface = [&](const float* vertices, uint32_t vertex_count,
+                                  const uint32_t* triangles, uint32_t triangle_count, uint32_t body) {
+        auto surface = import::cooker::CookMeshSurface(vertices, vertex_count, triangles, triangle_count);
+        auto edges = import::cooker::CookMeshEdges(vertices, vertex_count, triangles, triangle_count, false);
+        surface.info.vertex_offset = static_cast<uint32_t>(model.hull_verts.size() / 3u);
+        surface.info.triangle_offset = static_cast<uint32_t>(model.mesh_triangles.size() / 3u);
+        surface.info.node_offset = static_cast<uint32_t>(model.mesh_bvh_nodes.size());
+        edges.info.vertex_offset = surface.info.vertex_offset;
+        edges.info.edge_offset = static_cast<uint32_t>(model.mesh_edges.size());
+        edges.info.node_offset = static_cast<uint32_t>(model.mesh_edge_nodes.size());
+        model.hull_verts.insert(model.hull_verts.end(), vertices, vertices + 3u * vertex_count);
+        model.mesh_triangles.insert(model.mesh_triangles.end(), triangles, triangles + 3u * triangle_count);
+        model.mesh_bvh_nodes.insert(model.mesh_bvh_nodes.end(), surface.nodes.begin(), surface.nodes.end());
+        model.mesh_edges.insert(model.mesh_edges.end(), edges.edges.begin(), edges.edges.end());
+        model.mesh_edge_nodes.insert(model.mesh_edge_nodes.end(), edges.nodes.begin(), edges.nodes.end());
+        model.mesh_triangle_edges.insert(model.mesh_triangle_edges.end(),
+            edges.triangle_edges.begin(), edges.triangle_edges.end());
+        model.mesh_triangle_vertex_owner.insert(model.mesh_triangle_vertex_owner.end(),
+            edges.triangle_vertex_owner.begin(), edges.triangle_vertex_owner.end());
+        if (model.mesh_surface_info.size() <= body) model.mesh_surface_info.resize(body + 1u);
+        if (model.mesh_edge_info.size() <= body) model.mesh_edge_info.resize(body + 1u);
+        model.mesh_surface_info[body] = surface.info;
+        model.mesh_edge_info[body] = edges.info;
+        cap.max_hull_verts = static_cast<uint32_t>(model.hull_verts.size() / 3u);
+        cap.max_mesh_triangles = static_cast<uint32_t>(model.mesh_triangles.size() / 3u);
+        cap.max_mesh_bvh_nodes = static_cast<uint32_t>(model.mesh_bvh_nodes.size());
+        cap.max_mesh_edges = static_cast<uint32_t>(model.mesh_edges.size());
+        cap.max_mesh_edge_nodes = static_cast<uint32_t>(model.mesh_edge_nodes.size());
+    };
     const auto bind_mesh = [&](const nk::ModelShape& shape,
                                nk::Model::PairDrivenShape& row, uint32_t body) {
         if (shape.kind == static_cast<uint8_t>(ShapeType::Box)) {
@@ -369,37 +399,33 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
                 0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7,
                 0, 1, 5, 0, 5, 4, 1, 2, 6, 1, 6, 5,
                 2, 3, 7, 2, 7, 6, 3, 0, 4, 3, 4, 7};
-            auto surface = import::cooker::CookMeshSurface(
-                vertices.data(), 8u, triangles.data(), 12u);
-            auto edges = import::cooker::CookMeshEdges(
-                vertices.data(), 8u, triangles.data(), 12u, false);
-            surface.info.vertex_offset = static_cast<uint32_t>(model.hull_verts.size() / 3u);
-            surface.info.triangle_offset = static_cast<uint32_t>(model.mesh_triangles.size() / 3u);
-            surface.info.node_offset = static_cast<uint32_t>(model.mesh_bvh_nodes.size());
-            edges.info.vertex_offset = surface.info.vertex_offset;
-            edges.info.edge_offset = static_cast<uint32_t>(model.mesh_edges.size());
-            edges.info.node_offset = static_cast<uint32_t>(model.mesh_edge_nodes.size());
-            model.hull_verts.insert(model.hull_verts.end(), vertices.begin(), vertices.end());
-            model.mesh_triangles.insert(model.mesh_triangles.end(),
-                triangles.begin(), triangles.end());
-            model.mesh_bvh_nodes.insert(model.mesh_bvh_nodes.end(),
-                surface.nodes.begin(), surface.nodes.end());
-            model.mesh_edges.insert(model.mesh_edges.end(), edges.edges.begin(), edges.edges.end());
-            model.mesh_edge_nodes.insert(model.mesh_edge_nodes.end(),
-                edges.nodes.begin(), edges.nodes.end());
-            model.mesh_triangle_edges.insert(model.mesh_triangle_edges.end(),
-                edges.triangle_edges.begin(), edges.triangle_edges.end());
-            model.mesh_triangle_vertex_owner.insert(model.mesh_triangle_vertex_owner.end(),
-                edges.triangle_vertex_owner.begin(), edges.triangle_vertex_owner.end());
-            if (model.mesh_surface_info.size() <= body) model.mesh_surface_info.resize(body + 1u);
-            if (model.mesh_edge_info.size() <= body) model.mesh_edge_info.resize(body + 1u);
-            model.mesh_surface_info[body] = surface.info;
-            model.mesh_edge_info[body] = edges.info;
-            cap.max_hull_verts = static_cast<uint32_t>(model.hull_verts.size() / 3u);
-            cap.max_mesh_triangles = static_cast<uint32_t>(model.mesh_triangles.size() / 3u);
-            cap.max_mesh_bvh_nodes = static_cast<uint32_t>(model.mesh_bvh_nodes.size());
-            cap.max_mesh_edges = static_cast<uint32_t>(model.mesh_edges.size());
-            cap.max_mesh_edge_nodes = static_cast<uint32_t>(model.mesh_edge_nodes.size());
+            bind_surface(vertices.data(), 8u, triangles.data(), 12u, body);
+            return;
+        }
+        if (shape.kind == static_cast<uint8_t>(ShapeType::Cylinder)) {
+            // 32-segment prism: two rings (bottom 0..31, top 32..63) and the cap centers 64, 65.
+            constexpr uint32_t kSeg = 32u;
+            const float r = shape.radius;
+            const float hh = shape.half_height;
+            if (!(r > 0.0f && hh > 0.0f))
+                throw std::invalid_argument("cylinder mesh requires positive radius and half height");
+            std::vector<float> vertices;
+            vertices.reserve(3u * (2u * kSeg + 2u));
+            for (const float z : {-hh, hh}) {
+                for (uint32_t i = 0; i < kSeg; ++i) {
+                    const float t = 6.28318530718f * static_cast<float>(i) / static_cast<float>(kSeg);
+                    vertices.insert(vertices.end(), {r * std::cos(t), r * std::sin(t), z});
+                }
+            }
+            vertices.insert(vertices.end(), {0.0f, 0.0f, -hh, 0.0f, 0.0f, hh});
+            std::vector<uint32_t> triangles;
+            triangles.reserve(3u * 4u * kSeg);
+            for (uint32_t i = 0; i < kSeg; ++i) {
+                const uint32_t j = (i + 1u) % kSeg;
+                triangles.insert(triangles.end(), {i, j, kSeg + j, i, kSeg + j, kSeg + i});
+                triangles.insert(triangles.end(), {2u * kSeg, j, i, 2u * kSeg + 1u, kSeg + i, kSeg + j});
+            }
+            bind_surface(vertices.data(), 2u * kSeg + 2u, triangles.data(), 4u * kSeg, body);
             return;
         }
         const uint32_t piece = shape.convex_geometry_index;
@@ -785,7 +811,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             const size_t b = static_cast<size_t>(owner_link) * 4u;
             if (st == ShapeType::Sphere) {
                 m.link_geom_params[b + 0] = radius;
-            } else if (st == ShapeType::Capsule) {
+            } else if (st == ShapeType::Capsule || st == ShapeType::Cylinder) {
                 m.link_geom_params[b + 0] = radius;
                 m.link_geom_params[b + 1] = half_height;
             } else if (st == ShapeType::Box) {

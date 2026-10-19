@@ -307,11 +307,12 @@ nuka_result_t nuka_scene_add_collision_shape(
         case NUKA_PRIMITIVE_BOX:     type = nuka::scene::ShapeType::Box; break;
         case NUKA_PRIMITIVE_SPHERE:  type = nuka::scene::ShapeType::Sphere; break;
         case NUKA_PRIMITIVE_CAPSULE: type = nuka::scene::ShapeType::Capsule; break;
+        case NUKA_PRIMITIVE_CYLINDER: type = nuka::scene::ShapeType::Cylinder; break;
         default: return NUKA_RESULT_INVALID_ARG;  // PLANE is not a body-attached geom.
     }
     if (type == nuka::scene::ShapeType::Sphere && desc->dims[0] <= 0.0f)
         return NUKA_RESULT_INVALID_ARG;
-    if (type == nuka::scene::ShapeType::Capsule &&
+    if ((type == nuka::scene::ShapeType::Capsule || type == nuka::scene::ShapeType::Cylinder) &&
         (desc->dims[0] <= 0.0f || desc->dims[1] <= 0.0f))
         return NUKA_RESULT_INVALID_ARG;
     if (type == nuka::scene::ShapeType::Box &&

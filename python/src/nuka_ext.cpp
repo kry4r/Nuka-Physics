@@ -2101,6 +2101,7 @@ NB_MODULE(_nuka_ext, m) {
     m.attr("PRIMITIVE_BOX") = uint32_t{1};
     m.attr("PRIMITIVE_SPHERE") = uint32_t{2};
     m.attr("PRIMITIVE_CAPSULE") = uint32_t{3};
+    m.attr("PRIMITIVE_CYLINDER") = uint32_t{4};
     // SceneBuilder.add_media(kind=...) / (method=...) codes (nuka_media_kind_t /
     // nuka_media_method_t). Legal pairs: cloth=VBD; soft_tet=MLSMPM;
     // fluid=MLSMPM; granular=MLSMPM; cable=VBD (an illegal pair raises at add_media).
@@ -3507,8 +3508,8 @@ NB_MODULE(_nuka_ext, m) {
              nb::arg("mass") = 1.0f, nb::arg("friction") = -1.0f,
              nb::arg("material") = std::string(),
              "Add a rigid collision primitive (one body + one shape). kind is a "
-             "PRIMITIVE_* code (PLANE/BOX/SPHERE/CAPSULE). dims by kind: BOX "
-             "[hx,hy,hz]; SPHERE [r]; CAPSULE [r,half_height]; PLANE []. pos "
+             "PRIMITIVE_* code (PLANE/BOX/SPHERE/CAPSULE/CYLINDER). dims by kind: BOX "
+             "[hx,hy,hz]; SPHERE [r]; CAPSULE / CYLINDER [r,half_height]; PLANE []. pos "
              "[x,y,z], quat [w,x,y,z] (empty quat => identity). PLANE is always "
              "static. friction < 0 (default) inherits the material mu; >= 0 is an "
              "explicit per-shape override. material names an add_material render "
@@ -3652,8 +3653,8 @@ NB_MODULE(_nuka_ext, m) {
              nb::arg("quat") = std::vector<float>{}, nb::arg("friction") = -1.0f,
              nb::arg("contype") = 1u, nb::arg("conaffinity") = 1u,
              "Attach a collision shape to the body at derived tree path node_path. "
-             "kind is a PRIMITIVE_* code (BOX/SPHERE/CAPSULE). dims by kind: BOX "
-             "[hx,hy,hz]; SPHERE [r]; CAPSULE [r,half_height]. pos/quat are the "
+             "kind is a PRIMITIVE_* code (BOX/SPHERE/CAPSULE/CYLINDER). dims by kind: BOX "
+             "[hx,hy,hz]; SPHERE [r]; CAPSULE / CYLINDER [r,half_height]. pos/quat are the "
              "shape's LOCAL pose in the body frame (empty quat => identity). Use it "
              "to give an imported link (a robot head/trunk shipped visual-only) a "
              "colliding geom without editing the source asset.")

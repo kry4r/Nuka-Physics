@@ -794,12 +794,13 @@ CollisionShapeComponent::Kind KindFromShapeType(ShapeType type) {
         case ShapeType::ConvexHull:  return CollisionShapeComponent::Kind::ConvexHull;
         case ShapeType::TriMesh:     return CollisionShapeComponent::Kind::ConvexHull;
         case ShapeType::HeightField: return CollisionShapeComponent::Kind::Plane;
+        case ShapeType::Cylinder:    return CollisionShapeComponent::Kind::Cylinder;
     }
     return CollisionShapeComponent::Kind::Box;
 }
 
 // Pack a shape's primitive sizing into the component's params[4]. The layout is
-// per-kind: Sphere = (radius); Capsule = (radius, half_height); Box / Plane =
+// per-kind: Sphere = (radius); Capsule / Cylinder = (radius, half_height); Box / Plane =
 // half-extents (x,y,z). ConvexHull / SdfMesh carry no params (geometry lives in
 // the record / the cooked .nka).
 void FillShapeParams(const CollisionShapeRecord& rec, float (&params)[4]) {
@@ -809,6 +810,7 @@ void FillShapeParams(const CollisionShapeRecord& rec, float (&params)[4]) {
             params[0] = rec.radius;
             break;
         case ShapeType::Capsule:
+        case ShapeType::Cylinder:
             params[0] = rec.radius;
             params[1] = rec.half_height;
             break;
@@ -1059,16 +1061,12 @@ void SceneIR::ProjectShape(const CollisionShapeRecord& rec) {
             vis.inline_indices   = rec.mesh_indices;
         } else {
             // Preserve the visual primitive for render-time tessellation.
-            // A flat-capped capsule record projects to a cylinder.
             switch (rec.type) {
                 case ShapeType::Box:     vis.prim_kind = VisualMeshComponent::PrimKind::Box;     break;
                 case ShapeType::Plane:   vis.prim_kind = VisualMeshComponent::PrimKind::Plane;   break;
                 case ShapeType::Sphere:  vis.prim_kind = VisualMeshComponent::PrimKind::Sphere;  break;
-                case ShapeType::Capsule:
-                    vis.prim_kind = rec.flat_capped
-                        ? VisualMeshComponent::PrimKind::Cylinder
-                        : VisualMeshComponent::PrimKind::Capsule;
-                    break;
+                case ShapeType::Capsule: vis.prim_kind = VisualMeshComponent::PrimKind::Capsule; break;
+                case ShapeType::Cylinder: vis.prim_kind = VisualMeshComponent::PrimKind::Cylinder; break;
                 default:                 vis.prim_kind = VisualMeshComponent::PrimKind::None;    break;
             }
             if (vis.prim_kind != VisualMeshComponent::PrimKind::None) {

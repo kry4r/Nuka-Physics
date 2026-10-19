@@ -37,7 +37,7 @@ inline bool SurfaceQueryStorageValid(const SurfaceQueryView& view) {
 
 __device__ inline bool HasCollidableSurface(
     const SurfaceQueryView& view, uint32_t body, const PrimShapeDev& shape) {
-    if (shape.kind <= collision::kShapePlane) return true;
+    if (shape.kind <= collision::kShapePlane || shape.kind == collision::kShapeCylinder) return true;
     if (shape.kind != collision::kShapeConvexHull && shape.kind != collision::kShapeSdfMesh)
         return false;
     if (view.mesh.counts.triangles > 0u && view.mesh_info && body < view.shape_count &&
@@ -51,7 +51,7 @@ __device__ inline collision::MeshSurfacePoint QueryCollidableSurface(
     math::Vec3 position, float max_distance) {
     collision::MeshSurfacePoint result;
     if (body >= view.shape_count) return result;
-    if (shape.kind <= collision::kShapePlane) {
+    if (shape.kind <= collision::kShapePlane || shape.kind == collision::kShapeCylinder) {
         const auto primitive = collision::QueryPrimitiveSurface(shape.kind,
             {shape.params[0], shape.params[1], shape.params[2]}, position);
         result.distance = primitive.distance;

@@ -16,7 +16,7 @@ inline uint32_t RigidManifoldPointCapacity(uint32_t a, uint32_t b) {
     using namespace ::nuka::collision;
     if (a > b) std::swap(a, b);
     if ((a == kShapeSphere && (b == kShapeSphere || b == kShapeCapsule || b == kShapeBox || b == kShapePlane)) ||
-        (a == kShapeCapsule && b == kShapeCapsule)) return 1u;
+        (a == kShapeCapsule && b == kShapeCapsule) || (a == kShapeSphere && b == kShapeCylinder)) return 1u;
     if (a == kShapeCapsule && b == kShapePlane) return 2u;
     return kPairDrivenPtsPerSlot;
 }

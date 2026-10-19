@@ -15,6 +15,7 @@ constexpr uint32_t kSphere = static_cast<uint32_t>(scene::CollisionShapeComponen
 constexpr uint32_t kCapsule = static_cast<uint32_t>(scene::CollisionShapeComponent::Kind::Capsule);
 constexpr uint32_t kBox = static_cast<uint32_t>(scene::CollisionShapeComponent::Kind::Box);
 constexpr uint32_t kPlane = static_cast<uint32_t>(scene::CollisionShapeComponent::Kind::Plane);
+constexpr uint32_t kCylinder = static_cast<uint32_t>(scene::CollisionShapeComponent::Kind::Cylinder);
 constexpr scene::EntityId kDebugEntity{~uint32_t(0), ~uint32_t(0) - 1u};
 
 bool Finite(const Vec3& p) {
@@ -102,6 +103,21 @@ MeshGeometry MakeCapsule(float r, float hh, uint32_t slices = 14u, uint32_t cap_
     return m;
 }
 
+// Flat-capped cylinder along local Z: a side band plus two fan caps at +-hh.
+MeshGeometry MakeCylinder(float r, float hh, uint32_t slices = 32u) {
+    MeshGeometry m;
+    for (uint32_t j = 0; j < slices; ++j) {
+        const float u0 = 2.0f * kPi * static_cast<float>(j) / static_cast<float>(slices);
+        const float u1 = 2.0f * kPi * static_cast<float>(j + 1) / static_cast<float>(slices);
+        const Vec3 b0{r * std::cos(u0), r * std::sin(u0), -hh}, b1{r * std::cos(u1), r * std::sin(u1), -hh};
+        const Vec3 t0{b0.x, b0.y, hh}, t1{b1.x, b1.y, hh};
+        PushQuad(m, b0, b1, t1, t0);
+        PushTri(m, {0.0f, 0.0f, hh}, t0, t1);
+        PushTri(m, {0.0f, 0.0f, -hh}, b1, b0);
+    }
+    return m;
+}
+
 // A plane collidable's finite viz patch: a double-sided flat quad of half-extents
 // (hx,hy) in the local Z=0 plane (the physics plane is infinite; this shows where).
 MeshGeometry MakePlane(float hx, float hy) {
@@ -147,7 +163,7 @@ bool DebugDrawBatch::ShouldReadContacts(uint32_t capacity) {
 
 void DebugDrawBatch::AppendCollider(render::RenderWorld& world, uint32_t kind,
                                     const float* params, const Transform& pose, uint32_t material) {
-    if (kind > kPlane) { ++report_.unsupported_shapes; return; }
+    if (kind > kPlane && kind != kCylinder) { ++report_.unsupported_shapes; return; }
     const uint32_t count = kind == kSphere ? 1u : (kind == kBox ? 3u : 2u);
     float p[3] = {};
     for (uint32_t i = 0; i < count; ++i) {
@@ -157,13 +173,14 @@ void DebugDrawBatch::AppendCollider(render::RenderWorld& world, uint32_t kind,
     if (kind == kPlane) {
         // An infinite plane is represented by the existing finite 2 m half-extent patch.
         for (uint32_t i = 0; i < 2u; ++i) if (p[i] <= 0.0f) p[i] = 2.0f;
-    } else if (p[0] <= 0.0f || (kind == kCapsule && p[1] < 0.0f) ||
+    } else if (p[0] <= 0.0f || (kind == kCapsule && p[1] < 0.0f) || (kind == kCylinder && p[1] <= 0.0f) ||
                (kind == kBox && (p[1] <= 0.0f || p[2] <= 0.0f))) {
         RejectCollider(); return;
     }
     if (!IsValidDebugPose(pose)) { RejectCollider(); return; }
     Vec3 extent{p[0], p[0], p[0]};
     if (kind == kCapsule) extent.z += p[1];
+    if (kind == kCylinder) extent.z = p[1];
     if (kind == kBox) extent = {p[0], p[1], p[2]};
     if (kind == kPlane) extent = {p[0], p[1], 0.0f};
     for (int i = 0; i < 8; ++i) {
@@ -180,6 +197,7 @@ void DebugDrawBatch::AppendCollider(render::RenderWorld& world, uint32_t kind,
         switch (kind) {
             case kSphere: return MakeSphere(p[0]);
             case kCapsule: return MakeCapsule(p[0], p[1]);
+            case kCylinder: return MakeCylinder(p[0], p[1]);
             case kBox: return MakeBox(p[0], p[1], p[2]);
             default: return MakePlane(p[0], p[1]);
         }

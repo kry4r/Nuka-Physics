@@ -93,6 +93,11 @@ nmath::Vec3 PrimitiveInertia(uint32_t kind, const float dims[3], float mass) {
                 cap_mass * (0.4f * r * r + hh * hh + 0.75f * hh * r);
             return nmath::Vec3{trans, trans, axial};
         }
+        case NUKA_PRIMITIVE_CYLINDER: {
+            const float r = dims[0], hh = dims[1];
+            const float trans = mass * (3.0f * r * r + 4.0f * hh * hh) / 12.0f;
+            return nmath::Vec3{trans, trans, 0.5f * mass * r * r};
+        }
         default:  // PLANE: static, inertia irrelevant.
             return nmath::Vec3{1.0f, 1.0f, 1.0f};
     }
@@ -232,15 +237,17 @@ nuka_result_t nuka_scene_add_rigid_primitive(
                 type = nscene::ShapeType::Sphere; kind_name = "sphere"; break;
             case NUKA_PRIMITIVE_CAPSULE:
                 type = nscene::ShapeType::Capsule; kind_name = "capsule"; break;
+            case NUKA_PRIMITIVE_CYLINDER:
+                type = nscene::ShapeType::Cylinder; kind_name = "cylinder"; break;
             default:
                 return NUKA_RESULT_INVALID_ARG;
         }
-        // A box/sphere/capsule needs positive extents (zero/negative cooks degenerate
+        // A box/sphere/capsule/cylinder needs positive extents (zero/negative cooks degenerate
         // geometry); a plane carries no extent.
         if (type == nscene::ShapeType::Sphere && desc->dims[0] <= 0.0f) {
             return NUKA_RESULT_INVALID_ARG;
         }
-        if (type == nscene::ShapeType::Capsule &&
+        if ((type == nscene::ShapeType::Capsule || type == nscene::ShapeType::Cylinder) &&
             (desc->dims[0] <= 0.0f || desc->dims[1] <= 0.0f)) {
             return NUKA_RESULT_INVALID_ARG;
         }
@@ -272,7 +279,7 @@ nuka_result_t nuka_scene_add_rigid_primitive(
                 nmath::Vec3{desc->dims[0], desc->dims[1], desc->dims[2]};
         } else if (type == nscene::ShapeType::Sphere) {
             shape.radius = desc->dims[0];
-        } else if (type == nscene::ShapeType::Capsule) {
+        } else if (type == nscene::ShapeType::Capsule || type == nscene::ShapeType::Cylinder) {
             shape.radius = desc->dims[0];
             shape.half_height = desc->dims[1];
         }

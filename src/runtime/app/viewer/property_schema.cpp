@@ -138,8 +138,9 @@ private:
         Add(g, kFriction, false);
         if (sh.type == scene::ShapeType::Box)
             for (const Spec& spec : kHalfExtents) Add(g, spec, false);
-        if (sh.type == scene::ShapeType::Sphere || sh.type == scene::ShapeType::Capsule) Add(g, kRadius, false);
-        if (sh.type == scene::ShapeType::Capsule) Add(g, kHalfHeight, false);
+        const bool axial = sh.type == scene::ShapeType::Capsule || sh.type == scene::ShapeType::Cylinder;
+        if (sh.type == scene::ShapeType::Sphere || axial) Add(g, kRadius, false);
+        if (axial) Add(g, kHalfHeight, false);
         Add(g, kMargin, false);
         Add(g, kGap, false);
         groups_.push_back(std::move(g));

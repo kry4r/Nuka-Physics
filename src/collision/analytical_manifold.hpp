@@ -210,6 +210,7 @@ NUKA_AMF_HD inline Vec3 Norm(Vec3 v, Vec3 fallback) {
 // clip can track which incident-face vertex produced each survivor -- intersection
 // vertices inherit the id of the edge's ORIGIN vertex (fixed rule -> D1).
 inline constexpr int kClipMax = 8;  // 4 input + up to 4 new intersections
+inline constexpr int kSpreadMax = 24;  // candidate cap of ReduceAndEmitSpread
 
 struct ClipPoly {
     Vec3      v[kClipMax];
@@ -356,7 +357,7 @@ NUKA_AMF_HD inline void ReduceAndEmitSpread(ManifoldPointCand* cand, int n,
     }
     // n > 4: farthest-point sampling.
     int kept[4];
-    bool used[kClipMax] = {false};
+    bool used[kSpreadMax] = {false};
     // 1) seed = deepest (tie -> lowest index, via strict > improvement).
     int seed = 0;
     for (int i = 1; i < n; ++i) {
@@ -773,6 +774,61 @@ NUKA_AMF_HD inline void CapsuleSphere(const PrimParams& cap, const PrimParams& s
     pt.normal = cap.frame.DirLocalToWorld(surface.normal) * -1.0f;
     pt.penetration = pen;
     pt.stable_key = 0ull;
+    out->AddPoint(pt);
+}
+
+inline constexpr float kCylinderCapCos = 0.95f;  // a cap polygon faces the normal above this |axis . n|
+
+// Unit rim directions of a cylinder cap at 45-degree steps in the local XY plane.
+NUKA_AMF_HD inline Vec3 CylinderRimDir(const PrimFrame& f, int k) {
+    constexpr float kS = 0.70710678f;
+    const float c[8] = {1.0f, kS, 0.0f, -kS, -1.0f, -kS, 0.0f, kS};
+    const float s[8] = {0.0f, kS, 1.0f, kS, 0.0f, -kS, -1.0f, -kS};
+    return f.cx * c[k] + f.cy * s[k];
+}
+
+// Cylinder-plane contact from the facing feature: the lower cap's octagon and deepest point, the
+// two ends of the side line, or each cap's deepest point. The normal separates the cylinder.
+NUKA_AMF_HD inline void CylinderPlane(const PrimParams& cyl, const PrimParams& plane,
+                                      ContactManifold* out) {
+    out->Clear();
+    const Vec3 n = Norm(plane.frame.cz, Vec3::UnitZ());
+    const Vec3 axis = cyl.frame.cz;
+    const float d = axis.Dot(n);
+    const bool on_cap = (d < 0.0f ? -d : d) >= kCylinderCapCos;
+    const Vec3 down = Norm(axis * d - n, cyl.frame.cx);
+    ManifoldPointCand cand[10];
+    int ncand = 0;
+    for (int cap = 0; cap < 2; ++cap) {
+        if (on_cap && (cap == 0) == (d > 0.0f)) continue;  // only the lower cap carries the disk
+        const Vec3 center = cyl.frame.t + axis * (cap == 0 ? cyl.half_height : -cyl.half_height);
+        for (int k = -1; k < (on_cap ? 8 : 0); ++k) {
+            const Vec3 p = center + (k < 0 ? down : CylinderRimDir(cyl.frame, k)) * cyl.radius;
+            const float signed_dist = (p - plane.frame.t).Dot(n);
+            if (signed_dist >= 0.0f) continue;
+            cand[ncand].position = p - n * (signed_dist * 0.5f);
+            cand[ncand].penetration = -signed_dist;
+            cand[ncand].feature = static_cast<uint32_t>(k < 0 ? cap : 2 + cap * 8 + k);
+            ++ncand;
+        }
+    }
+    ReduceAndEmitSpread(cand, ncand, n, out);
+}
+
+// Cylinder (a) x sphere (b) -> 1 point from the exact cylinder distance; normal separates A.
+NUKA_AMF_HD inline void CylinderSphere(const PrimParams& cyl, const PrimParams& sph,
+                                       ContactManifold* out) {
+    out->Clear();
+    const auto surface = QueryPrimitiveSurface(kShapeCylinder,
+        {cyl.radius, cyl.half_height, 0.0f}, cyl.frame.WorldToLocal(sph.frame.t));
+    if (!surface.valid) return;
+    const float pen = sph.radius - surface.distance;
+    if (pen <= 0.0f) return;
+    ContactPoint pt;
+    pt.position = cyl.frame.LocalToWorld(surface.point);
+    pt.normal = cyl.frame.DirLocalToWorld(surface.normal) * -1.0f;
+    pt.penetration = pen;
+    pt.stable_key = static_cast<uint64_t>(surface.feature);
     out->AddPoint(pt);
 }
 

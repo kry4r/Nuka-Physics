@@ -855,8 +855,12 @@ bool ShapeTypeFromUsdPrim(const UsdPrim& prim, scene::ShapeType& shape_type) {
         shape_type = scene::ShapeType::Sphere;
         return true;
     }
-    if (prim.type == "Capsule" || prim.type == "Cylinder") {
+    if (prim.type == "Capsule") {
         shape_type = scene::ShapeType::Capsule;
+        return true;
+    }
+    if (prim.type == "Cylinder") {
+        shape_type = scene::ShapeType::Cylinder;
         return true;
     }
     if (prim.type == "Mesh") {
@@ -1109,14 +1113,15 @@ scene::SceneIR BuildSceneFromUsdPrims(const std::vector<UsdPrim>& prims) {
                                   half * prim.scale.z};
         } else if (shape_type == scene::ShapeType::Sphere) {
             shape.radius = prim.radius;
-        } else if (shape_type == scene::ShapeType::Capsule) {
+        } else if (shape_type == scene::ShapeType::Capsule || shape_type == scene::ShapeType::Cylinder) {
             shape.radius = prim.radius;
             shape.half_height = prim.height * 0.5f;
             const auto axis = Lowercase(prim.geometry_axis_token);
             math::Quat alignment;
             if (axis == "x") alignment = math::Quat::FromAxisAngle({0, 1, 0}, 1.5707963267948966f);
             else if (axis == "y") alignment = math::Quat::FromAxisAngle({1, 0, 0}, -1.5707963267948966f);
-            else if (axis != "z") throw std::runtime_error("USD: invalid capsule axis '" + prim.geometry_axis_token + "'");
+            else if (axis != "z")
+                throw std::runtime_error("USD: invalid " + prim.type + " axis '" + prim.geometry_axis_token + "'");
             shape.local_transform.rotation = (shape.local_transform.rotation * alignment).Normalized();
         }
         if (shape_type == scene::ShapeType::TriMesh) {

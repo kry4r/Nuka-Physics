@@ -75,6 +75,7 @@ struct SpawnChoice {
 const SpawnChoice kSpawns[] = {{"Box", "box", icon::kBox},
                                {"Sphere", "sphere", icon::kSphere},
                                {"Capsule", "capsule", icon::kCapsule},
+                               {"Cylinder", "cylinder", icon::kCylinder},
                                {"Plane", "plane", icon::kPlane}};
 
 struct PanelSpec {
@@ -155,8 +156,8 @@ const std::vector<MenuSpec>& Menus() {
             {"Edit", {"edit"}, {"edit.undo", "edit.redo", "-", "edit.delete", "-", "scene.set_visible", "scene.set_locked"}},
             {"Create",
              {"scene"},
-             {"scene.add_box", "scene.add_sphere", "scene.add_capsule", "scene.add_plane", "-", "file.import",
-              "scene.collision_dialog"}},
+             {"scene.add_box", "scene.add_sphere", "scene.add_capsule", "scene.add_cylinder", "scene.add_plane", "-",
+              "file.import", "scene.collision_dialog"}},
             {"View",
              {"view"},
              {"app.command_palette", "-", "view.frame_all", "view.frame_selected", "view.reset_camera", "-",

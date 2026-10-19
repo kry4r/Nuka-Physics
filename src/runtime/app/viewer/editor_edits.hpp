@@ -107,7 +107,7 @@ std::string RenameNode(EditorScene& es, const std::string& path,
                        const std::string& new_leaf);
 
 // Spawn a primitive rigid body at `placement` under the body or group at
-// `parent_path` ("" -> scene root). Box/Sphere/Capsule spawn DYNAMIC + movable;
+// `parent_path` ("" -> scene root). Box/Sphere/Capsule/Cylinder spawn DYNAMIC + movable;
 // Plane spawns static + massless. Authors a colliding geom (physics), a visual-only
 // twin geom (a VisualMeshComponent, so the body renders in ANY scene -- a robot
 // scene's real meshes otherwise suppress the collision-proxy render), and a neutral

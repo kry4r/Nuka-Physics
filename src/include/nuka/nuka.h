@@ -1118,7 +1118,7 @@ nuka_result_t nuka_world_get_link_binding(nuka_world_handle world, uint32_t link
                                           nuka_link_binding_t* out);
 
 // One cooked collision shape with its live world pose (xyz, wxyz) in an environment.
-// params hold the sphere radius, capsule radius and half height, or box half extents.
+// params hold the sphere radius, capsule or cylinder radius and half height, or box half extents.
 typedef struct nuka_collider_t {
     uint32_t kind;
     uint32_t is_static;

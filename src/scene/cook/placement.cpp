@@ -5,6 +5,7 @@
 #include "scene/cook/placement.hpp"
 
 #include <array>
+#include <cmath>
 #include <limits>
 
 namespace nuka::scene::cook {
@@ -73,6 +74,17 @@ void AppendShapeSupportPointsLocal(const CollisionShapeRecord& shape,
                 out.push_back({-r, 0.0f, cz});
                 out.push_back({0.0f, r, cz});
                 out.push_back({0.0f, -r, cz});
+            }
+            break;
+        }
+        case ShapeType::Cylinder: {
+            // Local z-axis cylinder: eight rim points on each flat cap at +- hh.
+            const float r = shape.radius;
+            for (float s : {-1.0f, 1.0f}) {
+                for (int k = 0; k < 8; ++k) {
+                    const float t = 0.78539816f * static_cast<float>(k);
+                    out.push_back({r * std::cos(t), r * std::sin(t), s * shape.half_height});
+                }
             }
             break;
         }

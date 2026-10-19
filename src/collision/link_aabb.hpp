@@ -47,6 +47,7 @@
 #include "scene/canonical_types.hpp"   // scene::ShapeType
 #include "scene/cooked_blob.hpp"       // scene::CookedShapeTable (host glue only)
 
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
@@ -179,6 +180,22 @@ NUKA_LINK_AABB_HD inline AABB CapsuleWorldAabb(const math::Transform& link,
     return box;
 }
 
+// A cylinder's bounds per world axis: the half axis projected plus the cap disk's reach.
+NUKA_LINK_AABB_HD inline AABB CylinderWorldAabb(const math::Transform& link,
+                                                const math::Transform& local,
+                                                float radius, float half_height) {
+    const math::Vec3 a =
+        RotateByQuatPair(link.rotation, local.rotation, math::Vec3{0.0f, 0.0f, 1.0f});
+    const math::Vec3 c = LinkPointToWorld(link, local.position);
+    const math::Vec3 he{half_height * fabsf(a.x) + radius * sqrtf(MaxHd(0.0f, 1.0f - a.x * a.x)),
+                        half_height * fabsf(a.y) + radius * sqrtf(MaxHd(0.0f, 1.0f - a.y * a.y)),
+                        half_height * fabsf(a.z) + radius * sqrtf(MaxHd(0.0f, 1.0f - a.z * a.z))};
+    AABB box;
+    box.min = c - he;
+    box.max = c + he;
+    return box;
+}
+
 // --- the by-type dispatch (device-callable) -----------------------------------
 
 // World AABB of ONE shape from its ShapeType + local params + the owning link's
@@ -198,6 +215,8 @@ NUKA_LINK_AABB_HD inline AABB ShapeWorldAabb(scene::ShapeType type,
             return BoxWorldAabb(link, local, half_extents);
         case scene::ShapeType::Capsule:
             return CapsuleWorldAabb(link, local, radius, half_height);
+        case scene::ShapeType::Cylinder:
+            return CylinderWorldAabb(link, local, radius, half_height);
         default:
             return AABB{};  // inverted sentinel (min=+FLT_MAX, max=-FLT_MAX).
     }
@@ -252,10 +271,11 @@ inline LinkShapeAabbs ExtractLinkShapeAabbs(
 
     for (uint32_t shape = 0u; shape < shape_count; ++shape) {
         const scene::ShapeType type = shapes.types[shape];
-        // Only Sphere/Box/Capsule carry a bounded primitive AABB here.
+        // Only Sphere/Box/Capsule/Cylinder carry a bounded primitive AABB here.
         if (type != scene::ShapeType::Sphere &&
             type != scene::ShapeType::Box &&
-            type != scene::ShapeType::Capsule) {
+            type != scene::ShapeType::Capsule &&
+            type != scene::ShapeType::Cylinder) {
             continue;
         }
         // shape -> owning body -> owning link (first link whose body matches).

@@ -91,6 +91,7 @@ const char* ShapeTypeName(ShapeType t) {
         case ShapeType::ConvexHull:  return "convex_hull";
         case ShapeType::TriMesh:     return "trimesh";
         case ShapeType::HeightField: return "heightfield";
+        case ShapeType::Cylinder:    return "cylinder";
     }
     return "box";
 }
@@ -102,6 +103,7 @@ ShapeType ShapeTypeFromName(const std::string& s) {
     if (s == "convex_hull") return ShapeType::ConvexHull;
     if (s == "trimesh") return ShapeType::TriMesh;
     if (s == "heightfield") return ShapeType::HeightField;
+    if (s == "cylinder") return ShapeType::Cylinder;
     return ShapeType::Box;
 }
 

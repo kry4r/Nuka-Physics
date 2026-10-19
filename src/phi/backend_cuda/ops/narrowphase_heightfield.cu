@@ -33,6 +33,7 @@ constexpr uint32_t kKindBox         = ::nuka::collision::kShapeBox;
 constexpr uint32_t kKindSphere      = ::nuka::collision::kShapeSphere;
 constexpr uint32_t kKindCapsule     = ::nuka::collision::kShapeCapsule;
 constexpr uint32_t kKindConvexHull  = ::nuka::collision::kShapeConvexHull;
+constexpr uint32_t kKindCylinder    = ::nuka::collision::kShapeCylinder;
 
 constexpr int kMaxCand = 32;
 
@@ -67,6 +68,7 @@ __device__ bool MakeConvexProxy(uint32_t kind, const amf::PrimParams& prim,
         case kKindBox:     out->kind = cvx::SupportKind::Box;     out->prim = &prim; return true;
         case kKindSphere:  out->kind = cvx::SupportKind::Sphere;  out->prim = &prim; return true;
         case kKindCapsule: out->kind = cvx::SupportKind::Capsule; out->prim = &prim; return true;
+        case kKindCylinder: out->kind = cvx::SupportKind::Cylinder; out->prim = &prim; return true;
         case kKindConvexHull:
             hull_store->verts = hull_verts + static_cast<size_t>(hull_off) * 3u;
             hull_store->vcount = hull_cnt;
@@ -99,6 +101,13 @@ __device__ void ConvexLocalAabb(uint32_t kind, const amf::PrimParams& prim,
         case kKindBox:     he = rotabs(prim.half_extents); break;
         case kKindCapsule: he = rotabs(Vec3{prim.radius, prim.radius,
                                             prim.radius + prim.half_height}); break;
+        case kKindCylinder: {
+            const Vec3 a = prim.frame.cz;
+            he = {prim.half_height * fabsf(a.x) + prim.radius * sqrtf(fmaxf(0.0f, 1.0f - a.x * a.x)),
+                  prim.half_height * fabsf(a.y) + prim.radius * sqrtf(fmaxf(0.0f, 1.0f - a.y * a.y)),
+                  prim.half_height * fabsf(a.z) + prim.radius * sqrtf(fmaxf(0.0f, 1.0f - a.z * a.z))};
+            break;
+        }
         case kKindConvexHull: {
             
             const float* hv = hull_verts + static_cast<size_t>(hull_off) * 3u;

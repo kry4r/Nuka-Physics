@@ -519,7 +519,7 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
             build_common(e, mesh_id, resolve_material(vis.render_material_id));
         });
 
-    // Collision-proxy fallback, per body: box/sphere/capsule tessellate from params
+    // Collision-proxy fallback, per body: box/sphere/capsule/cylinder tessellate from params
     // for a body with no visual of its own; hull/SDF carry no host geometry.
     using CK = scene::CollisionShapeComponent::Kind;
     registry.ForEach<scene::CollisionShapeComponent>(
@@ -559,6 +559,13 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
                     mesh_id = world.meshes.InternPrimitive(
                         PrimKey("capsule", r, hh, 0),
                         [&]() { return MakeCapsule(r, hh); });
+                    break;
+                }
+                case CK::Cylinder: {
+                    const float r = cs.params[0], hh = cs.params[1];
+                    mesh_id = world.meshes.InternPrimitive(
+                        PrimKey("cylinder", r, hh, 0),
+                        [&]() { return MakeCylinder(r, hh, 32); });
                     break;
                 }
                 case CK::ConvexHull:

@@ -65,6 +65,27 @@ void AddRound(float radius, float half_height, const math::Transform& world, con
     AddTriangles(points, indices, world, color, out);
 }
 
+// A flat-capped cylinder along local Z: rings at +-half_height and a fan per cap.
+void AddCylinder(float radius, float half_height, const math::Transform& world, const math::Vec3& color,
+                 std::vector<Tri>* out) {
+    constexpr auto kSeg = static_cast<uint32_t>(kRoundSegments);
+    std::vector<math::Vec3> points;
+    for (const float z : {-half_height, half_height})
+        for (uint32_t s = 0; s < kSeg; ++s) {
+            const float phi = 6.2831853f * static_cast<float>(s) / static_cast<float>(kSeg);
+            points.push_back(math::Vec3{radius * std::cos(phi), radius * std::sin(phi), z});
+        }
+    points.push_back(math::Vec3{0.0f, 0.0f, -half_height});
+    points.push_back(math::Vec3{0.0f, 0.0f, half_height});
+    std::vector<uint32_t> indices;
+    for (uint32_t i = 0; i < kSeg; ++i) {
+        const uint32_t j = (i + 1u) % kSeg;
+        indices.insert(indices.end(), {i, j, kSeg + j, i, kSeg + j, kSeg + i});
+        indices.insert(indices.end(), {2u * kSeg, j, i, 2u * kSeg + 1u, kSeg + i, kSeg + j});
+    }
+    AddTriangles(points, indices, world, color, out);
+}
+
 void AddShape(const scene::CollisionShapeRecord& sh, const math::Transform& world, const math::Vec3& color,
               std::vector<Tri>* out) {
     switch (sh.type) {
@@ -81,6 +102,7 @@ void AddShape(const scene::CollisionShapeRecord& sh, const math::Transform& worl
         }
         case scene::ShapeType::Sphere: AddRound(sh.radius, 0.0f, world, color, out); break;
         case scene::ShapeType::Capsule: AddRound(sh.radius, sh.half_height, world, color, out); break;
+        case scene::ShapeType::Cylinder: AddCylinder(sh.radius, sh.half_height, world, color, out); break;
         case scene::ShapeType::ConvexHull:
         case scene::ShapeType::TriMesh: {
             std::vector<math::Vec3> points;

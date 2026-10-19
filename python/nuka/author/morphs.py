@@ -284,6 +284,25 @@ class Capsule:
 
 
 @_dc.dataclass(frozen=True)
+class Cylinder:
+    """A rigid flat-capped cylinder of ``radius`` + ``half_height`` (center to each cap,
+    local Z axis), at ``pos`` with orientation ``quat`` (w,x,y,z)."""
+
+    PRIMITIVE = "cylinder"
+    FORCE_STATIC = False
+
+    radius: float
+    half_height: float
+    pos: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    quat: Tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
+
+    def primitive_geometry_kwargs(self) -> dict:
+        return dict(dims=[float(self.radius), float(self.half_height)],
+                    pos=[float(c) for c in self.pos],
+                    quat=[float(q) for q in self.quat])
+
+
+@_dc.dataclass(frozen=True)
 class Plane:
     """An infinite static ground plane (+Z normal) at ``pos``."""
 
@@ -309,5 +328,5 @@ class Ground:
 
 __all__ = [
     "NKS", "ClothRegion", "Grid", "TetSphere", "FluidBox", "GranularBed", "MpmFill", "Cable",
-    "CableSlab", "Box", "Sphere", "Capsule", "Plane", "Ground",
+    "CableSlab", "Box", "Sphere", "Capsule", "Cylinder", "Plane", "Ground",
 ]

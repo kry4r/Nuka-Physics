@@ -146,7 +146,7 @@ json::Value MaterialToJson(const scene::RenderMaterial& m) {
 
 bool ParsePrimitiveKind(const std::string& s, PrimitiveKind* out) {
     for (const PrimitiveKind kind : {PrimitiveKind::Box, PrimitiveKind::Sphere, PrimitiveKind::Capsule,
-                                     PrimitiveKind::Plane}) {
+                                     PrimitiveKind::Plane, PrimitiveKind::Cylinder}) {
         if (s == PrimitiveKindName(kind)) {
             *out = kind;
             return true;
@@ -161,6 +161,7 @@ const char* PrimitiveKindName(PrimitiveKind kind) {
         case PrimitiveKind::Sphere: return "sphere";
         case PrimitiveKind::Capsule: return "capsule";
         case PrimitiveKind::Plane: return "plane";
+        case PrimitiveKind::Cylinder: return "cylinder";
     }
     return "";
 }

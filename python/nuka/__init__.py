@@ -65,6 +65,7 @@ from ._nuka_ext import (  # noqa: F401
     PRIMITIVE_BOX,
     PRIMITIVE_SPHERE,
     PRIMITIVE_CAPSULE,
+    PRIMITIVE_CYLINDER,
     # SceneBuilder.add_media(kind=..., method=...) codes.
     MEDIA_CLOTH,
     MEDIA_SOFT_TET,
@@ -314,6 +315,7 @@ __all__ = [
     "PRIMITIVE_BOX",
     "PRIMITIVE_SPHERE",
     "PRIMITIVE_CAPSULE",
+    "PRIMITIVE_CYLINDER",
     "MEDIA_CLOTH",
     "MEDIA_SOFT_TET",
     "MEDIA_FLUID",

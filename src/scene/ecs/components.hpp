@@ -119,7 +119,8 @@ struct VisualMeshComponent {
 };
 
 struct CollisionShapeComponent {
-    enum class Kind : uint8_t { Sphere, Capsule, Box, Plane, ConvexHull, SdfMesh };
+    // Values mirror collision::ShapeKind; 6 is the heightfield, which has no component kind.
+    enum class Kind : uint8_t { Sphere, Capsule, Box, Plane, ConvexHull, SdfMesh, Cylinder = 7 };
     Kind     kind = Kind::Sphere;
     bool     mesh_oriented = false;
     float    params[4]{0.0f, 0.0f, 0.0f, 0.0f};

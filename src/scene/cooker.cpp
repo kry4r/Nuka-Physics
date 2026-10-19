@@ -341,7 +341,8 @@ void CookLinkVisualSdfs(const SceneIR& scene, CookedBlob& blob) {
             body_collide_shape[s.body_id] = i;
         const bool is_primitive = s.type == ShapeType::Sphere ||
                                   s.type == ShapeType::Box ||
-                                  s.type == ShapeType::Capsule;
+                                  s.type == ShapeType::Capsule ||
+                                  s.type == ShapeType::Cylinder;
         if (is_primitive && body_anchor_shape[s.body_id] == ~uint32_t(0))
             body_anchor_shape[s.body_id] = i;
     }

@@ -129,7 +129,8 @@ scene::ShapeType UrdfGeomType(const char* tag_name) {
     const std::string t(tag_name);
     if (t == "box")      return scene::ShapeType::Box;
     if (t == "sphere")   return scene::ShapeType::Sphere;
-    if (t == "cylinder")  return scene::ShapeType::Capsule; // approximate
+    if (t == "cylinder") return scene::ShapeType::Cylinder;
+    if (t == "capsule")  return scene::ShapeType::Capsule;
     if (t == "mesh")     return scene::ShapeType::TriMesh;
     return scene::ShapeType::Box;
 }
@@ -245,7 +246,7 @@ static scene::SceneIR ParseUrdf(tinyxml2::XMLElement* robot, const std::string& 
                 }
             } else if (shape.type == scene::ShapeType::Sphere) {
                 shape_elem->QueryFloatAttribute("radius", &shape.radius);
-            } else if (shape.type == scene::ShapeType::Capsule) {
+            } else if (shape.type == scene::ShapeType::Capsule || shape.type == scene::ShapeType::Cylinder) {
                 shape_elem->QueryFloatAttribute("radius", &shape.radius);
                 float length = 1.0f;
                 shape_elem->QueryFloatAttribute("length", &length);
@@ -321,7 +322,7 @@ static scene::SceneIR ParseUrdf(tinyxml2::XMLElement* robot, const std::string& 
                 }
             } else if (shape.type == scene::ShapeType::Sphere) {
                 shape_elem->QueryFloatAttribute("radius", &shape.radius);
-            } else if (shape.type == scene::ShapeType::Capsule) {
+            } else if (shape.type == scene::ShapeType::Capsule || shape.type == scene::ShapeType::Cylinder) {
                 shape_elem->QueryFloatAttribute("radius", &shape.radius);
                 float length = 1.0f;
                 shape_elem->QueryFloatAttribute("length", &length);

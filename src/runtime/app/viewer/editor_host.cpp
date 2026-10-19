@@ -277,7 +277,7 @@ void PrintUsage() {
                 "  [--capture-frame N --capture-out FILE.ppm]\n"
                 "  [--run-script FILE.py runs a script once against the loaded scene]\n"
                 "  [--undo / --redo fire one undo/redo after a headless load edit]\n"
-                "  [--spawn box|sphere|capsule|plane spawns a primitive body after load]\n"
+                "  [--spawn box|sphere|capsule|cylinder|plane spawns a primitive body after load]\n"
                 "  [--reset-at N fires transport Reset (re-seed physics) at frame N]\n"
                 "  [--show-colliders / --show-contacts enable the read-only debug overlays]\n"
                 "  [--teleop-nudge DOF,DELTA PD-holds the robot + nudges one drive target]\n"

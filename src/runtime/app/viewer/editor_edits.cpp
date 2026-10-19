@@ -244,8 +244,8 @@ namespace {
 struct SpawnSpec {
     scene::ShapeType type;
     math::Vec3       half_extents;   // box / plane
-    float            radius;         // sphere / capsule
-    float            half_height;    // capsule
+    float            radius;         // sphere / capsule / cylinder
+    float            half_height;    // capsule / cylinder
     bool             is_static;      // plane: a ground-like body has no mass
     const char*      tag;            // node + material base name
 };
@@ -256,6 +256,8 @@ SpawnSpec SpecOf(PrimitiveKind kind) {
             return {scene::ShapeType::Sphere,  {0.25f, 0.25f, 0.25f}, 0.25f, 0.25f, false, "sphere"};
         case PrimitiveKind::Capsule:
             return {scene::ShapeType::Capsule, {0.20f, 0.20f, 0.45f}, 0.20f, 0.25f, false, "capsule"};
+        case PrimitiveKind::Cylinder:
+            return {scene::ShapeType::Cylinder, {0.20f, 0.20f, 0.25f}, 0.20f, 0.25f, false, "cylinder"};
         case PrimitiveKind::Plane:
             return {scene::ShapeType::Plane,   {5.0f, 5.0f, 0.05f},   0.50f, 0.50f, true,  "plane"};
         case PrimitiveKind::Box:
@@ -290,6 +292,14 @@ std::string SpawnPrimitive(EditorScene& es, PrimitiveKind kind,
     b.name = (parent_body != scene::kInvalidBody || parent_path.empty())
                  ? std::string(spec.tag)
                  : parent_path + "/" + spec.tag;
+    // Body names stay unique: a rebuild carries state over by body name.
+    const auto taken = [&](const std::string& n) {
+        for (const scene::RigidBodyRecord& r : es.scene.Bodies())
+            if (r.name == n) return true;
+        return false;
+    };
+    const std::string base = b.name;
+    for (int i = 1; taken(b.name); ++i) b.name = base + "_" + std::to_string(i);
     b.local_transform = parent_world.Inverse() * placement;
     const scene::BodyId nb = es.scene.AddRigidBody(b);
 

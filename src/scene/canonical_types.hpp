@@ -42,7 +42,8 @@ enum class ShapeType : uint8_t {
     Plane,  // Infinite solid half-space local z <= 0; outward normal is +Z.
     ConvexHull,
     TriMesh,
-    HeightField
+    HeightField,
+    Cylinder  // Flat-capped along local Z: radius, and half_height from the center to each cap.
 };
 
 // Unified sensor kind covering the Isaac Lab suite: analytic (Imu/Contact/

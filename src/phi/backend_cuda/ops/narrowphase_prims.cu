@@ -26,6 +26,7 @@ constexpr uint32_t kKindCapsule = ::nuka::collision::kShapeCapsule;
 constexpr uint32_t kKindBox     = ::nuka::collision::kShapeBox;
 constexpr uint32_t kKindPlane   = ::nuka::collision::kShapePlane;
 constexpr uint32_t kKindConvexHull = ::nuka::collision::kShapeConvexHull;
+constexpr uint32_t kKindCylinder = ::nuka::collision::kShapeCylinder;
 
 __device__ amf::PrimParams MakePrim(const PrimShapeDev& s,
                                      const math::Transform& xf) {
@@ -50,6 +51,7 @@ __device__ bool MakeSupportProxy(uint32_t kind, const amf::PrimParams& prim,
         case kKindBox:     out->kind = cvx::SupportKind::Box;     out->prim = &prim; return true;
         case kKindSphere:  out->kind = cvx::SupportKind::Sphere;  out->prim = &prim; return true;
         case kKindCapsule: out->kind = cvx::SupportKind::Capsule; out->prim = &prim; return true;
+        case kKindCylinder: out->kind = cvx::SupportKind::Cylinder; out->prim = &prim; return true;
         case kKindConvexHull:
 
             hull_store->verts = hull_verts + static_cast<size_t>(hull_off) * 3u;
@@ -78,6 +80,8 @@ __device__ bool DispatchAnalyticPair(uint32_t ka, const amf::PrimParams& a,
     if (ka == kKindCapsule && kb == kKindSphere){ amf::CapsuleSphere(a, b, out); return true; }
 
     if (ka == kKindCapsule && kb == kKindCapsule){ amf::CapsuleCapsule(a, b, out); return true; }
+    if (ka == kKindCylinder && kb == kKindPlane) { amf::CylinderPlane(a, b, out); return true; }
+    if (ka == kKindCylinder && kb == kKindSphere) { amf::CylinderSphere(a, b, out); return true; }
     
     auto flip = [&]() {
         for (uint32_t i = 0; i < out->point_count; ++i) {
@@ -91,6 +95,8 @@ __device__ bool DispatchAnalyticPair(uint32_t ka, const amf::PrimParams& a,
     if (ka == kKindPlane && kb == kKindBox)     { amf::BoxPlane(b, a, out); flip(); return true; }
     if (ka == kKindPlane && kb == kKindCapsule) { amf::CapsulePlane(b, a, out); flip(); return true; }
     if (ka == kKindSphere && kb == kKindCapsule){ amf::CapsuleSphere(b, a, out); flip(); return true; }
+    if (ka == kKindPlane && kb == kKindCylinder) { amf::CylinderPlane(b, a, out); flip(); return true; }
+    if (ka == kKindSphere && kb == kKindCylinder) { amf::CylinderSphere(b, a, out); flip(); return true; }
 
     return false;
 }

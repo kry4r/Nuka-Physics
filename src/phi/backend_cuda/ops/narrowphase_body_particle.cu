@@ -74,6 +74,7 @@ constexpr uint32_t kKindBox         = ::nuka::collision::kShapeBox;
 constexpr uint32_t kKindPlane       = ::nuka::collision::kShapePlane;
 constexpr uint32_t kKindConvexHull  = ::nuka::collision::kShapeConvexHull;
 constexpr uint32_t kKindSdfMesh     = ::nuka::collision::kShapeSdfMesh;
+constexpr uint32_t kKindCylinder    = ::nuka::collision::kShapeCylinder;
 constexpr uint32_t kKindHeightfield = ::nuka::collision::kShapeHeightfield;
 namespace sdfq = ::nuka::runtime::sdf;
 
@@ -501,6 +502,12 @@ __global__ void NarrowphaseBodyParticleKernel(
                                                                  -m.points[i].normal.z};
                                }
                                break;
+            case kKindCylinder: if (lane == 0u) {
+                                    amf::CylinderSphere(pb, ps, &m);
+                                    for (uint32_t i = 0u; i < m.point_count; ++i)
+                                        m.points[i].normal = m.points[i].normal * -1.0f;
+                                }
+                                break;
             case kKindConvexHull: {
                 // Under kWarp ALL 32 lanes call SphereHull in full-warp lockstep: the
                 // giant-hull SupportHull scan splits across lanes (warp_lockstep) for

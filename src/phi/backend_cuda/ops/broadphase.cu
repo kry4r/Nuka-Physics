@@ -148,6 +148,7 @@ constexpr uint32_t kKindPlane       = ::nuka::collision::kShapePlane;
 constexpr uint32_t kKindConvexHull  = ::nuka::collision::kShapeConvexHull;
 constexpr uint32_t kKindSdfMesh     = ::nuka::collision::kShapeSdfMesh;
 constexpr uint32_t kKindHeightfield = ::nuka::collision::kShapeHeightfield;
+constexpr uint32_t kKindCylinder    = ::nuka::collision::kShapeCylinder;
 
 __forceinline__ __device__ math::Vec3 RotAbs(math::Quat q, math::Vec3 v) {
     // |R| * v applied component-wise: the world AABB half-extent of a local box
@@ -191,6 +192,17 @@ __global__ void BuildAabbsKernel(const float* __restrict__ shape_table,
                                   math::Vec3{r, r, r + s.p[1]}); break;
         case kKindBox:        he = RotAbs(xf.rotation,
                                   math::Vec3{s.p[0], s.p[1], s.p[2]}); break;
+        // Cylinder: per world axis hh*|a_i| + r*sqrt(1 - a_i^2) for the world axis a (exact).
+        case kKindCylinder: {
+            const math::Vec3 qv{xf.rotation.x, xf.rotation.y, xf.rotation.z};
+            const math::Vec3 ez{0.0f, 0.0f, 1.0f};
+            const math::Vec3 tz = 2.0f * qv.Cross(ez);
+            const math::Vec3 a = ez + xf.rotation.w * tz + qv.Cross(tz);
+            he = {s.p[1] * fabsf(a.x) + s.p[0] * sqrtf(fmaxf(0.0f, 1.0f - a.x * a.x)),
+                  s.p[1] * fabsf(a.y) + s.p[0] * sqrtf(fmaxf(0.0f, 1.0f - a.y * a.y)),
+                  s.p[1] * fabsf(a.z) + s.p[0] * sqrtf(fmaxf(0.0f, 1.0f - a.z * a.z))};
+            break;
+        }
         // Hull: conservative BOUND-RADIUS sphere (p[0] = the cooked max |vertex|
         // — rotation-invariant, so no RotAbs needed).
         case kKindConvexHull: r = s.p[0]; he = {r, r, r}; break;

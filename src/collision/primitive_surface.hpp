@@ -23,7 +23,7 @@ struct PrimitiveSurface {
     bool valid = false;
 };
 
-// Capsules extend along local Z. Planes bound the solid half-space local z <= 0.
+// Capsules and cylinders extend along local Z. Planes bound the solid half-space local z <= 0.
 // Parameters are radius, (radius, half-height), or box half-extents.
 NUKA_SURFACE_HD inline PrimitiveSurface QueryPrimitiveSurface(
     uint32_t kind, math::Vec3 parameters, math::Vec3 position) {
@@ -85,6 +85,31 @@ NUKA_SURFACE_HD inline PrimitiveSurface QueryPrimitiveSurface(
             result.distance = position.z;
             result.normal = {0.0f, 0.0f, 1.0f};
             break;
+        case kShapeCylinder: {
+            if (!(parameters.x >= 0.0f && parameters.y >= 0.0f)) return result;
+            // Features: 0 bottom cap, 1 side, 2 top cap, 3 bottom rim, 4 top rim.
+            const float rho = sqrtf(position.x * position.x + position.y * position.y);
+            const Vec3 radial = rho > 0.0f ? Vec3{position.x / rho, position.y / rho, 0.0f}
+                                           : Vec3{1.0f, 0.0f, 0.0f};
+            const Vec3 axial{0.0f, 0.0f, position.z < 0.0f ? -1.0f : 1.0f};
+            const float side = rho - parameters.x;
+            const float cap = fabsf(position.z) - parameters.y;
+            const uint32_t cap_feature = position.z < 0.0f ? 0u : 2u;
+            if (side > 0.0f && cap > 0.0f) {
+                result.distance = sqrtf(side * side + cap * cap);
+                result.normal = (radial * side + axial * cap) / result.distance;
+                result.feature = position.z < 0.0f ? 3u : 4u;
+            } else if (side > cap) {
+                result.distance = side;
+                result.normal = radial;
+                result.feature = 1u;
+            } else {
+                result.distance = cap;
+                result.normal = axial;
+                result.feature = cap_feature;
+            }
+            break;
+        }
         default:
             return result;
     }

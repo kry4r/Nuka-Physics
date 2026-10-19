@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cfloat>
+#include <cmath>
 #include <exception>
 #include <fstream>
 #include <utility>
@@ -102,6 +103,15 @@ void GrowShape(const scene::CollisionShapeRecord& sh, const math::Transform& wor
                 Grow(c - r, lo, hi);
                 Grow(c + r, lo, hi);
             }
+            break;
+        }
+        case scene::ShapeType::Cylinder: {
+            // Eight rim points per cap bound the disk closely enough for placement.
+            for (const float z : {-sh.half_height, sh.half_height})
+                for (int k = 0; k < 8; ++k) {
+                    const float t = 0.78539816f * static_cast<float>(k);
+                    Grow(world.TransformPoint(math::Vec3{sh.radius * std::cos(t), sh.radius * std::sin(t), z}), lo, hi);
+                }
             break;
         }
         case scene::ShapeType::ConvexHull:
