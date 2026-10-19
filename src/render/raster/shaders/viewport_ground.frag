@@ -41,7 +41,8 @@ void main() {
     const float t = (height - origin.z) / dir.z;
     if (t <= 0.0) discard;
     const vec3 p = origin + dir * t;
-    const vec4 clip = scene.view_proj * vec4(p, 1.0);
+    // Depth from a hair behind the plane, so a surface the scene puts at the same height wins.
+    const vec4 clip = scene.view_proj * vec4(origin + dir * (t * 1.001), 1.0);
     gl_FragDepth = clip.z / clip.w;
 
     vec3 albedo = mix(kFloor, kLine, max(GridLine(p.xy, 1.0) * 0.8, GridLine(p.xy, 0.25) * 0.3));

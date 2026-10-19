@@ -57,12 +57,14 @@
 #include "import/mjcf_importer.hpp"
 #include "import/urdf_importer.hpp"
 #include "import/usd_importer.hpp"
+#include "scene/asset/asset_bytes.hpp"
 #include "scene/asset/asset_ref.hpp"
 #include "scene/asset/nka.hpp"
 #include "scene/format/json.hpp"
 #include "scene/scene_compose.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -328,15 +330,18 @@ struct MeshSink {
 
     std::string AddAsset(const AssetRef& source) {
         if (source.Empty()) return {};
-        const auto payload = NkaFile::Open(source.nka_path).LoadChunk(source.fourcc, source.index);
-        const std::string key = std::to_string(source.fourcc) + ":" +
-                                std::to_string(NkaContentHash(payload));
+        return AddChunk(source.fourcc, NkaFile::Open(source.nka_path).LoadChunk(source.fourcc, source.index));
+    }
+
+    // Append a chunk deduped by family and content hash; return AssetRef text.
+    std::string AddChunk(uint32_t fourcc, std::vector<uint8_t> payload) {
+        const std::string key = std::to_string(fourcc) + ":" + std::to_string(NkaContentHash(payload));
         const auto found = imported.find(key);
         if (found != imported.end()) return found->second;
         AssetRef target;
         target.nka_path = nka_basename;
-        target.fourcc = source.fourcc;
-        target.index = writer.AddChunk(source.fourcc, payload);
+        target.fourcc = fourcc;
+        target.index = writer.AddChunk(fourcc, std::move(payload));
         const auto text = ToString(target);
         imported.emplace(key, text);
         return text;
@@ -763,6 +768,25 @@ Value SaveScript(const ScriptRecord& s) {
     return o;
 }
 
+// An import source; a file under `dir` (the .nks dir) is written relative to it.
+Value SaveSource(const SourceRecord& s, const std::filesystem::path& dir) {
+    const std::filesystem::path file = std::filesystem::path(s.file).lexically_normal();
+    const std::filesystem::path relative = file.lexically_relative(dir);
+    const bool inside = file.is_absolute() && !relative.empty() && *relative.begin() != "..";
+    Value o = Value::Object();
+    o.Set("node", Value::Str(s.node));
+    o.Set("file", Value::Str(inside ? relative.generic_string() : s.file));
+    o.Set("kind", Value::Str(s.kind));
+    o.Set("profile", Value::Str(s.profile));
+    o.Set("fix_base", Value::Bool(s.fix_base));
+    Value paths = Value::Array();
+    for (const std::string& path : s.package_paths) paths.PushBack(Value::Str(path));
+    o.Set("package_paths", std::move(paths));
+    o.Set("light_units", Value::Str(s.light_units));
+    o.Set("ground", Value::Bool(s.ground));
+    return o;
+}
+
 // Cameras / lights serialize from their ECS COMPONENT inline on their own tree
 // node (see SaveNode): the component is a 1:1 projection of the record, the node
 // carries the name, and the attached body is the parent body node — so there is
@@ -798,6 +822,12 @@ Value WeaveJson(const ClothWeave& w) {
     o.Set("yarn_gap", Value::Float(w.yarn_gap));
     o.Set("yarn_height", Value::Float(w.yarn_height));
     return o;
+}
+
+// A material's image maps, in the order SaveRenderMaterial writes them.
+template <typename Material>
+auto MapsOf(Material& m) {
+    return std::array{&m.albedo_map, &m.roughness_map, &m.normal_map, &m.metallic_map, &m.emissive_map};
 }
 
 // The authored MaterialRecord (the cook-fidelity authority) carries BOTH render
@@ -1057,7 +1087,7 @@ Value SaveNode(const SceneIR& scene, const NodeIndex& idx, MeshSink& sink,
 
 }  // namespace
 
-void Save(const SceneIR& scene, const std::string& nks_path) {
+void Save(const SceneIR& scene, const std::string& nks_path, const SaveOptions& options) {
     namespace fs = std::filesystem;
     const fs::path p(nks_path);
     const std::string stem = p.stem().string();
@@ -1066,6 +1096,14 @@ void Save(const SceneIR& scene, const std::string& nks_path) {
 
     MeshSink sink;
     sink.nka_basename = nka_name;
+    // An image named as a TEXB chunk copies into the sibling .nka, and so does a readable file when packing;
+    // anything else is written as it stands.
+    const auto image = [&](const std::string& path) {
+        if (NamesTextureChunk(path)) return sink.AddAsset(ParseAssetRef(path));
+        if (path.empty() || !options.pack_images) return path;
+        std::vector<uint8_t> bytes = ReadAssetBytes(path);
+        return bytes.empty() ? path : sink.AddChunk(NkaTagTexb(), std::move(bytes));
+    };
 
     Value root = Value::Object();
     root.Set("nks_version", Value::Int(1));
@@ -1075,8 +1113,10 @@ void Save(const SceneIR& scene, const std::string& nks_path) {
         Value phys = Value::Object();
         Value rend = Value::Object();
         for (const MaterialRecord& m : scene.Materials()) {
+            MaterialRecord written = m;
+            for (std::string* map : MapsOf(written)) *map = image(*map);
             phys.Set(m.name, SavePhysicsMaterial(m));
-            rend.Set(m.name, SaveRenderMaterial(m));
+            rend.Set(m.name, SaveRenderMaterial(written));
         }
         root.Set("physics_materials", std::move(phys));
         root.Set("render_materials", std::move(rend));
@@ -1141,7 +1181,10 @@ void Save(const SceneIR& scene, const std::string& nks_path) {
     // Emitted only when present so a terrain-free scene's bytes are unchanged.
     if (!scene.Terrain().empty()) {
         Value terrain = Value::Array();
-        for (const TerrainRecord& t : scene.Terrain()) terrain.PushBack(SaveTerrain(t));
+        for (TerrainRecord t : scene.Terrain()) {
+            t.image_path = image(t.image_path);
+            terrain.PushBack(SaveTerrain(t));
+        }
         root.Set("terrain", std::move(terrain));
     }
 
@@ -1161,7 +1204,7 @@ void Save(const SceneIR& scene, const std::string& nks_path) {
     if (envr.Authored()) {
         Value env = Value::Object();
         if (!envr.hdri.empty()) {
-            env.Set("hdri", Value::Str(envr.hdri));
+            env.Set("hdri", Value::Str(image(envr.hdri)));
         }
         if (envr.yaw_deg != 0.0f) {
             env.Set("yaw_deg", Value::Float(envr.yaw_deg));
@@ -1211,6 +1254,15 @@ void Save(const SceneIR& scene, const std::string& nks_path) {
         root.Set("environment", std::move(env));
     }
 
+    // -- sources (the files imported parts came from) -----------------------
+    // Emitted only when present so a scene without import sources is unchanged.
+    if (!scene.Sources().empty()) {
+        const fs::path dir = fs::absolute(p).lexically_normal().parent_path();
+        Value sources = Value::Array();
+        for (const SourceRecord& s : scene.Sources()) sources.PushBack(SaveSource(s, dir));
+        root.Set("sources", std::move(sources));
+    }
+
     // -- M7 metadata: initial_state / settle (only when present) ------------
     // Emitted only when authored so a scene without IC/settle is unchanged (the
     // existing SecondSaveByteIdentical fixtures stay byte-equal). A legacy
@@ -1233,6 +1285,19 @@ void Save(const SceneIR& scene, const std::string& nks_path) {
     // Always write the sibling .nka (possibly empty: a valid 0-chunk container),
     // so a scene with no inline mesh geometry still round-trips byte-identically.
     sink.writer.Write(nka_path.string());
+}
+
+std::vector<std::string> ExternalImages(const SceneIR& scene) {
+    std::vector<std::string> out;
+    const auto add = [&](const std::string& path) {
+        if (!path.empty() && !NamesTextureChunk(path) && std::find(out.begin(), out.end(), path) == out.end())
+            out.push_back(path);
+    };
+    for (const MaterialRecord& m : scene.Materials())
+        for (const std::string* map : MapsOf(m)) add(*map);
+    for (const TerrainRecord& t : scene.Terrain()) add(t.image_path);
+    add(scene.Environment().hdri);
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -1261,6 +1326,14 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
         if (found == containers.end())
             found = containers.emplace(ref.nka_path, NkaFile::Open(ref.nka_path)).first;
         return found->second.LoadChunk(ref.fourcc, ref.index);
+    };
+    // A packed image's .nka resolves against the NKS dir; an image file path reads as written.
+    auto image_ref = [&](const Value& value) {
+        const std::string text = value.AsString();
+        if (!NamesTextureChunk(text)) return text;
+        AssetRef ref = ParseAssetRef(text);
+        ref.nka_path = std::filesystem::absolute(base_dir / ref.nka_path).lexically_normal().string();
+        return ToString(ref);
     };
 
     // -- imports (compose first, deterministic) -----------------------------
@@ -1297,11 +1370,11 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                 if (const Value* tr = rm.Find("transmission")) rec.transmission = tr->AsFloat();
                 if (const Value* io = rm.Find("ior")) rec.ior = io->AsFloat();
                 if (const Value* ab = rm.Find("absorption")) rec.absorption = Vec3FromJson(*ab);
-                if (const Value* am = rm.Find("albedo_map")) rec.albedo_map = am->AsString();
-                if (const Value* rg = rm.Find("roughness_map")) rec.roughness_map = rg->AsString();
-                if (const Value* nm = rm.Find("normal_map")) rec.normal_map = nm->AsString();
-                if (const Value* mm = rm.Find("metallic_map")) rec.metallic_map = mm->AsString();
-                if (const Value* em = rm.Find("emissive_map")) rec.emissive_map = em->AsString();
+                if (const Value* am = rm.Find("albedo_map")) rec.albedo_map = image_ref(*am);
+                if (const Value* rg = rm.Find("roughness_map")) rec.roughness_map = image_ref(*rg);
+                if (const Value* nm = rm.Find("normal_map")) rec.normal_map = image_ref(*nm);
+                if (const Value* mm = rm.Find("metallic_map")) rec.metallic_map = image_ref(*mm);
+                if (const Value* em = rm.Find("emissive_map")) rec.emissive_map = image_ref(*em);
                 if (const Value* rc = rm.Find("roughness_channel"))
                     rec.roughness_channel = static_cast<uint32_t>(rc->AsInt());
                 if (const Value* mc = rm.Find("metallic_channel"))
@@ -1922,7 +1995,7 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             rec.feature_seed = u(tv, "feature_seed", rec.feature_seed);
             rec.curric_levels = u(tv, "curric_levels", rec.curric_levels);
             rec.curric_types = u(tv, "curric_types", rec.curric_types);
-            if (const Value* ip = tv.Find("image_path")) rec.image_path = ip->AsString();
+            if (const Value* ip = tv.Find("image_path")) rec.image_path = image_ref(*ip);
             rec.image_radius_x = f(tv, "image_radius_x", rec.image_radius_x);
             rec.image_radius_y = f(tv, "image_radius_y", rec.image_radius_y);
             rec.image_elevation_z = f(tv, "image_elevation_z", rec.image_elevation_z);
@@ -1935,7 +2008,7 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
     // procedural studio sky (backward-compatible).
     if (const Value* env = root.Find("environment")) {
         EnvironmentRecord rec = scene.Environment();
-        if (const Value* hp = env->Find("hdri")) rec.hdri = hp->AsString();
+        if (const Value* hp = env->Find("hdri")) rec.hdri = image_ref(*hp);
         if (const Value* yv = env->Find("yaw_deg")) rec.yaw_deg = yv->AsFloat();
         if (const Value* iv = env->Find("intensity")) rec.intensity = iv->AsFloat();
         if (const Value* um = env->Find("use_scene_materials"))
@@ -1971,6 +2044,25 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             if (const Value* v = shadow->Find("filter_radius")) rec.shadow.filter_radius = v->AsFloat();
         }
         scene.EnvironmentMut() = std::move(rec);
+    }
+
+    // -- sources: a relative file resolves against the .nks dir ---------------
+    if (const Value* sources = root.Find("sources")) {
+        for (const Value& sv : sources->Elements()) {
+            SourceRecord rec;
+            rec.node = sv.At("node").AsString();
+            const std::filesystem::path file(sv.At("file").AsString());
+            rec.file = file.is_absolute() ? file.string()
+                                          : std::filesystem::absolute(base_dir / file).lexically_normal().string();
+            rec.kind = sv.At("kind").AsString();
+            if (const Value* v = sv.Find("profile")) rec.profile = v->AsString();
+            if (const Value* v = sv.Find("fix_base")) rec.fix_base = v->AsBool();
+            if (const Value* v = sv.Find("package_paths"))
+                for (const Value& path : v->Elements()) rec.package_paths.push_back(path.AsString());
+            if (const Value* v = sv.Find("light_units")) rec.light_units = v->AsString();
+            if (const Value* v = sv.Find("ground")) rec.ground = v->AsBool();
+            scene.SourcesMut().push_back(std::move(rec));
+        }
     }
 
     // -- scripts (/script nodes) --------------------------------------------
@@ -2051,8 +2143,10 @@ SceneIR ApplyImports(SceneIR scene, const Value& imports,
             throw std::runtime_error("nks import: unsupported extension: " + ext);
         }
 
+        // A packed image's .nka already resolved when the addon loaded.
         const auto resolve_path = [&](const std::string& path) {
-            return path.empty() ? path : (src.parent_path() / path).lexically_normal().string();
+            if (path.empty() || NamesTextureChunk(path)) return path;
+            return (src.parent_path() / path).lexically_normal().string();
         };
         for (uint32_t i = 0u; i < addon.MaterialCount(); ++i) {
             auto& material = addon.GetMaterialMut(i);

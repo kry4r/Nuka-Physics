@@ -229,6 +229,10 @@ SceneIR Compose(const SceneIR& base, const SceneIR& addon,
         if (!rec.parent_path.empty() && rec.parent_path.back() == '/') rec.parent_path.pop_back();
         out.AddScript(std::move(rec));
     }
+    for (SourceRecord source : addon.Sources()) {
+        if (!source.node.empty()) source.node = PrefixName(addon_name_prefix, source.node);
+        out.SourcesMut().push_back(std::move(source));
+    }
     if (addon.Environment().Authored()) {
         out.EnvironmentMut() = addon.Environment();
         if (out.Environment().shadow.enabled)

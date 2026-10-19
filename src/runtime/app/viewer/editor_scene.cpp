@@ -2,6 +2,7 @@
 
 #include "render/render_world.hpp"
 #include "runtime/app/viewer/editor_profile.hpp"
+#include "scene/asset/asset_bytes.hpp"
 #include "scene/format/nks.hpp"
 
 #include <chrono>
@@ -82,8 +83,9 @@ void AnchorMaps(scene::SceneIR& scene, const std::string& scene_path) {
 
 void RelativeMaps(scene::SceneIR& scene, const std::string& scene_path) {
     const std::filesystem::path dir = Utf8Path(NormalPath(scene_path)).parent_path();
+    // A packed image stays absolute: the save copies it into the scene's own .nka.
     RewriteMaps(scene, [&](const std::string& map) {
-        if (map.empty() || Utf8Path(map).is_relative()) return map;
+        if (map.empty() || Utf8Path(map).is_relative() || scene::NamesTextureChunk(map)) return map;
         const std::u8string relative = Utf8Path(map).lexically_relative(dir).generic_u8string();
         return relative.empty() ? map : std::string(relative.begin(), relative.end());
     });

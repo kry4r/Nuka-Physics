@@ -41,6 +41,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -312,6 +313,10 @@ struct RenderWorld {
     // materials + procedural sky (byte-identical to a scene authored without them).
     TextureLibrary                     textures;
     rt::EnvironmentMap                 environment;
+
+    // The scene's ground: its highest static upward plane collider with no size or look of its own, which a
+    // viewport draws endless at this height rather than as an instance. Empty when the scene has none.
+    std::optional<float>               ground_height;
 
     // The default render material applied when an instance references no material
     // (render_material_id == kNoId). Lives at the end of `materials` after build.

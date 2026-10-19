@@ -247,7 +247,21 @@ std::string RenameNode(EditorScene& es, const std::string& path,
         es.scene.GetMediaMut(i).name = new_leaf;
         return PathOfEntity(es.scene, es.scene.EntityOfMedia(i));
     }
-    return "";  // pure group / not record-backed
+    // A pure group renames the prefix of every body name under it, unless the new path is taken.
+    const size_t slash = path.rfind('/');
+    const std::string renamed = (slash == std::string::npos ? std::string() : path.substr(0, slash + 1)) + new_leaf;
+    const auto under = [](const std::string& name, const std::string& group) {
+        return name == group || name.rfind(group + "/", 0) == 0;
+    };
+    for (const scene::RigidBodyRecord& r : es.scene.Bodies())
+        if (under(r.name, renamed)) return "";
+    bool any = false;
+    for (scene::BodyId i = 0; i < es.scene.RigidBodyCount(); ++i) {
+        if (!under(es.scene.GetBody(i).name, path)) continue;
+        es.scene.GetBodyMut(i).name = renamed + es.scene.GetBody(i).name.substr(path.size());
+        any = true;
+    }
+    return any ? renamed : "";
 }
 
 namespace {
@@ -368,8 +382,19 @@ std::string DeleteSubtree(EditorScene& es, const std::string& path) {
     // A body subtree deletes through the ONE general SceneIR remover: joints /
     // actuators / sensors / pairs / touched ICs go with it, everything else persists.
     const scene::BodyId root = BodyOfEntity(es.scene, node->entity);
-    if (root == scene::kInvalidBody) return "";
-    return es.scene.RemoveBodySubtree(root) ? parent_path : "";
+    if (root != scene::kInvalidBody) return es.scene.RemoveBodySubtree(root) ? parent_path : "";
+    // A group deletes each body subtree its path prefixes; a removal re-densifies the ids, so each scan restarts.
+    const std::string prefix = path + "/";
+    bool removed = false;
+    for (bool more = true; more; removed = removed || more) {
+        more = false;
+        for (scene::BodyId b = 0; b < es.scene.RigidBodyCount() && !more; ++b) {
+            const scene::RigidBodyRecord& r = es.scene.GetBody(b);
+            if (r.parent_id == scene::kInvalidBody && r.name.rfind(prefix, 0) == 0)
+                more = es.scene.RemoveBodySubtree(b);
+        }
+    }
+    return removed ? parent_path : "";
 }
 
 std::string ReparentNode(EditorScene& es, const std::string& path,

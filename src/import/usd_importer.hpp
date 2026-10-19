@@ -27,9 +27,17 @@ struct UsdImportResult {
     bool HasErrors() const;
 };
 
+// How authored UsdLux intensities read: Isaac Lab units (its 3000 sun is Nuka's 3), the schema's nits,
+// or the number as written. Unauthored ones read as nits; a sun's authored angle counts only under Nits.
+enum class UsdLightUnits { Isaac, Nits, Raw };
+
+struct UsdImportOptions {
+    UsdLightUnits light_units = UsdLightUnits::Isaac;
+};
+
 // Reads a USD stage with the UsdPhysics semantics: world-placed bodies, joint frames, drives, mass,
 // metersPerUnit, kilogramsPerUnit and upAxis. Throws only when OpenUSD cannot open the file.
-UsdImportResult ImportUsd(const std::string& path);
+UsdImportResult ImportUsd(const std::string& path, const UsdImportOptions& options = {});
 
 // Loads a USD scene into the canonical SceneIR. OpenUSD opens and composes the file (references,
 // payloads, variants, instancing), so every format it reads imports the same way. Throws on the

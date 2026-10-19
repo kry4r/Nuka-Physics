@@ -84,6 +84,7 @@ add_library(nuka_scene STATIC
     # addressed cook cache) + json (self-written minimal). nks.cpp lives in
     # nuka_import (it calls the importers/Compose) to avoid a dep cycle.
     scene/asset/nka.cpp
+    scene/asset/asset_bytes.cpp
     scene/asset/asset_cache.cpp
     scene/format/json.cpp
 )

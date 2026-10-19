@@ -10,9 +10,10 @@
 #include "scene/terrain/image_grayscale.hpp"
 
 #include <cctype>
-#include <cstdio>
 #include <string>
 #include <vector>
+
+#include "scene/asset/asset_bytes.hpp"
 
 namespace nuka::terrain {
 namespace {
@@ -25,30 +26,12 @@ std::string LowerExt(const std::string& path) {
     return ext;
 }
 
-// Read the whole file into bytes. Returns false (err set) on open/read failure.
+// Read the image's bytes (a file, or a packed .nka chunk). Returns false (err set) when there are none.
 bool ReadAllBytes(const std::string& path, std::vector<unsigned char>& bytes,
                   std::string& err) {
-    std::FILE* f = std::fopen(path.c_str(), "rb");
-    if (f == nullptr) {
-        err = "cannot open image file: " + path;
-        return false;
-    }
-    std::fseek(f, 0, SEEK_END);
-    const long size = std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
-    if (size <= 0) {
-        std::fclose(f);
-        err = "empty image file: " + path;
-        return false;
-    }
-    bytes.resize(static_cast<size_t>(size));
-    const size_t got = std::fread(bytes.data(), 1u, bytes.size(), f);
-    std::fclose(f);
-    if (got != bytes.size()) {
-        err = "short read on image file: " + path;
-        return false;
-    }
-    return true;
+    bytes = scene::ReadAssetBytes(path);
+    if (bytes.empty()) err = "cannot read image file: " + path;
+    return !bytes.empty();
 }
 
 // Advance pos past whitespace and '#'-to-end-of-line comments (Netpbm rule).
@@ -169,7 +152,8 @@ bool LoadGrayscaleRaw16(const std::string& path, uint32_t width, uint32_t height
 bool LoadGrayscaleImage(const std::string& path, GrayscaleImage& out,
                         std::string& err) {
     const std::string ext = LowerExt(path);
-    if (ext == ".pgm") {
+    // A packed height map (an .nka TEXB chunk) has no extension of its own; PGM is the format it carries.
+    if (ext == ".pgm" || scene::NamesTextureChunk(path)) {
         return LoadGrayscalePgm(path, out, err);
     }
     if (ext == ".png") {

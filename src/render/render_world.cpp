@@ -30,6 +30,7 @@
 #include "scene/graph/scene_graph.hpp"
 #include "scene/scene_map.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <memory>
@@ -524,6 +525,19 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
     using CK = scene::CollisionShapeComponent::Kind;
     registry.ForEach<scene::CollisionShapeComponent>(
         [&](scene::EntityId e, const scene::CollisionShapeComponent& cs) {
+            // A static upward plane with no size or look of its own is the scene's ground, which viewports draw
+            // endless; a finite patch of it would z-fight that ground.
+            if (cs.kind == CK::Plane) {
+                const std::shared_ptr<scene::SceneNode> node = registry.NodeOf(e);
+                const math::Transform pose = NodeWorldTransform(registry, node);
+                const bool plain = cs.params[0] <= 0.0f || cs.params[1] <= 0.0f ||
+                                   resolve_material(cs.render_material_id) == world.default_material_id;
+                if (plain && pose.rotation.Rotate({0.0f, 0.0f, 1.0f}).z > 0.9999f &&
+                    ResolvePoseSource(registry, map, node).source.kind == PoseSource::Kind::Static) {
+                    world.ground_height = std::max(world.ground_height.value_or(pose.position.z), pose.position.z);
+                    return;
+                }
+            }
             // The shape's own body already shows a visual: its proxy would be a
             // redundant coplanar occluder (z-fight with the authored appearance).
             if (const scene::SceneNode* b = nearest_body_node(e)) {

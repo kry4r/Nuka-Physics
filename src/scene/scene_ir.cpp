@@ -44,8 +44,9 @@ SceneIR::SceneIR(const SceneIR& other)
       initial_state_(other.initial_state_),
       settle_(other.settle_),
       terrain_(other.terrain_),
-      environment_(other.environment_) {
-    // initial_state_ / settle_ / terrain_ / environment_ are authored metadata,
+      environment_(other.environment_),
+      sources_(other.sources_) {
+    // initial_state_ / settle_ / terrain_ / environment_ / sources_ are authored metadata,
     // NOT projected from records, so they must be copied explicitly (RebuildFacade
     // only rebuilds the tree/ECS from records and would otherwise drop them).
     RebuildFacade();
@@ -71,6 +72,7 @@ SceneIR& SceneIR::operator=(const SceneIR& other) {
     settle_        = other.settle_;
     terrain_       = other.terrain_;
     environment_   = other.environment_;
+    sources_       = other.sources_;
     RebuildFacade();
     return *this;
 }
@@ -521,6 +523,22 @@ bool SceneIR::RemoveShape(ShapeId id) {
         kept.push_back(p);
     }
     contact_pairs_ = std::move(kept);
+    RebuildFacade();
+    return true;
+}
+
+bool SceneIR::RemoveCamera(CameraId id) {
+    if (id >= cameras_.size()) return false;
+    cameras_.erase(cameras_.begin() + static_cast<std::ptrdiff_t>(id));
+    for (size_t i = 0; i < cameras_.size(); ++i) cameras_[i].id = static_cast<CameraId>(i);
+    RebuildFacade();
+    return true;
+}
+
+bool SceneIR::RemoveLight(LightId id) {
+    if (id >= lights_.size()) return false;
+    lights_.erase(lights_.begin() + static_cast<std::ptrdiff_t>(id));
+    for (size_t i = 0; i < lights_.size(); ++i) lights_[i].id = static_cast<LightId>(i);
     RebuildFacade();
     return true;
 }

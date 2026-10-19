@@ -13,12 +13,11 @@
 #define STBI_ONLY_HDR
 #include "stb/stb_image.h"
 
-#include <algorithm>
-#include <cctype>
 #include <cmath>
 #include <cstdint>
-#include <fstream>
 #include <vector>
+
+#include "scene/asset/asset_bytes.hpp"
 
 namespace nuka::render {
 
@@ -27,37 +26,8 @@ namespace {
 // stb writes RGBE .hdr paths as linear floats; LDR bytes come back in [0,255].
 constexpr float kInv255 = 1.0f / 255.0f;
 
-// A path ending in "#offset+length" names image bytes inside a container file (a .glb, a .usdz).
-bool SplitRange(const std::string& path, std::string& file, std::size_t& offset, std::size_t& length) {
-    const std::size_t hash = path.rfind('#');
-    const std::size_t plus = path.rfind('+');
-    if (hash == std::string::npos || plus == std::string::npos || plus < hash + 2 || plus + 1 == path.size())
-        return false;
-    const auto digits = [&](std::size_t b, std::size_t e) {
-        return std::all_of(path.begin() + b, path.begin() + e, [](unsigned char c) { return std::isdigit(c); });
-    };
-    if (!digits(hash + 1, plus) || !digits(plus + 1, path.size())) return false;
-    file = path.substr(0, hash);
-    offset = std::stoull(path.substr(hash + 1, plus - hash - 1));
-    length = std::stoull(path.substr(plus + 1));
-    return true;
-}
-
-// The bytes `path` names: the whole file, or its "#offset+length" range; empty when they cannot be read.
-std::vector<unsigned char> ReadBytes(const std::string& path) {
-    std::string file = path;
-    std::size_t offset = 0, length = 0;
-    const bool range = SplitRange(path, file, offset, length);
-    std::ifstream in(file, std::ios::binary | std::ios::ate);
-    if (!range) length = static_cast<std::size_t>(std::max<std::streamoff>(in.tellg(), 0));
-    std::vector<unsigned char> bytes(length);
-    in.seekg(static_cast<std::streamoff>(offset));
-    if (!in.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(length))) bytes.clear();
-    return bytes;
-}
-
 unsigned char* DecodeImage(const std::string& path, int& w, int& h, int& comp) {
-    const std::vector<unsigned char> bytes = ReadBytes(path);
+    const std::vector<uint8_t> bytes = scene::ReadAssetBytes(path);
     return stbi_load_from_memory(bytes.data(), static_cast<int>(bytes.size()), &w, &h, &comp, 0);
 }
 
@@ -90,7 +60,7 @@ rt::EnvironmentMap LoadEnvironment(const std::string& path, float yaw, float int
     env.yaw = yaw;
     env.intensity = intensity;
     int w = 0, h = 0, comp = 0;
-    const std::vector<unsigned char> bytes = ReadBytes(path);
+    const std::vector<uint8_t> bytes = scene::ReadAssetBytes(path);
     const int size = static_cast<int>(bytes.size());
     if (stbi_is_hdr_from_memory(bytes.data(), size)) {
         float* data = stbi_loadf_from_memory(bytes.data(), size, &w, &h, &comp, 3);

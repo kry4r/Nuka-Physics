@@ -357,11 +357,14 @@ struct PrimData {
     double cube_size = 1.0;
     double radius = 0.5;
     double height = 1.0;
+    double plane_width = 2.0;            // Plane width and length, along its local x and y
+    double plane_length = 2.0;
     std::string geometry_axis_token = "Z";
     math::Vec3 color = {1.0f, 1.0f, 1.0f};
     float intensity = 1.0f;
     bool intensity_authored = false;     // false: the UsdLux schema's fallback intensity
     float exposure = 0.0f;               // UsdLux inputs:exposure (stops)
+    float light_angle = 0.53f;           // DistantLight inputs:angle (degrees)
     float focal_length = 50.0f;
     bool has_focal_length = false;        // UsdGeomCamera focalLength authored?
     // UsdGeomCamera verticalAperture (mm); USD default 15.2908 == 0.602362"*25.4.
@@ -424,6 +427,8 @@ PrimData ReadPrim(const pxr::UsdPrim& prim, pxr::UsdGeomXformCache& xforms, cons
     ReadValue(prim, "size", d.cube_size);
     ReadValue(prim, "radius", d.radius);
     ReadValue(prim, "height", d.height);
+    ReadValue(prim, "width", d.plane_width);
+    ReadValue(prim, "length", d.plane_length);
     pxr::TfToken axis;
     if (ReadValue(prim, "axis", axis) && !axis.IsEmpty()) {
         d.geometry_axis_token = axis.GetString();
@@ -438,6 +443,7 @@ PrimData ReadPrim(const pxr::UsdPrim& prim, pxr::UsdGeomXformCache& xforms, cons
     if (!Read(prim, "inputs:exposure", d.exposure)) {
         Read(prim, "exposure", d.exposure);
     }
+    ReadValue(prim, "inputs:angle", d.light_angle);
     d.has_focal_length = Read(prim, "focalLength", d.focal_length);
     Read(prim, "verticalAperture", d.vertical_aperture);
     Read(prim, "clippingRange:min", d.near_clip);
@@ -910,19 +916,24 @@ scene::DecomposeMode DecomposeModeFromToken(const std::string& token) {
 // UsdGeomCamera -- USD has no implied FOV without focal length + aperture.
 constexpr float kDefaultCameraVFovDegrees = 45.0f;
 
-// Authored UsdLux intensity (times 2^exposure) per Nuka radiance unit: an Isaac Lab sun of 3000 is a
-// Nuka sun of 3.
+// Authored UsdLux intensity (times 2^exposure) per Nuka radiance unit in Isaac Lab units: an Isaac Lab
+// sun of 3000 is a Nuka sun of 3.
 constexpr float kUsdLuxToNuka = 1.0f / 1000.0f;
 
-// The schema's fallback DistantLight, 50000 nits over a 0.53 degree disc, lights a facing surface with
-// pi * sin^2(0.265 deg) * 50000 = 3.36 at EV0; other fallbacks are nits, which Nuka takes as they are.
-constexpr float kFallbackSunToNuka = 6.7204e-5f;
+constexpr double kSchemaSunAngle = 0.53;  // degrees
 
-// A light's Nuka intensity: authored values in Isaac Lab units, fallbacks per the UsdLux spec at EV0.
-float LightIntensity(const PrimData& prim) {
-    const float scale = prim.intensity_authored ? kUsdLuxToNuka
-                                                : prim.type == "DistantLight" ? kFallbackSunToNuka : 1.0f;
-    return prim.intensity * std::exp2(prim.exposure) * scale;
+// A light's Nuka intensity at EV0: a sun's nits light a facing surface pi * sin^2(angle / 2) times over, its
+// authored angle only under Nits, else 0.53 degrees (50000 gives 3.36); other lights' nits are Nuka units.
+float LightIntensity(const PrimData& prim, UsdLightUnits units) {
+    const float value = prim.intensity * std::exp2(prim.exposure);
+    if (prim.intensity_authored && units != UsdLightUnits::Nits) {
+        return units == UsdLightUnits::Isaac ? value * kUsdLuxToNuka : value;
+    }
+    if (prim.type != "DistantLight") {
+        return value;
+    }
+    const double half = 0.5 * (units == UsdLightUnits::Nits ? prim.light_angle : kSchemaSunAngle) * kDegToRad;
+    return F(value * kPi * std::sin(half) * std::sin(half));
 }
 
 // Vertical FOV (degrees) from a UsdGeomCamera, per the physCamera convention:
@@ -982,9 +993,9 @@ struct Joint {
 
 class SceneBuilder {
 public:
-    SceneBuilder(pxr::UsdStageRefPtr stage, const StageUnits& units, std::vector<PrimData> prims,
-                 std::vector<UsdDiagnostic>& out)
-        : stage_(std::move(stage)), units_(units), prims_(std::move(prims)), out_(out) {}
+    SceneBuilder(pxr::UsdStageRefPtr stage, const StageUnits& units, const UsdImportOptions& options,
+                 std::vector<PrimData> prims, std::vector<UsdDiagnostic>& out)
+        : stage_(std::move(stage)), units_(units), options_(options), prims_(std::move(prims)), out_(out) {}
 
     scene::SceneIR Build();
 
@@ -1045,6 +1056,7 @@ private:
 
     pxr::UsdStageRefPtr stage_;
     StageUnits units_;
+    UsdImportOptions options_;
     std::vector<PrimData> prims_;
     std::vector<UsdDiagnostic>& out_;
     std::unordered_map<std::string, size_t> prim_at_;
@@ -1511,7 +1523,7 @@ void SceneBuilder::ReadOmniPbr(const pxr::UsdShadeShader& surface, const std::st
     scalar("metallic", record.metallic, "metallic_texture", 2u, record.metallic_map, record.metallic_channel);
     record.normal_map = map("normalmap_texture");
 
-    // Emission is in Kit units, like the lights.
+    // Emission reads in the lights' units.
     bool emission = false;
     read("enable_emission", emission);
     if (emission) {
@@ -1520,7 +1532,7 @@ void SceneBuilder::ReadOmniPbr(const pxr::UsdShadeShader& surface, const std::st
         read("emissive_color", color);
         read("emissive_intensity", intensity);
         record.emissive_map = map("emissive_color_texture");
-        const float scale = intensity * kUsdLuxToNuka;
+        const float scale = intensity * (options_.light_units == UsdLightUnits::Isaac ? kUsdLuxToNuka : 1.0f);
         record.emissive = record.emissive_map.empty() ? color * scale : math::Vec3{scale, scale, scale};
     }
     bool opacity = false, opacity_texture = false;
@@ -1789,13 +1801,20 @@ bool SceneBuilder::SizePrimitive(const PrimData& prim, const Placement& placemen
         }
         const int along = Lowercase(prim.geometry_axis_token) == "x" ? 0
                         : Lowercase(prim.geometry_axis_token) == "y" ? 1 : 2;
-        const double across0 = scale[(along + 1) % 3], across1 = scale[(along + 2) % 3];
-        if (shape.type != scene::ShapeType::Plane && !uniform(across0, across1)) {
-            Warn("USD_SCALE_NONUNIFORM", prim, "a " + prim.type + " scaled unevenly across its axis "
-                 "keeps its largest radius");
+        if (shape.type == scene::ShapeType::Plane) {
+            // USD runs width along X unless the axis is X, and length along Y unless the axis is Y.
+            const int width_axis = along == 0 ? 2 : 0, length_axis = along == 1 ? 2 : 1;
+            shape.half_extents = {F(prim.plane_width * 0.5 * scale[width_axis]),
+                                  F(prim.plane_length * 0.5 * scale[length_axis]), 0.0f};
+        } else {
+            const double across0 = scale[(along + 1) % 3], across1 = scale[(along + 2) % 3];
+            if (!uniform(across0, across1)) {
+                Warn("USD_SCALE_NONUNIFORM", prim, "a " + prim.type + " scaled unevenly across its axis "
+                     "keeps its largest radius");
+            }
+            shape.radius = F(prim.radius * std::max(across0, across1));
+            shape.half_height = F(prim.height * 0.5 * scale[along]);
         }
-        shape.radius = F(prim.radius * std::max(across0, across1));
-        shape.half_height = F(prim.height * 0.5 * scale[along]);
         shape.local_transform.rotation = (shape.local_transform.rotation * alignment).Normalized();
     }
     return true;
@@ -2373,7 +2392,7 @@ void SceneBuilder::AddDome(const PrimData& prim, scene::SceneIR& scene) {
     }
     dome_ = true;
     scene::EnvironmentRecord& env = scene.EnvironmentMut();
-    env.intensity = LightIntensity(prim);
+    env.intensity = LightIntensity(prim, options_.light_units);
     pxr::SdfAssetPath file;
     if (!ReadValue(prim.prim, "inputs:texture:file", file) || file.GetAssetPath().empty()) {
         return;
@@ -2471,7 +2490,7 @@ scene::SceneIR SceneBuilder::Build() {
             light.type = LightTypeFromUsdType(prim.type);
             light.local_transform = ToTransform(Place(prim.world).pose);
             light.color = prim.color;
-            light.intensity = LightIntensity(prim);
+            light.intensity = LightIntensity(prim, options_.light_units);
             scene.AddLight(std::move(light));
         } else if (IsJointPrim(prim)) {
             for (const Joint& joint : joints_) {
@@ -2553,7 +2572,7 @@ bool UsdImportResult::HasErrors() const {
     });
 }
 
-UsdImportResult ImportUsd(const std::string& path) {
+UsdImportResult ImportUsd(const std::string& path, const UsdImportOptions& options) {
     const pxr::UsdStageRefPtr stage = OpenUsdStage(path);
     const StageUnits units = UnitsOf(stage);
     pxr::UsdGeomXformCache xforms(kTime);
@@ -2562,7 +2581,7 @@ UsdImportResult ImportUsd(const std::string& path) {
         prims.push_back(ReadPrim(prim, xforms, units));
     }
     UsdImportResult result;
-    scene::SceneIR scene = SceneBuilder(stage, units, std::move(prims), result.diagnostics).Build();
+    scene::SceneIR scene = SceneBuilder(stage, units, options, std::move(prims), result.diagnostics).Build();
     // A USD scene must yield rigid bodies (a physics scene) or at least one shape (an environment or
     // a geometry-only asset).
     if (scene.RigidBodyCount() == 0u && scene.ShapeCount() == 0u) {

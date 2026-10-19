@@ -25,10 +25,24 @@ constexpr uint32_t kNoParam = ~0u;
 
 bool IsStructural(const std::string& field) {
     return field == "spawn" || field == "delete" || field == "reparent" || field == "script" || field == "import" ||
-           field == "collision" || field == "static" || field == "pin" || field == "drive" ||
+           field == "reimport" || field == "collision" || field == "static" || field == "pin" || field == "drive" ||
            field == "initial_position" || field == "attach" || field == "sensor" || field == "material_new" ||
            field == "material_rename" || field == "material_delete" || field == "material_assign" ||
            field == "material_unique" || field == "material_friction";
+}
+
+// Moves the import sources recorded at node `from` or under it to `to`; an empty `to` drops them.
+void MoveSources(scene::SceneIR& scene, const std::string& from, const std::string& to) {
+    std::vector<scene::SourceRecord>& sources = scene.SourcesMut();
+    for (auto it = sources.begin(); it != sources.end();) {
+        const bool under = !from.empty() && (it->node == from || it->node.rfind(from + "/", 0) == 0);
+        if (under && to.empty()) {
+            it = sources.erase(it);
+            continue;
+        }
+        if (under) it->node = to + it->node.substr(from.size());
+        ++it;
+    }
 }
 
 json::Value Floats(const float* v, size_t n) {
@@ -445,6 +459,7 @@ bool EditorDocument::ApplyOp(const EditOp& op, EditOp* done, EditOp* inverse, Op
             *error = "cannot rename '" + op.target + "'";
             return false;
         }
+        MoveSources(es_->scene, op.target, out->focus);
         done->before = json::Value::Str(Leaf(op.target));
         inverse->target = out->focus;
     } else if (op.field == "spawn") {
@@ -470,8 +485,38 @@ bool EditorDocument::ApplyOp(const EditOp& op, EditOp* done, EditOp* inverse, Op
         math::Transform placement;
         if (const json::Value* pose = op.after.Find("pose")) placement = TransformFromJson(*pose);
         const json::Value* ground = op.after.Find("ground");
-        out->focus = ComposeAsset(es_->scene, *a.scene, a.kind, op.after.At("name").AsString(), placement,
-                                  ground == nullptr || ground->AsBool());
+        const bool rest = ground == nullptr || ground->AsBool();
+        out->focus = ComposeAsset(es_->scene, *a.scene, a.kind, op.after.At("name").AsString(), placement, rest,
+                                  SourceOf(a, rest));
+        out->rebuild = true;
+    } else if (op.field == "reimport") {
+        // The node's source imports again where the node's root stands; edits made inside the node are lost.
+        const std::vector<scene::SourceRecord>& sources = es_->scene.Sources();
+        const auto found = std::find_if(sources.begin(), sources.end(),
+                                        [&](const scene::SourceRecord& s) { return s.node == op.target; });
+        if (op.target.empty() || found == sources.end()) {
+            *error = "'" + op.target + "' was not imported from a file";
+            return false;
+        }
+        const scene::SourceRecord source = *found;
+        const ImportAnalysis a = AnalyzeImport(source.file, OptionsOf(source));
+        if (!Importable(a)) {
+            *error = ImportError(a);
+            return false;
+        }
+        // Cameras and lights the import set apart from its bodies stayed in the scene on their own; they don't
+        // come in twice.
+        scene::SceneIR addon = *a.scene;
+        for (size_t i = addon.CameraCount(); i-- > 0;)
+            if (addon.GetCamera(static_cast<scene::CameraId>(i)).attached_body == scene::kInvalidBody)
+                addon.RemoveCamera(static_cast<scene::CameraId>(i));
+        for (size_t i = addon.LightCount(); i-- > 0;)
+            if (addon.GetLight(static_cast<scene::LightId>(i)).attached_body == scene::kInvalidBody)
+                addon.RemoveLight(static_cast<scene::LightId>(i));
+        const math::Transform placement = ReimportPlacement(es_->scene, addon, source);
+        DeleteSubtree(*es_, op.target);
+        MoveSources(es_->scene, op.target, "");
+        out->focus = ComposeAsset(es_->scene, addon, a.kind, Leaf(op.target), placement, false, source);
         out->rebuild = true;
     } else if (op.field == "collision") {
         std::vector<std::string> paths;
@@ -708,6 +753,7 @@ bool EditorDocument::ApplyOp(const EditOp& op, EditOp* done, EditOp* inverse, Op
             *error = "nothing to delete at '" + op.target + "'";
             return false;
         }
+        MoveSources(es_->scene, op.target, "");
         out->rebuild = out->rebuild || body_deleted;
     } else if (op.field == "reparent") {
         out->focus = ReparentNode(*es_, op.target, op.after.AsString());
@@ -715,6 +761,7 @@ bool EditorDocument::ApplyOp(const EditOp& op, EditOp* done, EditOp* inverse, Op
             *error = "cannot move '" + op.target + "' under '" + op.after.AsString() + "'";
             return false;
         }
+        MoveSources(es_->scene, op.target, out->focus);
         out->rebuild = true;
     } else if (op.field == "script") {
         scene::ScriptId id = scene::kInvalidScript;

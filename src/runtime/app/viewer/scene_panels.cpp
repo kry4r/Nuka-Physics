@@ -9,12 +9,15 @@
 #include "render/imgui/nuka_imgui.hpp"
 #include "render/imgui/nuka_theme.hpp"
 #include "runtime/app/viewer/camera_controller.hpp"
+#include "runtime/app/viewer/editor_profile.hpp"
 #include "runtime/app/viewer/shell_util.hpp"
+#include "scene/scene_ir.hpp"
 
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
 #include <cstdlib>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <string>
@@ -351,6 +354,7 @@ void ImGuiLayer::DrawImportWizard() {
     const std::string kind = a.At("kind").AsString();
     const std::string profile = a.At("profile").AsString();
     const bool fix_base = a.At("fix_base").AsBool();
+    const std::string light_units = a.At("light_units").AsString();
     const bool ok = a.At("ok").AsBool();
     const json::Value& stats = a.At("stats");
     const json::Value& diagnostics = a.At("diagnostics");
@@ -373,9 +377,10 @@ void ImGuiLayer::DrawImportWizard() {
         }
     };
     // Analyzing again under other options keeps the wizard's name and choices.
-    const auto analyze = [&](const std::string& next, bool fix) {
+    const auto analyze = [&](const std::string& next, bool fix, const std::string& units) {
         json::Value args = Args({{"path", json::Value::Str(w.path)}, {"profile", json::Value::Str(next)},
-                                 {"fix_base", json::Value::Bool(fix)}, {"package_paths", packages()}});
+                                 {"fix_base", json::Value::Bool(fix)}, {"package_paths", packages()},
+                                 {"light_units", json::Value::Str(units)}});
         if (!w.pose.IsNull()) args.Set("pose", w.pose);
         Queue("file.import", std::move(args));
     };
@@ -474,7 +479,7 @@ void ImGuiLayer::DrawImportWizard() {
     if (!ok && kind == "urdf" && profile == "strict") {
         ImGui::TextColored(theme::kFgMuted, "%s", Tr("The legacy profile accepts the forms older exporters write."));
         ImGui::SameLine();
-        if (ImGui::SmallButton(Tr("Retry with Legacy"))) analyze("legacy", fix_base);
+        if (ImGui::SmallButton(Tr("Retry with Legacy"))) analyze("legacy", fix_base, light_units);
     }
     ImGui::Dummy(ImVec2(0.0f, 6.0f * s));
 
@@ -488,20 +493,30 @@ void ImGuiLayer::DrawImportWizard() {
             nui::Segmented profiles({"Strict", "Legacy"}, nui::Ref(&choice));
             profiles.id = "profile";
             profiles.tips = {"Reject deprecated and ambiguous forms", "Accept the forms older exporters write"};
-            profiles.on_change = [&](int v) { analyze(v == 1 ? "legacy" : "strict", fix_base); };
+            profiles.on_change = [&](int v) { analyze(v == 1 ? "legacy" : "strict", fix_base, light_units); };
             profiles.Draw();
             OptionLabel("Base");
             bool fixed = fix_base;
-            if (ImGui::Checkbox(Tr("Fix to the world"), &fixed)) analyze(profile, fixed);
+            if (ImGui::Checkbox(Tr("Fix to the world"), &fixed)) analyze(profile, fixed, light_units);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", Tr("Links no joint carries become static"));
             OptionLabel("Packages");
             ImGui::SetNextItemWidth(-FLT_MIN);
             if (ImGui::InputTextWithHint("##packages", Tr("name=folder; search folder"), w.packages, sizeof(w.packages),
                                          ImGuiInputTextFlags_EnterReturnsTrue) ||
                 ImGui::IsItemDeactivatedAfterEdit())
-                analyze(profile, fix_base);
+                analyze(profile, fix_base, light_units);
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s", Tr("Where package:// mesh paths look; Enter checks again"));
+        }
+        if (kind == "usd") {
+            OptionLabel("Lights");
+            int choice = light_units == "nits" ? 1 : light_units == "raw" ? 2 : 0;
+            nui::Segmented units({"Isaac", "Nits", "Raw"}, nui::Ref(&choice));
+            units.id = "light_units";
+            units.tips = {"Authored intensities are Isaac units: its 3000 sun is 3",
+                          "Authored intensities are the schema's nits", "Authored intensities are read as written"};
+            units.on_change = [&](int v) { analyze(profile, fix_base, v == 1 ? "nits" : v == 2 ? "raw" : "isaac"); };
+            units.Draw();
         }
         OptionLabel("Destination");
         nui::Segmented destinations({"Add to Scene", "Open as New Scene"}, nui::Ref(&dest));
@@ -514,14 +529,15 @@ void ImGuiLayer::DrawImportWizard() {
             OptionLabel("Name");
             ImGui::SetNextItemWidth(-FLT_MIN);
             ImGui::InputText("##name", w.name, sizeof(w.name));
-            OptionLabel("Placement");
-            ImGui::Checkbox(Tr("Rest on the ground"), &w.ground);
-            if (!w.pose.IsNull()) {
-                ImGui::SameLine();
-                const json::Value& pos = w.pose.At("pos");
-                ImGui::TextColored(theme::kFgDim, "%s",
-                                   Fmt(Tr("at X %.2f  Y %.2f"), pos.Elements()[0].AsDouble(), pos.Elements()[1].AsDouble()).c_str());
-            }
+        }
+        OptionLabel("Placement");
+        ImGui::Checkbox(Tr("Rest on the ground"), &w.ground);
+        if (dest == 0 && !w.pose.IsNull()) {
+            ImGui::SameLine();
+            const json::Value& pos = w.pose.At("pos");
+            const std::string where = Fmt(Tr("at X %.2f  Y %.2f"), pos.Elements()[0].AsDouble(),
+                                          pos.Elements()[1].AsDouble());
+            ImGui::TextColored(theme::kFgDim, "%s", where.c_str());
         }
         ImGui::EndTable();
     }
@@ -541,11 +557,135 @@ void ImGuiLayer::DrawImportWizard() {
                                  {"profile", json::Value::Str(profile)},
                                  {"fix_base", json::Value::Bool(fix_base)},
                                  {"package_paths", packages()},
+                                 {"light_units", json::Value::Str(light_units)},
                                  {"name", json::Value::Str(w.name)},
                                  {"ground", json::Value::Bool(w.ground)}});
         if (add && !w.pose.IsNull()) args.Set("pose", w.pose);
         Queue("file.import", std::move(args));
         w.path.clear();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
+// ---- import sources -----------------------------------------------------------------------
+
+const nuka::scene::SourceRecord* ImGuiLayer::SelectedSource() const {
+    if (frame_.scene == nullptr) return nullptr;
+    std::string path;
+    if (frame_.ui->selected_entity != nuka::scene::kInvalidEntity) {
+        const auto node = frame_.scene->Ecs().NodeOf(frame_.ui->selected_entity);
+        if (!node) return nullptr;
+        path = frame_.scene->Tree().PathOf(node);
+    }
+    for (const nuka::scene::SourceRecord& source : frame_.scene->Sources())
+        if (source.node == path) return &source;
+    return nullptr;
+}
+
+void ImGuiLayer::DrawSourceSection() {
+    const nuka::scene::SourceRecord* source = SelectedSource();
+    if (source == nullptr) return;
+    const float s = nui::Scale();
+    const bool exists = std::filesystem::exists(Utf8Path(source->file));
+    std::string options;
+    const auto add = [&](const std::string& part) { options += (options.empty() ? "" : "  \xC2\xB7  ") + part; };
+    if (source->kind == "urdf") {
+        add(Tr(source->profile == "legacy" ? "Legacy" : "Strict"));
+        if (source->fix_base) add(Tr("Fixed base"));
+        if (!source->package_paths.empty()) add(Fmt(Tr("%zu package paths"), source->package_paths.size()));
+    }
+    if (source->kind == "usd") {
+        const char* units = source->light_units == "nits" ? "Nits" : source->light_units == "raw" ? "Raw" : "Isaac";
+        add(Fmt(Tr("Lights: %s"), Tr(units)));
+    }
+    if (source->ground) add(Tr("Rests on the ground"));
+
+    if (ImGui::BeginTable("##source", 2, ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed, 70.0f * s);
+        ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
+        OptionLabel("File");
+        nui::PushTextStyle(TextStyle::Mono);
+        const std::string shown = Elide(GetNukaFont(FontRole::Mono), theme::kFontMono * s, source->file,
+                                        ImGui::GetContentRegionAvail().x, true);
+        ImGui::TextColored(exists ? theme::kFg : theme::kErr, "%s", shown.c_str());
+        nui::PopTextStyle();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip)) {
+            const std::string tip = exists ? source->file : Fmt(Tr("%s is missing"), source->file.c_str());
+            ImGui::SetTooltip("%s", tip.c_str());
+        }
+        OptionLabel("Format");
+        draw::Badge(Upper(Tr(KindOf(source->kind).label)).c_str(), Tone::Accent);
+        if (!options.empty()) {
+            OptionLabel("Options");
+            ImGui::TextWrapped("%s", options.c_str());
+        }
+        ImGui::EndTable();
+    }
+    ImGui::BeginDisabled(!exists);
+    if (ImGui::Button(Iconed(icon::kImport, Tr("Reimport")).c_str())) {
+        if (source->node.empty()) {
+            Queue("asset.reimport", Args({{"path", json::Value::Str("")}}));
+        } else {
+            reimport_ask_ = source->node;
+            reimport_open_ = true;
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(Iconed(icon::kOpen, Tr("Show in Folder")).c_str()))
+        Queue("asset.show_source", Args({{"path", json::Value::Str(source->node)}}));
+    ImGui::EndDisabled();
+}
+
+void ImGuiLayer::DrawReimportConfirm() {
+    const std::string title = std::string(Tr("Reimport")) + "###reimport";
+    if (reimport_open_) {
+        ImGui::OpenPopup(title.c_str());
+        reimport_open_ = false;
+    }
+    const float s = nui::Scale();
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(460.0f * s, 0.0f), ImVec2(460.0f * s, FLT_MAX));
+    if (!ImGui::BeginPopupModal(title.c_str(), nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize))
+        return;
+    const nuka::scene::SourceRecord* source = nullptr;
+    if (frame_.scene != nullptr)
+        for (const nuka::scene::SourceRecord& r : frame_.scene->Sources())
+            if (r.node == reimport_ask_) source = &r;
+    if (source == nullptr) {
+        reimport_ask_.clear();
+        ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        return;
+    }
+    ImDrawList* list = ImGui::GetWindowDrawList();
+    const ImVec2 at = ImGui::GetCursorScreenPos();
+    draw::Glyph(list, ImVec2(at.x + 14.0f * s, at.y + 14.0f * s), icon::kWarn, U32(theme::kWarn), true, 22.0f);
+    ImGui::SetCursorScreenPos(ImVec2(at.x + 38.0f * s, at.y));
+    ImGui::BeginGroup();
+    nui::PushTextStyle(TextStyle::Strong);
+    ImGui::TextWrapped("%s", Fmt(Tr("Import %s again from its file?"), reimport_ask_.c_str()).c_str());
+    nui::PopTextStyle();
+    ImGui::TextWrapped("%s", Tr("A fresh import replaces the group where its root stands now; edits made inside it "
+                                "are lost. Undo brings them back."));
+    nui::PushTextStyle(TextStyle::Mono);
+    ImGui::TextColored(theme::kFgDim, "%s",
+                       Elide(GetNukaFont(FontRole::Mono), theme::kFontMono * s, source->file,
+                             ImGui::GetContentRegionAvail().x, true).c_str());
+    nui::PopTextStyle();
+    ImGui::EndGroup();
+    ImGui::Dummy(ImVec2(0.0f, 10.0f * s));
+
+    const float bw = 120.0f * s, spacing = ImGui::GetStyle().ItemSpacing.x;
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - bw * 2.0f - spacing);
+    if (ImGui::Button(Tr("Cancel"), ImVec2(bw, 0.0f)) || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        reimport_ask_.clear();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    if (PrimaryButton(Tr("Reimport"), bw, true)) {
+        Queue("asset.reimport", Args({{"path", json::Value::Str(reimport_ask_)}}));
+        reimport_ask_.clear();
         ImGui::CloseCurrentPopup();
     }
     ImGui::EndPopup();

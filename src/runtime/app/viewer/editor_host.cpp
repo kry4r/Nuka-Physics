@@ -45,6 +45,7 @@
 #include "runtime/app/viewer/teleop.hpp"
 #include "runtime/app/viewer/train_observe.hpp"
 #include "runtime/inference/go2_policy_controller.hpp"
+#include "scene/asset/asset_bytes.hpp"
 #include "scene/format/json.hpp"
 #include "scene/format/nks.hpp"
 #include "scene/scene_ir.hpp"
@@ -1065,7 +1066,7 @@ struct EditorHost::State : DocumentHost {
     void LightView(render::RasterOptions& opts);
     // Whether the Lit view draws its ground grid; under GroundGrid::Auto, when no shown instance is a floor.
     bool GroundGridShown();
-    // The grid's height: the shown scene's bottom when that is below z = 0.
+    // The grid's height: the scene's ground plane, else the shown scene's bottom when that is below z = 0.
     float GroundGridHeight();
     // Rescans the shown instances for a floor and their bottom once the scene or its instances change.
     void RefreshFloor();
@@ -3020,6 +3021,7 @@ void EditorHost::State::RefreshFloor() {
     floor_instances_ = count;
     scene_bottom_ = 0.0f;
     scene_floor_ = ScanFloor(w, &scene_bottom_);
+    if (w.ground_height) scene_bottom_ = *w.ground_height;
 }
 
 void EditorHost::State::StepRt(const CameraController& camera) {
@@ -6704,6 +6706,31 @@ void EditorHost::State::RegisterFileActions() {
                                                 (doc_path_.empty() ? std::string("untitled.nks") : doc_path_).c_str());
                       return path.empty() ? ActionResult::Fail("no save path chosen") : SaveScene(path);
                   }});
+    // Saves a copy at `path` that carries every image the scene uses in its own .nka, so it opens with no other
+    // files; the document keeps its path. `missing` lists the images that could not be read.
+    actions_.Add({"file.package", "Package Scene...", "file", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      std::string path = StrArg(args, "path");
+                      if (path.empty())
+                          path = SaveFileDialog(nui::Tr("Package Scene"), nui::Tr("Nuka scenes"), "*.nks",
+                                                "packaged.nks");
+                      if (path.empty()) return ActionResult::Fail("no package path chosen");
+                      path = NormalPath(path);
+                      json::Value missing = json::Value::Array();
+                      int64_t packed = 0;
+                      for (const std::string& image : scene::nks::ExternalImages(loaded_->scene)) {
+                          if (scene::ReadAssetBytes(image).empty())
+                              missing.PushBack(json::Value::Str(image));
+                          else
+                              ++packed;
+                      }
+                      fs::create_directories(Utf8Path(path).parent_path());
+                      scene::nks::Save(loaded_->scene, path, {.pack_images = true});
+                      ui_.Nui().Toast(nui::Level::Ok, std::string(nui::Tr("Packaged")) + " " + FileName(path));
+                      return Ok(Object({{"path", json::Value::Str(path)},
+                                        {"packed", json::Value::Int(packed)},
+                                        {"missing", std::move(missing)}}));
+                  }});
 }
 
 void EditorHost::State::RegisterAppActions() {
@@ -7160,6 +7187,7 @@ void EditorHost::State::RegisterAssetActions() {
                           if (borrowed_) return Spawn({path});
                           json::Value resolved = Object({{"path", json::Value::Str(path)},
                                                          {"mode", json::Value::Str(mode)},
+                                                         {"ground", json::Value::Bool(BoolArg(args, "ground", true))},
                                                          {"discard",
                                                           json::Value::Bool(BoolArg(args, "discard", false))}});
                           SetImportOptions(resolved, options);
@@ -7170,7 +7198,11 @@ void EditorHost::State::RegisterAssetActions() {
                           const ImportAnalysis a = AnalyzeImport(path, options);
                           if (!Importable(a)) return ActionResult::Fail(ImportError(a));
                           const std::string file = cache_.File("import.nks");
-                          scene::nks::Save(*a.scene, file);
+                          scene::SceneIR scene = *a.scene;
+                          const bool rest = BoolArg(args, "ground", true);
+                          if (rest) RestOnGround(scene);
+                          scene.SourcesMut().push_back(SourceOf(a, rest));
+                          scene::nks::Save(scene, file);
                           return OpenDocument(file, std::string());
                       }
                       if (!loaded_) return ActionResult::Fail("no document is open to add to");
@@ -7183,6 +7215,59 @@ void EditorHost::State::RegisterAssetActions() {
                       if (r.ok) ui_state_.import.path.clear();
                       return r;
                   }});
+    // The import source recorded at node `path`, or null.
+    const auto source_at = [this](const std::string& path) -> const scene::SourceRecord* {
+        if (!loaded_) return nullptr;
+        for (const scene::SourceRecord& s : loaded_->scene.Sources())
+            if (s.node == path) return &s;
+        return nullptr;
+    };
+    actions_.Add({"asset.sources", "Import Sources", "assets", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value&) {
+                      json::Value list = json::Value::Array();
+                      if (loaded_)
+                          for (const scene::SourceRecord& s : loaded_->scene.Sources()) list.PushBack(SourceToJson(s));
+                      return Ok(std::move(list));
+                  },
+                  "", true});
+    // Imports the source of the node at `path` (the selection by default) again in its place, as one edit to
+    // undo; the node "" is an asset opened whole, which opens again as a new document.
+    actions_.Add({"asset.reimport", "Reimport", "assets", "", ShortcutScope::Global, {}, {},
+                  [this, source_at](const json::Value& args) {
+                      if (!loaded_) return ActionResult::Fail("no document is open");
+                      const std::string path = StrArg(args, "path", SelectedPath());
+                      const scene::SourceRecord* found = source_at(path);
+                      if (found == nullptr) return ActionResult::Fail("'" + path + "' was not imported from a file");
+                      if (path.empty()) {
+                          json::Value open = Object({{"path", json::Value::Str(found->file)},
+                                                     {"mode", json::Value::Str("open")},
+                                                     {"ground", json::Value::Bool(found->ground)},
+                                                     {"discard", json::Value::Bool(BoolArg(args, "discard", false))}});
+                          SetImportOptions(open, OptionsOf(*found));
+                          return RunAction("file.import", open, "reimport");
+                      }
+                      return SubmitTxn(
+                          EditTxn{"Reimport " + path, {EditOp{path, "reimport", json::Value(), json::Value()}}});
+                  },
+                  "", true});
+    // Shows the source file of the node at `path` (the selection by default) in the system's file browser.
+    actions_.Add({"asset.show_source", "Show Source in Folder", "assets", "", ShortcutScope::Global, {}, {},
+                  [this, source_at](const json::Value& args) {
+                      if (!loaded_) return ActionResult::Fail("no document is open");
+                      const std::string path = StrArg(args, "path", SelectedPath());
+                      const scene::SourceRecord* found = source_at(path);
+                      if (found == nullptr) return ActionResult::Fail("'" + path + "' was not imported from a file");
+#ifdef _WIN32
+                      const std::string shown = PathText(Utf8Path(found->file).make_preferred());
+                      const std::vector<std::string> argv{"explorer", "/select," + shown};
+#else
+                      const std::vector<std::string> argv{"xdg-open", PathText(Utf8Path(found->file).parent_path())};
+#endif
+                      std::string error;
+                      if (SpawnDetached(argv, &error) == 0u) return ActionResult::Fail(error);
+                      return Ok(Object({{"file", json::Value::Str(found->file)}}));
+                  },
+                  "", true});
     actions_.Add({"assets.add_folder", "Add Asset Folder...", "assets", "", ShortcutScope::Global, {}, {},
                   [this](const json::Value& args) {
                       std::string folder = StrArg(args, "path");

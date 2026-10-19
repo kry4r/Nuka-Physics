@@ -182,6 +182,13 @@ std::string UniqueRootName(const scene::SceneIR& doc, std::string base) {
     return name;
 }
 
+// A scene that brings its own floor, a plane or a terrain.
+bool Floored(const scene::SceneIR& scene) {
+    return !scene.Terrain().empty() || std::any_of(scene.Shapes().begin(), scene.Shapes().end(), [](const auto& s) {
+        return s.type == scene::ShapeType::Plane;
+    });
+}
+
 }  // namespace
 
 math::Transform BodyWorld(const scene::SceneIR& s, scene::BodyId b) {
@@ -230,6 +237,7 @@ ImportOptions ImportOptionsOf(const json::Value& fields, const std::string& fall
     if (const json::Value* fix = fields.Find("fix_base")) o.fix_base = fix->AsBool();
     if (const json::Value* paths = fields.Find("package_paths"))
         for (const json::Value& p : paths->Elements()) o.package_paths.push_back(p.AsString());
+    if (const json::Value* units = fields.Find("light_units")) o.light_units = units->AsString();
     return o;
 }
 
@@ -239,6 +247,7 @@ void SetImportOptions(json::Value& fields, const ImportOptions& options) {
     json::Value paths = json::Value::Array();
     for (const std::string& p : options.package_paths) paths.PushBack(json::Value::Str(p));
     fields.Set("package_paths", std::move(paths));
+    fields.Set("light_units", json::Value::Str(options.light_units));
 }
 
 // Importers throw on files they cannot read; the failure becomes the analysis's one error.
@@ -269,7 +278,12 @@ ImportAnalysis AnalyzeImport(const std::string& path, const ImportOptions& optio
             }
             case AssetKind::Mjcf: a.scene = import::LoadMjcf(path); break;
             case AssetKind::Usd: {
-                import::UsdImportResult r = import::ImportUsd(path);
+                a.light_units = options.light_units == "nits" || options.light_units == "raw" ? options.light_units
+                                                                                               : "isaac";
+                const import::UsdLightUnits units = a.light_units == "nits"  ? import::UsdLightUnits::Nits
+                                                    : a.light_units == "raw" ? import::UsdLightUnits::Raw
+                                                                             : import::UsdLightUnits::Isaac;
+                import::UsdImportResult r = import::ImportUsd(path, import::UsdImportOptions{units});
                 for (const import::UsdDiagnostic& d : r.diagnostics) {
                     const bool error = d.severity == import::UsdDiagnosticSeverity::Error;
                     a.diagnostics.push_back(
@@ -337,7 +351,7 @@ json::Value AnalysisToJson(const ImportAnalysis& a) {
     json::Value v = json::Value::Object();
     v.Set("path", json::Value::Str(a.path));
     v.Set("kind", json::Value::Str(AssetKindName(a.kind)));
-    SetImportOptions(v, ImportOptions{a.profile, a.fix_base, a.package_paths});
+    SetImportOptions(v, ImportOptions{a.profile, a.fix_base, a.package_paths, a.light_units});
     v.Set("ok", json::Value::Bool(Importable(a)));
     v.Set("loaded", json::Value::Bool(a.scene.has_value()));
     v.Set("name", json::Value::Str(Stem(a.path)));
@@ -419,14 +433,19 @@ bool SceneBounds(const scene::SceneIR& scene, math::Vec3* lo, math::Vec3* hi) {
     return BoundsUnder(scene, math::Transform::Identity(), lo, hi);
 }
 
-std::string ComposeAsset(scene::SceneIR& doc, const scene::SceneIR& addon, AssetKind kind, const std::string& name,
-                         math::Transform placement, bool ground) {
+void RestOnGround(scene::SceneIR& scene) {
     math::Vec3 lo, hi;
-    // An asset that brings its own floor plane keeps its authored heights.
-    const bool floored = std::any_of(addon.Shapes().begin(), addon.Shapes().end(), [](const auto& s) {
-        return s.type == scene::ShapeType::Plane;
-    });
-    if (ground && !floored && BoundsUnder(addon, placement, &lo, &hi))
+    if (Floored(scene) || !SceneBounds(scene, &lo, &hi) || lo.z == 0.0f) return;
+    math::Transform lift = math::Transform::Identity();
+    lift.position.z = -lo.z;
+    scene = scene::Compose(scene::SceneIR(), scene, lift);
+}
+
+std::string ComposeAsset(scene::SceneIR& doc, const scene::SceneIR& addon, AssetKind kind, const std::string& name,
+                         math::Transform placement, bool ground, std::optional<scene::SourceRecord> source) {
+    math::Vec3 lo, hi;
+    // An asset that brings its own floor keeps its authored heights.
+    if (ground && !Floored(addon) && BoundsUnder(addon, placement, &lo, &hi))
         placement.position.z += placement.position.z - lo.z;
     const std::string leaf = UniqueRootName(doc, name);
     const size_t first = doc.RigidBodyCount();
@@ -438,7 +457,62 @@ std::string ComposeAsset(scene::SceneIR& doc, const scene::SceneIR& addon, Asset
         scene::RigidBodyRecord& rec = doc.GetBodyMut(b);
         rec.name = kind == AssetKind::Mesh ? leaf : leaf + "/" + rec.name;
     }
+    if (source) {
+        source->node = leaf;
+        doc.SourcesMut().push_back(std::move(*source));
+    }
     return leaf;
+}
+
+scene::SourceRecord SourceOf(const ImportAnalysis& analysis, bool ground) {
+    scene::SourceRecord s;
+    s.file = PathText(std::filesystem::absolute(Utf8Path(analysis.path)).lexically_normal());
+    s.kind = AssetKindName(analysis.kind);
+    s.profile = analysis.profile;
+    s.fix_base = analysis.fix_base;
+    s.package_paths = analysis.package_paths;
+    s.light_units = analysis.light_units;
+    s.ground = ground;
+    return s;
+}
+
+ImportOptions OptionsOf(const scene::SourceRecord& source) {
+    ImportOptions o;
+    if (!source.profile.empty()) o.profile = source.profile;
+    o.fix_base = source.fix_base;
+    o.package_paths = source.package_paths;
+    if (!source.light_units.empty()) o.light_units = source.light_units;
+    return o;
+}
+
+json::Value SourceToJson(const scene::SourceRecord& source) {
+    json::Value v = json::Value::Object();
+    v.Set("node", json::Value::Str(source.node));
+    v.Set("file", json::Value::Str(source.file));
+    v.Set("kind", json::Value::Str(source.kind));
+    SetImportOptions(v, OptionsOf(source));
+    v.Set("ground", json::Value::Bool(source.ground));
+    v.Set("exists", json::Value::Bool(std::filesystem::exists(Utf8Path(source.file))));
+    return v;
+}
+
+math::Transform ReimportPlacement(const scene::SceneIR& doc, const scene::SceneIR& addon,
+                                  const scene::SourceRecord& source) {
+    // The node's first root body, and the addon root of the same name under the group (or its first root).
+    const std::string group = source.node + "/";
+    for (const scene::RigidBodyRecord& was : doc.Bodies()) {
+        if (was.parent_id != scene::kInvalidBody) continue;
+        if (was.name != source.node && was.name.rfind(group, 0) != 0) continue;
+        const std::string leaf = was.name == source.node ? std::string() : was.name.substr(group.size());
+        const scene::RigidBodyRecord* now = nullptr;
+        for (const scene::RigidBodyRecord& b : addon.Bodies()) {
+            if (b.parent_id != scene::kInvalidBody) continue;
+            if (now == nullptr || b.name == leaf) now = &b;
+            if (b.name == leaf) break;
+        }
+        if (now != nullptr) return was.local_transform * now->local_transform.Inverse();
+    }
+    return math::Transform::Identity();
 }
 
 }  // namespace nuka::runtime::app::viewer

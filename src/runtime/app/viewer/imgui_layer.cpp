@@ -152,7 +152,8 @@ const std::vector<MenuSpec>& Menus() {
             {"File",
              {"file"},
              {"file.new", "file.open", "file.open_recent", "file.open_window", "-", "file.import",
-              "dataset.exporter", "-", "file.save", "file.save_as", "file.revert", "-", "file.close", "app.exit"}},
+              "dataset.exporter", "-", "file.save", "file.save_as", "file.package", "file.revert", "-", "file.close",
+              "app.exit"}},
             {"Edit", {"edit"}, {"edit.undo", "edit.redo", "-", "edit.delete", "-", "scene.set_visible", "scene.set_locked"}},
             {"Create",
              {"scene"},
@@ -594,7 +595,8 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
         {"file.new", icon::kNew},           {"file.open", icon::kOpen},               {"file.save", icon::kSave},
         {"file.open_window", icon::kNewWindow}, {"file.revert", icon::kReset},        {"file.close", icon::kClose},
         {"app.exit", icon::kExit},
-        {"file.save_as", icon::kSaveAs},    {"edit.undo", icon::kUndo},               {"edit.redo", icon::kRedo},
+        {"file.save_as", icon::kSaveAs},    {"file.package", icon::kPackage},
+        {"edit.undo", icon::kUndo},         {"edit.redo", icon::kRedo},
         {"edit.delete", icon::kTrash},      {"script.run", icon::kRun},               {"script.clear_console", icon::kClear},
         {"script.attach", icon::kScriptNode}, {"script.load", icon::kFile},           {"sim.toggle_play", icon::kPlay},
         {"sim.step", icon::kStep},          {"sim.reset", icon::kReset},              {"view.frame_all", icon::kFrame},
@@ -945,6 +947,20 @@ void ImGuiLayer::BuildStage(nui::VStack& root) {
                 Queue("scene.select", Args({{"path", json::Value::Str(path)}}));
             Queue("scene.collision_dialog");
         }
+        const std::vector<nuka::scene::SourceRecord>& sources = frame_.scene->Sources();
+        const auto imported = [&](const nuka::scene::SourceRecord& s) { return s.node == path; };
+        if (std::any_of(sources.begin(), sources.end(), imported)) {
+            if (ImGui::MenuItemEx(Tr("Reimport..."), icon::kImport)) {
+                if (path.empty()) {
+                    Queue("asset.reimport", Args({{"path", json::Value::Str(path)}}));
+                } else {
+                    reimport_ask_ = path;
+                    reimport_open_ = true;
+                }
+            }
+            if (ImGui::MenuItemEx(Tr("Show Source in Folder"), icon::kOpen))
+                Queue("asset.show_source", Args({{"path", json::Value::Str(path)}}));
+        }
         if (ImGui::MenuItemEx(Tr("Import Asset..."), icon::kImport)) Queue("file.import");
         if (ImGui::MenuItemEx(Tr("Delete subtree"), icon::kTrash, "Delete"))
             Queue("edit.delete", Args({{"path", json::Value::Str(path)}}));
@@ -974,6 +990,11 @@ void ImGuiLayer::BuildProperties(nui::VStack& root) {
     mobility.visible_if = editable;
     auto& semantic = root.Add<nui::Custom>([this] { DrawSemanticField(); });
     semantic.visible_if = selected;
+
+    // Where the selected group, or the document while nothing is selected, was imported from.
+    auto& source = Fold(root.Add<nui::Collapsible>("Source", true, icon::kImport), "source");
+    source.visible_if = [this] { return SelectedSource() != nullptr; };
+    source.Add<nui::Custom>([this] { DrawSourceSection(); });
 
     auto& sensor = Fold(root.Add<nui::Collapsible>("Sensor", true, icon::kCamera), "sensor");
     sensor.visible_if = [this] { return frame_.ui->sensors.selected >= 0; };
@@ -1645,6 +1666,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
     DrawPalette();
     DrawAbout();
     DrawImportWizard();
+    DrawReimportConfirm();
     DrawCollisionDialog();
     DrawGainTuner();
     DrawDatasetExporter();

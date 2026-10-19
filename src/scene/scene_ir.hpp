@@ -276,6 +276,19 @@ struct EnvironmentRecord {
     }
 };
 
+// Where part of a scene was imported from, so it can be imported again: `node` is the group the import
+// made ("" for an asset opened whole), with the options the importer took. Authored metadata: never cooked.
+struct SourceRecord {
+    std::string node;
+    std::string file;                      // a relative path resolves against the .nks dir
+    std::string kind;                      // "urdf", "mjcf", "usd" or "mesh"
+    std::string profile;
+    bool fix_base                          = false;
+    std::vector<std::string> package_paths;
+    std::string light_units;
+    bool ground                            = true;
+};
+
 struct CameraRecord {
     std::string name;
     CameraId id                            = 0;
@@ -601,6 +614,9 @@ public:
     // Remove one collision shape; later shapes re-densify and <pair> overrides naming it
     // drop. False when `id` is invalid.
     bool RemoveShape(ShapeId id);
+    // Remove one camera or light; later ones re-densify. False when `id` is invalid.
+    bool RemoveCamera(CameraId id);
+    bool RemoveLight(LightId id);
     // Add a shape after its body's last one, the id a reload gives it; later shapes and
     // the <pair> overrides naming them shift up by one.
     ShapeId InsertCollisionShape(CollisionShapeRecord record);
@@ -678,6 +694,8 @@ public:
     cook::SettleSpec&            SettleMut() { return settle_; }
     const EnvironmentRecord&     Environment() const { return environment_; }
     EnvironmentRecord&           EnvironmentMut() { return environment_; }
+    const std::vector<SourceRecord>& Sources() const { return sources_; }
+    std::vector<SourceRecord>&       SourcesMut() { return sources_; }
 
     // -- facade: structural world (M2b) -------------------------------------
     // The scene TREE and the ECS Registry built by the Add* write-through. The
@@ -736,6 +754,7 @@ private:
     cook::SettleSpec   settle_;
     std::vector<TerrainRecord> terrain_;
     EnvironmentRecord  environment_;
+    std::vector<SourceRecord> sources_;
 
     // -- facade state -------------------------------------------------------
     SceneGraph tree_;

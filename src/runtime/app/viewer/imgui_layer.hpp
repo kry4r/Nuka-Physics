@@ -36,6 +36,7 @@
 namespace nuka::scene {
 class SceneIR;
 class Registry;
+struct SourceRecord;
 }
 
 namespace nuka::runtime::app::viewer {
@@ -540,6 +541,12 @@ private:
     void DrawAbout();
     void DrawStartPage();
     void DrawPrompt();
+    // The import source of the selected node, or of the document while nothing is selected; null without one.
+    const nuka::scene::SourceRecord* SelectedSource() const;
+    // Properties' Source section: the file, its format and options, Reimport and Show in Folder.
+    void DrawSourceSection();
+    // Asks before a reimport replaces the node `reimport_ask_` and the edits made inside it.
+    void DrawReimportConfirm();
     void DrawImportWizard();
     void DrawCollisionDialog();
     // The floating Gain Tuner while it is open.
@@ -685,6 +692,8 @@ private:
     std::string library_delete_;      // a material in use whose deletion asks what replaces it
     std::string library_replace_;     // what its users take, "" for the default material
     bool library_delete_open_ = false;
+    std::string reimport_ask_;  // the node a reimport waits to replace
+    bool reimport_open_ = false;
     float tuner_gains_[3] = {};      // the tuner's kp, damping and force limit fields
     int tuner_active_ = -1;          // the field being dragged, which keeps its own value
     // A dope sheet drag: the clip as it was at the press, the keys it moves and the press point.

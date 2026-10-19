@@ -29,13 +29,23 @@
 #include "scene/scene_ir.hpp"
 
 #include <string>
+#include <vector>
 
 namespace nuka::scene::nks {
+
+// An image a scene names as a TEXB chunk of an .nka is always copied into the saved scene's own .nka.
+struct SaveOptions {
+    // Also copy in the images it names as files: material maps, the environment HDRI, terrain height maps.
+    bool pack_images = false;
+};
 
 // Save `scene` to `<nks_path>` (+ a sibling `<base>.nka` next to it). The .nka
 // path stored inside the JSON is the sibling file's basename. Throws on I/O or
 // structural errors.
-void Save(const SceneIR& scene, const std::string& nks_path);
+void Save(const SceneIR& scene, const std::string& nks_path, const SaveOptions& options = {});
+
+// The images `scene` names as files rather than .nka chunks, each once, in the order Save meets them.
+std::vector<std::string> ExternalImages(const SceneIR& scene);
 
 // Load a scene from `<nks_path>` (reads the sibling .nka named inside). The
 // reconstructed SceneIR's records (and thus its facade tree/ECS) are identical
