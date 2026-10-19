@@ -154,7 +154,7 @@ class NukaGymEnv:
         if obs_builder_factory is not None:
             self._obs = obs_builder_factory(self._device, self._world)
         else:
-            self._obs = G.Go2ObsBuilder(self._device, self._world)
+            self._obs = G.Go2ObsBuilder(self._device, self._world, scene=scene)
         self._obs.apply_pd_gains()
 
         # gym spaces.

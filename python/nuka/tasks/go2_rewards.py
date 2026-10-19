@@ -256,7 +256,7 @@ class Go2Reward:
     """
 
     def __init__(self, num_envs: int, device, *, dtype=torch.float32,
-                 gait_mode: str = "walk"):
+                 gait_mode: str = "walk", reward_scales: "dict | None" = None):
         self.num_envs = int(num_envs)
         self.device = device
         self.dtype = dtype
@@ -270,7 +270,7 @@ class Go2Reward:
                 f"expected one of {sorted(GAIT_SCALE_OVERRIDES)}"
             )
         self.gait_mode = str(gait_mode)
-        self.scales = {**SCALES, **GAIT_SCALE_OVERRIDES[gait_mode]}
+        self.scales = {**SCALES, **GAIT_SCALE_OVERRIDES[gait_mode], **(reward_scales or {})}
         # Per-gait feet_air_time bias (replaces the module FEET_AIR_TIME_BIAS const
         # in _feet_air_time). walk == 0.5 (the legged_gym value) -> byte-identical.
         self.air_time_bias = GAIT_AIR_TIME_BIAS[gait_mode]

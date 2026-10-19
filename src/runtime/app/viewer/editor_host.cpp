@@ -31,6 +31,7 @@
 #include "runtime/app/viewer/editor_randomize.hpp"
 #include "runtime/app/viewer/editor_scene.hpp"
 #include "runtime/app/viewer/editor_sensors.hpp"
+#include "runtime/app/viewer/editor_training.hpp"
 #include "runtime/app/viewer/entity_drag.hpp"
 #include "runtime/app/viewer/file_dialog.hpp"
 #include "runtime/app/viewer/imgui_layer.hpp"
@@ -987,6 +988,21 @@ struct EditorHost::State : DocumentHost {
     void RegisterSensorActions();
     void RegisterRandomizeActions();
     void RegisterDatasetActions();
+    void RegisterTrainActions();
+    // Runs nuka.train.exchange on `request`; returns why it failed, empty when `*response` is set.
+    std::string TrainExchange(const json::Value& request, json::Value* response);
+    // The probe of the interpreter runs start in, from the profile's train.python; cached until it changes.
+    std::string Trainer(json::Value* out);
+    // The scene's robot counts, as a task checks them.
+    json::Value TrainLayout() const;
+    // The document's training task and configuration against its scene, with `edits` ({path: value})
+    // applied after `task`'s defaults (the stored task when empty); `store` keeps the result.
+    ActionResult TrainConfig(const json::Value& edits, const std::string& task, bool store);
+    // The document's folders of training configuration and runs in the profile.
+    fs::path TrainConfigFile() const;
+    fs::path TrainRunsDir() const;
+    // The run `name` names, else the one started last, else the newest; empty when there is none.
+    fs::path TrainRunDir(const json::Value& args) const;
     // Drops sensor `index` in one undo step and clears its selection.
     ActionResult RemoveSensor(int index);
     void RegisterTeleopActions();
@@ -1257,6 +1273,13 @@ struct EditorHost::State : DocumentHost {
     std::vector<Clip> clips_saved_;  // the clips at the newest undo point
     std::vector<std::vector<Clip>> clip_undo_, clip_redo_;
     uint64_t clip_merge_until_ = 0u;  // merging commits before this frame fold into the newest point
+    std::optional<json::Value> trainer_;  // the training interpreter's probe
+    // The training run this session started; its process id stands in until the run reports.
+    struct TrainRun {
+        fs::path dir;
+        uint32_t pid = 0u;
+    };
+    std::optional<TrainRun> train_run_;
     std::unique_ptr<EditorScene> loaded_;
     bool attach_pending_ = false;
     EntityDrag entity_drag_;
@@ -4101,6 +4124,7 @@ void EditorHost::State::RegisterActions() {
     RegisterSensorActions();
     RegisterRandomizeActions();
     RegisterDatasetActions();
+    RegisterTrainActions();
     RegisterScriptActions();
     ui_.RegisterActions(actions_);
 }
@@ -5158,6 +5182,266 @@ void EditorHost::State::RegisterDatasetActions() {
                       DatasetView& v = ui_state_.dataset;
                       v.open = BoolArg(args, "on", !v.open);
                       return Ok(Object({{"on", json::Value::Bool(v.open)}}));
+                  }});
+}
+
+std::string EditorHost::State::TrainExchange(const json::Value& request, json::Value* response) {
+    if (!script_host_.Valid()) return "training needs the editor's Python";
+    const std::string req = cache_.File("train_request.json"), resp = cache_.File("train_response.json");
+    std::ofstream(Utf8Path(req), std::ios::binary | std::ios::trunc) << request.Dump(0);
+    const auto literal = [](const std::string& s) { return json::Value::Str(s).Dump(0); };
+    const std::string why = RunPython("import nuka.train.exchange\nnuka.train.exchange.call(" + literal(req) + ", " +
+                                          literal(resp) + ")\n",
+                                      "<train>");
+    if (!why.empty()) return why;
+    *response = ReadJsonFile(Utf8Path(resp));
+    if (const json::Value* failed = response->Find("failed")) return failed->AsString();
+    return std::string();
+}
+
+std::string EditorHost::State::Trainer(json::Value* out) {
+    if (!trainer_) {
+        json::Value probe;
+        const json::Value request = Object({{"op", json::Value::Str("trainer")},
+                                            {"python", json::Value::Str(profile_->Setting("train", "python", ""))}});
+        if (const std::string why = TrainExchange(request, &probe); !why.empty()) return why;
+        trainer_ = std::move(probe);
+    }
+    *out = *trainer_;
+    return std::string();
+}
+
+json::Value EditorHost::State::TrainLayout() const {
+    const WorldLayout& l = loaded_->Layout();
+    return Object({{"articulations", json::Value::Int(l.articulations_per_env)},
+                   {"links", json::Value::Int(l.links_per_env)},
+                   {"joints", json::Value::Int(static_cast<int64_t>(l.links_per_env) - l.articulations_per_env)}});
+}
+
+fs::path EditorHost::State::TrainConfigFile() const {
+    const std::string key = doc_path_.empty() ? std::string("untitled") : Hex(Fnv1a(doc_path_));
+    return profile_->Dir() / "train" / (key + ".json");
+}
+
+fs::path EditorHost::State::TrainRunsDir() const {
+    const std::string key = doc_path_.empty() ? std::string("untitled") : Hex(Fnv1a(doc_path_));
+    return profile_->Dir() / "runs" / key;
+}
+
+fs::path EditorHost::State::TrainRunDir(const json::Value& args) const {
+    const std::string name = StrArg(args, "name");
+    if (!name.empty()) {
+        const fs::path dir = TrainRunsDir() / Utf8Path(name);
+        return fs::is_regular_file(dir / "job.json") ? dir : fs::path();
+    }
+    if (train_run_) return train_run_->dir;
+    const std::vector<fs::path> runs = RunFolders(TrainRunsDir());
+    return runs.empty() ? fs::path() : runs.back();
+}
+
+ActionResult EditorHost::State::TrainConfig(const json::Value& edits, const std::string& task, bool store) {
+    const fs::path file = TrainConfigFile();
+    const json::Value stored = ReadJsonFile(file);
+    const bool same = stored.IsObject() && (task.empty() || task == stored.At("task").AsString());
+    const json::Value request = Object({{"op", json::Value::Str("resolve")},
+                                        {"task", same ? stored.At("task") : json::Value::Str(task)},
+                                        {"config", same ? stored.At("config") : json::Value::Object()},
+                                        {"set", edits},
+                                        {"layout", TrainLayout()}});
+    json::Value out;
+    if (const std::string why = TrainExchange(request, &out); !why.empty()) return ActionResult::Fail(why);
+    if (!store) return Ok(std::move(out));
+    for (const json::Value& e : out.At("errors").Elements())
+        if (e.Find("rejected") != nullptr && edits.Find(e.At("path").AsString()) != nullptr)
+            return ActionResult::Fail(e.At("path").AsString() + ": " + e.At("message").AsString());
+    fs::create_directories(file.parent_path());
+    std::ofstream(file, std::ios::binary | std::ios::trunc)
+        << Object({{"task", out.At("task")}, {"config", out.At("changed")}}).Dump(2);
+    return Ok(std::move(out));
+}
+
+void EditorHost::State::RegisterTrainActions() {
+    const auto has_scene = [this] { return loaded_ != nullptr; };
+    // A run's status; this session's run lends its process id until the run reports its own.
+    const auto status_of = [this](const fs::path& dir) {
+        return RunStatus(dir, train_run_ && train_run_->dir == dir ? train_run_->pid : 0u);
+    };
+    const auto no_run = [](const json::Value& args) {
+        const std::string name = StrArg(args, "name");
+        return ActionResult::Fail(name.empty() ? "no training run" : "no run named '" + name + "'");
+    };
+    // The tasks: each one's groups of parameters, the robot its scene holds and the step it trains at.
+    actions_.Add({"train.tasks", "Training Tasks", "train", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value&) {
+                      json::Value out;
+                      const json::Value request = Object({{"op", json::Value::Str("tasks")}});
+                      if (const std::string why = TrainExchange(request, &out); !why.empty())
+                          return ActionResult::Fail(why);
+                      return Ok(out.At("tasks"));
+                  },
+                  "", true});
+    // The document's task and full configuration, the values that differ from the defaults (`changed`)
+    // and what keeps them from training the scene (`errors`); `task` switches to that task's defaults.
+    actions_.Add({"train.config", "Training Configuration", "train", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      const std::string task = StrArg(args, "task");
+                      return TrainConfig(json::Value::Object(), task, !task.empty());
+                  },
+                  "", true});
+    // Sets `values` ({"group.key": value}), or `path` to `value`, after switching to `task` if given; a
+    // value that does not fit fails the call and changes nothing.
+    actions_.Add({"train.set", "Set Training Parameter", "train", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      json::Value edits = json::Value::Object();
+                      if (const json::Value* values = args.Find("values")) edits = *values;
+                      if (args.Find("path") != nullptr) edits.Set(StrArg(args, "path"), args.At("value"));
+                      if (edits.Items().empty() && StrArg(args, "task").empty())
+                          return ActionResult::Fail("give `values`, or `path` and `value`");
+                      return TrainConfig(edits, StrArg(args, "task"), true);
+                  },
+                  "", true});
+    actions_.Add({"train.validate", "Validate Training", "train", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value&) {
+                      ActionResult r = TrainConfig(json::Value::Object(), std::string(), false);
+                      if (!r.ok) return r;
+                      const json::Value& errors = r.value.At("errors");
+                      return Ok(Object({{"ok", json::Value::Bool(errors.Elements().empty())}, {"errors", errors}}));
+                  },
+                  "", true});
+    // The Python runs start in and whether it can train; `path` sets it, "" returns to the editor's own.
+    actions_.Add({"train.python", "Training Python", "train", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value& args) {
+                      if (args.Find("path") != nullptr) profile_->SetSetting("train", "python", StrArg(args, "path"));
+                      trainer_.reset();
+                      json::Value out;
+                      if (const std::string why = Trainer(&out); !why.empty()) return ActionResult::Fail(why);
+                      return Ok(std::move(out));
+                  },
+                  "", true});
+    // Trains the scene as it stands, with the document's configuration, in another process as run `name`
+    // (the time by default), from the rl_games `checkpoint` if given.
+    actions_.Add({"train.start", "Start Training", "train", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      if (train_run_ && ProcessAlive(train_run_->pid))
+                          return ActionResult::Fail("run '" + PathText(train_run_->dir.filename()) +
+                                                    "' is training; stop it first");
+                      ActionResult config = TrainConfig(json::Value::Object(), std::string(), false);
+                      if (!config.ok) return config;
+                      std::string problems;
+                      for (const json::Value& e : config.value.At("errors").Elements())
+                          problems += (problems.empty() ? "" : "; ") + e.At("path").AsString() + ": " +
+                                      e.At("message").AsString();
+                      if (!problems.empty()) return ActionResult::Fail(problems);
+                      json::Value trainer, tasks;
+                      if (const std::string why = Trainer(&trainer); !why.empty()) return ActionResult::Fail(why);
+                      if (!trainer.At("ready").AsBool()) return ActionResult::Fail(trainer.At("error").AsString());
+                      const json::Value request = Object({{"op", json::Value::Str("tasks")}});
+                      if (const std::string why = TrainExchange(request, &tasks); !why.empty())
+                          return ActionResult::Fail(why);
+                      const std::string task = config.value.At("task").AsString();
+                      json::Value schema;
+                      for (const json::Value& t : tasks.At("tasks").Elements())
+                          if (t.At("name").AsString() == task) schema = t;
+                      const std::string name = StrArg(args, "name", RunName());
+                      if (name.empty() || name == "." || name == ".." ||
+                          name.find_first_of("/\\:*?\"<>|") != std::string::npos)
+                          return ActionResult::Fail("a run name is a plain folder name, without / \\ : * ? \" < > |");
+                      const std::string checkpoint = StrArg(args, "checkpoint");
+                      if (!checkpoint.empty() && !fs::is_regular_file(Utf8Path(checkpoint)))
+                          return ActionResult::Fail("no checkpoint " + checkpoint);
+                      const fs::path dir = TrainRunsDir() / Utf8Path(name);
+                      if (fs::exists(dir)) return ActionResult::Fail("a run named '" + name + "' exists");
+                      fs::create_directories(dir);
+                      const std::string scene = PathText(dir / "scene.nks"), job = PathText(dir / "job.json");
+                      scene::nks::Save(loaded_->scene, scene);
+                      json::Value spec = Object({{"task", json::Value::Str(task)}, {"module", schema.At("module")},
+                                                 {"root", schema.At("root")}, {"config", config.value.At("config")},
+                                                 {"scene", json::Value::Str(scene)}, {"name", json::Value::Str(name)}});
+                      if (!checkpoint.empty())
+                          spec.Set("checkpoint", json::Value::Str(PathText(fs::absolute(Utf8Path(checkpoint)))));
+                      std::ofstream(Utf8Path(job), std::ios::binary | std::ios::trunc) << spec.Dump(2);
+                      std::vector<std::string> argv;
+                      for (const json::Value& a : trainer.At("argv").Elements()) argv.push_back(a.AsString());
+                      argv.push_back(job);
+                      std::string error;
+                      const uint64_t pid = SpawnDetached(argv, &error);
+                      if (pid == 0u) return ActionResult::Fail(error);
+                      train_run_ = TrainRun{dir, static_cast<uint32_t>(pid)};
+                      return Ok(RunStatus(dir, train_run_->pid));
+                  }});
+    // Ends run `name` (else the one started last) after its current epoch, with a final checkpoint.
+    actions_.Add({"train.stop", "Stop Training", "train", "", ShortcutScope::Global, {}, {},
+                  [this, status_of, no_run](const json::Value& args) {
+                      const fs::path dir = TrainRunDir(args);
+                      if (dir.empty()) return no_run(args);
+                      const json::Value status = status_of(dir);
+                      if (!status.At("alive").AsBool())
+                          return ActionResult::Fail("run '" + PathText(dir.filename()) + "' is not training");
+                      std::ofstream(dir / "stop", std::ios::binary | std::ios::trunc);
+                      return Ok(status);
+                  }});
+    // A run's state, epoch, rewards and checkpoint count, and the last `log` lines (20) of its output.
+    actions_.Add({"train.status", "Training Status", "train", "", ShortcutScope::Global, {}, {},
+                  [this, status_of, no_run](const json::Value& args) {
+                      const fs::path dir = TrainRunDir(args);
+                      if (dir.empty()) return no_run(args);
+                      json::Value status = status_of(dir);
+                      const size_t lines = static_cast<size_t>(NumArg(args, "log", 20.0));
+                      status.Set("log", json::Value::Str(TailText(dir / "log.txt", lines)));
+                      return Ok(std::move(status));
+                  },
+                  "", true});
+    // The document's runs, newest first.
+    actions_.Add({"train.runs", "Training Runs", "train", "", ShortcutScope::Global, {}, {},
+                  [this, status_of](const json::Value&) {
+                      const std::vector<fs::path> runs = RunFolders(TrainRunsDir());
+                      json::Value list = json::Value::Array();
+                      for (auto run = runs.rbegin(); run != runs.rend(); ++run) list.PushBack(status_of(*run));
+                      return Ok(std::move(list));
+                  },
+                  "", true});
+    // A run's epoch rows after the first `since`; `next` is the `since` of the following call.
+    actions_.Add({"train.metrics", "Training Metrics", "train", "", ShortcutScope::Global, {}, {},
+                  [this, no_run](const json::Value& args) {
+                      const fs::path dir = TrainRunDir(args);
+                      if (dir.empty()) return no_run(args);
+                      const size_t since = static_cast<size_t>(NumArg(args, "since", 0.0));
+                      json::Value rows = ReadJsonLines(dir / "metrics.jsonl", since);
+                      const size_t next = since + rows.Elements().size();
+                      return Ok(Object({{"name", json::Value::Str(PathText(dir.filename()))},
+                                        {"rows", std::move(rows)},
+                                        {"next", json::Value::Int(static_cast<int64_t>(next))}}));
+                  },
+                  "", true});
+    // A run's saves in order: each rl_games checkpoint, its NKML policy, kind, epoch and reward.
+    actions_.Add({"train.checkpoints", "Training Checkpoints", "train", "", ShortcutScope::Global, {}, {},
+                  [this, no_run](const json::Value& args) {
+                      const fs::path dir = TrainRunDir(args);
+                      if (dir.empty()) return no_run(args);
+                      return Ok(Object({{"name", json::Value::Str(PathText(dir.filename()))},
+                                        {"checkpoints", ReadJsonLines(dir / "checkpoints.jsonl")}}));
+                  },
+                  "", true});
+    // Loads a run's policy onto the scene's robots and plays: `policy` (a file), else the newest
+    // checkpoint of `kind`: "best" (the default), "final", "epoch" or "last".
+    actions_.Add({"train.play", "Play Trained Policy", "train", "", ShortcutScope::Global, has_scene, {},
+                  [this, no_run](const json::Value& args) {
+                      std::string policy = StrArg(args, "policy");
+                      if (policy.empty()) {
+                          const fs::path dir = TrainRunDir(args);
+                          if (dir.empty()) return no_run(args);
+                          const std::string kind = StrArg(args, "kind", "best");
+                          policy = RunPolicy(ReadJsonLines(dir / "checkpoints.jsonl"), kind);
+                          if (policy.empty())
+                              return ActionResult::Fail("run '" + PathText(dir.filename()) + "' has no " + kind +
+                                                        " checkpoint yet");
+                      }
+                      const json::Value load = Object({{"path", json::Value::Str(policy)}});
+                      ActionResult loaded = actions_.Run("policy.load", load, "train.play", frame_index_);
+                      if (!loaded.ok) return loaded;
+                      ActionResult played = actions_.Run("sim.play", json::Value::Object(), "train.play", frame_index_);
+                      if (!played.ok) return played;
+                      return Ok(Object({{"policy", json::Value::Str(policy)}, {"status", loaded.value}}));
                   }});
 }
 

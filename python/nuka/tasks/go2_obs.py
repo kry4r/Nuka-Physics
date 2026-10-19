@@ -135,7 +135,7 @@ def _classify_quadrant(x: float, y: float) -> str:
     return fb + lr
 
 
-def discover_joint_permutation(device) -> np.ndarray:
+def discover_joint_permutation(device, scene=None) -> np.ndarray:
     """Return ``urdf_from_nuka_slot`` (length-12 int64) s.t.
     ``urdf_index = urdf_from_nuka_slot[nuka_slot]`` maps a Nuka actuated slot
     index (0..11, i.e. buffer slot 1..12) -> URDF joint index (0..11).
@@ -158,7 +158,7 @@ def discover_joint_permutation(device) -> np.ndarray:
     the stack must NOT silently run past).
     """
     urdf_index_of_name = {n: i for i, n in enumerate(URDF_JOINT_NAMES)}
-    scene = _go2_scene_path()
+    scene = scene or _go2_scene_path()
     with nuka.World.create_from_scene(device, scene, 4) as w:
         w.step_n(2)  # populate the one-step-lagged non-root link poses
         nuka.sync()
@@ -232,14 +232,14 @@ class Go2ObsBuilder:
     Every per-step call is pure torch on the engine's zero-copy DLPack views.
     """
 
-    def __init__(self, device, world, *, dtype=torch.float32):
+    def __init__(self, device, world, *, dtype=torch.float32, scene=None):
         self.world = world
         self.num_envs = world.env_count
         self._torch_device = torch.device("cuda")
         self.dtype = dtype
 
         # Discover the permutation on a throwaway world (does NOT step `world`).
-        urdf_from_nuka_slot = discover_joint_permutation(device)
+        urdf_from_nuka_slot = discover_joint_permutation(device, scene)
         self.urdf_from_nuka_slot_np = urdf_from_nuka_slot
         # nuka_slot_for_urdf is the inverse: nuka_slot = nuka_slot_for_urdf[urdf_idx]
         nuka_slot_for_urdf = np.empty(12, dtype=np.int64)

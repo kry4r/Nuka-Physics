@@ -97,6 +97,9 @@ class Go2LocomotionEnv(NukaGymEnv):
                  heightfield_nrow: int = 0,
                  heightfield_ncol: int = 0,
                  heightfield_cell: float = 0.0,
+                 reward_scales: "dict | None" = None,
+                 command_ranges: "dict | None" = None,
+                 domain_randomization: "dict | None" = None,
                  **kw) -> None:
         # GAIT MODE (Go2 pronk/bound skill). Re-weights the reward dict only (see
         # go2_rewards.GAIT_SCALE_OVERRIDES / GAIT_AIR_TIME_BIAS) -- no engine, obs or
@@ -123,7 +126,7 @@ class Go2LocomotionEnv(NukaGymEnv):
         # to the legged_gym symmetric +-1 ranges. A forward-biased range (e.g.
         # lin_vel_x [0.0, 1.0]) makes the tracking reward drive the dog UP the stairs
         # it spawns facing on the curriculum tile grid.
-        cr = tcfg.get("command_ranges") or {}
+        cr = command_ranges or tcfg.get("command_ranges") or {}
         self._cmd_range_x = tuple(cr.get("lin_vel_x", CMD_RANGE_LIN_VEL_X))
         self._cmd_range_y = tuple(cr.get("lin_vel_y", CMD_RANGE_LIN_VEL_Y))
         self._cmd_range_yaw = tuple(cr.get("ang_vel_yaw", CMD_RANGE_ANG_VEL_YAW))
@@ -195,6 +198,10 @@ class Go2LocomotionEnv(NukaGymEnv):
             kw["terrain_create"] = tc
 
         super().__init__(scene, num_envs, **kw)
+
+        # Startup event: one physics randomization draw per env (mass, armature, gravity ...).
+        if domain_randomization:
+            nuka.DomainRandomization(**domain_randomization).apply(self._world)
 
         # Build the curriculum + cache the engine terrain field views (zero-copy).
         if self._terrain_on:
@@ -359,7 +366,8 @@ class Go2LocomotionEnv(NukaGymEnv):
         # Ported legged_gym reward (owns last_dof_vel for dof_acc + feet_air_time).
         # gait_mode re-weights its scale dict (walk == byte-identical to before).
         self._reward = Go2Reward(
-            self.num_envs, self._torch_device, gait_mode=self._gait_mode
+            self.num_envs, self._torch_device, gait_mode=self._gait_mode,
+            reward_scales=reward_scales,
         )
 
         # LANDING GRACE (flight gaits only). A hard pronk/bound touchdown can dip the

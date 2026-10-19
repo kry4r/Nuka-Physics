@@ -70,10 +70,14 @@ bool Go2PolicyController::Init(const std::string& policy_path, uint32_t links_pe
                  std::to_string(kBlc) + " (a root and " + std::to_string(kJoints) + " joints)";
         return false;
     }
-    scan_nx_ = static_cast<uint32_t>(
-                   std::lround((cfg_.scan_x_max - cfg_.scan_x_min) / cfg_.scan_res)) + 1u;
-    scan_ny_ = static_cast<uint32_t>(
-                   std::lround((cfg_.scan_y_max - cfg_.scan_y_min) / cfg_.scan_res)) + 1u;
+    // A policy that observes only the proprioceptive values runs without the height scan.
+    const bool scan = policy_.ObsDim() != kProprio;
+    scan_nx_ = scan ? static_cast<uint32_t>(
+                          std::lround((cfg_.scan_x_max - cfg_.scan_x_min) / cfg_.scan_res)) + 1u
+                    : 0u;
+    scan_ny_ = scan ? static_cast<uint32_t>(
+                          std::lround((cfg_.scan_y_max - cfg_.scan_y_min) / cfg_.scan_res)) + 1u
+                    : 0u;
     scan_n_ = scan_nx_ * scan_ny_;
     if (kProprio + scan_n_ != policy_.ObsDim()) {
         *error = "the policy observes " + std::to_string(policy_.ObsDim()) +

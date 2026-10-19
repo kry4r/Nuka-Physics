@@ -10,7 +10,8 @@ Public surface:
 * term dataclasses + managers: :class:`ObservationTerm` /
   :class:`ObservationManager`, :class:`RewardTerm` / :class:`RewardManager`,
   :class:`TerminationTerm` / :class:`TerminationManager`, :class:`ActionTerm` /
-  :class:`ActionManager`, :class:`CommandManager`.
+  :class:`ActionManager`, :class:`CommandManager`, :class:`EventTerm` /
+  :class:`EventManager`.
 * :class:`ManagerBasedRLEnvCfg` + :class:`ManagerBasedRLEnv`.
 
 Like :mod:`nuka.gym`, this imports torch at module top (it is a hard dep of the
@@ -31,6 +32,8 @@ from .managers import (
     ActionTerm,
     ActionManager,
     CommandManager,
+    EventTerm,
+    EventManager,
 )
 from .envs import ManagerBasedRLEnv, ManagerBasedRLEnvCfg
 
@@ -45,6 +48,8 @@ __all__ = [
     "ActionTerm",
     "ActionManager",
     "CommandManager",
+    "EventTerm",
+    "EventManager",
     "ManagerBasedRLEnv",
     "ManagerBasedRLEnvCfg",
 ]

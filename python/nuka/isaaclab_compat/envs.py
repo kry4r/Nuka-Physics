@@ -26,6 +26,7 @@ from .managers import (
     TerminationManager,
     ActionManager,
     CommandManager,
+    EventManager,
 )
 
 
@@ -43,6 +44,7 @@ class ManagerBasedRLEnvCfg:
     obs_terms: list = field(default_factory=list)
     termination_terms: list = field(default_factory=list)
     action_term: object = None
+    event_terms: list = field(default_factory=list)
 
 
 class ManagerBasedRLEnv:
@@ -67,10 +69,12 @@ class ManagerBasedRLEnv:
         self.reward_manager = RewardManager(self, cfg.reward_terms)
         self.termination_manager = TerminationManager(self, cfg.termination_terms)
         self.action_manager = ActionManager(self, cfg.action_term)
+        self.event_manager = EventManager(self, cfg.event_terms)
 
         self.episode_step = torch.zeros(
             self.num_envs, dtype=torch.long, device="cuda"
         )
+        self.event_manager.apply("startup")
 
     # -- gym-style API ------------------------------------------------------
     def reset(self, env_ids=None):
@@ -86,6 +90,7 @@ class ManagerBasedRLEnv:
             self.num_envs, self.world.action_dim, device="cuda"
         )
         self.command_manager.reset()
+        self.event_manager.apply("reset")
         obs = self.observation_manager.compute()
         return obs, {}
 
@@ -94,6 +99,7 @@ class ManagerBasedRLEnv:
         self.action_manager.process_action(actions)
         self.sim.step(self.decimation)
         self.episode_step += 1
+        self.event_manager.apply("interval", dt=self.cfg.sim_dt * self.decimation)
 
         obs = self.observation_manager.compute()
         reward = self.reward_manager.compute()
@@ -109,6 +115,7 @@ class ManagerBasedRLEnv:
             self.episode_step[done] = 0
             if self.action_manager.last_action is not None:
                 self.action_manager.last_action[done] = 0.0
+            self.event_manager.apply("reset", done_ids.to(torch.long))
 
         return obs, reward, terminated, truncated, info
 

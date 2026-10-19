@@ -2,9 +2,9 @@
 // ---------------------------------------------------------------------------
 // nuka::runtime::inference::Go2PolicyController -- a WorldController that drives K
 // co-resident Go2 closed-loop under a trained locomotion policy. Each control step
-// (decimation) it builds the 235-dim height-scan obs per dog (48 proprio + 187 scan
-// of the retained terrain grid), runs the MLP policy, and writes PD drive targets
-// through the C ABI field seam.
+// (decimation) it builds the obs per dog (48 proprio, plus 187 scan of the retained
+// terrain grid when the policy observes 235), runs the MLP policy, and writes PD
+// drive targets through the C ABI field seam.
 //
 // The Go2 obs/action contract -- joint slot order, scales, default stance, scan grid,
 // PD gains -- is CONFIG DATA on the Config struct, NOT a branch in world.Step() or

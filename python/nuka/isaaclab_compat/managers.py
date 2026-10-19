@@ -167,3 +167,46 @@ class CommandManager:
     def reset(self, env_ids=None) -> None:
         # Fixed command in v0.3 -- nothing to resample.
         return None
+
+
+# ---------------------------------------------------------------------------
+# Event
+# ---------------------------------------------------------------------------
+@dataclass
+class EventTerm:
+    """One event. ``func(env, env_ids)`` acts on those envs (an int64 cuda tensor).
+
+    ``mode`` is ``"startup"`` (once, after the env is built), ``"reset"`` (on the
+    envs that reset) or ``"interval"`` (on all envs every ``interval_s`` of
+    simulated time)."""
+
+    name: str
+    func: Callable[["object", torch.Tensor], None]
+    mode: str = "reset"
+    interval_s: float = 0.0
+
+
+class EventManager:
+    def __init__(self, env, terms):
+        self._env = env
+        self._terms = list(terms or [])
+        self._elapsed = [0.0] * len(self._terms)
+
+    @property
+    def terms(self):
+        return self._terms
+
+    def apply(self, mode: str, env_ids=None, dt: float = 0.0) -> None:
+        """Runs the ``mode`` terms; ``env_ids`` None means every env, ``dt`` advances
+        the interval clocks."""
+        if env_ids is None:
+            env_ids = torch.arange(self._env.num_envs, device="cuda")
+        for i, term in enumerate(self._terms):
+            if term.mode != mode:
+                continue
+            if mode == "interval":
+                self._elapsed[i] += dt
+                if self._elapsed[i] < term.interval_s:
+                    continue
+                self._elapsed[i] = 0.0
+            term.func(self._env, env_ids)

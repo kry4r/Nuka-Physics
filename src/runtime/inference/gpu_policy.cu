@@ -593,7 +593,7 @@ void Go2GpuPolicy::Step(void* stream, const float* link_pose,
     }
 
     Go2ProprioKernel<<<Grid(g.num_dogs), kBlock, 0, s>>>(p);
-    Go2HeightScanKernel<<<Grid(g.num_dogs * g.scan_n), kBlock, 0, s>>>(p);
+    if (g.scan_n != 0u) Go2HeightScanKernel<<<Grid(g.num_dogs * g.scan_n), kBlock, 0, s>>>(p);
     g.mlp.impl_->ForwardDevice(g.d_obs, g.d_act, g.num_dogs, s);
     Go2DriveWriteKernel<<<Grid(g.num_dogs * g.c.njoints), kBlock, 0, s>>>(p);
 
