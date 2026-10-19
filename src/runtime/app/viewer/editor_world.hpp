@@ -117,7 +117,8 @@ public:
         uint32_t env;
         uint32_t instance;
     };
-    // A velocity arrow from `at` along the planar `velocity`, in the command or the measured colour.
+    // A velocity arrow from `at` along the planar `velocity`, in the command or the measured colour; the
+    // measured one stacks on the command's.
     struct Arrow {
         math::Vec3 at;
         math::Vec3 velocity;
@@ -142,6 +143,8 @@ public:
     void SetTerrain(const terrain::HeightField& terrain);
     // Replaces the velocity arrows.
     void SetArrows(const std::vector<Arrow>& arrows);
+    // The highest point of the link-driven instances posed at one environment's `links`; -inf when none is.
+    float LinkTop(const std::vector<math::Transform>& links) const;
 
     // Edits queue live teleports; the frame hands them to the physics thread.
     void QueuePoseWrite(const PoseWrite& write) { pose_writes_.push_back(write); }

@@ -5,7 +5,9 @@
 #include "runtime/app/viewer/imgui_layer.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -16,10 +18,16 @@ namespace {
 static_assert(sizeof(math::Transform) == 7u * sizeof(float), "pose wire layout");
 static_assert(sizeof(math::Vec3) == 3u * sizeof(float), "velocity wire layout");
 
-// Arrow radii and head length in metres; metres of arrow per m/s, the longest arrow and the slowest
-// speed drawn. Lengths snap to a step so the mesh library keeps few arrows.
-constexpr float kArrowShaft = 0.03f, kArrowHead = 0.075f, kArrowHeadLength = 0.15f;
-constexpr float kArrowPerSpeed = 0.45f, kArrowMax = 1.0f, kArrowMinSpeed = 0.01f, kArrowStep = 0.02f;
+// The command arrow's shaft and head widths, head length and thickness in metres; the measured arrow
+// is narrower so the command shows around it where the two agree.
+constexpr float kArrowShaft = 0.05f, kArrowHead = 0.15f, kArrowHeadLength = 0.13f, kArrowThick = 0.03f;
+constexpr float kMeasuredWidth = 0.7f;
+// Metres of arrow per m/s, the longest arrow and the slowest speed drawn. Lengths snap to a step so
+// the mesh library keeps few arrows; one shorter than kArrowShortest shrinks whole.
+constexpr float kArrowPerSpeed = 0.6f, kArrowMax = 1.2f, kArrowMinSpeed = 0.02f, kArrowStep = 0.02f;
+constexpr float kArrowShortest = 1.5f * kArrowHeadLength;
+// The measured arrow's rise over the command's, a thickness and a hair.
+constexpr float kArrowRise = kArrowThick + 0.01f;
 // The terrain checker's square and the lift that keeps the surface over a coplanar floor.
 constexpr float kCheckerSquare = 1.0f, kTerrainLift = 0.004f;
 
@@ -47,38 +55,47 @@ const ParticleSurfaceBinding* SurfaceOf(const WorldLayout& layout, uint32_t part
     return nullptr;
 }
 
-// A smooth-shaded arrow along +X from the origin: a capped shaft and a cone head.
-render::MeshGeometry ArrowMesh(float length, float shaft, float head, float head_length) {
-    constexpr uint32_t kSides = 16u;
-    render::MeshGeometry g;
-    // A ring of radius r at x; its normals blend the axis (nx) with the outward radial (nr).
-    auto ring = [&](float x, float r, float nx, float nr) {
-        const uint32_t first = g.VertexCount();
-        for (uint32_t i = 0; i < kSides; ++i) {
-            const float a = 6.2831853f * static_cast<float>(i) / static_cast<float>(kSides);
-            const float c = std::cos(a), s = std::sin(a);
-            g.positions.insert(g.positions.end(), {x, r * c, r * s});
-            g.normals.insert(g.normals.end(), {nx, nr * c, nr * s});
-        }
-        return first;
-    };
-    auto band = [&](uint32_t a, uint32_t b) {
-        for (uint32_t i = 0; i < kSides; ++i) {
-            const uint32_t j = (i + 1u) % kSides;
-            g.indices.insert(g.indices.end(), {a + i, b + i, b + j, a + i, b + j, a + j});
-        }
-    };
+// A flat block arrow along +X from the origin, centred on the XY plane: a shaft and a triangular head
+// `thick` from top to bottom, flat-shaded so its edges read from afar.
+render::MeshGeometry ArrowMesh(float length, float shaft, float head, float head_length, float thick) {
     const float neck = length - head_length;
-    const float slant = std::sqrt(head * head + head_length * head_length);
-    const uint32_t cap = ring(0.0f, shaft, -1.0f, 0.0f);
-    const uint32_t center = g.VertexCount();
-    g.positions.insert(g.positions.end(), {0.0f, 0.0f, 0.0f});
-    g.normals.insert(g.normals.end(), {-1.0f, 0.0f, 0.0f});
-    for (uint32_t i = 0; i < kSides; ++i) g.indices.insert(g.indices.end(), {center, cap + (i + 1u) % kSides, cap + i});
-    band(ring(0.0f, shaft, 0.0f, 1.0f), ring(neck, shaft, 0.0f, 1.0f));
-    band(ring(neck, shaft, -1.0f, 0.0f), ring(neck, head, -1.0f, 0.0f));
-    band(ring(neck, head, head / slant, head_length / slant), ring(length, 0.0f, head / slant, head_length / slant));
+    // The outline, counter-clockwise from above.
+    const float outline[7][2] = {{0.0f, -0.5f * shaft}, {neck, -0.5f * shaft}, {neck, -0.5f * head}, {length, 0.0f},
+                                 {neck, 0.5f * head},   {neck, 0.5f * shaft},  {0.0f, 0.5f * shaft}};
+    render::MeshGeometry g;
+    const auto vertex = [&](const float* p, float z, const math::Vec3& n) {
+        g.positions.insert(g.positions.end(), {p[0], p[1], z});
+        g.normals.insert(g.normals.end(), {n.x, n.y, n.z});
+        return g.VertexCount() - 1u;
+    };
+    // Top and bottom: the shaft's rectangle (corners 0, 1, 5, 6) and the head's triangle (2, 3, 4).
+    for (const float side : {1.0f, -1.0f}) {
+        uint32_t v[7];
+        for (int k = 0; k < 7; ++k) v[k] = vertex(outline[k], 0.5f * thick * side, {0.0f, 0.0f, side});
+        for (const auto& t : {std::array<uint32_t, 3>{v[0], v[1], v[5]}, std::array<uint32_t, 3>{v[0], v[5], v[6]},
+                              std::array<uint32_t, 3>{v[2], v[3], v[4]}}) {
+            if (side > 0.0f) g.indices.insert(g.indices.end(), {t[0], t[1], t[2]});
+            else g.indices.insert(g.indices.end(), {t[0], t[2], t[1]});
+        }
+    }
+    // The walls: a quad per outline edge, facing out.
+    for (int k = 0; k < 7; ++k) {
+        const float* a = outline[k];
+        const float* b = outline[(k + 1) % 7];
+        const math::Vec3 n = math::Vec3{b[1] - a[1], a[0] - b[0], 0.0f}.Normalized();
+        const uint32_t a0 = vertex(a, -0.5f * thick, n), b0 = vertex(b, -0.5f * thick, n);
+        const uint32_t b1 = vertex(b, 0.5f * thick, n), a1 = vertex(a, 0.5f * thick, n);
+        g.indices.insert(g.indices.end(), {a0, b0, b1, a0, b1, a1});
+    }
     return g;
+}
+
+// The highest world point of local bounds `box` posed at `pose`.
+float TopOf(const std::array<math::Vec3, 2>& box, const math::Transform& pose) {
+    float top = -std::numeric_limits<float>::infinity();
+    for (int k = 0; k < 8; ++k)
+        top = std::max(top, pose.TransformPoint({box[k & 1].x, box[(k >> 1) & 1].y, box[k >> 2].z}).z);
+    return top;
 }
 
 // The terrain surface: a quad per cell with its own corners so each cell takes one checker shade,
@@ -424,15 +441,16 @@ EditorSim::EditorSim(WorldLayout layout, render::RenderWorld render_world, const
     ground.roughness = 0.9f;
     terrain_material_ = render_world_.MaterialCount();
     render_world_.materials.push_back(ground);
-    // Arrows: the measured velocity in the shell's info blue and the command in its ok green, faintly lit.
+    // Arrows: the measured velocity in the shell's info blue and the command in its ok green. Half the colour
+    // glows, so sunlit faces stay saturated and the faces still shade apart.
     constexpr float kArrowColors[2][3] = {{0.20f, 0.55f, 0.95f}, {0.18f, 0.80f, 0.36f}};
     for (int k = 0; k < 2; ++k) {
         scene::RenderMaterial arrow;
         for (int c = 0; c < 3; ++c) {
-            arrow.base_color[c] = kArrowColors[k][c];
-            arrow.emissive[c] = 0.2f * kArrowColors[k][c];
+            arrow.base_color[c] = 0.45f * kArrowColors[k][c];
+            arrow.emissive[c] = 0.45f * kArrowColors[k][c];
         }
-        arrow.roughness = 0.35f;
+        arrow.roughness = 0.7f;
         arrow_materials_[k] = render_world_.MaterialCount();
         render_world_.materials.push_back(arrow);
     }
@@ -495,15 +513,45 @@ void EditorSim::SetArrows(const std::vector<Arrow>& arrows) {
         if (speed < kArrowMinSpeed) continue;
         const long steps = std::max(1L, std::lround(std::min(speed * kArrowPerSpeed, kArrowMax) / kArrowStep));
         const float length = static_cast<float>(steps) * kArrowStep;
+        const float shrink = std::min(1.0f, length / kArrowShortest);
+        const float width = shrink * (a.command ? 1.0f : kMeasuredWidth);
         render::RenderInstance& inst = extra.emplace_back();
-        inst.mesh_id = render_world_.meshes.InternPrimitive("marker:arrow:" + std::to_string(steps), [&] {
-            return ArrowMesh(length, kArrowShaft, kArrowHead, std::min(kArrowHeadLength, 0.5f * length));
+        const std::string key =
+            (a.command ? "marker:arrow:command:" : "marker:arrow:measured:") + std::to_string(steps);
+        inst.mesh_id = render_world_.meshes.InternPrimitive(key, [&] {
+            return ArrowMesh(length, kArrowShaft * width, kArrowHead * width, kArrowHeadLength * shrink,
+                             kArrowThick * shrink);
         });
         inst.render_material_id = arrow_materials_[a.command ? 1 : 0];
-        inst.world_xform.position = a.at;
+        inst.world_xform.position = a.at + math::Vec3{0.0f, 0.0f, a.command ? 0.0f : kArrowRise};
         inst.world_xform.rotation =
             math::Quat::FromAxisAngle(math::Vec3::UnitZ(), std::atan2(a.velocity.y, a.velocity.x));
     }
+}
+
+float EditorSim::LinkTop(const std::vector<math::Transform>& links) const {
+    constexpr float kInf = std::numeric_limits<float>::infinity();
+    std::vector<std::array<math::Vec3, 2>> bounds(render_world_.meshes.Count(),
+                                                  {math::Vec3{kInf, kInf, kInf}, math::Vec3{-kInf, -kInf, -kInf}});
+    std::vector<char> known(bounds.size(), 0);
+    float top = -kInf;
+    for (const render::RenderInstance& inst : render_world_.instances) {
+        if (inst.pose_source.kind != render::PoseSource::Kind::Link || inst.pose_source.row >= links.size() ||
+            inst.mesh_id >= bounds.size())
+            continue;
+        std::array<math::Vec3, 2>& box = bounds[inst.mesh_id];
+        if (!known[inst.mesh_id]) {
+            known[inst.mesh_id] = 1;
+            const std::vector<float>& p = render_world_.meshes.Geometry(inst.mesh_id).positions;
+            for (size_t v = 0; v + 2 < p.size(); v += 3) {
+                box[0] = {std::min(box[0].x, p[v]), std::min(box[0].y, p[v + 1]), std::min(box[0].z, p[v + 2])};
+                box[1] = {std::max(box[1].x, p[v]), std::max(box[1].y, p[v + 1]), std::max(box[1].z, p[v + 2])};
+            }
+        }
+        if (box[0].x <= box[1].x)
+            top = std::max(top, TopOf(box, links[inst.pose_source.row] * inst.cached_visual_local));
+    }
+    return top;
 }
 
 void EditorSim::ApplyPoses(const std::vector<math::Transform>& links,

@@ -1320,6 +1320,7 @@ struct EditorHost::State : DocumentHost {
         fs::path dir;
         uint32_t envs = 0u, links = 0u, bodies = 0u, articulations = 0u;
         float spacing = 0.0f;  // the run's: 0 when its environments stand apart already
+        float lift = 0.0f;     // the arrows' height over each base; the first frame sets it
         ObserveFrame frame;
         uint64_t frames = 0u;
         Clock::time_point status_due{};
@@ -5723,18 +5724,33 @@ void EditorHost::State::StepObserve() {
     }
     t.arrows.clear();
     if (o.frames == 0u) return;
-    // Isaac Lab's height of the arrows over a robot's base, the measured arrow's rise over the command's,
-    // and the share of the way the camera closes per frame.
-    constexpr float kArrowLift = 0.5f, kArrowGap = 0.09f, kFollowShare = 0.1f;
+    // Isaac Lab's height of the arrows over a robot's base, their clearance over its top, and the share
+    // of the way the camera closes per frame.
+    constexpr float kArrowLift = 0.5f, kArrowClearance = 0.3f, kFollowShare = 0.1f;
     const uint32_t current = ui_state_.env_index % ui_state_.envs.count;
     t.current = current;
     const auto base = [&](uint32_t e) {
         const float* p = o.frame.bases.data() + size_t{e} * o.articulations * 7u;
         return math::Vec3{p[0], p[1], p[2]};
     };
+    // The arrows clear the middle robot's top over its base at the first frame; with no robot drawn
+    // they keep Isaac Lab's lift.
+    if (o.lift == 0.0f) {
+        std::vector<float> reach;
+        std::vector<math::Transform> links(o.links);
+        for (uint32_t e = 0; e < o.envs; ++e) {
+            std::memcpy(links.data(), o.frame.links.data() + size_t{e} * o.links * 7u,
+                        links.size() * sizeof(math::Transform));
+            const float top = loaded_->sim->LinkTop(links);
+            if (std::isfinite(top)) reach.push_back(top - base(e).z);
+        }
+        const auto middle = reach.begin() + static_cast<ptrdiff_t>(reach.size() / 2u);
+        std::nth_element(reach.begin(), middle, reach.end());
+        o.lift = reach.empty() ? kArrowLift : std::max(*middle, 0.0f) + kArrowClearance;
+    }
     std::vector<EditorSim::Arrow> arrows;
     for (uint32_t e = 0; e < o.envs; ++e) {
-        const math::Vec3 at = base(e) + EnvOffset(e, current) + math::Vec3{0.0f, 0.0f, kArrowLift};
+        const math::Vec3 at = base(e) + EnvOffset(e, current) + math::Vec3{0.0f, 0.0f, o.lift};
         TrainArrow arrow;
         arrow.at[0] = at.x;
         arrow.at[1] = at.y;
@@ -5743,7 +5759,7 @@ void EditorHost::State::StepObserve() {
         std::copy_n(o.frame.velocity.data() + size_t{e} * 3u, 3, arrow.velocity);
         t.arrows.push_back(arrow);
         arrows.push_back({at, {arrow.command[0], arrow.command[1], 0.0f}, true});
-        arrows.push_back({at + math::Vec3{0.0f, 0.0f, kArrowGap}, {arrow.velocity[0], arrow.velocity[1], 0.0f}, false});
+        arrows.push_back({at, {arrow.velocity[0], arrow.velocity[1], 0.0f}, false});
     }
     loaded_->sim->SetArrows(arrows);
     if (!t.follow) return;
@@ -5778,6 +5794,7 @@ json::Value EditorHost::State::ObserveJson() const {
                    {"sequence", json::Value::Int(static_cast<int64_t>(o.frame.sequence))},
                    {"steps", json::Value::Int(static_cast<int64_t>(o.frame.steps))},
                    {"spacing", json::Value::Float(o.spacing)},
+                   {"lift", json::Value::Float(o.lift)},
                    {"follow", json::Value::Bool(t.follow)},
                    {"epoch", json::Value::Int(t.epoch)},
                    {"max_epochs", json::Value::Int(t.max_epochs)},
