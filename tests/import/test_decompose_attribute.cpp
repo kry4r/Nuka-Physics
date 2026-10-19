@@ -109,7 +109,8 @@ def Xform "robot"
     const auto path = WriteTemp("nuka_decompose_test.usda", usd);
     const auto scene = nuka::import::LoadUsd(path.string());
 
-    ASSERT_EQ(scene.ShapeCount(), 1u);
+    // The collider, then the visual record the drawn mesh adds.
+    ASSERT_EQ(scene.ShapeCount(), 2u);
     const auto& shape = scene.GetShape(0);
     EXPECT_EQ(shape.type, nuka::scene::ShapeType::TriMesh);
     EXPECT_EQ(shape.decompose_mode, nuka::scene::DecomposeMode::Force);
@@ -146,7 +147,7 @@ def Xform "robot"
     const auto path = WriteTemp("nuka_decompose_default.usda", usd);
     const auto scene = nuka::import::LoadUsd(path.string());
 
-    ASSERT_EQ(scene.ShapeCount(), 1u);
+    ASSERT_EQ(scene.ShapeCount(), 2u);
     EXPECT_EQ(scene.GetShape(0).decompose_mode, nuka::scene::DecomposeMode::Auto);
 
     std::filesystem::remove(path);

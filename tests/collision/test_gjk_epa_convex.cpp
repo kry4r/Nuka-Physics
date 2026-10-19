@@ -61,6 +61,7 @@
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -252,12 +253,24 @@ const std::string kCupUsda =
 
 bool CupHullAvailable() { return std::filesystem::exists(kCupUsda); }
 
+// The cup's mesh made collision-only (CollisionAPI on a guide-purpose prim); as authored it is a visual.
+std::string CupCollider() {
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "nuka_gjk_cup_collider.usda";
+    std::ofstream(path) << "#usda 1.0\n(\n    defaultPrim = \"root\"\n    metersPerUnit = 1\n    upAxis = \"Z\"\n)\n\n"
+        "def Xform \"root\" (\n"
+        "    prepend references = @" + std::filesystem::absolute(kCupUsda).generic_string() + "@</root>\n"
+        ")\n{\n    over \"Model\"\n    {\n        over \"Model\" (\n"
+        "            prepend apiSchemas = [\"PhysicsCollisionAPI\"]\n        )\n        {\n"
+        "            uniform token purpose = \"guide\"\n        }\n    }\n}\n";
+    return path.string();
+}
+
 // Load the C7a cup -> a SINGLE cooked ConvexHull, recenter its verts about the
 // bbox center (the grasp poses the cup with its center at BodyState.position), and
 // report the +X support-x (the wall the fingertip pinches). Out verts are flat
 // x,y,z triples, mesh-local, centered.
 void LoadCupHullCenteredAndFaceX(std::vector<float>* verts, float* face_x) {
-    auto scene = nuka::import::LoadUsd(kCupUsda);
+    auto scene = nuka::import::LoadUsd(CupCollider());
     for (size_t i = 0; i < scene.ShapeCount(); ++i) {
         auto& s = scene.GetShapeMut(static_cast<nuka::scene::ShapeId>(i));
         if (!s.mesh_vertices.empty())

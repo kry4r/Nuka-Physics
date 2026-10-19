@@ -16,29 +16,58 @@
 #include <pxr/base/gf/quatf.h>
 #include <pxr/base/gf/quath.h>
 #include <pxr/base/gf/rotation.h>
+#include <pxr/base/gf/vec2d.h>
+#include <pxr/base/gf/vec2f.h>
 #include <pxr/base/gf/vec3d.h>
 #include <pxr/base/gf/vec3f.h>
 #include <pxr/base/gf/vec3h.h>
+#include <pxr/base/gf/vec4f.h>
 #include <pxr/base/vt/array.h>
+#include <pxr/base/vt/types.h>
 #include <pxr/base/vt/value.h>
+#include <pxr/usd/ar/packageUtils.h>
+#include <pxr/usd/sdf/assetPath.h>
 #include <pxr/usd/sdf/path.h>
+#include <pxr/usd/sdf/zipFile.h>
 #include <pxr/usd/usd/attribute.h>
+#include <pxr/usd/usd/collectionAPI.h>
+#include <pxr/usd/usd/collectionMembershipQuery.h>
 #include <pxr/usd/usd/prim.h>
 #include <pxr/usd/usd/primRange.h>
 #include <pxr/usd/usd/relationship.h>
+#include <pxr/usd/usd/stage.h>
+#include <pxr/usd/usdGeom/gprim.h>
+#include <pxr/usd/usdGeom/imageable.h>
+#include <pxr/usd/usdGeom/mesh.h>
 #include <pxr/usd/usdGeom/metrics.h>
+#include <pxr/usd/usdGeom/primvarsAPI.h>
+#include <pxr/usd/usdGeom/subset.h>
 #include <pxr/usd/usdGeom/tokens.h>
 #include <pxr/usd/usdGeom/xformCache.h>
+#include <pxr/usd/usdPhysics/collisionGroup.h>
 #include <pxr/usd/usdPhysics/metrics.h>
+#include <pxr/usd/usdShade/input.h>
+#include <pxr/usd/usdShade/material.h>
+#include <pxr/usd/usdShade/materialBindingAPI.h>
+#include <pxr/usd/usdShade/output.h>
+#include <pxr/usd/usdShade/shader.h>
+#include <pxr/usd/usdShade/tokens.h>
+#include <pxr/usd/usdShade/utils.h>
 
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -204,6 +233,12 @@ void ReadTarget(const pxr::UsdPrim& prim, const char* name, std::string& out) {
     }
 }
 
+// The value a shader input's source attribute holds; false for outputs and unauthored inputs.
+template <typename T>
+bool ReadSource(const pxr::UsdAttribute& attr, T& out) {
+    return attr && Read(attr.GetPrim(), attr.GetName().GetString(), out);
+}
+
 // ---------------------------------------------------------------------------
 // Poses
 // ---------------------------------------------------------------------------
@@ -323,12 +358,8 @@ struct PrimData {
     double height = 1.0;
     std::string geometry_axis_token = "Z";
     math::Vec3 color = {1.0f, 1.0f, 1.0f};
-    float alpha = 1.0f;
-    float roughness = 0.5f;
-    float metallic = 0.0f;
-    bool has_friction = false;           // physics:dynamicFriction authored?
-    float friction_mu = 1.0f;            // UsdPhysics PhysicsMaterialAPI friction
     float intensity = 1.0f;
+    bool intensity_authored = false;     // false: the UsdLux schema's fallback intensity
     float exposure = 0.0f;               // UsdLux inputs:exposure (stops)
     float focal_length = 50.0f;
     bool has_focal_length = false;        // UsdGeomCamera focalLength authored?
@@ -339,7 +370,11 @@ struct PrimData {
     std::string joint_path;
     std::string body_path;
     std::string nuka_type;
-    std::string purpose;                 // USD `purpose` token: default|render|proxy|guide
+    std::string purpose = "default";    // inherited USD purpose: default|render|proxy|guide
+    bool visible = true;                 // inherited USD visibility
+    bool left_handed = false;            // Mesh orientation leftHanded: clockwise faces
+    std::string approximation;           // MeshCollisionAPI physics:approximation
+    int max_hulls = 0;                   // physxConvexDecompositionCollision:maxConvexHulls
     std::string decompose_mode;          // nuka:decompose token
     int decompose_max_pieces = 32;       // nuka:decompose:max_pieces
     bool has_initial_position = false;
@@ -394,12 +429,9 @@ PrimData ReadPrim(const pxr::UsdPrim& prim, pxr::UsdGeomXformCache& xforms, cons
     if (!Read(prim, "inputs:color", d.color) && !Read(prim, "inputs:diffuseColor", d.color)) {
         Read(prim, "color", d.color);
     }
-    Read(prim, "inputs:alpha", d.alpha);
-    Read(prim, "inputs:roughness", d.roughness);
-    Read(prim, "inputs:metallic", d.metallic);
-    d.has_friction = Read(prim, "physics:dynamicFriction", d.friction_mu);
-    if (!Read(prim, "inputs:intensity", d.intensity)) {
-        Read(prim, "intensity", d.intensity);
+    d.intensity_authored = Read(prim, "inputs:intensity", d.intensity) || Read(prim, "intensity", d.intensity);
+    if (!d.intensity_authored) {
+        ReadValue(prim, "inputs:intensity", d.intensity);
     }
     if (!Read(prim, "inputs:exposure", d.exposure)) {
         Read(prim, "exposure", d.exposure);
@@ -411,7 +443,15 @@ PrimData ReadPrim(const pxr::UsdPrim& prim, pxr::UsdGeomXformCache& xforms, cons
     ReadTarget(prim, "nuka:joint", d.joint_path);
     ReadTarget(prim, "nuka:body", d.body_path);
     Read(prim, "nuka:type", d.nuka_type);
-    Read(prim, "purpose", d.purpose);
+    if (prim.IsA<pxr::UsdGeomImageable>()) {
+        const pxr::UsdGeomImageable imageable(prim);
+        d.purpose = imageable.ComputePurpose().GetString();
+        d.visible = imageable.ComputeVisibility(kTime) != pxr::UsdGeomTokens->invisible;
+    }
+    pxr::TfToken orientation;
+    d.left_handed = ReadValue(prim, "orientation", orientation) && orientation == pxr::UsdGeomTokens->leftHanded;
+    Read(prim, "physics:approximation", d.approximation);
+    Read(prim, "physxConvexDecompositionCollision:maxConvexHulls", d.max_hulls);
     Read(prim, "nuka:decompose", d.decompose_mode);
     Read(prim, "nuka:decompose:max_pieces", d.decompose_max_pieces);
     d.has_initial_position = Read(prim, "nuka:initialPosition", d.initial_position);
@@ -455,76 +495,328 @@ math::Quat LocalRotation(const PrimData& prim) {
     return (qz * qy * qx).Normalized();
 }
 
-bool MeshHasGeometry(const PrimData& prim) {
-    return prim.type == "Mesh" && !prim.mesh_points.empty();
+bool IsGprim(const std::string& type) {
+    return type == "Mesh" || type == "Cube" || type == "Sphere" || type == "Capsule" || type == "Cylinder" ||
+           type == "Plane" || type == "Cone";
 }
 
-bool ShapeTypeFromPrim(const PrimData& prim, scene::ShapeType& shape_type) {
-    // A Mesh carrying geometry is always a TriMesh shape, even without a PhysicsCollisionAPI;
-    // the primitive shapes need the collision API.
-    if (MeshHasGeometry(prim)) {
-        shape_type = scene::ShapeType::TriMesh;
-        return true;
-    }
-    if (!prim.HasApi("PhysicsCollisionAPI")) {
+// The engine shape of a primitive gprim; false for meshes and cones.
+bool PrimitiveType(const std::string& type, scene::ShapeType& shape_type) {
+    if (type == "Cube") {
+        shape_type = scene::ShapeType::Box;
+    } else if (type == "Sphere") {
+        shape_type = scene::ShapeType::Sphere;
+    } else if (type == "Capsule") {
+        shape_type = scene::ShapeType::Capsule;
+    } else if (type == "Cylinder") {
+        shape_type = scene::ShapeType::Cylinder;
+    } else if (type == "Plane") {
+        shape_type = scene::ShapeType::Plane;
+    } else {
         return false;
     }
-    if (prim.type == "Cube") {
-        shape_type = scene::ShapeType::Box;
-        return true;
-    }
-    if (prim.type == "Sphere") {
-        shape_type = scene::ShapeType::Sphere;
-        return true;
-    }
-    if (prim.type == "Capsule") {
-        shape_type = scene::ShapeType::Capsule;
-        return true;
-    }
-    if (prim.type == "Cylinder") {
-        shape_type = scene::ShapeType::Cylinder;
-        return true;
-    }
-    if (prim.type == "Plane") {
-        shape_type = scene::ShapeType::Plane;
-        return true;
-    }
-    return false;
+    return true;
 }
 
-// Fan-triangulates a USD face list into triangle indices in authored order; without counts the
-// indices are already triangles.
-std::vector<uint32_t> FanTriangulate(const std::vector<int>& indices,
-                                     const std::vector<int>& counts) {
-    std::vector<uint32_t> out;
-    if (counts.empty()) {
-        out.reserve(indices.size());
-        for (const int idx : indices) {
-            if (idx >= 0) {
-                out.push_back(static_cast<uint32_t>(idx));
-            }
+// ---------------------------------------------------------------------------
+// Meshes
+// ---------------------------------------------------------------------------
+
+// A mesh primvar as authored: `width` floats per element, optional indices, and its interpolation.
+struct Primvar {
+    std::vector<float> values;
+    std::vector<int> indices;
+    pxr::TfToken interpolation;
+    size_t width = 0;
+};
+
+template <typename V>
+bool AppendElements(const pxr::VtValue& value, size_t width, std::vector<float>& out) {
+    if (!value.IsHolding<pxr::VtArray<V>>()) {
+        return false;
+    }
+    for (const V& v : value.UncheckedGet<pxr::VtArray<V>>()) {
+        for (size_t k = 0; k < width; ++k) {
+            out.push_back(static_cast<float>(v[k]));
         }
+    }
+    return true;
+}
+
+// Primvar `name` as `width`-float elements (2 for UVs, 3 for normals); empty when absent.
+Primvar ReadPrimvar(const pxr::UsdPrim& prim, const pxr::TfToken& name, size_t width) {
+    Primvar out;
+    out.width = width;
+    const pxr::UsdGeomPrimvar primvar = pxr::UsdGeomPrimvarsAPI(prim).GetPrimvar(name);
+    pxr::VtValue value;
+    if (!primvar || !primvar.HasAuthoredValue() || !primvar.Get(&value, kTime)) {
         return out;
     }
-    size_t cursor = 0;
-    for (const int raw_count : counts) {
-        if (raw_count < 3) {
-            cursor += static_cast<size_t>(raw_count < 0 ? 0 : raw_count);
-            continue;
-        }
-        const size_t count = static_cast<size_t>(raw_count);
-        if (cursor + count > indices.size()) {
-            break;  // malformed: not enough indices for this face.
-        }
-        for (size_t v = 1; v + 1 < count; ++v) {
-            out.push_back(static_cast<uint32_t>(indices[cursor]));
-            out.push_back(static_cast<uint32_t>(indices[cursor + v]));
-            out.push_back(static_cast<uint32_t>(indices[cursor + v + 1]));
-        }
-        cursor += count;
+    const bool read = width == 2u ? AppendElements<pxr::GfVec2f>(value, 2u, out.values) ||
+                                        AppendElements<pxr::GfVec2d>(value, 2u, out.values)
+                                  : AppendElements<pxr::GfVec3f>(value, 3u, out.values) ||
+                                        AppendElements<pxr::GfVec3d>(value, 3u, out.values);
+    if (!read) {
+        return out;
+    }
+    out.interpolation = primvar.GetInterpolation();
+    pxr::VtIntArray indices;
+    if (primvar.GetIndices(&indices, kTime)) {
+        out.indices.assign(indices.begin(), indices.end());
     }
     return out;
 }
+
+// The normals primvar, else the plain normals attribute, as UsdGeomPointBased orders them.
+Primvar NormalsOf(const pxr::UsdPrim& prim) {
+    Primvar out = ReadPrimvar(prim, pxr::TfToken("normals"), 3u);
+    const pxr::UsdGeomMesh mesh(prim);
+    pxr::VtVec3fArray normals;
+    if (out.values.empty() && mesh.GetNormalsAttr().Get(&normals, kTime)) {
+        AppendElements<pxr::GfVec3f>(pxr::VtValue(normals), 3u, out.values);
+        out.interpolation = mesh.GetNormalsInterpolation();
+    }
+    return out;
+}
+
+// The element a face corner reads: by point, face or corner as the interpolation says.
+size_t ElementOf(const Primvar& primvar, size_t point, size_t face, size_t corner) {
+    const pxr::TfToken& mode = primvar.interpolation;
+    const size_t element = mode == pxr::UsdGeomTokens->constant      ? 0u
+                         : mode == pxr::UsdGeomTokens->uniform       ? face
+                         : mode == pxr::UsdGeomTokens->faceVarying   ? corner
+                                                                     : point;
+    return primvar.indices.empty() ? element : static_cast<size_t>(primvar.indices[element]);
+}
+
+// Whether the primvar has an element for every point, face or corner its interpolation addresses.
+bool Covers(const Primvar& primvar, size_t points, size_t faces, size_t corners) {
+    const pxr::TfToken& mode = primvar.interpolation;
+    const size_t needed = mode == pxr::UsdGeomTokens->constant      ? 1u
+                        : mode == pxr::UsdGeomTokens->uniform       ? faces
+                        : mode == pxr::UsdGeomTokens->faceVarying   ? corners
+                                                                    : points;
+    const size_t elements = primvar.values.size() / primvar.width;
+    if (primvar.indices.empty()) {
+        return elements >= needed;
+    }
+    return primvar.indices.size() >= needed &&
+           std::all_of(primvar.indices.begin(), primvar.indices.end(),
+                       [&](int i) { return i >= 0 && static_cast<size_t>(i) < elements; });
+}
+
+// Triangles ready for a shape record, with one vertex per distinct (point, normal, UV) corner.
+struct MeshBuffers {
+    std::vector<float> vertices;
+    std::vector<float> normals;
+    std::vector<float> uvs;
+    std::vector<uint32_t> indices;
+    size_t dropped_faces = 0;            // faces naming points the mesh does not have
+};
+
+// A welded vertex: its point, then the normal and UV it carries (zero when the mesh has none).
+struct CornerKey {
+    int point = 0;
+    float attributes[5] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    bool operator==(const CornerKey& other) const { return std::memcmp(this, &other, sizeof(CornerKey)) == 0; }
+};
+
+struct CornerHash {
+    size_t operator()(const CornerKey& key) const {
+        const auto* bytes = reinterpret_cast<const unsigned char*>(&key);
+        uint64_t hash = 14695981039346656037ull;
+        for (size_t b = 0; b < sizeof(CornerKey); ++b) {
+            hash = (hash ^ bytes[b]) * 1099511628211ull;
+        }
+        return static_cast<size_t>(hash);
+    }
+};
+
+// Fan-triangulates `faces`, welding corners that share a point, normal and UV into vertices kept in authored
+// point order, so points no face uses drop out; `flip` reverses the winding.
+MeshBuffers AssembleMesh(const PrimData& prim, const std::vector<int>& faces, const Primvar& normals,
+                         const Primvar& uvs, bool flip) {
+    const std::vector<int>& counts = prim.face_vertex_counts;
+    const std::vector<int>& corners = prim.face_vertex_indices;
+    std::vector<size_t> starts(counts.size() + 1u, 0u);
+    for (size_t f = 0; f < counts.size(); ++f) {
+        starts[f + 1u] = starts[f] + static_cast<size_t>(std::max(counts[f], 0));
+    }
+    const int points = static_cast<int>(prim.mesh_points.size() / 3u);
+    MeshBuffers out;
+    std::unordered_map<CornerKey, uint32_t, CornerHash> welded;
+    std::vector<int> point_of;
+    const auto vertex = [&](size_t face, size_t corner) {
+        CornerKey key;
+        key.point = corners[corner];
+        const size_t point = static_cast<size_t>(key.point);
+        if (!normals.values.empty()) {
+            const float* n = &normals.values[3u * ElementOf(normals, point, face, corner)];
+            std::copy(n, n + 3, key.attributes);
+        }
+        if (!uvs.values.empty()) {
+            const float* uv = &uvs.values[2u * ElementOf(uvs, point, face, corner)];
+            std::copy(uv, uv + 2, key.attributes + 3);
+        }
+        const auto [it, added] = welded.try_emplace(key, static_cast<uint32_t>(welded.size()));
+        if (added) {
+            point_of.push_back(key.point);
+            const float* p = &prim.mesh_points[3u * point];
+            out.vertices.insert(out.vertices.end(), p, p + 3);
+            if (!normals.values.empty()) {
+                out.normals.insert(out.normals.end(), key.attributes, key.attributes + 3);
+            }
+            if (!uvs.values.empty()) {
+                out.uvs.insert(out.uvs.end(), key.attributes + 3, key.attributes + 5);
+            }
+        }
+        return it->second;
+    };
+    for (const int face : faces) {
+        const size_t f = static_cast<size_t>(face);
+        if (counts[f] < 3) {
+            continue;
+        }
+        const size_t start = starts[f];
+        const size_t end = starts[f + 1u];
+        if (end > corners.size() || std::any_of(corners.begin() + static_cast<std::ptrdiff_t>(start),
+                                                corners.begin() + static_cast<std::ptrdiff_t>(end),
+                                                [&](int p) { return p < 0 || p >= points; })) {
+            ++out.dropped_faces;
+            continue;
+        }
+        for (size_t k = start + 1u; k + 1u < end; ++k) {
+            const uint32_t a = vertex(f, start), b = vertex(f, k), c = vertex(f, k + 1u);
+            out.indices.insert(out.indices.end(), {a, flip ? c : b, flip ? b : c});
+        }
+    }
+    std::vector<uint32_t> order(point_of.size());
+    std::iota(order.begin(), order.end(), 0u);
+    std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return point_of[a] < point_of[b]; });
+    std::vector<uint32_t> rank(order.size());
+    for (uint32_t i = 0; i < order.size(); ++i) {
+        rank[order[i]] = i;
+    }
+    const auto permute = [&](std::vector<float>& values, size_t width) {
+        std::vector<float> sorted(values.size());
+        for (size_t i = 0; i < order.size(); ++i) {
+            std::copy_n(values.begin() + static_cast<std::ptrdiff_t>(order[i] * width), width,
+                        sorted.begin() + static_cast<std::ptrdiff_t>(i * width));
+        }
+        values.swap(sorted);
+    };
+    permute(out.vertices, 3u);
+    if (!out.normals.empty()) {
+        permute(out.normals, 3u);
+    }
+    if (!out.uvs.empty()) {
+        permute(out.uvs, 2u);
+    }
+    for (uint32_t& index : out.indices) {
+        index = rank[index];
+    }
+    return out;
+}
+
+// Bakes the scale, mirror or shear a placement leaves over into the points, and its inverse
+// transpose into the normals.
+void BakeResidual(const pxr::GfMatrix3d& residual, MeshBuffers& mesh) {
+    if (IsIdentity(residual)) {
+        return;
+    }
+    for (size_t v = 0; v + 2u < mesh.vertices.size(); v += 3u) {
+        float* p = &mesh.vertices[v];
+        const pxr::GfVec3d q = pxr::GfVec3d(p[0], p[1], p[2]) * residual;
+        p[0] = F(q[0]);
+        p[1] = F(q[1]);
+        p[2] = F(q[2]);
+    }
+    const pxr::GfMatrix3d cotangent = residual.GetInverse().GetTranspose();
+    for (size_t v = 0; v + 2u < mesh.normals.size(); v += 3u) {
+        float* n = &mesh.normals[v];
+        const pxr::GfVec3d m = (pxr::GfVec3d(n[0], n[1], n[2]) * cotangent).GetNormalized();
+        n[0] = F(m[0]);
+        n[1] = F(m[1]);
+        n[2] = F(m[2]);
+    }
+}
+
+// The gprim's displayColor and displayOpacity, inherited from ancestors as constant primvars are, and
+// averaged when they vary over the surface.
+bool DisplayColorOf(const pxr::UsdPrim& prim, math::Vec3& color, float& opacity) {
+    const pxr::UsdGeomPrimvarsAPI primvars(prim);
+    pxr::VtVec3fArray colors;
+    if (!primvars.FindPrimvarWithInheritance(pxr::TfToken("displayColor")).ComputeFlattened(&colors, kTime) ||
+        colors.empty()) {
+        return false;
+    }
+    pxr::GfVec3d sum(0.0);
+    for (const pxr::GfVec3f& c : colors) {
+        sum += pxr::GfVec3d(c);
+    }
+    sum /= static_cast<double>(colors.size());
+    color = {F(sum[0]), F(sum[1]), F(sum[2])};
+    pxr::VtFloatArray opacities;
+    if (primvars.FindPrimvarWithInheritance(pxr::TfToken("displayOpacity")).ComputeFlattened(&opacities, kTime) &&
+        !opacities.empty()) {
+        opacity = F(std::accumulate(opacities.begin(), opacities.end(), 0.0) / static_cast<double>(opacities.size()));
+    }
+    return true;
+}
+
+// "rrggbb" of a colour, then "_aa" when it is not opaque.
+std::string Hex(const math::Vec3& color, float alpha) {
+    const auto byte = [](float v) { return static_cast<int>(std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f)); };
+    char text[16];
+    std::snprintf(text, sizeof(text), "%02x%02x%02x", byte(color.x), byte(color.y), byte(color.z));
+    std::string out(text);
+    if (alpha < 1.0f) {
+        std::snprintf(text, sizeof(text), "_%02x", byte(alpha));
+        out += text;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Shading networks
+// ---------------------------------------------------------------------------
+
+// The attribute that gives a shader input its value: its own authored value or the output it connects to.
+pxr::UsdAttribute SourceOf(const pxr::UsdShadeInput& input) {
+    if (!input) {
+        return {};
+    }
+    const pxr::UsdShadeAttributeVector sources = input.GetValueProducingAttributes();
+    return sources.empty() ? pxr::UsdAttribute() : sources.front();
+}
+
+bool IsOutput(const pxr::UsdAttribute& attr) {
+    return attr && pxr::UsdShadeUtils::GetType(attr.GetName()) == pxr::UsdShadeAttributeType::Output;
+}
+
+std::string ShaderIdOf(const pxr::UsdPrim& prim) {
+    pxr::TfToken id;
+    pxr::UsdShadeShader(prim).GetShaderId(&id);
+    return id.GetString();
+}
+
+// One UsdUVTexture channel feeding a material input.
+struct Texture {
+    std::string path;                    // resolved file, or "package#offset+length"
+    int channel = 0;                     // 0 R, 1 G, 2 B, 3 A; rgb reads from R
+    pxr::GfVec4f scale{1.0f};
+    pxr::GfVec4f bias{0.0f};
+    std::string uv_set = "st";
+    float uv_scale = 1.0f;
+};
+
+// What the builder keeps about an imported material besides its record.
+struct MaterialInfo {
+    double density = 0.0;                // PhysicsMaterialAPI density, stage units
+    bool display_color = false;          // diffuseColor reads the gprim's displayColor
+    std::string uv_set;                  // primvar its textures sample; empty when untextured
+};
 
 bool IsJointPrim(const PrimData& prim) {
     return (StartsWith(prim.type, "Physics") || StartsWith(prim.type, "Physx")) &&
@@ -615,9 +907,20 @@ scene::DecomposeMode DecomposeModeFromToken(const std::string& token) {
 // UsdGeomCamera -- USD has no implied FOV without focal length + aperture.
 constexpr float kDefaultCameraVFovDegrees = 45.0f;
 
-// UsdLux intensity (times 2^exposure) per Nuka radiance unit: an Isaac Lab sun of 3000 is a
+// Authored UsdLux intensity (times 2^exposure) per Nuka radiance unit: an Isaac Lab sun of 3000 is a
 // Nuka sun of 3.
 constexpr float kUsdLuxToNuka = 1.0f / 1000.0f;
+
+// The schema's fallback DistantLight, 50000 nits over a 0.53 degree disc, lights a facing surface with
+// pi * sin^2(0.265 deg) * 50000 = 3.36 at EV0; other fallbacks are nits, which Nuka takes as they are.
+constexpr float kFallbackSunToNuka = 6.7204e-5f;
+
+// A light's Nuka intensity: authored values in Isaac Lab units, fallbacks per the UsdLux spec at EV0.
+float LightIntensity(const PrimData& prim) {
+    const float scale = prim.intensity_authored ? kUsdLuxToNuka
+                                                : prim.type == "DistantLight" ? kFallbackSunToNuka : 1.0f;
+    return prim.intensity * std::exp2(prim.exposure) * scale;
+}
 
 // Vertical FOV (degrees) from a UsdGeomCamera, per the physCamera convention:
 //   vFOV = 2 * atan(verticalAperture / (2 * focalLength)).
@@ -676,21 +979,25 @@ struct Joint {
 
 class SceneBuilder {
 public:
-    SceneBuilder(const StageUnits& units, std::vector<PrimData> prims, std::vector<UsdDiagnostic>& out)
-        : units_(units), prims_(std::move(prims)), out_(out) {}
+    SceneBuilder(pxr::UsdStageRefPtr stage, const StageUnits& units, std::vector<PrimData> prims,
+                 std::vector<UsdDiagnostic>& out)
+        : stage_(std::move(stage)), units_(units), prims_(std::move(prims)), out_(out) {}
 
     scene::SceneIR Build();
 
 private:
-    void Report(UsdDiagnosticSeverity severity, const char* code, const PrimData& prim,
+    void Report(UsdDiagnosticSeverity severity, const char* code, const std::string& path,
                 std::string message) const {
-        out_.push_back(UsdDiagnostic{severity, code, prim.path, std::move(message)});
+        out_.push_back(UsdDiagnostic{severity, code, path, std::move(message)});
     }
     void Error(const char* code, const PrimData& prim, std::string message) const {
-        Report(UsdDiagnosticSeverity::Error, code, prim, std::move(message));
+        Report(UsdDiagnosticSeverity::Error, code, prim.path, std::move(message));
     }
     void Warn(const char* code, const PrimData& prim, std::string message) const {
-        Report(UsdDiagnosticSeverity::Warning, code, prim, std::move(message));
+        Report(UsdDiagnosticSeverity::Warning, code, prim.path, std::move(message));
+    }
+    void Warn(const char* code, const std::string& path, std::string message) const {
+        Report(UsdDiagnosticSeverity::Warning, code, path, std::move(message));
     }
 
     int BodyAt(std::string path) const;
@@ -699,15 +1006,37 @@ private:
     void ReadJoint(size_t index);
     bool ReadD6(const PrimData& prim, Joint& joint);
     void BreakCycles();
+    scene::MaterialId MaterialFor(const pxr::UsdPrim& material, scene::SceneIR& scene);
+    scene::MaterialRecord ReadMaterial(const pxr::UsdPrim& prim, MaterialInfo& info) const;
+    void ReadPreviewSurface(const pxr::UsdShadeShader& surface, const std::string& material,
+                            scene::MaterialRecord& record, MaterialInfo& info) const;
+    bool TextureOf(const pxr::UsdAttribute& source, const char* input, const std::string& material, Texture& out,
+                   MaterialInfo& info) const;
+    std::string TexturePath(const pxr::SdfAssetPath& file, const std::string& material) const;
+    scene::MaterialId LookOf(const pxr::UsdPrim& bound, const PrimData& gprim, scene::SceneIR& scene);
+    scene::MaterialId ColliderMaterial(const PrimData& prim, bool drawn, scene::SceneIR& scene);
+    scene::MaterialId ColorMaterial(scene::MaterialRecord record, scene::MaterialId from, scene::SceneIR& scene);
+    double MaterialDensity(scene::MaterialId id) const;
+    void AddGprim(size_t index, scene::SceneIR& scene);
+    bool SizePrimitive(const PrimData& prim, const Placement& placement, scene::CollisionShapeRecord& shape) const;
+    void AddMeshCollider(size_t index, int owner, scene::CollisionShapeRecord shape, const Placement& placement,
+                         bool flip, scene::SceneIR& scene);
+    void AddMeshVisual(size_t index, int owner, scene::CollisionShapeRecord shape, const Placement& placement,
+                       bool flip, bool collider, scene::SceneIR& scene);
+    void Push(size_t index, int owner, scene::CollisionShapeRecord shape);
+    void ApplyCollisionGroups();
+    void AddFilteredPairs(scene::SceneIR& scene) const;
     void AddBodies(scene::SceneIR& scene);
     void AddShapes(scene::SceneIR& scene);
     void SetMass(const Body& body, scene::RigidBodyRecord& record) const;
     void AddJoints(scene::SceneIR& scene);
     void AddDrive(const Joint& joint, scene::SceneIR& scene);
+    void AddDome(const PrimData& prim, scene::SceneIR& scene);
     scene::BodyId WorldBody(scene::SceneIR& scene);
     Pose FrameOf(int body) const { return body < 0 ? Pose{} : bodies_[static_cast<size_t>(body)].frame; }
     scene::BodyId IdOf(int body) const { return static_cast<scene::BodyId>(body); }
 
+    pxr::UsdStageRefPtr stage_;
     StageUnits units_;
     std::vector<PrimData> prims_;
     std::vector<UsdDiagnostic>& out_;
@@ -719,6 +1048,10 @@ private:
     std::vector<scene::CollisionShapeRecord> shapes_;
     std::vector<std::pair<size_t, int>> shape_sources_;  // prim index and body index of each shape
     std::vector<scene::BodyId> anchors_;                 // per joint: the static body a world joint holds
+    std::unordered_map<std::string, scene::MaterialId> material_at_;     // by Material prim path
+    std::unordered_map<scene::MaterialId, MaterialInfo> material_info_;
+    std::unordered_map<std::string, scene::MaterialId> color_materials_; // displayColor materials by name
+    bool dome_ = false;                                                   // a DomeLight set the environment
     scene::BodyId world_body_ = scene::kInvalidBody;
     scene::BodyId next_body_ = 0;
 };
@@ -989,6 +1322,592 @@ void SceneBuilder::BreakCycles() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Materials
+// ---------------------------------------------------------------------------
+
+// The record of a Material prim, added the first time anything asks for it.
+scene::MaterialId SceneBuilder::MaterialFor(const pxr::UsdPrim& material, scene::SceneIR& scene) {
+    const std::string path = material.GetPath().GetString();
+    const auto found = material_at_.find(path);
+    if (found != material_at_.end()) {
+        return found->second;
+    }
+    MaterialInfo info;
+    const scene::MaterialId id = scene.AddMaterial(ReadMaterial(material, info));
+    material_at_[path] = id;
+    material_info_[id] = std::move(info);
+    return id;
+}
+
+// A Material prim's UsdPreviewSurface, or without one the inputs written on the prim itself (Nuka's
+// own scenes), plus its UsdPhysics material values.
+scene::MaterialRecord SceneBuilder::ReadMaterial(const pxr::UsdPrim& prim, MaterialInfo& info) const {
+    const std::string path = prim.GetPath().GetString();
+    scene::MaterialRecord record;
+    record.name = prim.GetName().GetString();
+    const pxr::UsdShadeShader surface = pxr::UsdShadeMaterial(prim).ComputeSurfaceSource();
+    if (surface && ShaderIdOf(surface.GetPrim()) == "UsdPreviewSurface") {
+        ReadPreviewSurface(surface, path, record, info);
+    } else {
+        if (!Read(prim, "inputs:color", record.base_color) && !Read(prim, "inputs:diffuseColor", record.base_color)) {
+            Read(prim, "color", record.base_color);
+        }
+        Read(prim, "inputs:alpha", record.alpha);
+        Read(prim, "inputs:roughness", record.roughness);
+        Read(prim, "inputs:metallic", record.metallic);
+    }
+    Read(prim, "physics:dynamicFriction", record.friction_mu);
+    Read(prim, "physics:density", info.density);
+    double restitution = 0.0;
+    if (Read(prim, "physics:restitution", restitution) && restitution > 0.0) {
+        Warn("USD_MATERIAL_RESTITUTION", path, "restitution is not represented; contacts stay inelastic");
+    }
+    return record;
+}
+
+// UsdPreviewSurface inputs, each a constant or a UsdUVTexture channel; unauthored inputs keep the spec's
+// defaults.
+void SceneBuilder::ReadPreviewSurface(const pxr::UsdShadeShader& surface, const std::string& material,
+                                      scene::MaterialRecord& record, MaterialInfo& info) const {
+    const auto source = [&](const char* name) { return SourceOf(surface.GetInput(pxr::TfToken(name))); };
+    record.base_color = {0.18f, 0.18f, 0.18f};
+    record.ior = 1.5f;
+    Texture map;
+    const pxr::UsdAttribute diffuse = source("diffuseColor");
+    if (IsOutput(diffuse) && StartsWith(ShaderIdOf(diffuse.GetPrim()), "UsdPrimvarReader")) {
+        const pxr::UsdShadeShader reader(diffuse.GetPrim());
+        std::string varname;
+        ReadSource(SourceOf(reader.GetInput(pxr::TfToken("varname"))), varname);
+        ReadSource(SourceOf(reader.GetInput(pxr::TfToken("fallback"))), record.base_color);
+        info.display_color = varname == "displayColor";
+        if (!info.display_color) {
+            Warn("USD_MATERIAL_PRIMVAR", material, "diffuseColor reads primvar '" + varname +
+                 "', which is not supported; its fallback colour is used");
+        }
+    } else if (TextureOf(diffuse, "diffuseColor", material, map, info)) {
+        record.albedo_map = map.path;
+        record.base_color = {map.scale[0], map.scale[1], map.scale[2]};
+        record.uv_scale = map.uv_scale;
+    } else {
+        ReadSource(diffuse, record.base_color);
+    }
+    const auto scalar = [&](const char* input, float& value, std::string& path, uint32_t& channel) {
+        const pxr::UsdAttribute attr = source(input);
+        if (!TextureOf(attr, input, material, map, info)) {
+            ReadSource(attr, value);
+        } else if (map.channel == 3) {
+            Warn("USD_TEXTURE_CHANNEL", material, std::string(input) + " reads a texture's alpha channel, "
+                 "which is not supported; the map is left out");
+        } else {
+            path = map.path;
+            channel = static_cast<uint32_t>(map.channel);
+            value = map.scale[map.channel];
+        }
+    };
+    scalar("roughness", record.roughness, record.roughness_map, record.roughness_channel);
+    scalar("metallic", record.metallic, record.metallic_map, record.metallic_channel);
+    const pxr::UsdAttribute emissive = source("emissiveColor");
+    if (TextureOf(emissive, "emissiveColor", material, map, info)) {
+        record.emissive_map = map.path;
+        record.emissive = {map.scale[0], map.scale[1], map.scale[2]};
+    } else {
+        ReadSource(emissive, record.emissive);
+    }
+    if (TextureOf(source("normal"), "normal", material, map, info)) {
+        record.normal_map = map.path;
+        const bool standard = map.scale[0] == 2.0f && map.scale[1] == 2.0f && map.scale[2] == 2.0f &&
+                              map.bias[0] == -1.0f && map.bias[1] == -1.0f && map.bias[2] == -1.0f;
+        if (!standard) {
+            Warn("USD_NORMAL_MAP_ENCODING", material, "the normal map's scale and bias are not (2, 2, 2) and "
+                 "(-1, -1, -1); it is read as a standard tangent-space map");
+        }
+    }
+    const pxr::UsdAttribute opacity = source("opacity");
+    if (IsOutput(opacity)) {
+        Warn("USD_MATERIAL_INPUT_UNSUPPORTED", material, "a textured opacity is not supported; the material "
+             "stays opaque");
+    } else {
+        ReadSource(opacity, record.alpha);
+    }
+    ReadSource(source("ior"), record.ior);
+    int specular = 0;
+    if (ReadSource(source("useSpecularWorkflow"), specular) && specular != 0) {
+        Warn("USD_MATERIAL_SPECULAR", material, "the specular workflow is not supported; the material is read "
+             "as metallic-roughness");
+    }
+    record.triplanar = record.albedo_map.empty() && record.roughness_map.empty() && record.metallic_map.empty() &&
+                       record.normal_map.empty() && record.emissive_map.empty();
+}
+
+// The UsdUVTexture channel `source` names, with the UV set its st reads and a uniform UsdTransform2d scale.
+bool SceneBuilder::TextureOf(const pxr::UsdAttribute& source, const char* input, const std::string& material,
+                             Texture& out, MaterialInfo& info) const {
+    if (!IsOutput(source)) {
+        return false;
+    }
+    const pxr::UsdShadeShader shader(source.GetPrim());
+    const std::string id = ShaderIdOf(source.GetPrim());
+    if (id != "UsdUVTexture") {
+        Warn("USD_MATERIAL_INPUT_UNSUPPORTED", material, std::string(input) + " comes from a '" + id +
+             "' shader, which is not supported; the default is used");
+        return false;
+    }
+    out = Texture{};
+    const std::string channel = pxr::UsdShadeOutput(source).GetBaseName().GetString();
+    out.channel = channel == "g" ? 1 : channel == "b" ? 2 : channel == "a" ? 3 : 0;
+    ReadSource(SourceOf(shader.GetInput(pxr::TfToken("scale"))), out.scale);
+    ReadSource(SourceOf(shader.GetInput(pxr::TfToken("bias"))), out.bias);
+    pxr::SdfAssetPath file;
+    ReadSource(SourceOf(shader.GetInput(pxr::TfToken("file"))), file);
+    out.path = TexturePath(file, material);
+    pxr::UsdAttribute st = SourceOf(shader.GetInput(pxr::TfToken("st")));
+    if (IsOutput(st) && ShaderIdOf(st.GetPrim()) == "UsdTransform2d") {
+        const pxr::UsdShadeShader transform(st.GetPrim());
+        pxr::GfVec2f scale(1.0f), translation(0.0f);
+        float rotation = 0.0f;
+        ReadSource(SourceOf(transform.GetInput(pxr::TfToken("scale"))), scale);
+        ReadSource(SourceOf(transform.GetInput(pxr::TfToken("translation"))), translation);
+        ReadSource(SourceOf(transform.GetInput(pxr::TfToken("rotation"))), rotation);
+        if (scale[0] != scale[1] || rotation != 0.0f || translation != pxr::GfVec2f(0.0f)) {
+            Warn("USD_TEXTURE_TRANSFORM", material, "only a uniform scale is kept from UV transform <" +
+                 transform.GetPath().GetString() + ">");
+        }
+        out.uv_scale = scale[0];
+        st = SourceOf(transform.GetInput(pxr::TfToken("in")));
+    }
+    if (IsOutput(st) && StartsWith(ShaderIdOf(st.GetPrim()), "UsdPrimvarReader")) {
+        ReadSource(SourceOf(pxr::UsdShadeShader(st.GetPrim()).GetInput(pxr::TfToken("varname"))), out.uv_set);
+    }
+    if (out.path.empty()) {
+        return false;
+    }
+    if (info.uv_set.empty()) {
+        info.uv_set = out.uv_set;
+    } else if (info.uv_set != out.uv_set) {
+        Warn("USD_TEXTURE_UV_SETS", material, "textures sample both '" + info.uv_set + "' and '" + out.uv_set +
+             "'; all of them use '" + info.uv_set + "'");
+    }
+    return true;
+}
+
+// A texture file the renderer can open: the resolved path, or "package#offset+length" for an image stored
+// in a .usdz; missing files, UDIM sets and formats it cannot decode give "".
+std::string SceneBuilder::TexturePath(const pxr::SdfAssetPath& file, const std::string& material) const {
+    const std::string& authored = file.GetAssetPath();
+    if (authored.empty()) {
+        return {};
+    }
+    if (authored.find("<UDIM>") != std::string::npos) {
+        Warn("USD_TEXTURE_UDIM", material, "UDIM texture '" + authored + "' is not supported; it is left out");
+        return {};
+    }
+    const std::string& resolved = file.GetResolvedPath();
+    if (resolved.empty()) {
+        Warn("USD_TEXTURE_MISSING", material, "texture '" + authored + "' was not found; it is left out");
+        return {};
+    }
+    std::string package, inner = resolved;
+    if (pxr::ArIsPackageRelativePath(resolved)) {
+        std::tie(package, inner) = pxr::ArSplitPackageRelativePathOuter(resolved);
+    }
+    const std::string extension = Lowercase(std::filesystem::path(inner).extension().string());
+    if (extension != ".png" && extension != ".jpg" && extension != ".jpeg" && extension != ".tga" &&
+        extension != ".bmp" && extension != ".hdr") {
+        Warn("USD_TEXTURE_FORMAT", material, "texture '" + authored + "' is a " + extension +
+             " file, which the renderer cannot decode; it is left out");
+        return {};
+    }
+    if (package.empty()) {
+        return resolved;
+    }
+    const pxr::SdfZipFile zip = pxr::SdfZipFile::Open(package);
+    if (zip) {
+        const pxr::SdfZipFile::Iterator entry = zip.Find(inner);
+        if (entry != zip.end()) {
+            const pxr::SdfZipFile::FileInfo stored = entry.GetFileInfo();
+            if (stored.compressionMethod == 0 && !stored.encrypted) {
+                return package + "#" + std::to_string(stored.dataOffset) + "+" + std::to_string(stored.size);
+            }
+            Warn("USD_TEXTURE_FORMAT", material, "texture '" + authored + "' is compressed inside the package; "
+                 "it is left out");
+            return {};
+        }
+    }
+    Warn("USD_TEXTURE_MISSING", material, "texture '" + authored + "' is not in " + package + "; it is left out");
+    return {};
+}
+
+// What a drawn gprim, or one of its subsets, looks like: its preview binding (copied per colour when the
+// material reads displayColor), else a material per displayColor.
+scene::MaterialId SceneBuilder::LookOf(const pxr::UsdPrim& bound, const PrimData& gprim, scene::SceneIR& scene) {
+    const pxr::UsdShadeMaterial material =
+        pxr::UsdShadeMaterialBindingAPI(bound).ComputeBoundMaterial(pxr::UsdShadeTokens->preview);
+    math::Vec3 color;
+    float opacity = 1.0f;
+    const bool colored = DisplayColorOf(gprim.prim, color, opacity);
+    if (material) {
+        const scene::MaterialId id = MaterialFor(material.GetPrim(), scene);
+        if (!colored || !material_info_.at(id).display_color) {
+            return id;
+        }
+        scene::MaterialRecord copy = scene.GetMaterial(id);
+        copy.name += "_" + Hex(color, opacity);
+        copy.base_color = color;
+        copy.alpha *= opacity;
+        return ColorMaterial(std::move(copy), id, scene);
+    }
+    if (!colored) {
+        return scene::kInvalidMaterial;
+    }
+    scene::MaterialRecord record;
+    record.name = "displayColor_" + Hex(color, opacity);
+    record.base_color = color;
+    record.alpha = opacity;
+    return ColorMaterial(std::move(record), scene::kInvalidMaterial, scene);
+}
+
+// One record per colour name; a copy of `from` keeps its textures' UV set and its density.
+scene::MaterialId SceneBuilder::ColorMaterial(scene::MaterialRecord record, scene::MaterialId from,
+                                              scene::SceneIR& scene) {
+    const auto found = color_materials_.find(record.name);
+    if (found != color_materials_.end()) {
+        return found->second;
+    }
+    MaterialInfo info = from == scene::kInvalidMaterial ? MaterialInfo{} : material_info_.at(from);
+    info.display_color = false;
+    const std::string name = record.name;
+    const scene::MaterialId id = scene.AddMaterial(std::move(record));
+    color_materials_[name] = id;
+    material_info_[id] = std::move(info);
+    return id;
+}
+
+// A collider's physics binding, which falls back to its allPurpose one; a collider drawn as itself takes
+// its look when it has neither.
+scene::MaterialId SceneBuilder::ColliderMaterial(const PrimData& prim, bool drawn, scene::SceneIR& scene) {
+    const pxr::UsdShadeMaterial material =
+        pxr::UsdShadeMaterialBindingAPI(prim.prim).ComputeBoundMaterial(pxr::TfToken("physics"));
+    if (material) {
+        return MaterialFor(material.GetPrim(), scene);
+    }
+    return drawn ? LookOf(prim.prim, prim, scene) : scene::kInvalidMaterial;
+}
+
+double SceneBuilder::MaterialDensity(scene::MaterialId id) const {
+    const auto found = material_info_.find(id);
+    return found == material_info_.end() ? 0.0 : found->second.density;
+}
+
+// ---------------------------------------------------------------------------
+// Shapes
+// ---------------------------------------------------------------------------
+
+// A gprim gives a collider when it has CollisionAPI and a visual when it is drawn; a primitive collider
+// is drawn as itself, so only meshes and primitives that never collide add a visual record.
+void SceneBuilder::AddGprim(size_t index, scene::SceneIR& scene) {
+    const PrimData& prim = prims_[index];
+    bool enabled = true;
+    Read(prim.prim, "physics:collisionEnabled", enabled);
+    const bool collider = prim.HasApi("PhysicsCollisionAPI") && enabled;
+    const bool drawn = prim.visible && (prim.purpose == "default" || prim.purpose == "render");
+    if (!collider && !drawn) {
+        return;
+    }
+    if (prim.type == "Cone") {
+        Warn("USD_SHAPE_UNSUPPORTED", prim, "cones are not supported; the cone is left out");
+        return;
+    }
+    const int owner = BodyAt(prim.path);
+    const Placement placement = Place(prim.world);
+    scene::CollisionShapeRecord shape;
+    shape.name = prim.name;
+    shape.body_id = owner < 0 ? scene::kInvalidBody : IdOf(owner);
+    shape.local_transform = ToTransform(FrameOf(owner).Inverse() * placement.pose);
+    if (prim.type == "Mesh") {
+        const bool flip = prim.left_handed != (placement.residual.GetDeterminant() < 0.0);
+        if (collider) {
+            AddMeshCollider(index, owner, shape, placement, flip, scene);
+        }
+        if (drawn) {
+            AddMeshVisual(index, owner, shape, placement, flip, collider, scene);
+        }
+        return;
+    }
+    if (!SizePrimitive(prim, placement, shape)) {
+        return;
+    }
+    if (collider) {
+        shape.material_id = ColliderMaterial(prim, drawn, scene);
+    } else {
+        shape.contype = 0;
+        shape.conaffinity = 0;
+        shape.material_id = LookOf(prim.prim, prim, scene);
+    }
+    Push(index, owner, std::move(shape));
+}
+
+// A primitive's type and size; scale off its axes is kept per axis, shear is dropped.
+bool SceneBuilder::SizePrimitive(const PrimData& prim, const Placement& placement,
+                                 scene::CollisionShapeRecord& shape) const {
+    PrimitiveType(prim.type, shape.type);
+    const pxr::GfVec3d scale = ScaleOf(placement.residual);
+    if (Sheared(placement.residual)) {
+        Warn("USD_SHAPE_SHEARED", prim, "the shape's transform shears it; only its axis scales are kept");
+    }
+    const auto uniform = [&](double a, double b) { return std::abs(a - b) <= 1e-6 * std::max(a, b); };
+    if (shape.type == scene::ShapeType::Box) {
+        const double half = prim.cube_size * 0.5;
+        shape.half_extents = {F(half * scale[0]), F(half * scale[1]), F(half * scale[2])};
+    } else if (shape.type == scene::ShapeType::Sphere) {
+        if (!uniform(scale[0], scale[1]) || !uniform(scale[0], scale[2])) {
+            Warn("USD_SCALE_NONUNIFORM", prim, "a sphere scaled unevenly keeps its largest radius");
+        }
+        shape.radius = F(prim.radius * std::max({scale[0], scale[1], scale[2]}));
+    } else {
+        math::Quat alignment;
+        if (!AxisAlignment(prim.geometry_axis_token, alignment)) {
+            Error("USD_SHAPE_AXIS_INVALID", prim, "invalid " + prim.type + " axis '" + prim.geometry_axis_token +
+                  "'; the shape is left out");
+            return false;
+        }
+        const int along = Lowercase(prim.geometry_axis_token) == "x" ? 0
+                        : Lowercase(prim.geometry_axis_token) == "y" ? 1 : 2;
+        const double across0 = scale[(along + 1) % 3], across1 = scale[(along + 2) % 3];
+        if (shape.type != scene::ShapeType::Plane && !uniform(across0, across1)) {
+            Warn("USD_SCALE_NONUNIFORM", prim, "a " + prim.type + " scaled unevenly across its axis "
+                 "keeps its largest radius");
+        }
+        shape.radius = F(prim.radius * std::max(across0, across1));
+        shape.half_height = F(prim.height * 0.5 * scale[along]);
+        shape.local_transform.rotation = (shape.local_transform.rotation * alignment).Normalized();
+    }
+    return true;
+}
+
+// A mesh collider as its MeshCollisionAPI approximation asks; nuka:decompose wins over the approximation.
+void SceneBuilder::AddMeshCollider(size_t index, int owner, scene::CollisionShapeRecord shape,
+                                   const Placement& placement, bool flip, scene::SceneIR& scene) {
+    const PrimData& prim = prims_[index];
+    std::vector<int> faces(prim.face_vertex_counts.size());
+    std::iota(faces.begin(), faces.end(), 0);
+    MeshBuffers mesh = AssembleMesh(prim, faces, Primvar{}, Primvar{}, flip);
+    if (mesh.dropped_faces > 0u) {
+        Warn("USD_MESH_INVALID", prim, std::to_string(mesh.dropped_faces) + " faces name points the mesh does "
+             "not have; they are left out");
+    }
+    if (mesh.indices.empty()) {
+        return;
+    }
+    BakeResidual(placement.residual, mesh);
+    shape.type = scene::ShapeType::TriMesh;
+    shape.mesh_vertices = std::move(mesh.vertices);
+    shape.mesh_indices = std::move(mesh.indices);
+    shape.decompose_mode = DecomposeModeFromToken(prim.decompose_mode);
+    if (prim.decompose_max_pieces > 0) {
+        shape.decompose_max_pieces = static_cast<uint32_t>(prim.decompose_max_pieces);
+    }
+    const std::string& approximation = prim.approximation;
+    if (approximation == "convexHull") {
+        shape.type = scene::ShapeType::ConvexHull;
+    } else if (approximation == "convexDecomposition") {
+        if (prim.decompose_mode.empty()) {
+            shape.decompose_mode = scene::DecomposeMode::Force;
+            if (prim.max_hulls > 0) {
+                shape.decompose_max_pieces = static_cast<uint32_t>(prim.max_hulls);
+            }
+        }
+    } else if (approximation == "boundingSphere" || approximation == "boundingCube") {
+        pxr::GfVec3d low(kInf), high(-kInf);
+        for (size_t v = 0; v + 2u < shape.mesh_vertices.size(); v += 3u) {
+            for (int k = 0; k < 3; ++k) {
+                low[k] = std::min(low[k], static_cast<double>(shape.mesh_vertices[v + k]));
+                high[k] = std::max(high[k], static_cast<double>(shape.mesh_vertices[v + k]));
+            }
+        }
+        const pxr::GfVec3d center = 0.5 * (low + high);
+        if (approximation == "boundingSphere") {
+            double radius = 0.0;
+            for (size_t v = 0; v + 2u < shape.mesh_vertices.size(); v += 3u) {
+                const float* p = &shape.mesh_vertices[v];
+                radius = std::max(radius, (pxr::GfVec3d(p[0], p[1], p[2]) - center).GetLength());
+            }
+            shape.type = scene::ShapeType::Sphere;
+            shape.radius = F(radius);
+        } else {
+            const pxr::GfVec3d half = 0.5 * (high - low);
+            shape.type = scene::ShapeType::Box;
+            shape.half_extents = {F(half[0]), F(half[1]), F(half[2])};
+        }
+        const math::Vec3 offset{F(center[0]), F(center[1]), F(center[2])};
+        shape.local_transform.position = shape.local_transform.position + shape.local_transform.rotation.Rotate(offset);
+        shape.mesh_vertices.clear();
+        shape.mesh_indices.clear();
+    } else if (approximation == "sdf") {
+        shape.mesh_contact = scene::CollisionShapeRecord::MeshContact::Sdf;
+    } else if (!approximation.empty() && approximation != "none" && approximation != "meshSimplification") {
+        Warn("USD_APPROXIMATION_UNSUPPORTED", prim, "collision approximation '" + approximation +
+             "' is not supported; the mesh collides as authored");
+    }
+    shape.material_id = ColliderMaterial(prim, false, scene);
+    Push(index, owner, std::move(shape));
+}
+
+// A drawn mesh as visual records: one per materialBind subset with its own material, and one for the
+// faces no subset takes.
+void SceneBuilder::AddMeshVisual(size_t index, int owner, scene::CollisionShapeRecord shape,
+                                 const Placement& placement, bool flip, bool collider, scene::SceneIR& scene) {
+    const PrimData& prim = prims_[index];
+    const size_t points = prim.mesh_points.size() / 3u;
+    const size_t faces = prim.face_vertex_counts.size();
+    const size_t corners = prim.face_vertex_indices.size();
+    Primvar normals = NormalsOf(prim.prim);
+    if (!normals.values.empty() && !Covers(normals, points, faces, corners)) {
+        Warn("USD_PRIMVAR_MISMATCH", prim, "the normals do not cover the mesh; they are recomputed");
+        normals = Primvar{};
+    }
+    std::vector<std::pair<pxr::UsdPrim, std::vector<int>>> parts;
+    std::vector<char> taken(faces, 0);
+    for (const pxr::UsdGeomSubset& subset : pxr::UsdShadeMaterialBindingAPI(prim.prim).GetMaterialBindSubsets()) {
+        pxr::VtIntArray indices;
+        subset.GetIndicesAttr().Get(&indices, kTime);
+        std::vector<int> list;
+        for (const int f : indices) {
+            if (f >= 0 && static_cast<size_t>(f) < faces && !taken[static_cast<size_t>(f)]) {
+                taken[static_cast<size_t>(f)] = 1;
+                list.push_back(f);
+            }
+        }
+        parts.emplace_back(subset.GetPrim(), std::move(list));
+    }
+    std::vector<int> rest;
+    for (size_t f = 0; f < faces; ++f) {
+        if (!taken[f]) {
+            rest.push_back(static_cast<int>(f));
+        }
+    }
+    parts.emplace_back(prim.prim, std::move(rest));
+    const std::string base = collider ? prim.name + "_visual" : prim.name;
+    std::unordered_map<std::string, Primvar> uv_sets;
+    size_t dropped = 0;
+    for (const auto& [bound, list] : parts) {
+        if (list.empty()) {
+            continue;
+        }
+        scene::CollisionShapeRecord part = shape;
+        part.name = bound == prim.prim ? base : base + "_" + bound.GetName().GetString();
+        part.contype = 0;
+        part.conaffinity = 0;
+        part.material_id = LookOf(bound, prim, scene);
+        const std::string uv_set = part.material_id == scene::kInvalidMaterial
+                                 ? std::string() : material_info_.at(part.material_id).uv_set;
+        auto uvs = uv_sets.find(uv_set);
+        if (uvs == uv_sets.end()) {
+            Primvar read = uv_set.empty() ? Primvar{} : ReadPrimvar(prim.prim, pxr::TfToken(uv_set), 2u);
+            if (!uv_set.empty() && read.values.empty()) {
+                Warn("USD_PRIMVAR_MISSING", prim, "the mesh has no '" + uv_set + "' primvar for its textures");
+            } else if (!read.values.empty() && !Covers(read, points, faces, corners)) {
+                Warn("USD_PRIMVAR_MISMATCH", prim, "primvar '" + uv_set + "' does not cover the mesh; it is "
+                     "left out");
+                read = Primvar{};
+            }
+            uvs = uv_sets.emplace(uv_set, std::move(read)).first;
+        }
+        MeshBuffers mesh = AssembleMesh(prim, list, normals, uvs->second, flip);
+        dropped += mesh.dropped_faces;
+        if (mesh.indices.empty()) {
+            continue;
+        }
+        BakeResidual(placement.residual, mesh);
+        part.type = scene::ShapeType::TriMesh;
+        part.mesh_vertices = std::move(mesh.vertices);
+        part.mesh_normals = std::move(mesh.normals);
+        part.mesh_uvs = std::move(mesh.uvs);
+        part.mesh_indices = std::move(mesh.indices);
+        Push(index, owner, std::move(part));
+    }
+    if (dropped > 0u && !collider) {
+        Warn("USD_MESH_INVALID", prim, std::to_string(dropped) + " faces name points the mesh does not have; "
+             "they are left out");
+    }
+}
+
+void SceneBuilder::Push(size_t index, int owner, scene::CollisionShapeRecord shape) {
+    shapes_.push_back(std::move(shape));
+    shape_sources_.emplace_back(index, owner);
+}
+
+// UsdPhysics collision groups as contype and conaffinity bits: bit 0 stands for every collider outside the
+// groups and bit g + 1 for group g, so a stage without groups keeps 1 and 1.
+void SceneBuilder::ApplyCollisionGroups() {
+    const pxr::UsdPhysicsCollisionGroup::CollisionGroupTable table =
+        pxr::UsdPhysicsCollisionGroup::ComputeCollisionGroupTable(*stage_);
+    const pxr::SdfPathVector& groups = table.GetCollisionGroups();
+    const size_t count = std::min<size_t>(groups.size(), 31u);
+    if (groups.size() > count) {
+        Warn("USD_COLLISION_GROUP_LIMIT", groups[count].GetString(), "only 31 collision groups fit the "
+             "contact bits; this group and the ones after it collide with everything");
+    }
+    std::vector<pxr::UsdCollectionMembershipQuery> members;
+    std::vector<uint32_t> accepts(count, 1u);
+    for (size_t g = 0; g < count; ++g) {
+        const pxr::UsdPhysicsCollisionGroup group(stage_->GetPrimAtPath(groups[g]));
+        members.push_back(group.GetCollidersCollectionAPI().ComputeMembershipQuery());
+        for (size_t h = 0; h < count; ++h) {
+            if (table.IsCollisionEnabled(static_cast<unsigned int>(g), static_cast<unsigned int>(h))) {
+                accepts[g] |= 1u << (h + 1u);
+            }
+        }
+    }
+    for (size_t s = 0; s < shapes_.size(); ++s) {
+        if (shapes_[s].contype == 0u) {
+            continue;
+        }
+        const pxr::SdfPath path = prims_[shape_sources_[s].first].prim.GetPath();
+        uint32_t type = 0u, accept = ~0u;
+        for (size_t g = 0; g < count; ++g) {
+            if (members[g].IsPathIncluded(path)) {
+                type |= 1u << (g + 1u);
+                accept &= accepts[g];
+            }
+        }
+        if (type != 0u) {
+            shapes_[s].contype = type;
+            shapes_[s].conaffinity = accept;
+        }
+    }
+}
+
+// FilteredPairsAPI as body exclude pairs; the engine filters whole bodies, so a filter set on a collider
+// widens to its body.
+void SceneBuilder::AddFilteredPairs(scene::SceneIR& scene) const {
+    for (const PrimData& prim : prims_) {
+        if (!prim.HasApi("PhysicsFilteredPairsAPI")) {
+            continue;
+        }
+        pxr::SdfPathVector targets;
+        prim.prim.GetRelationship(pxr::TfToken("physics:filteredPairs")).GetTargets(&targets);
+        const int a = BodyAt(prim.path);
+        for (const pxr::SdfPath& target : targets) {
+            const int b = BodyAt(target.GetString());
+            if (a < 0 || b < 0) {
+                Warn("USD_FILTER_PAIR_UNSUPPORTED", prim, "the filter with <" + target.GetString() +
+                     "> does not join two rigid bodies; it is dropped");
+                continue;
+            }
+            if (a == b) {
+                continue;
+            }
+            if (prims_[bodies_[static_cast<size_t>(a)].prim].path != prim.path ||
+                prims_[bodies_[static_cast<size_t>(b)].prim].path != target.GetString()) {
+                Warn("USD_FILTER_PAIR_WIDENED", prim, "the filter with <" + target.GetString() +
+                     "> applies to the whole bodies on both sides");
+            }
+            scene.AddExcludePair(IdOf(a), IdOf(b));
+        }
+    }
+}
+
 scene::BodyId SceneBuilder::WorldBody(scene::SceneIR& scene) {
     if (world_body_ == scene::kInvalidBody) {
         scene::RigidBodyRecord body;
@@ -1017,8 +1936,10 @@ void SceneBuilder::SetMass(const Body& body, scene::RigidBodyRecord& record) con
         double density = 0.0, mass = 0.0;
         Read(source.prim, "physics:density", density);
         Read(source.prim, "physics:mass", mass);
+        const double material_density = MaterialDensity(shapes_[s].material_id);
         const double rho = density > 0.0 ? density * density_unit
-                         : body_density > 0.0 ? body_density * density_unit : kDefaultDensity;
+                         : body_density > 0.0 ? body_density * density_unit
+                         : material_density > 0.0 ? material_density * density_unit : kDefaultDensity;
         AddGeomMass(shapes_[s], F(rho), mass > 0.0 ? F(mass * units_.kilograms) : -1.0f, sum);
     }
     const bool from_shapes = sum.mass > 0.0;
@@ -1199,24 +2120,43 @@ void SceneBuilder::AddDrive(const Joint& joint, scene::SceneIR& scene) {
     scene.AddActuator(std::move(actuator));
 }
 
+// The first DomeLight is the scene's environment: its latlong texture the HDRI, its intensity the HDRI's scale.
+void SceneBuilder::AddDome(const PrimData& prim, scene::SceneIR& scene) {
+    if (dome_) {
+        Warn("USD_DOME_LIGHT_EXTRA", prim, "only the first DomeLight becomes the environment; this one is left out");
+        return;
+    }
+    dome_ = true;
+    scene::EnvironmentRecord& env = scene.EnvironmentMut();
+    env.intensity = LightIntensity(prim);
+    pxr::SdfAssetPath file;
+    if (!ReadValue(prim.prim, "inputs:texture:file", file) || file.GetAssetPath().empty()) {
+        return;
+    }
+    pxr::TfToken format;
+    ReadValue(prim.prim, "inputs:texture:format", format);
+    if (format.GetString() != "automatic" && format.GetString() != "latlong") {
+        Warn("USD_DOME_LIGHT_FORMAT", prim, "a " + format.GetString() + " dome texture is not supported; "
+             "it is left out");
+        return;
+    }
+    env.hdri = TexturePath(file, prim.path);
+    if (!env.hdri.empty()) {
+        Warn("USD_DOME_LIGHT_ORIENTATION", prim, "the dome texture keeps the environment's own latlong orientation; "
+             "the light's rotation is not imported");
+    }
+}
+
 scene::SceneIR SceneBuilder::Build() {
     scene::SceneIR scene;
     for (size_t i = 0; i < prims_.size(); ++i) {
         prim_at_[prims_[i].path] = i;
     }
 
+    // Every Material prim gets a record in prim order, bound or not.
     for (const PrimData& prim : prims_) {
         if (prim.type == "Material") {
-            scene::MaterialRecord material;
-            material.name = prim.name;
-            material.base_color = prim.color;
-            material.alpha = prim.alpha;
-            material.roughness = prim.roughness;
-            material.metallic = prim.metallic;
-            if (prim.has_friction) {
-                material.friction_mu = prim.friction_mu;
-            }
-            scene.AddMaterial(std::move(material));
+            MaterialFor(prim.prim, scene);
         }
     }
 
@@ -1255,98 +2195,15 @@ scene::SceneIR SceneBuilder::Build() {
     }
 
     for (size_t i = 0; i < prims_.size(); ++i) {
-        const PrimData& prim = prims_[i];
-        // Purpose only steers drawing: guide and proxy geometry stays out unless it is a collider
-        // (Isaac and Newton author colliders as guides), and render-only geometry never collides.
-        const std::string purpose = Lowercase(prim.purpose);
-        const bool collider = prim.HasApi("PhysicsCollisionAPI");
-        if ((purpose == "guide" || purpose == "proxy") && !collider) {
-            continue;
+        if (IsGprim(prims_[i].type)) {
+            AddGprim(i, scene);
         }
-        if (prim.type == "Cone" && collider) {
-            Warn("USD_SHAPE_UNSUPPORTED", prim, "cone colliders are not supported; the cone is left out");
-            continue;
-        }
-        scene::ShapeType shape_type = scene::ShapeType::Box;
-        if (!ShapeTypeFromPrim(prim, shape_type)) {
-            continue;
-        }
-        bool collide = true;
-        Read(prim.prim, "physics:collisionEnabled", collide);
-        if (!collide) {
-            continue;
-        }
-        const int owner = BodyAt(prim.path);
-        const Placement placement = Place(prim.world);
-        const pxr::GfVec3d scale = ScaleOf(placement.residual);
-        if (Sheared(placement.residual)) {
-            Warn("USD_SHAPE_SHEARED", prim, "the shape's transform shears it; only its axis scales are kept");
-        }
-        scene::CollisionShapeRecord shape;
-        shape.name = prim.name;
-        shape.body_id = owner < 0 ? scene::kInvalidBody : IdOf(owner);
-        shape.type = shape_type;
-        shape.local_transform = ToTransform(FrameOf(owner).Inverse() * placement.pose);
-        if (purpose == "render" && !collider) {
-            shape.contype = 0;
-            shape.conaffinity = 0;
-        }
-        const auto uniform = [&](double a, double b) { return std::abs(a - b) <= 1e-6 * std::max(a, b); };
-        if (shape_type == scene::ShapeType::Box) {
-            const double half = prim.cube_size * 0.5;
-            shape.half_extents = {F(half * scale[0]), F(half * scale[1]), F(half * scale[2])};
-        } else if (shape_type == scene::ShapeType::Sphere) {
-            if (!uniform(scale[0], scale[1]) || !uniform(scale[0], scale[2])) {
-                Warn("USD_SCALE_NONUNIFORM", prim, "a sphere scaled unevenly keeps its largest radius");
-            }
-            shape.radius = F(prim.radius * std::max({scale[0], scale[1], scale[2]}));
-        } else if (shape_type == scene::ShapeType::Capsule || shape_type == scene::ShapeType::Cylinder ||
-                   shape_type == scene::ShapeType::Plane) {
-            math::Quat alignment;
-            if (!AxisAlignment(prim.geometry_axis_token, alignment)) {
-                Error("USD_SHAPE_AXIS_INVALID", prim, "invalid " + prim.type + " axis '" +
-                      prim.geometry_axis_token + "'; the shape is left out");
-                continue;
-            }
-            const int along = Lowercase(prim.geometry_axis_token) == "x" ? 0
-                            : Lowercase(prim.geometry_axis_token) == "y" ? 1 : 2;
-            const double across0 = scale[(along + 1) % 3], across1 = scale[(along + 2) % 3];
-            if (shape_type != scene::ShapeType::Plane && !uniform(across0, across1)) {
-                Warn("USD_SCALE_NONUNIFORM", prim, "a " + prim.type + " scaled unevenly across its axis "
-                     "keeps its largest radius");
-            }
-            shape.radius = F(prim.radius * std::max(across0, across1));
-            shape.half_height = F(prim.height * 0.5 * scale[along]);
-            shape.local_transform.rotation = (shape.local_transform.rotation * alignment).Normalized();
-        } else if (shape_type == scene::ShapeType::TriMesh) {
-            shape.decompose_mode = DecomposeModeFromToken(prim.decompose_mode);
-            if (prim.decompose_max_pieces > 0) {
-                shape.decompose_max_pieces =
-                    static_cast<uint32_t>(prim.decompose_max_pieces);
-            }
-            shape.mesh_vertices = prim.mesh_points;
-            shape.mesh_indices = FanTriangulate(prim.face_vertex_indices, prim.face_vertex_counts);
-            if (!IsIdentity(placement.residual)) {
-                for (size_t v = 0; v + 2 < shape.mesh_vertices.size(); v += 3) {
-                    float* p = &shape.mesh_vertices[v];
-                    const pxr::GfVec3d q = pxr::GfVec3d(p[0], p[1], p[2]) * placement.residual;
-                    p[0] = F(q[0]);
-                    p[1] = F(q[1]);
-                    p[2] = F(q[2]);
-                }
-                if (placement.residual.GetDeterminant() < 0.0) {
-                    for (size_t t = 0; t + 2 < shape.mesh_indices.size(); t += 3) {
-                        std::swap(shape.mesh_indices[t + 1], shape.mesh_indices[t + 2]);
-                    }
-                }
-            }
-        }
-        shapes_.push_back(std::move(shape));
-        shape_sources_.emplace_back(i, owner);
     }
+    ApplyCollisionGroups();
 
     AddBodies(scene);
     AddShapes(scene);
+    AddFilteredPairs(scene);
     AddJoints(scene);
 
     for (size_t i = 0; i < prims_.size(); ++i) {
@@ -1361,13 +2218,15 @@ scene::SceneIR SceneBuilder::Build() {
             camera.near_clip = prim.near_clip;
             camera.far_clip = prim.far_clip;
             scene.AddCamera(std::move(camera));
+        } else if (prim.type == "DomeLight" || prim.type == "DomeLight_1") {
+            AddDome(prim, scene);
         } else if (prim.type.find("Light") != std::string::npos) {
             scene::LightRecord light;
             light.name = prim.name;
             light.type = LightTypeFromUsdType(prim.type);
             light.local_transform = ToTransform(Place(prim.world).pose);
             light.color = prim.color;
-            light.intensity = prim.intensity * std::exp2(prim.exposure) * kUsdLuxToNuka;
+            light.intensity = LightIntensity(prim);
             scene.AddLight(std::move(light));
         } else if (IsJointPrim(prim)) {
             for (const Joint& joint : joints_) {
@@ -1456,7 +2315,7 @@ UsdImportResult ImportUsd(const std::string& path) {
         prims.push_back(ReadPrim(prim, xforms, units));
     }
     UsdImportResult result;
-    scene::SceneIR scene = SceneBuilder(units, std::move(prims), result.diagnostics).Build();
+    scene::SceneIR scene = SceneBuilder(stage, units, std::move(prims), result.diagnostics).Build();
     // A USD scene must yield rigid bodies (a physics scene) or at least one shape (an environment or
     // a geometry-only asset).
     if (scene.RigidBodyCount() == 0u && scene.ShapeCount() == 0u) {

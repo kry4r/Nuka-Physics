@@ -11,6 +11,9 @@
 //   * D1: two loads are byte-identical; two cooks are byte-identical,
 //   * the cup cooks to a COLLIDABLE convex hull (the C7b grasp-gate need).
 //
+// The asset's Mesh has no PhysicsCollisionAPI, so it imports as a visual; collider checks go through a
+// wrapper that applies the API on a guide-purpose prim, as Isaac and Newton author collision meshes.
+//
 // The asset path resolves relative to ${CMAKE_SOURCE_DIR} (the import test's
 // WORKING_DIRECTORY). The cup is a fetch-per-env asset (.nuka-assets is
 // gitignored, per the newton-assets policy), so this suite SKIPS when the asset
@@ -27,6 +30,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <string>
 #include <utility>
@@ -69,6 +73,33 @@ const nuka::scene::CollisionShapeRecord* FirstMeshShape(
     return nullptr;
 }
 
+std::string WriteWrapper(const char* name, const std::string& text) {
+    const fs::path path = fs::temp_directory_path() / name;
+    std::ofstream(path) << text;
+    return path.string();
+}
+
+// The crate's mesh as a collision-only mesh. The crate authors no stage metadata, so the wrapper
+// declares the metres and +Z up model.usda declares for it.
+std::string CrateCollider() {
+    return WriteWrapper("nuka_cup_crate_collider.usda",
+        "#usda 1.0\n(\n    metersPerUnit = 1\n    upAxis = \"Z\"\n)\n\ndef Mesh \"Model\" (\n"
+        "    prepend apiSchemas = [\"PhysicsCollisionAPI\"]\n"
+        "    prepend references = @" + fs::absolute(kMeshUsd).generic_string() + "@</Model>\n"
+        ")\n{\n    uniform token purpose = \"guide\"\n}\n");
+}
+
+// The wrapper asset with its mesh made collision-only.
+std::string ModelCollider() {
+    return WriteWrapper("nuka_cup_model_collider.usda",
+        "#usda 1.0\n(\n    defaultPrim = \"root\"\n    metersPerUnit = 1\n    upAxis = \"Z\"\n)\n\n"
+        "def Xform \"root\" (\n"
+        "    prepend references = @" + fs::absolute(kModelUsda).generic_string() + "@</root>\n"
+        ")\n{\n    over \"Model\"\n    {\n        over \"Model\" (\n"
+        "            prepend apiSchemas = [\"PhysicsCollisionAPI\"]\n        )\n        {\n"
+        "            uniform token purpose = \"guide\"\n        }\n    }\n}\n");
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -94,7 +125,8 @@ protected:
 // The crate alone: counts, bbox, hand-pinned UNSCALED vertices.
 // ---------------------------------------------------------------------------
 TEST_F(UsdcCup, DirectCrateReadCountsAndPinnedVerts) {
-    const auto scene = nuka::import::LoadUsd(kMeshUsd);
+    const auto scene = nuka::import::LoadUsd(CrateCollider());
+    ASSERT_EQ(scene.ShapeCount(), 1u);
     const auto* shape = FirstMeshShape(scene);
     ASSERT_NE(shape, nullptr);
     EXPECT_EQ(shape->name, "Model");
@@ -126,7 +158,7 @@ TEST_F(UsdcCup, DirectCrateReadCountsAndPinnedVerts) {
 // array fails one of these. NONE of these are loosened.
 // ---------------------------------------------------------------------------
 TEST_F(UsdcCup, TopologyInvariantsAndWatertight) {
-    const auto scene = nuka::import::LoadUsd(kMeshUsd);
+    const auto scene = nuka::import::LoadUsd(CrateCollider());
     const auto* shape = FirstMeshShape(scene);
     ASSERT_NE(shape, nullptr);
     const uint32_t nPoints = static_cast<uint32_t>(shape->mesh_vertices.size() / 3u);
@@ -161,7 +193,7 @@ TEST_F(UsdcCup, TopologyInvariantsAndWatertight) {
 // hand-pinned SCALED vertex values and the few-cm cup bbox.
 // ---------------------------------------------------------------------------
 TEST_F(UsdcCup, ImporterScaleBakedAndPinnedVerts) {
-    const auto scene = nuka::import::LoadUsd(kModelUsda);
+    const auto scene = nuka::import::LoadUsd(ModelCollider());
     const auto* shape = FirstMeshShape(scene);
     ASSERT_NE(shape, nullptr);
     EXPECT_EQ(shape->type, nuka::scene::ShapeType::TriMesh);
@@ -189,8 +221,9 @@ TEST_F(UsdcCup, ImporterScaleBakedAndPinnedVerts) {
 // D1: two independent loads are byte-identical (vertices AND indices).
 // ---------------------------------------------------------------------------
 TEST_F(UsdcCup, DeterministicAcrossLoads) {
-    const auto a = nuka::import::LoadUsd(kModelUsda);
-    const auto b = nuka::import::LoadUsd(kModelUsda);
+    const std::string path = ModelCollider();
+    const auto a = nuka::import::LoadUsd(path);
+    const auto b = nuka::import::LoadUsd(path);
     const auto* sa = FirstMeshShape(a);
     const auto* sb = FirstMeshShape(b);
     ASSERT_NE(sa, nullptr);
@@ -203,7 +236,7 @@ TEST_F(UsdcCup, DeterministicAcrossLoads) {
 
 // Preserve the cup's concavity and its original collision triangles.
 TEST_F(UsdcCup, CooksToCollidableTriangleSurface) {
-    auto scene = nuka::import::LoadUsd(kModelUsda);
+    auto scene = nuka::import::LoadUsd(ModelCollider());
     for (size_t i = 0; i < scene.ShapeCount(); ++i) {
         auto& s = scene.GetShapeMut(static_cast<nuka::scene::ShapeId>(i));
         if (!s.mesh_vertices.empty()) {
@@ -240,4 +273,24 @@ TEST_F(UsdcCup, CooksToCollidableTriangleSurface) {
     const auto blob2 = nuka::scene::CookScene(scene);
     EXPECT_EQ(blob.convex_geometry.vertices, blob2.convex_geometry.vertices);
     EXPECT_EQ(blob.convex_geometry.indices, blob2.convex_geometry.indices);
+}
+
+// ---------------------------------------------------------------------------
+// The asset as authored: a visual record with one vertex per distinct
+// (point, normal) corner, kept in the authored point order.
+// ---------------------------------------------------------------------------
+TEST_F(UsdcCup, PlainMeshImportsAsVisual) {
+    const auto scene = nuka::import::LoadUsd(kModelUsda);
+    ASSERT_EQ(scene.ShapeCount(), 1u);
+    const auto& shape = scene.GetShape(0u);
+    EXPECT_EQ(shape.contype, 0u);
+    EXPECT_EQ(shape.conaffinity, 0u);
+    ASSERT_EQ(shape.mesh_indices.size(), 3588u * 3u);
+    ASSERT_EQ(shape.mesh_vertices.size(), 6307u * 3u);
+    EXPECT_EQ(shape.mesh_normals.size(), shape.mesh_vertices.size());
+    EXPECT_NEAR(shape.mesh_vertices[0], -0.7071071863f * kScaleX, 1e-6f);
+    EXPECT_NEAR(shape.mesh_vertices[2], -1.0000017881f * kScaleZ, 1e-6f);
+    const Bbox b = BboxOf(shape.mesh_vertices);
+    EXPECT_NEAR(b.lo[2], -kScaleZ, 2e-4f);
+    EXPECT_NEAR(b.hi[2], kScaleZ, 2e-4f);
 }

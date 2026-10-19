@@ -506,6 +506,8 @@ target_link_libraries(nuka_import
         usd
         usdGeom
         usdPhysics
+        usdShade
+        ar
         sdf
         tf
         vt
