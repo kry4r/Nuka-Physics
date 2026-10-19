@@ -13,8 +13,12 @@
 #define STBI_ONLY_HDR
 #include "stb/stb_image.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <fstream>
+#include <vector>
 
 namespace nuka::render {
 
@@ -23,13 +27,40 @@ namespace {
 // stb writes RGBE .hdr paths as linear floats; LDR bytes come back in [0,255].
 constexpr float kInv255 = 1.0f / 255.0f;
 
+// A path ending in "#offset+length" names image bytes inside a container file (a .glb).
+bool SplitRange(const std::string& path, std::string& file, std::size_t& offset, std::size_t& length) {
+    const std::size_t hash = path.rfind('#');
+    const std::size_t plus = path.rfind('+');
+    if (hash == std::string::npos || plus == std::string::npos || plus < hash + 2 || plus + 1 == path.size())
+        return false;
+    const auto digits = [&](std::size_t b, std::size_t e) {
+        return std::all_of(path.begin() + b, path.begin() + e, [](unsigned char c) { return std::isdigit(c); });
+    };
+    if (!digits(hash + 1, plus) || !digits(plus + 1, path.size())) return false;
+    file = path.substr(0, hash);
+    offset = std::stoull(path.substr(hash + 1, plus - hash - 1));
+    length = std::stoull(path.substr(plus + 1));
+    return true;
+}
+
+unsigned char* DecodeImage(const std::string& path, int& w, int& h, int& comp) {
+    std::string file;
+    std::size_t offset = 0, length = 0;
+    if (!SplitRange(path, file, offset, length)) return stbi_load(path.c_str(), &w, &h, &comp, 0);
+    std::ifstream in(file, std::ios::binary);
+    std::vector<unsigned char> bytes(length);
+    in.seekg(static_cast<std::streamoff>(offset));
+    if (!in.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(length))) return nullptr;
+    return stbi_load_from_memory(bytes.data(), static_cast<int>(length), &w, &h, &comp, 0);
+}
+
 }  // namespace
 
 rt::Texture LoadTexture(const std::string& path, bool srgb) {
     rt::Texture tex;
     if (path.empty()) return tex;
     int w = 0, h = 0, comp = 0;
-    unsigned char* data = stbi_load(path.c_str(), &w, &h, &comp, 0);
+    unsigned char* data = DecodeImage(path, w, h, comp);
     if (data == nullptr || w <= 0 || h <= 0 || comp <= 0) {
         if (data != nullptr) stbi_image_free(data);
         return tex;

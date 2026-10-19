@@ -336,8 +336,33 @@ MeshGeometry LoadMeshFile(const std::string& path) {
     if (ext == ".obj") {
         return LoadObj(path);
     }
+    if (ext == ".gltf" || ext == ".glb") {
+        return LoadGltf(path);
+    }
+    if (ext == ".dae") {
+        return LoadDae(path);
+    }
     throw std::runtime_error("mesh-loader: unsupported mesh extension '" + ext +
                              "' for file: " + path);
+}
+
+MeshGeometry ExtractPart(const MeshGeometry& mesh, std::size_t part) {
+    const MeshPart& run = mesh.parts[part];
+    MeshGeometry g;
+    std::vector<std::uint32_t> remap(mesh.VertexCount(), UINT32_MAX);
+    for (std::uint32_t k = run.first_index; k < run.first_index + run.index_count; ++k) {
+        const std::uint32_t v = mesh.indices[k];
+        if (remap[v] == UINT32_MAX) {
+            remap[v] = static_cast<std::uint32_t>(g.VertexCount());
+            g.vertices.insert(g.vertices.end(), mesh.vertices.begin() + v * 3u, mesh.vertices.begin() + v * 3u + 3u);
+            if (!mesh.normals.empty())
+                g.normals.insert(g.normals.end(), mesh.normals.begin() + v * 3u, mesh.normals.begin() + v * 3u + 3u);
+            if (!mesh.uvs.empty())
+                g.uvs.insert(g.uvs.end(), mesh.uvs.begin() + v * 2u, mesh.uvs.begin() + v * 2u + 2u);
+        }
+        g.indices.push_back(remap[v]);
+    }
+    return g;
 }
 
 } // namespace nuka::import

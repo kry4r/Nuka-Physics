@@ -3,12 +3,14 @@
 #include "render/render_world.hpp"
 #include "runtime/app/viewer/editor_collision.hpp"
 #include "runtime/app/viewer/editor_import.hpp"
+#include "runtime/app/viewer/editor_materials.hpp"
 #include "runtime/app/viewer/editor_sensors.hpp"
 #include "runtime/app/viewer/robot_tools.hpp"
 #include "scene/scene_fields.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <initializer_list>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -24,7 +26,9 @@ constexpr uint32_t kNoParam = ~0u;
 bool IsStructural(const std::string& field) {
     return field == "spawn" || field == "delete" || field == "reparent" || field == "script" || field == "import" ||
            field == "collision" || field == "static" || field == "pin" || field == "drive" ||
-           field == "initial_position" || field == "attach" || field == "sensor";
+           field == "initial_position" || field == "attach" || field == "sensor" || field == "material_new" ||
+           field == "material_rename" || field == "material_delete" || field == "material_assign" ||
+           field == "material_unique" || field == "material_friction";
 }
 
 json::Value Floats(const float* v, size_t n) {
@@ -49,6 +53,45 @@ void MaterialFromJson(const json::Value& v, scene::RenderMaterial* m) {
     if (const json::Value* f = v.Find("transmission")) m->transmission = f->AsFloat();
     if (const json::Value* f = v.Find("ior")) m->ior = f->AsFloat();
     if (const json::Value* f = v.Find("absorption")) ReadFloats(*f, m->absorption, 3u);
+    for (size_t k = 0; k < 5u; ++k)
+        if (const json::Value* f = v.Find(kMaterialMaps[k])) m->*kMaterialMapFields[k] = f->AsString();
+    const auto channel = [&](const char* key, uint32_t* out) {
+        const json::Value* f = v.Find(key);
+        if (f == nullptr) return;
+        if (f->AsInt() < 0 || f->AsInt() > 2) throw std::runtime_error("a channel is 0 (R), 1 (G) or 2 (B)");
+        *out = static_cast<uint32_t>(f->AsInt());
+    };
+    channel("roughness_channel", &m->roughness_channel);
+    channel("metallic_channel", &m->metallic_channel);
+    if (const json::Value* f = v.Find("uv_scale")) m->uv_scale = f->AsFloat();
+    if (const json::Value* f = v.Find("triplanar")) m->triplanar = f->AsBool();
+}
+
+// The material `after.material` names, as `error` says when there is none.
+scene::MaterialId NamedMaterial(const scene::SceneIR& scene, const json::Value& after, std::string* error) {
+    const std::string& name = after.At("material").AsString();
+    const scene::MaterialId id = FindMaterial(scene, name);
+    if (id == scene::kInvalidMaterial) *error = "no material '" + name + "'";
+    return id;
+}
+
+std::string MaterialName(const scene::SceneIR& scene, scene::MaterialId id) {
+    return id == scene::kInvalidMaterial ? std::string() : scene.GetMaterial(id).name;
+}
+
+json::Value Obj(std::initializer_list<std::pair<const char*, json::Value>> items) {
+    json::Value v = json::Value::Object();
+    for (const auto& [key, value] : items) v.Set(key, value);
+    return v;
+}
+
+// `v` with `key` set to `value` in place of what it had.
+json::Value Replaced(const json::Value& v, const std::string& key, json::Value value) {
+    json::Value out = json::Value::Object();
+    for (const auto& [k, item] : v.Items())
+        if (k != key) out.Set(k, item);
+    out.Set(key, std::move(value));
+    return out;
 }
 
 std::string Leaf(const std::string& path) {
@@ -141,6 +184,11 @@ json::Value MaterialToJson(const scene::RenderMaterial& m) {
     v.Set("transmission", json::Value::Float(m.transmission));
     v.Set("ior", json::Value::Float(m.ior));
     v.Set("absorption", Floats(m.absorption, 3u));
+    for (size_t k = 0; k < 5u; ++k) v.Set(kMaterialMaps[k], json::Value::Str(m.*kMaterialMapFields[k]));
+    v.Set("roughness_channel", json::Value::Int(m.roughness_channel));
+    v.Set("metallic_channel", json::Value::Int(m.metallic_channel));
+    v.Set("uv_scale", json::Value::Float(m.uv_scale));
+    v.Set("triplanar", json::Value::Bool(m.triplanar));
     return v;
 }
 
@@ -246,10 +294,10 @@ bool EditorDocument::LiveField(const std::string& target, const std::string& fie
 bool EditorDocument::ApplyOp(const EditOp& op, EditOp* done, EditOp* inverse, OpOutcome* out, std::string* error) {
     *done = op;
     const scene::EntityId e = EntityAt(op.target);
-    const bool needs_node = !op.target.empty() || op.field == "transform" || op.field == "material" ||
-                            op.field == "name" || op.field == "delete" || op.field == "reparent" ||
-                            op.field == "static" || op.field == "pin" || op.field == "drive" ||
-                            op.field == "initial_position";
+    const bool needs_node = !op.target.empty() || op.field == "transform" || op.field == "name" ||
+                            op.field == "delete" || op.field == "reparent" || op.field == "static" ||
+                            op.field == "pin" || op.field == "drive" || op.field == "initial_position" ||
+                            op.field == "material_assign" || op.field == "material_unique";
     if (needs_node && e == scene::kInvalidEntity) {
         *error = "no node at '" + op.target + "'";
         return false;
@@ -261,18 +309,136 @@ bool EditorDocument::ApplyOp(const EditOp& op, EditOp* done, EditOp* inverse, Op
         }
         ApplyTransformEdit(*es_, records_, e, TransformFromJson(op.after), /*commit=*/true);
     } else if (op.field == "material") {
-        const MaterialBinding mb = ResolveMaterial(*es_, records_, e);
+        // The target node's material, or without a target the one `after.material` names.
+        MaterialBinding mb;
+        if (op.target.empty()) {
+            const scene::MaterialId id = NamedMaterial(es_->scene, op.after, error);
+            if (id == scene::kInvalidMaterial) return false;
+            mb = BindMaterial(*es_, id);
+        } else {
+            mb = ResolveMaterial(*es_, records_, e);
+        }
         if (!mb.valid) {
             *error = "'" + op.target + "' has no material";
             return false;
         }
-        scene::RenderMaterial m;
-        const render::RenderWorld& rw = es_->sim->GetRenderWorld();
-        if (mb.render_slot != render::kNoId && mb.render_slot < rw.MaterialCount()) m = rw.materials[mb.render_slot];
+        scene::RenderMaterial m = BoundMaterial(*es_, mb);
         if (done->before.IsNull()) done->before = MaterialToJson(m);
         MaterialFromJson(op.after, &m);
         done->after = MaterialToJson(m);
+        if (op.target.empty()) {
+            done->before = Replaced(done->before, "material", op.after.At("material"));
+            done->after.Set("material", op.after.At("material"));
+        }
         ApplyMaterialEdit(*es_, mb, m, /*commit=*/true);
+    } else if (op.field == "material_new") {
+        // A copy of `after.from`, else a fresh material, with `after.fields` over it; the name is made unique.
+        scene::MaterialRecord rec;
+        rec.name = "Material";
+        if (const json::Value* from = op.after.Find("from")) {
+            const scene::MaterialId src = FindMaterial(es_->scene, from->AsString());
+            if (src == scene::kInvalidMaterial) {
+                *error = "no material '" + from->AsString() + "'";
+                return false;
+            }
+            rec = es_->scene.GetMaterial(src);
+        }
+        if (const json::Value* name = op.after.Find("name"); name != nullptr && !name->AsString().empty())
+            rec.name = name->AsString();
+        rec.name = UniqueMaterialName(es_->scene, rec.name);
+        if (const json::Value* fields = op.after.Find("fields")) {
+            scene::RenderMaterial m = scene::RenderMaterialOf(rec);
+            MaterialFromJson(*fields, &m);
+            WriteMaterialRecord(m, &rec);
+            if (const json::Value* friction = fields->Find("friction")) rec.friction_mu = friction->AsFloat();
+        }
+        es_->scene.AddMaterial(rec);
+        done->after = Replaced(op.after, "name", json::Value::Str(rec.name));
+    } else if (op.field == "material_rename") {
+        const scene::MaterialId id = NamedMaterial(es_->scene, op.after, error);
+        if (id == scene::kInvalidMaterial) return false;
+        const std::string from = es_->scene.GetMaterial(id).name, to = op.after.At("name").AsString();
+        if (to.empty() || (to != from && FindMaterial(es_->scene, to) != scene::kInvalidMaterial)) {
+            *error = to.empty() ? "a material needs a name" : "a material is named '" + to + "' already";
+            return false;
+        }
+        es_->scene.GetMaterialMut(id).name = to;
+        done->before = Obj({{"material", json::Value::Str(to)}, {"name", json::Value::Str(from)}});
+    } else if (op.field == "material_delete") {
+        // What used the material takes `after.replace` ("" for the default one); one in use needs it.
+        const scene::MaterialId id = NamedMaterial(es_->scene, op.after, error);
+        if (id == scene::kInvalidMaterial) return false;
+        const json::Value* replace = op.after.Find("replace");
+        scene::MaterialId to = scene::kInvalidMaterial;
+        if (replace != nullptr && !replace->AsString().empty()) {
+            to = FindMaterial(es_->scene, replace->AsString());
+            if (to == scene::kInvalidMaterial || to == id) {
+                *error = to == id ? "a material cannot replace itself" : "no material '" + replace->AsString() + "'";
+                return false;
+            }
+        }
+        const uint32_t users = MaterialUsers(es_->scene, id);
+        if (users > 0u && replace == nullptr) {
+            const std::string count = users == 1u ? "a shape uses" : std::to_string(users) + " shapes use";
+            *error = count + " '" + es_->scene.GetMaterial(id).name + "'; name the material they take instead";
+            return false;
+        }
+        es_->scene.RemoveMaterial(id, to);
+        out->rebuild = true;
+    } else if (op.field == "material_assign") {
+        // The shapes at or under the target take the material `after` names ("" for the default one).
+        const std::string name = op.after.AsString();
+        const scene::MaterialId id = name.empty() ? scene::kInvalidMaterial : FindMaterial(es_->scene, name);
+        if (!name.empty() && id == scene::kInvalidMaterial) {
+            *error = "no material '" + name + "'";
+            return false;
+        }
+        const std::vector<MaterialPart> shapes = ShapesUnder(*es_, records_, op.target, /*rendering=*/false);
+        if (shapes.empty()) {
+            *error = "'" + op.target + "' has no shape";
+            return false;
+        }
+        const scene::MaterialId was = es_->scene.GetShape(shapes.front().shape).material_id;
+        done->before = json::Value::Str(MaterialName(es_->scene, was));
+        for (const MaterialPart& s : shapes) es_->scene.GetShapeMut(s.shape).material_id = id;
+        out->rebuild = true;
+    } else if (op.field == "material_unique") {
+        // The part takes a copy of its material, under the next free name, that no other shape shares.
+        const auto it = records_.shape.find(e);
+        if (it == records_.shape.end()) {
+            *error = "'" + op.target + "' is not a part";
+            return false;
+        }
+        const scene::MaterialId from = es_->scene.GetShape(it->second).material_id;
+        if (from != scene::kInvalidMaterial && MaterialUsers(es_->scene, from) == 1u) {
+            *error = "'" + op.target + "' has '" + MaterialName(es_->scene, from) + "' to itself already";
+            return false;
+        }
+        scene::MaterialRecord rec;
+        if (from != scene::kInvalidMaterial) {
+            rec = es_->scene.GetMaterial(from);
+        } else {
+            // The default material's look.
+            rec.name = "Material";
+            rec.base_color = math::Vec3{0.8f, 0.8f, 0.8f};
+        }
+        rec.name = UniqueMaterialName(es_->scene, rec.name);
+        es_->scene.GetShapeMut(it->second).material_id = es_->scene.AddMaterial(rec);
+        done->before = json::Value::Str(MaterialName(es_->scene, from));
+        done->after = json::Value::Str(rec.name);
+        out->rebuild = true;
+    } else if (op.field == "material_friction") {
+        const scene::MaterialId id = NamedMaterial(es_->scene, op.after, error);
+        if (id == scene::kInvalidMaterial) return false;
+        const float friction = op.after.At("friction").AsFloat();
+        if (!(friction >= 0.0f)) {
+            *error = "friction is 0 or more";
+            return false;
+        }
+        scene::MaterialRecord& rec = es_->scene.GetMaterialMut(id);
+        done->before = Obj({{"material", op.after.At("material")}, {"friction", json::Value::Float(rec.friction_mu)}});
+        rec.friction_mu = friction;
+        out->rebuild = true;
     } else if (op.field == "name") {
         out->focus = RenameNode(*es_, op.target, op.after.AsString());
         if (out->focus.empty()) {
@@ -296,9 +462,7 @@ bool EditorDocument::ApplyOp(const EditOp& op, EditOp* done, EditOp* inverse, Op
         }
         out->rebuild = true;
     } else if (op.field == "import") {
-        const json::Value* profile = op.after.Find("profile");
-        const ImportAnalysis a =
-            AnalyzeImport(op.after.At("path").AsString(), profile != nullptr ? profile->AsString() : std::string());
+        const ImportAnalysis a = AnalyzeImport(op.after.At("path").AsString(), ImportOptionsOf(op.after));
         if (!Importable(a)) {
             *error = ImportError(a);
             return false;
@@ -408,8 +572,7 @@ bool EditorDocument::ApplyOp(const EditOp& op, EditOp* done, EditOp* inverse, Op
         const scene::SceneIR* source = &es_->scene;
         std::vector<scene::BodyId> roots;
         if (asset != nullptr) {
-            const json::Value* profile = asset->Find("profile");
-            analysis = AnalyzeImport(asset->At("path").AsString(), profile != nullptr ? profile->AsString() : std::string());
+            analysis = AnalyzeImport(asset->At("path").AsString(), ImportOptionsOf(*asset));
             if (!Importable(*analysis)) {
                 *error = ImportError(*analysis);
                 return false;

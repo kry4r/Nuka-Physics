@@ -5,6 +5,7 @@
 #include "import/mjcf_importer.hpp"
 #include "import/urdf_importer.hpp"
 #include "import/usd_importer.hpp"
+#include "runtime/app/viewer/editor_materials.hpp"
 #include "runtime/app/viewer/editor_profile.hpp"
 #include "scene/format/nks.hpp"
 #include "scene/scene_compose.hpp"
@@ -17,6 +18,8 @@
 #include <cmath>
 #include <exception>
 #include <fstream>
+#include <string>
+#include <unordered_map>
 #include <utility>
 
 namespace nuka::runtime::app::viewer {
@@ -200,7 +203,8 @@ AssetKind AssetKindOf(const std::string& path) {
     if (ext == ".nks") return AssetKind::Scene;
     if (ext == ".urdf") return AssetKind::Urdf;
     if (ext == ".usd" || ext == ".usda" || ext == ".usdc") return AssetKind::Usd;
-    if (ext == ".stl" || ext == ".obj") return AssetKind::Mesh;
+    if (ext == ".stl" || ext == ".obj" || ext == ".dae" || ext == ".gltf" || ext == ".glb") return AssetKind::Mesh;
+    if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tga" || ext == ".bmp") return AssetKind::Image;
     if (ext != ".xml") return AssetKind::Unknown;
     const std::string root = RootElement(path);
     return root == "mujoco" ? AssetKind::Mjcf : root == "robot" ? AssetKind::Urdf : AssetKind::Unknown;
@@ -213,27 +217,53 @@ const char* AssetKindName(AssetKind kind) {
         case AssetKind::Mjcf: return "mjcf";
         case AssetKind::Usd: return "usd";
         case AssetKind::Mesh: return "mesh";
+        case AssetKind::Image: return "image";
         case AssetKind::Unknown: break;
     }
     return "unknown";
 }
 
+ImportOptions ImportOptionsOf(const json::Value& fields, const std::string& fallback) {
+    ImportOptions o;
+    const json::Value* profile = fields.Find("profile");
+    o.profile = profile != nullptr ? profile->AsString() : fallback;
+    if (const json::Value* fix = fields.Find("fix_base")) o.fix_base = fix->AsBool();
+    if (const json::Value* paths = fields.Find("package_paths"))
+        for (const json::Value& p : paths->Elements()) o.package_paths.push_back(p.AsString());
+    return o;
+}
+
+void SetImportOptions(json::Value& fields, const ImportOptions& options) {
+    fields.Set("profile", json::Value::Str(options.profile));
+    fields.Set("fix_base", json::Value::Bool(options.fix_base));
+    json::Value paths = json::Value::Array();
+    for (const std::string& p : options.package_paths) paths.PushBack(json::Value::Str(p));
+    fields.Set("package_paths", std::move(paths));
+}
+
 // Importers throw on files they cannot read; the failure becomes the analysis's one error.
-ImportAnalysis AnalyzeImport(const std::string& path, const std::string& profile) {
+ImportAnalysis AnalyzeImport(const std::string& path, const ImportOptions& options) {
     ImportAnalysis a;
     a.path = path;
     a.kind = AssetKindOf(path);
     try {
         switch (a.kind) {
             case AssetKind::Urdf: {
-                const bool legacy = profile == "legacy";
+                const bool legacy = options.profile == "legacy";
                 a.profile = legacy ? "legacy" : "strict";
+                a.fix_base = options.fix_base;
+                a.package_paths = options.package_paths;
+                const import::UrdfImportProfile mode =
+                    legacy ? import::UrdfImportProfile::LegacyCompatible : import::UrdfImportProfile::Strict;
                 import::UrdfImportResult r =
-                    import::ImportUrdf(path, legacy ? import::UrdfImportProfile::LegacyCompatible : import::UrdfImportProfile::Strict);
+                    import::ImportUrdf(path, mode, import::UrdfImportOptions{options.fix_base, options.package_paths});
                 const std::vector<Owner> owners = Owners(path);
-                for (const import::UrdfDiagnostic& d : r.diagnostics)
-                    a.diagnostics.push_back(ImportDiagnostic{r.scene ? "warning" : "error", d.code, d.element,
+                // Legacy projects despite the schema's losses, so only its last diagnostic, the failure, blocks.
+                for (const import::UrdfDiagnostic& d : r.diagnostics) {
+                    const bool error = !r.scene && (!legacy || &d == &r.diagnostics.back());
+                    a.diagnostics.push_back(ImportDiagnostic{error ? "error" : "warning", d.code, d.element,
                                                              OwnerOf(owners, d.line), d.message, d.line});
+                }
                 a.scene = std::move(r.scene);
                 break;
             }
@@ -241,6 +271,10 @@ ImportAnalysis AnalyzeImport(const std::string& path, const std::string& profile
             case AssetKind::Usd: a.scene = import::LoadUsd(path); break;
             case AssetKind::Scene: a.scene = scene::nks::Load(path); break;
             case AssetKind::Mesh: a.scene = MeshAssetScene(path); break;
+            case AssetKind::Image:
+                a.diagnostics.push_back(
+                    ImportDiagnostic{"error", "ASSET_IMAGE", "", "", "an image is a material's map, not a scene", 0});
+                break;
             case AssetKind::Unknown:
                 a.diagnostics.push_back(ImportDiagnostic{"error", "ASSET_UNKNOWN", "", "", "not a scene, robot or mesh file", 0});
                 break;
@@ -294,7 +328,7 @@ json::Value AnalysisToJson(const ImportAnalysis& a) {
     json::Value v = json::Value::Object();
     v.Set("path", json::Value::Str(a.path));
     v.Set("kind", json::Value::Str(AssetKindName(a.kind)));
-    v.Set("profile", json::Value::Str(a.profile));
+    SetImportOptions(v, ImportOptions{a.profile, a.fix_base, a.package_paths});
     v.Set("ok", json::Value::Bool(Importable(a)));
     v.Set("loaded", json::Value::Bool(a.scene.has_value()));
     v.Set("name", json::Value::Str(Stem(a.path)));
@@ -320,6 +354,8 @@ scene::SceneIR MeshAssetScene(const std::string& path) {
                            b.mass / 12.0f * (size.x * size.x + size.z * size.z),
                            b.mass / 12.0f * (size.x * size.x + size.y * size.y)};
     b.inertial_transform.position = (lo + hi) * 0.5f;
+    // A flat mesh has no hull, so it stays a static visual with nothing to collide.
+    b.is_static = hull.indices.empty();
     const scene::BodyId body = s.AddRigidBody(b);
 
     scene::MaterialRecord m;
@@ -327,19 +363,38 @@ scene::SceneIR MeshAssetScene(const std::string& path) {
     m.base_color = math::Vec3{0.72f, 0.72f, 0.75f};
     const scene::MaterialId mid = s.AddMaterial(m);
 
-    scene::CollisionShapeRecord vis;
-    vis.body_id = body;
-    vis.type = scene::ShapeType::TriMesh;
-    vis.material_id = mid;
-    vis.name = name + "_visual";
-    vis.contype = 0u;
-    vis.conaffinity = 0u;
-    vis.mesh_vertices = std::move(mesh.vertices);
-    vis.mesh_indices = std::move(mesh.indices);
-    vis.mesh_normals = std::move(mesh.normals);
-    vis.mesh_uvs = std::move(mesh.uvs);
-    s.AddCollisionShape(std::move(vis));
+    const auto add_visual = [&](import::MeshGeometry&& piece, scene::MaterialId material, const std::string& vis_name) {
+        scene::CollisionShapeRecord vis;
+        vis.body_id = body;
+        vis.type = scene::ShapeType::TriMesh;
+        vis.material_id = material;
+        vis.name = vis_name;
+        vis.contype = 0u;
+        vis.conaffinity = 0u;
+        vis.mesh_vertices = std::move(piece.vertices);
+        vis.mesh_indices = std::move(piece.indices);
+        vis.mesh_normals = std::move(piece.normals);
+        vis.mesh_uvs = std::move(piece.uvs);
+        s.AddCollisionShape(std::move(vis));
+    };
+    // A mesh file's material runs keep their materials, one visual per run.
+    if (mesh.parts.empty()) {
+        add_visual(std::move(mesh), mid, name + "_visual");
+    } else {
+        std::unordered_map<std::string, scene::MaterialId> colors;
+        for (size_t p = 0; p < mesh.parts.size(); ++p) {
+            const import::MeshPart& part = mesh.parts[p];
+            scene::MaterialId material = mid;
+            if (part.has_color) {
+                const auto [it, fresh] = colors.emplace(part.material, mid);
+                if (fresh) it->second = s.AddMaterial(import::PartMaterial(part, name + "/" + part.material));
+                material = it->second;
+            }
+            add_visual(import::ExtractPart(mesh, p), material, name + "_visual_" + std::to_string(p));
+        }
+    }
 
+    if (b.is_static) return s;
     scene::CollisionShapeRecord col;
     col.body_id = body;
     col.type = scene::ShapeType::ConvexHull;
@@ -358,10 +413,17 @@ bool SceneBounds(const scene::SceneIR& scene, math::Vec3* lo, math::Vec3* hi) {
 std::string ComposeAsset(scene::SceneIR& doc, const scene::SceneIR& addon, AssetKind kind, const std::string& name,
                          math::Transform placement, bool ground) {
     math::Vec3 lo, hi;
-    if (ground && BoundsUnder(addon, placement, &lo, &hi)) placement.position.z += placement.position.z - lo.z;
+    // An asset that brings its own floor plane keeps its authored heights.
+    const bool floored = std::any_of(addon.Shapes().begin(), addon.Shapes().end(), [](const auto& s) {
+        return s.type == scene::ShapeType::Plane;
+    });
+    if (ground && !floored && BoundsUnder(addon, placement, &lo, &hi))
+        placement.position.z += placement.position.z - lo.z;
     const std::string leaf = UniqueRootName(doc, name);
     const size_t first = doc.RigidBodyCount();
+    const auto first_material = static_cast<scene::MaterialId>(doc.MaterialCount());
     doc = scene::Compose(doc, addon, placement);
+    UniqueMaterialNames(doc, first_material);
     for (scene::BodyId b = static_cast<scene::BodyId>(first); b < doc.RigidBodyCount(); ++b) {
         if (doc.GetBody(b).parent_id != scene::kInvalidBody) continue;
         scene::RigidBodyRecord& rec = doc.GetBodyMut(b);

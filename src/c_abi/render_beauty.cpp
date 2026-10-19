@@ -133,6 +133,8 @@ nuka_result_t EnsureBeautyBridge(WorldRecord* record, uint32_t width, uint32_t h
         m.albedo_map = ResolveScenePath(m.albedo_map, record->scene_dir);
         m.roughness_map = ResolveScenePath(m.roughness_map, record->scene_dir);
         m.normal_map = ResolveScenePath(m.normal_map, record->scene_dir);
+        m.metallic_map = ResolveScenePath(m.metallic_map, record->scene_dir);
+        m.emissive_map = ResolveScenePath(m.emissive_map, record->scene_dir);
     }
     nuka::render::DecodeMaterialTextures(bridge->scene->world);
     if (!env.hdri.empty()) {

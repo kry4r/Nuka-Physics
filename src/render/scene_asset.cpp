@@ -60,6 +60,8 @@ SceneRenderAsset BuildSceneRenderAsset(const scene::SceneIR& scene,
         material.albedo_map = Resolve(material.albedo_map, asset_directory);
         material.roughness_map = Resolve(material.roughness_map, asset_directory);
         material.normal_map = Resolve(material.normal_map, asset_directory);
+        material.metallic_map = Resolve(material.metallic_map, asset_directory);
+        material.emissive_map = Resolve(material.emissive_map, asset_directory);
     }
     DecodeMaterialTextures(asset.world);
     if (!asset.environment.hdri.empty()) {

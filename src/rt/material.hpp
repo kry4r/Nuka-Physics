@@ -43,6 +43,11 @@ struct Material {
     int   albedo_tex    = -1;
     int   roughness_tex = -1;
     int   normal_tex    = -1;
+    // Metallic multiplies its scalar, emission its colour (sRGB); the channels pick R, G or B.
+    int   metallic_tex  = -1;
+    int   emissive_tex  = -1;
+    uint32_t roughness_channel = 0u;
+    uint32_t metallic_channel  = 0u;
     float uv_scale      = 1.0f;    // tiles per world metre (triplanar) or per UV unit
     uint32_t triplanar  = 1u;      // 1 => world-space triplanar for no-UV geometry
 

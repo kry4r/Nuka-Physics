@@ -21,12 +21,17 @@ void RewriteMaps(scene::SceneIR& scene, Rewrite rewrite) {
     for (size_t i = 0; i < scene.Materials().size(); ++i) {
         const scene::MaterialRecord& m = scene.Materials()[i];
         std::string albedo = rewrite(m.albedo_map), roughness = rewrite(m.roughness_map);
-        std::string normal = rewrite(m.normal_map);
-        if (albedo == m.albedo_map && roughness == m.roughness_map && normal == m.normal_map) continue;
+        std::string normal = rewrite(m.normal_map), metallic = rewrite(m.metallic_map);
+        std::string emissive = rewrite(m.emissive_map);
+        if (albedo == m.albedo_map && roughness == m.roughness_map && normal == m.normal_map &&
+            metallic == m.metallic_map && emissive == m.emissive_map)
+            continue;
         scene::MaterialRecord& rec = scene.GetMaterialMut(m.id);
         rec.albedo_map = std::move(albedo);
         rec.roughness_map = std::move(roughness);
         rec.normal_map = std::move(normal);
+        rec.metallic_map = std::move(metallic);
+        rec.emissive_map = std::move(emissive);
     }
 }
 

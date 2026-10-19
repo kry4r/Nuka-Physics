@@ -120,6 +120,10 @@ class Server:
             conn, _ = self._socket.accept()
             threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
 
+    def close(self) -> None:
+        """Lets go of the env and its world's buffers, which the accept thread would keep past the interpreter."""
+        self._env = self._links = self._bodies = self._bases = self._joints = self._velocity = None
+
     def _answer_to(self, line: bytes) -> dict:
         try:
             hello = json.loads(line)

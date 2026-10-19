@@ -75,11 +75,15 @@ TEST(MjcfImporter, JointDynamicsRespectDefaultsAndExplicitOverrides) {
 TEST(MjcfImporter, ParsesSceneAuthoringRecords) {
     const auto scene = nuka::import::LoadMjcf("tests/data/complete_robot.xml");
 
-    EXPECT_EQ(scene.RigidBodyCount(), 2u);
+    // The root hinge turns against a static anchor body ahead of base.
+    EXPECT_EQ(scene.RigidBodyCount(), 3u);
+    EXPECT_TRUE(scene.GetBody(0).is_static);
     ASSERT_EQ(scene.JointCount(), 2u);
+    EXPECT_EQ(scene.GetJoint(0).parent_body, 0u);
+    EXPECT_EQ(scene.GetJoint(0).child_body, 1u);
     EXPECT_EQ(scene.GetJoint(1).type, nuka::scene::JointType::Fixed);
-    EXPECT_EQ(scene.GetJoint(1).parent_body, 0u);
-    EXPECT_EQ(scene.GetJoint(1).child_body, 1u);
+    EXPECT_EQ(scene.GetJoint(1).parent_body, 1u);
+    EXPECT_EQ(scene.GetJoint(1).child_body, 2u);
     EXPECT_EQ(scene.ShapeCount(), 2u);
     EXPECT_EQ(scene.MaterialCount(), 1u);
     EXPECT_EQ(scene.CameraCount(), 1u);
@@ -95,7 +99,7 @@ TEST(MjcfImporter, ParsesSceneAuthoringRecords) {
     // <framepos> maps to the FramePose kind; mount resolves to link1's body row.
     EXPECT_EQ(scene.GetSensor(0).type, nuka::scene::SensorType::FramePose);
     EXPECT_EQ(scene.GetSensor(0).mount, nuka::scene::MountFrame::Body);
-    EXPECT_EQ(scene.GetSensor(0).mount_index, 1u);
+    EXPECT_EQ(scene.GetSensor(0).mount_index, 2u);
 }
 
 TEST(MjcfImporter, ThrowsOnMissingFile) {

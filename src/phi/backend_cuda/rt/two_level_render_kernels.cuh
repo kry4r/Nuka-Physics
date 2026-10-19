@@ -590,9 +590,14 @@ NUKA_RT_HD inline Vec3 TriplanarNormal(const DevTexture& tex, const Vec3& p,
     return Vec3{acc.x * inv, acc.y * inv, acc.z * inv};
 }
 
-// Enrich `mat` (albedo/roughness multiply their maps, glTF-style) and return the
-// texture-perturbed WORLD shading normal at the winning prim. `full` false samples
-// the albedo only (GI bounces). Authored triangle UVs are used when the material
+// One channel of a sampled map: 0 R, 1 G, 2 B.
+__device__ __forceinline__ float TextureChannel(const Vec3& c, uint32_t channel) {
+    return channel == 1u ? c.y : channel == 2u ? c.z : c.x;
+}
+
+// Enrich `mat` (albedo/roughness/metallic/emission multiply their maps, glTF-style) and return
+// the texture-perturbed WORLD shading normal at the winning prim. `full` false samples
+// the albedo and emission only (GI bounces). Authored triangle UVs are used when the material
 // asks (triplanar==0) and the mesh ships them; everything else projects triplanar
 // in INSTANCE-LOCAL space, so maps stick to moving bodies. BEAUTY-ONLY; a null
 // `textures` or an untextured material returns n_world with `mat` untouched.
@@ -605,7 +610,9 @@ __device__ __forceinline__ Vec3 ApplyMaterialTextures(
     const bool want_albedo = mat->albedo_tex >= 0;
     const bool want_rough = full && mat->roughness_tex >= 0;
     const bool want_normal = full && mat->normal_tex >= 0;
-    if (!want_albedo && !want_rough && !want_normal) return n_world;
+    const bool want_metal = full && mat->metallic_tex >= 0;
+    const bool want_emit = mat->emissive_tex >= 0;
+    if (!want_albedo && !want_rough && !want_normal && !want_metal && !want_emit) return n_world;
 
     uint32_t inst, local_prim;
     UnpackPrimId(packed_prim, &inst, &local_prim);
@@ -629,7 +636,15 @@ __device__ __forceinline__ Vec3 ApplyMaterialTextures(
         }
         if (want_rough) {
             const Vec3 r = SampleTexture(textures[mat->roughness_tex], u, texture_v);
-            mat->roughness = fminf(1.0f, fmaxf(0.02f, mat->roughness * r.x));
+            mat->roughness = fminf(1.0f, fmaxf(0.02f, mat->roughness * TextureChannel(r, mat->roughness_channel)));
+        }
+        if (want_metal) {
+            const Vec3 m = SampleTexture(textures[mat->metallic_tex], u, texture_v);
+            mat->metallic = fminf(1.0f, fmaxf(0.0f, mat->metallic * TextureChannel(m, mat->metallic_channel)));
+        }
+        if (want_emit) {
+            const Vec3 e = SampleTexture(textures[mat->emissive_tex], u, texture_v);
+            mat->emission = Vec3{mat->emission.x * e.x, mat->emission.y * e.y, mat->emission.z * e.z};
         }
         if (want_normal) {
             // Tangent frame from the local edges + UV deltas, rotated to world.
@@ -677,7 +692,15 @@ __device__ __forceinline__ Vec3 ApplyMaterialTextures(
     }
     if (want_rough) {
         const Vec3 r = SampleTriplanarColor(textures[mat->roughness_tex], p_l, scale, w);
-        mat->roughness = fminf(1.0f, fmaxf(0.02f, mat->roughness * r.x));
+        mat->roughness = fminf(1.0f, fmaxf(0.02f, mat->roughness * TextureChannel(r, mat->roughness_channel)));
+    }
+    if (want_metal) {
+        const Vec3 m = SampleTriplanarColor(textures[mat->metallic_tex], p_l, scale, w);
+        mat->metallic = fminf(1.0f, fmaxf(0.0f, mat->metallic * TextureChannel(m, mat->metallic_channel)));
+    }
+    if (want_emit) {
+        const Vec3 e = SampleTriplanarColor(textures[mat->emissive_tex], p_l, scale, w);
+        mat->emission = Vec3{mat->emission.x * e.x, mat->emission.y * e.y, mat->emission.z * e.z};
     }
     if (want_normal) {
         const Vec3 n_p = TriplanarNormal(textures[mat->normal_tex], p_l, scale, n_l, w);

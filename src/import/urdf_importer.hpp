@@ -10,6 +10,11 @@
 
 namespace nuka::import {
 
+struct MeshPart;
+
+/// The render material a mesh file gives one of its parts, under `name`; its maps follow the part's UVs.
+scene::MaterialRecord PartMaterial(const MeshPart& part, const std::string& name);
+
 enum class UrdfImportProfile { LegacyCompatible, Strict };
 enum class UrdfDiagnosticKind { Io, Syntax, Invalid, Unsupported };
 
@@ -31,11 +36,19 @@ struct UrdfImportResult {
     }
 };
 
+// Choices the URDF text does not carry.
+struct UrdfImportOptions {
+    bool fix_base = false;                   // every link no joint carries becomes static
+    std::vector<std::string> package_paths;  // "<pkg>=<dir>" names a package's folder; other entries are
+                                             // searched for package://<pkg>/... before ROS_PACKAGE_PATH
+};
+
 // Strict rejects unrepresented semantics; legacy reports losses alongside its projection.
 UrdfImportResult ImportUrdf(const std::string& path,
-                            UrdfImportProfile profile = UrdfImportProfile::Strict);
+                            UrdfImportProfile profile = UrdfImportProfile::Strict,
+                            const UrdfImportOptions& options = {});
 
 /// Load a URDF (.urdf) file and return a populated SceneIR.
-nuka::scene::SceneIR LoadUrdf(const std::string& path);
+nuka::scene::SceneIR LoadUrdf(const std::string& path, const UrdfImportOptions& options = {});
 
 } // namespace nuka::import

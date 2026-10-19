@@ -200,5 +200,7 @@ inline constexpr const char kRecord[] = "\xEE\x8F\xAE";
 inline constexpr const char kShuffle[] = "\xEE\x90\xA2";
 inline constexpr const char kTag[] = "\xEE\x91\xB8";
 inline constexpr const char kDatabase[] = "\xEE\x87\x9E";
+inline constexpr const char kImage[] = "\xEE\x8B\x8A";
+inline constexpr const char kSwatches[] = "\xEE\x96\xB8";
 
 }  // namespace nuka::render::imgui::icon

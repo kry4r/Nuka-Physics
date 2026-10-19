@@ -90,9 +90,14 @@ struct RenderMaterial {
     // base_color, roughness/normal are linear. uv_scale tiles the maps (tiles per
     // world metre under triplanar; per UV unit otherwise); triplanar projects the
     // maps in world space for geometry without UVs (boxes/terrain/particle skins).
+    // metallic/roughness read one channel each and multiply their factors; emissive is sRGB.
     std::string albedo_map;
     std::string roughness_map;
     std::string normal_map;
+    std::string metallic_map;
+    std::string emissive_map;
+    uint32_t roughness_channel = 0u;  // 0 R, 1 G, 2 B
+    uint32_t metallic_channel  = 0u;
     float uv_scale  = 1.0f;
     bool  triplanar = true;
     ClothWeave weave;

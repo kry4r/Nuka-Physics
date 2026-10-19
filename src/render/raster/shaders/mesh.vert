@@ -25,6 +25,9 @@ layout(location = 1) in vec3 inNormal;    // object-space normal (flat-synthesiz
 #ifdef NUKA_VERTEX_COLOR
 layout(location = 2) in vec3 inColor;     // per-vertex tint of the material colour
 #endif
+#ifdef NUKA_UV_STREAM
+layout(location = 3) in vec2 inUv;        // texture coordinates, v up the image
+#endif
 
 // Per-frame scene environment (camera + light rig). Bound once per render; see
 // the matching SceneUbo in mesh_pbr.frag.
@@ -74,7 +77,11 @@ void main() {
     // Normal matrix: for rigid (rotation+translation) model transforms the upper
     // 3x3 is orthonormal, so the inverse-transpose equals the 3x3 itself.
     vWorldNormal = mat3(pc.model) * inNormal;
+#ifdef NUKA_UV_STREAM
+    vUv = inUv;
+#else
     vUv = vec2(0.0, 0.0);
+#endif
 #ifdef NUKA_LOCAL_FRAME
     vLocalPos = inPosition;
     vLocalToWorld = mat3(pc.model);

@@ -206,11 +206,24 @@ Mat4 Inverse(const Mat4& a) {
 struct PushBlock {
     float model[16];
     float base_color[4];
-    float mr[4];            // x metallic, y roughness, z opacity, w pad
+    float mr[4];            // x metallic, y roughness, z opacity, w a viewport draw's material maps slot
     float emissive[4];      // rgb emissive, a pad
-    float ground_shadow[4]; // a viewport draw's map layers and tiling, or the id pass's texel
+    float ground_shadow[4]; // the id pass's texel
 };
 static_assert(sizeof(PushBlock) == 128, "PushBlock must match the shared push range");
+
+// One material's image maps as viewport_scene.glsl's MaterialMaps reads them (std430).
+struct MaterialMapsGpu {
+    float layers[4];   // albedo, roughness, normal, metallic layers (-1 none)
+    float extra[4];    // emissive layer, roughness channel, metallic channel, pad
+    float mapping[4];  // 1 projects triplanar, then the UV scale or tiles per metre
+};
+static_assert(sizeof(MaterialMapsGpu) == 48, "MaterialMapsGpu must match viewport_scene.glsl");
+
+bool HasMaps(const MaterialMapsGpu& m) {
+    return m.layers[0] >= 0.0f || m.layers[1] >= 0.0f || m.layers[2] >= 0.0f || m.layers[3] >= 0.0f ||
+           m.extra[0] >= 0.0f;
+}
 
 // outline.frag's push block.
 struct OutlinePush {
@@ -461,9 +474,11 @@ uint64_t MeshSignature(const MeshGeometry& geo) {
     mix(geo.positions.size());
     mix(geo.normals.size());
     mix(geo.colors.size());
+    mix(geo.uvs.size());
     mix(geo.indices.size());
     mix(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(geo.positions.data())));
     mix(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(geo.colors.data())));
+    mix(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(geo.uvs.data())));
     mix(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(geo.indices.data())));
     auto sample = [&](const std::vector<float>& v, size_t i) {
         if (i < v.size()) { uint32_t b = 0; std::memcpy(&b, &v[i], 4); mix(b); }
@@ -589,8 +604,10 @@ struct PresentRenderer::Impl {
     VkSampler      maps_sampler = VK_NULL_HANDLE;
     uint64_t       maps_version = 0u;
     uint32_t       map_layers = 0u;  // the library images that got a layer
-    // Per material: its albedo, roughness and normal map layers (-1 none) and tiles per metre.
-    std::vector<std::array<float, 4>> material_maps;
+    // set 0, binding 3: per material, its map layers and projection, as uploaded.
+    std::vector<MaterialMapsGpu> material_maps;
+    GpuBuffer      material_buffer;
+    size_t         material_capacity = 0u;
 
     // The id pass renders kId* texels at swapchain size with its own depth, for the selection
     // outline and Pick; outline.frag samples it through outline_set.
@@ -672,8 +689,9 @@ struct PresentRenderer::Impl {
     // so a resize never re-uploads geometry.
     struct MeshCacheEntry {
         uint64_t  signature = 0;  // 0 = unused slot
-        GpuBuffer pos, nrm, col, idx;
+        GpuBuffer pos, nrm, col, uv, idx;
         uint32_t  index_count = 0;
+        bool      has_uv = false;  // the mesh ships texture coordinates (else the uv stream is zeros)
     };
     std::vector<MeshCacheEntry> mesh_cache;
 
@@ -809,6 +827,7 @@ struct PresentRenderer::Impl {
         DestroyImage(shadow_map);
         vkDestroySampler(device, maps_sampler, nullptr);
         DestroyImage(maps);
+        Destroy(material_buffer);
         if (command_pool != VK_NULL_HANDLE) vkDestroyCommandPool(device, command_pool, nullptr);
         // ORDERED teardown (the VkSurfaceKHR is owned by window_surface but was
         // created against the renderer's VkInstance): the surface MUST be destroyed
@@ -1465,8 +1484,30 @@ struct PresentRenderer::Impl {
         }
     }
 
+    // Rewrites the material buffer, growing it and repointing every scene set's binding 3 as needed.
+    void UploadMaterialMaps(const std::vector<MaterialMapsGpu>& records) {
+        if (material_buffer.buffer == VK_NULL_HANDLE || records.size() > material_capacity) {
+            Destroy(material_buffer);
+            material_capacity = std::max<size_t>(records.size(), 1u);
+            material_buffer = CreateHostBuffer(material_capacity * sizeof(MaterialMapsGpu),
+                                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            const VkDescriptorBufferInfo info{material_buffer.buffer, 0u, VK_WHOLE_SIZE};
+            for (const UboSlot& slot : ubo_slots) {
+                VkWriteDescriptorSet write{};
+                write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                write.dstSet = slot.set;
+                write.dstBinding = 3u;
+                write.descriptorCount = 1u;
+                write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                write.pBufferInfo = &info;
+                vkUpdateDescriptorSets(device, 1u, &write, 0u, nullptr);
+            }
+        }
+        Upload(material_buffer, records.data(), records.size() * sizeof(MaterialMapsGpu));
+    }
+
     // Re-uploads the maps array when the world's texture library changed, then resolves each
-    // material's layers and tiling for the push block (triplanar materials only).
+    // material's map layers and projection into the material buffer when they changed.
     void SyncMaps(const RenderWorld& world) {
         if (world.textures.Version() != maps_version) {
             vkDeviceWaitIdle(device);
@@ -1479,14 +1520,22 @@ struct PresentRenderer::Impl {
             const int id = world.textures.Resolve(path, srgb);
             return id >= 0 && static_cast<uint32_t>(id) < map_layers ? static_cast<float>(id) : -1.0f;
         };
-        material_maps.resize(world.materials.size());
+        std::vector<MaterialMapsGpu> records(world.materials.size());
         for (size_t i = 0; i < world.materials.size(); ++i) {
             const scene::RenderMaterial& m = world.materials[i];
-            std::array<float, 4>& maps_of = material_maps[i];
-            maps_of = {layer(m.albedo_map, true), layer(m.roughness_map, false), layer(m.normal_map, false), 0.0f};
-            if (m.triplanar && (maps_of[0] >= 0.0f || maps_of[1] >= 0.0f || maps_of[2] >= 0.0f))
-                maps_of[3] = m.uv_scale;
+            records[i] = {{layer(m.albedo_map, true), layer(m.roughness_map, false), layer(m.normal_map, false),
+                           layer(m.metallic_map, false)},
+                          {layer(m.emissive_map, true), static_cast<float>(m.roughness_channel),
+                           static_cast<float>(m.metallic_channel), 0.0f},
+                          {m.triplanar ? 1.0f : 0.0f, m.uv_scale, 0.0f, 0.0f}};
         }
+        const auto same = [](const MaterialMapsGpu& a, const MaterialMapsGpu& b) {
+            return std::memcmp(&a, &b, sizeof(MaterialMapsGpu)) == 0;
+        };
+        if (std::equal(records.begin(), records.end(), material_maps.begin(), material_maps.end(), same)) return;
+        vkDeviceWaitIdle(device);
+        UploadMaterialMaps(records);
+        material_maps = std::move(records);
     }
 
     // The fixed-function state the present pipelines differ in.
@@ -1495,7 +1544,7 @@ struct PresentRenderer::Impl {
         VkShaderModule   frag = VK_NULL_HANDLE;
         VkPipelineLayout layout = VK_NULL_HANDLE;
         VkRenderPass     pass = VK_NULL_HANDLE;
-        bool             mesh = true;  // the three float3 vertex streams; false draws a bare triangle
+        bool             mesh = true;  // the vertex streams; false draws a bare triangle
         VkPolygonMode    polygon = VK_POLYGON_MODE_FILL;
         VkCullModeFlags  cull = VK_CULL_MODE_NONE;
         bool             depth_test = true;
@@ -1513,8 +1562,8 @@ struct PresentRenderer::Impl {
 
         // Set 0: binding 0 = per-frame SceneUbo (camera + light rig); binding 1 =
         // the shadow map sampler, both as in the offscreen renderer's layout; binding 2
-        // = the material maps array, read only by the viewport's shaders.
-        std::array<VkDescriptorSetLayoutBinding, 3> set_bindings{};
+        // = the material maps array and binding 3 = each material's map slots, read only by the viewport's shaders.
+        std::array<VkDescriptorSetLayoutBinding, 4> set_bindings{};
         set_bindings[0].binding = 0u;
         set_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         set_bindings[0].descriptorCount = 1u;
@@ -1525,6 +1574,9 @@ struct PresentRenderer::Impl {
         set_bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
         set_bindings[2] = set_bindings[1];
         set_bindings[2].binding = 2u;
+        set_bindings[3] = set_bindings[1];
+        set_bindings[3].binding = 3u;
+        set_bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         VkDescriptorSetLayoutCreateInfo set_info{};
         set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         set_info.bindingCount = static_cast<uint32_t>(set_bindings.size());
@@ -1607,18 +1659,20 @@ struct PresentRenderer::Impl {
         // Without a fragment stage the pipeline writes depth alone.
         const bool color = spec.frag != VK_NULL_HANDLE;
 
-        // Position, normal and colour, one float3 stream each.
-        std::array<VkVertexInputBindingDescription, 3> bindings{};
-        std::array<VkVertexInputAttributeDescription, 3> attrs{};
+        // Position, normal and colour, one float3 stream each, then the float2 UV stream.
+        std::array<VkVertexInputBindingDescription, 4> bindings{};
+        std::array<VkVertexInputAttributeDescription, 4> attrs{};
         for (uint32_t i = 0; i < 3u; ++i) {
             bindings[i] = {i, sizeof(float) * 3u, VK_VERTEX_INPUT_RATE_VERTEX};
             attrs[i] = {i, i, VK_FORMAT_R32G32B32_SFLOAT, 0u};
         }
+        bindings[3] = {3u, sizeof(float) * 2u, VK_VERTEX_INPUT_RATE_VERTEX};
+        attrs[3] = {3u, 3u, VK_FORMAT_R32G32_SFLOAT, 0u};
         VkPipelineVertexInputStateCreateInfo vertex_input{};
         vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        vertex_input.vertexBindingDescriptionCount = spec.mesh ? 3u : 0u;
+        vertex_input.vertexBindingDescriptionCount = spec.mesh ? 4u : 0u;
         vertex_input.pVertexBindingDescriptions = bindings.data();
-        vertex_input.vertexAttributeDescriptionCount = spec.mesh ? 3u : 0u;
+        vertex_input.vertexAttributeDescriptionCount = spec.mesh ? 4u : 0u;
         vertex_input.pVertexAttributeDescriptions = attrs.data();
 
         VkPipelineInputAssemblyStateCreateInfo input_assembly{};
@@ -1755,9 +1809,10 @@ struct PresentRenderer::Impl {
     // Persistent per-frame-in-flight SceneUbo buffers + descriptor sets.
     void CreateSceneDescriptors() {
         const uint32_t slot_count = static_cast<uint32_t>(ubo_slots.size());
-        const std::array<VkDescriptorPoolSize, 2> sizes{{
+        const std::array<VkDescriptorPoolSize, 3> sizes{{
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, slot_count},
-            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2u * slot_count}}};
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2u * slot_count},
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, slot_count}}};
         VkDescriptorPoolCreateInfo pool_info{};
         pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         pool_info.maxSets = slot_count;
@@ -1798,6 +1853,7 @@ struct PresentRenderer::Impl {
                                    0u, nullptr);
         }
         WriteMapsDescriptors();
+        UploadMaterialMaps(material_maps);
     }
 
     void CreateSyncObjects() {
@@ -2019,7 +2075,7 @@ struct PresentRenderer::Impl {
         if (shrink) {
             for (size_t i = mesh_count; i < mesh_cache.size(); ++i) {
                 Destroy(mesh_cache[i].pos); Destroy(mesh_cache[i].nrm); Destroy(mesh_cache[i].col);
-                Destroy(mesh_cache[i].idx);
+                Destroy(mesh_cache[i].uv); Destroy(mesh_cache[i].idx);
             }
         }
         mesh_cache.resize(mesh_count);
@@ -2031,7 +2087,7 @@ struct PresentRenderer::Impl {
         for (size_t k = 0; k < rebuild.size(); ++k) {
             const uint32_t id = rebuild[k];
             MeshCacheEntry& e = mesh_cache[id];
-            Destroy(e.pos); Destroy(e.nrm); Destroy(e.col); Destroy(e.idx);
+            Destroy(e.pos); Destroy(e.nrm); Destroy(e.col); Destroy(e.uv); Destroy(e.idx);
             const MeshGeometry& geo = world.meshes.Geometry(id);
             std::vector<float> synth;
             const std::vector<float>* nrm_src = &geo.normals;
@@ -2045,12 +2101,22 @@ struct PresentRenderer::Impl {
                 white.assign(geo.positions.size(), 1.0f);
                 col_src = &white;
             }
+            const size_t vertex_count = geo.positions.size() / 3u;
+            e.has_uv = geo.uvs.size() == vertex_count * 2u && vertex_count != 0u;
+            std::vector<float> zero_uv;
+            const std::vector<float>* uv_src = &geo.uvs;
+            if (!e.has_uv) {
+                zero_uv.assign(vertex_count * 2u, 0.0f);
+                uv_src = &zero_uv;
+            }
             const VkDeviceSize pos_bytes = geo.positions.size() * sizeof(float);
             const VkDeviceSize nrm_bytes = nrm_src->size() * sizeof(float);
+            const VkDeviceSize uv_bytes = uv_src->size() * sizeof(float);
             const VkDeviceSize idx_bytes = geo.indices.size() * sizeof(uint32_t);
             e.pos = CreateDeviceLocalBuffer(pos_bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
             e.nrm = CreateDeviceLocalBuffer(nrm_bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
             e.col = CreateDeviceLocalBuffer(pos_bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+            e.uv = CreateDeviceLocalBuffer(uv_bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
             e.idx = CreateDeviceLocalBuffer(idx_bytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
             e.index_count = static_cast<uint32_t>(geo.indices.size());
             auto stage_copy = [&](const void* data, VkDeviceSize n, const GpuBuffer& dst) {
@@ -2063,6 +2129,7 @@ struct PresentRenderer::Impl {
             stage_copy(geo.positions.data(), pos_bytes, e.pos);
             stage_copy(nrm_src->data(), nrm_bytes, e.nrm);
             stage_copy(col_src->data(), pos_bytes, e.col);
+            stage_copy(uv_src->data(), uv_bytes, e.uv);
             stage_copy(geo.indices.data(), idx_bytes, e.idx);
             e.signature = rebuild_sig[k];
         }
@@ -2072,13 +2139,15 @@ struct PresentRenderer::Impl {
 
     void DestroyMeshCache() {
         for (MeshCacheEntry& e : mesh_cache) {
-            Destroy(e.pos); Destroy(e.nrm); Destroy(e.col); Destroy(e.idx);
+            Destroy(e.pos); Destroy(e.nrm); Destroy(e.col); Destroy(e.uv); Destroy(e.idx);
         }
         mesh_cache.clear();
     }
 
     struct InstanceDraw {
-        VkBuffer  pos = VK_NULL_HANDLE, nrm = VK_NULL_HANDLE, col = VK_NULL_HANDLE, idx = VK_NULL_HANDLE;  // cache-owned
+        // Cache-owned.
+        VkBuffer  pos = VK_NULL_HANDLE, nrm = VK_NULL_HANDLE, col = VK_NULL_HANDLE, uv = VK_NULL_HANDLE;
+        VkBuffer  idx = VK_NULL_HANDLE;
         uint32_t  index_count = 0;
         Mat4      model;
         float     base_color[4] = {0.8f, 0.8f, 0.8f, 1.0f};
@@ -2087,8 +2156,8 @@ struct PresentRenderer::Impl {
         float     opacity = 1.0f;
         float     emissive[3] = {0.0f, 0.0f, 0.0f};
         float     shade = 0.0f;  // the view mode mesh_view.frag reads from emissive.a
-        // The material's albedo, roughness and normal map layers (-1 none) and tiles per metre (0 none).
-        float     maps[4] = {-1.0f, -1.0f, -1.0f, 0.0f};
+        // The material's maps slot + 1 (0 none), negated when the mesh has no UVs so the maps project triplanar.
+        float     maps_slot = 0.0f;
         // INT-F1: the ORIGINAL index into world.instances (== the scatter SSBO row).
         // Used as firstInstance so gl_InstanceIndex selects the right SSBO mat4 on
         // the instanced path (the draw loop skips geometry-less instances, so the
@@ -2214,6 +2283,7 @@ struct PresentRenderer::Impl {
             draw.pos = cached.pos.buffer;
             draw.nrm = cached.nrm.buffer;
             draw.col = cached.col.buffer;
+            draw.uv = cached.uv.buffer;
             draw.idx = cached.idx.buffer;
             draw.index_count = cached.index_count;
             const bool has_material = inst.render_material_id != kNoId &&
@@ -2230,9 +2300,9 @@ struct PresentRenderer::Impl {
                 draw.emissive[0] = mat.emissive[0];
                 draw.emissive[1] = mat.emissive[1];
                 draw.emissive[2] = mat.emissive[2];
-                if (options.view_mode == ViewMode::Lit) {
-                    const std::array<float, 4>& maps_of = material_maps[inst.render_material_id];
-                    std::copy(maps_of.begin(), maps_of.end(), draw.maps);
+                if (options.view_mode == ViewMode::Lit && HasMaps(material_maps[inst.render_material_id])) {
+                    const float slot = static_cast<float>(inst.render_material_id + 1u);
+                    draw.maps_slot = cached.has_uv ? slot : -slot;
                 }
             }
             ApplyViewMode(options.view_mode, has_material ? inst.render_material_id : kNoId, draw);
@@ -2327,21 +2397,19 @@ struct PresentRenderer::Impl {
             std::memcpy(push.base_color, draw.base_color, sizeof(push.base_color));
             push.mr[0] = draw.metallic; push.mr[1] = draw.roughness;
             push.mr[2] = pass == DrawPass::SeeThrough ? draw.opacity * kSeeThroughOpacity : draw.opacity;
-            push.mr[3] = 0.0f;
+            push.mr[3] = pass == DrawPass::Id ? 0.0f : draw.maps_slot;
             push.emissive[0] = draw.emissive[0]; push.emissive[1] = draw.emissive[1];
             push.emissive[2] = draw.emissive[2]; push.emissive[3] = draw.shade;
             if (pass == DrawPass::Id) {
                 const uint32_t id = (draw.instance_row + 1u) | ((f & kInstanceSelected) != 0 ? kIdSelected : 0u) |
                                     ((f & kInstanceHovered) != 0 ? kIdHovered : 0u);
                 std::memcpy(push.ground_shadow, &id, sizeof(id));
-            } else {
-                std::memcpy(push.ground_shadow, draw.maps, sizeof(push.ground_shadow));
             }
             vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0u,
                                sizeof(PushBlock), &push);
-            std::array<VkBuffer, 3> vbuffers{draw.pos, draw.nrm, draw.col};
-            std::array<VkDeviceSize, 3> offsets{0u, 0u, 0u};
-            vkCmdBindVertexBuffers(cmd, 0u, 3u, vbuffers.data(), offsets.data());
+            std::array<VkBuffer, 4> vbuffers{draw.pos, draw.nrm, draw.col, draw.uv};
+            std::array<VkDeviceSize, 4> offsets{0u, 0u, 0u, 0u};
+            vkCmdBindVertexBuffers(cmd, 0u, 4u, vbuffers.data(), offsets.data());
             vkCmdBindIndexBuffer(cmd, draw.idx, 0u, VK_INDEX_TYPE_UINT32);
             // INT-F1: on the instanced path, firstInstance == the SSBO row so
             // gl_InstanceIndex picks the right scattered transform (the draw loop
@@ -2431,9 +2499,10 @@ struct PresentRenderer::Impl {
             }
             vkCmdPushConstants(cmd, pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0u,
                                sizeof(PushBlock), &push);
-            std::array<VkBuffer, 3> vbuffers{cached.pos.buffer, cached.nrm.buffer, cached.col.buffer};
-            std::array<VkDeviceSize, 3> offsets{0u, 0u, 0u};
-            vkCmdBindVertexBuffers(cmd, 0u, 3u, vbuffers.data(), offsets.data());
+            std::array<VkBuffer, 4> vbuffers{cached.pos.buffer, cached.nrm.buffer, cached.col.buffer,
+                                             cached.uv.buffer};
+            std::array<VkDeviceSize, 4> offsets{0u, 0u, 0u, 0u};
+            vkCmdBindVertexBuffers(cmd, 0u, 4u, vbuffers.data(), offsets.data());
             vkCmdBindIndexBuffer(cmd, cached.idx.buffer, 0u, VK_INDEX_TYPE_UINT32);
             vkCmdDrawIndexed(cmd, cached.index_count, 1u, 0u, 0, 0u);
         }
@@ -2453,7 +2522,8 @@ struct PresentRenderer::Impl {
                 continue;
             if (caster < 0) {
                 caster = static_cast<int>(i);
-                const float radius = std::clamp(view.focus_distance * 0.9f + 1.0f, 2.0f, 80.0f);
+                // Sized by the focus distance alone, so a small model up close still gets fine texels.
+                const float radius = std::clamp(view.focus_distance * 1.2f, 0.25f, 80.0f);
                 const float depth = radius * 3.0f + 10.0f;
                 const bool overhead = std::abs(sun.z) > 0.99f;
                 const math::Vec3 up{0.0f, overhead ? 1.0f : 0.0f, overhead ? 0.0f : 1.0f};

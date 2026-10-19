@@ -289,6 +289,7 @@ void TreeView::DrawSelf() {
                         ImGui::EndDragDropTarget();
                     }
                 }
+                if (drop_target) drop_target(row.item);
 
                 const ImVec2 end(pos.x + w, pos.y + row_h);
                 const ImVec2 after = ImGui::GetCursorScreenPos();

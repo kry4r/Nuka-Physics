@@ -175,18 +175,32 @@ void ApplyMaterialEdit(EditorScene& es, const MaterialBinding& bind,
     render::RenderWorld& rw = es.sim->GetRenderWorld();
     if (bind.render_slot != render::kNoId && bind.render_slot < rw.MaterialCount()) {
         rw.materials[bind.render_slot] = mat;
+        // A map the world has not drawn yet decodes once here.
+        render::DecodeMaterialTextures(rw);
     }
     if (!commit || bind.material_id == scene::kInvalidMaterial) return;
-    scene::MaterialRecord& rec = es.scene.GetMaterialMut(bind.material_id);
-    rec.base_color = math::Vec3{mat.base_color[0], mat.base_color[1], mat.base_color[2]};
-    rec.alpha       = mat.base_color[3];
-    rec.roughness   = mat.roughness;
-    rec.metallic    = mat.metallic;
-    rec.emissive    = math::Vec3{mat.emissive[0], mat.emissive[1], mat.emissive[2]};
-    rec.sheen       = mat.sheen;
-    rec.transmission = mat.transmission;
-    rec.ior         = mat.ior;
-    rec.absorption  = math::Vec3{mat.absorption[0], mat.absorption[1], mat.absorption[2]};
+    WriteMaterialRecord(mat, &es.scene.GetMaterialMut(bind.material_id));
+}
+
+void WriteMaterialRecord(const scene::RenderMaterial& mat, scene::MaterialRecord* rec) {
+    rec->base_color = math::Vec3{mat.base_color[0], mat.base_color[1], mat.base_color[2]};
+    rec->alpha       = mat.base_color[3];
+    rec->roughness   = mat.roughness;
+    rec->metallic    = mat.metallic;
+    rec->emissive    = math::Vec3{mat.emissive[0], mat.emissive[1], mat.emissive[2]};
+    rec->sheen       = mat.sheen;
+    rec->transmission = mat.transmission;
+    rec->ior         = mat.ior;
+    rec->absorption  = math::Vec3{mat.absorption[0], mat.absorption[1], mat.absorption[2]};
+    rec->albedo_map    = mat.albedo_map;
+    rec->roughness_map = mat.roughness_map;
+    rec->normal_map    = mat.normal_map;
+    rec->metallic_map  = mat.metallic_map;
+    rec->emissive_map  = mat.emissive_map;
+    rec->roughness_channel = mat.roughness_channel;
+    rec->metallic_channel  = mat.metallic_channel;
+    rec->uv_scale  = mat.uv_scale;
+    rec->triplanar = mat.triplanar;
 }
 
 // -- scene-tree structural edits --------------------------------------------

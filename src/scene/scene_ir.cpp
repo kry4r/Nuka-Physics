@@ -483,6 +483,28 @@ bool SceneIR::RemoveScript(ScriptId id) {
     return true;
 }
 
+bool SceneIR::RemoveMaterial(MaterialId id, MaterialId replace) {
+    if (id >= materials_.size()) {
+        return false;
+    }
+    materials_.erase(materials_.begin() + static_cast<std::ptrdiff_t>(id));
+    for (size_t i = 0; i < materials_.size(); ++i) {
+        materials_[i].id = static_cast<MaterialId>(i);
+    }
+    const auto remap = [id, replace](MaterialId& m) {
+        if (m == id) m = replace;
+        if (m != kInvalidMaterial && m > id) --m;
+    };
+    for (CollisionShapeRecord& s : shapes_) remap(s.material_id);
+    for (MediaRecord& m : media_) {
+        remap(m.render_material_id);
+        remap(m.cable_line.slab.render_material_id);
+        for (MediaRecord::MpmFill& fill : m.mpm_fills) remap(fill.render_material_id);
+    }
+    RebuildFacade();
+    return true;
+}
+
 bool SceneIR::RemoveShape(ShapeId id) {
     if (id >= shapes_.size()) {
         return false;
@@ -889,10 +911,7 @@ std::string StableAutoName(const char* kind, uint32_t record_id,
 
 }  // namespace
 
-void SceneIR::ProjectMaterial(const MaterialRecord& rec) {
-    // Split one authored MaterialRecord into BOTH asset tables under the same
-    // name. The MaterialId -> {phys,render} mapping lets shape projection bind a
-    // shape's material to the right asset ids.
+RenderMaterial RenderMaterialOf(const MaterialRecord& rec) {
     RenderMaterial rm;
     rm.base_color[0] = rec.base_color.x;
     rm.base_color[1] = rec.base_color.y;
@@ -913,9 +932,21 @@ void SceneIR::ProjectMaterial(const MaterialRecord& rec) {
     rm.albedo_map    = rec.albedo_map;
     rm.roughness_map = rec.roughness_map;
     rm.normal_map    = rec.normal_map;
+    rm.metallic_map  = rec.metallic_map;
+    rm.emissive_map  = rec.emissive_map;
+    rm.roughness_channel = rec.roughness_channel;
+    rm.metallic_channel  = rec.metallic_channel;
     rm.uv_scale      = rec.uv_scale;
     rm.triplanar     = rec.triplanar;
     rm.weave         = rec.weave;
+    return rm;
+}
+
+void SceneIR::ProjectMaterial(const MaterialRecord& rec) {
+    // Split one authored MaterialRecord into BOTH asset tables under the same
+    // name. The MaterialId -> {phys,render} mapping lets shape projection bind a
+    // shape's material to the right asset ids.
+    const RenderMaterial rm = RenderMaterialOf(rec);
 
     PhysicsMaterial pm;
     if (rec.friction_mu >= 0.0f) {

@@ -834,6 +834,10 @@ Value SaveRenderMaterial(const MaterialRecord& m) {
     if (!m.albedo_map.empty()) o.Set("albedo_map", Value::Str(m.albedo_map));
     if (!m.roughness_map.empty()) o.Set("roughness_map", Value::Str(m.roughness_map));
     if (!m.normal_map.empty()) o.Set("normal_map", Value::Str(m.normal_map));
+    if (!m.metallic_map.empty()) o.Set("metallic_map", Value::Str(m.metallic_map));
+    if (!m.emissive_map.empty()) o.Set("emissive_map", Value::Str(m.emissive_map));
+    if (m.roughness_channel != 0u) o.Set("roughness_channel", Value::Int(m.roughness_channel));
+    if (m.metallic_channel != 0u) o.Set("metallic_channel", Value::Int(m.metallic_channel));
     if (m.uv_scale != 1.0f) o.Set("uv_scale", Value::Float(m.uv_scale));
     if (!m.triplanar) o.Set("triplanar", Value::Bool(false));
     if (m.weave.pattern != 0u) o.Set("weave", WeaveJson(m.weave));
@@ -1296,6 +1300,12 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                 if (const Value* am = rm.Find("albedo_map")) rec.albedo_map = am->AsString();
                 if (const Value* rg = rm.Find("roughness_map")) rec.roughness_map = rg->AsString();
                 if (const Value* nm = rm.Find("normal_map")) rec.normal_map = nm->AsString();
+                if (const Value* mm = rm.Find("metallic_map")) rec.metallic_map = mm->AsString();
+                if (const Value* em = rm.Find("emissive_map")) rec.emissive_map = em->AsString();
+                if (const Value* rc = rm.Find("roughness_channel"))
+                    rec.roughness_channel = static_cast<uint32_t>(rc->AsInt());
+                if (const Value* mc = rm.Find("metallic_channel"))
+                    rec.metallic_channel = static_cast<uint32_t>(mc->AsInt());
                 if (const Value* us = rm.Find("uv_scale")) rec.uv_scale = us->AsFloat();
                 if (const Value* tp = rm.Find("triplanar")) rec.triplanar = tp->AsBool();
                 if (const Value* wv = rm.Find("weave")) rec.weave = WeaveFromJson(*wv);
@@ -2049,6 +2059,8 @@ SceneIR ApplyImports(SceneIR scene, const Value& imports,
             material.albedo_map = resolve_path(material.albedo_map);
             material.roughness_map = resolve_path(material.roughness_map);
             material.normal_map = resolve_path(material.normal_map);
+            material.metallic_map = resolve_path(material.metallic_map);
+            material.emissive_map = resolve_path(material.emissive_map);
         }
         addon.EnvironmentMut().hdri = resolve_path(addon.Environment().hdri);
         for (uint32_t i = 0u; i < addon.Media().size(); ++i) {

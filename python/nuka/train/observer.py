@@ -39,6 +39,7 @@ class TrainObserver(AlgoObserver):
         self.run = run
         self.scene = scene
         self.spacing = spacing
+        self.server = None
 
     def after_init(self, algo):
         self.algo = algo
@@ -54,7 +55,7 @@ class TrainObserver(AlgoObserver):
         if sys.platform == "win32":
             from .observe import Server
 
-            server = Server(algo.vec_env.env, self.scene, self.spacing)
+            server = self.server = Server(algo.vec_env.env, self.scene, self.spacing)
             step = algo.vec_env.step
 
             def stepped(actions):
@@ -65,6 +66,12 @@ class TrainObserver(AlgoObserver):
             algo.vec_env.step = stepped
             fields["observe"] = server.port
         self.run.update(**fields)
+
+    def close(self):
+        """Closes the env, so its world and device go before the interpreter does."""
+        if self.server is not None:
+            self.server.close()
+        self.algo.vec_env.close()
 
     def after_clear_stats(self):
         pass

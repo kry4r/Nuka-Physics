@@ -28,6 +28,7 @@
 #include "runtime/app/viewer/editor_extensions.hpp"
 #include "runtime/app/viewer/editor_import.hpp"
 #include "runtime/app/viewer/editor_instance.hpp"
+#include "runtime/app/viewer/editor_materials.hpp"
 #include "runtime/app/viewer/editor_profile.hpp"
 #include "runtime/app/viewer/editor_randomize.hpp"
 #include "runtime/app/viewer/editor_scene.hpp"
@@ -109,6 +110,10 @@ constexpr double kAutosaveSeconds = 60.0;
 constexpr size_t kLogKeep = 20u;
 // A press and release closer than this many pixels is a click, not a drag.
 constexpr float kClickSlop = 4.0f;
+// A material map's picture is this many pixels square.
+constexpr int kMapThumb = 96;
+// A material's ball, on the Assets panel's Materials page, is this many pixels square.
+constexpr int kBallThumb = 160;
 // A grab spring at unit gain rings at this rate on what it holds, critically damped.
 constexpr float kGrabHz = 3.0f;
 // The viewport draws a plain held force as an arrow this long [m].
@@ -993,6 +998,7 @@ struct EditorHost::State : DocumentHost {
     void RegisterRandomizeActions();
     void RegisterDatasetActions();
     void RegisterTrainActions();
+    void RegisterMaterialActions();
     // Runs nuka.train.exchange on `request`; returns why it failed, empty when `*response` is set.
     std::string TrainExchange(const json::Value& request, json::Value* response);
     // The probe of the interpreter runs start in, from the profile's train.python; cached until it changes.
@@ -1272,6 +1278,11 @@ struct EditorHost::State : DocumentHost {
     void AttachController();
     void ApplyUnload();
     void SeedInspector(scene::EntityId e);
+    void SeedMaterial();
+    MaterialBinding MaterialTarget() const;
+    std::string MaterialTargetPath() const;
+    void RefreshMaterials();
+    MaterialMapItem MapItem(const std::string& path);
     void ApplyInspectorEdits();
 
     LaunchOptions opt_;
@@ -1387,6 +1398,7 @@ struct EditorHost::State : DocumentHost {
     json::Value rendered_;  // the last render's answer
     std::vector<CameraBookmark> bookmarks_;
     std::unique_ptr<ThumbnailCache> thumbnails_;  // asset and example pictures
+    std::unique_ptr<ThumbnailCache> map_thumbnails_;  // material map and ball pictures
     uint64_t start_thumb_version_ = 0u;
     std::vector<AssetFile> asset_files_;
     bool assets_stale_ = true;
@@ -1399,6 +1411,10 @@ struct EditorHost::State : DocumentHost {
     std::vector<std::string> props_paths_;  // what the Properties schema was built for
     uint64_t props_scene_version_ = ~0ull;
     uint64_t props_revision_ = ~0ull;
+    // What the Materials view was built for.
+    std::string mat_view_path_;
+    int mat_view_active_ = 0;
+    uint64_t mat_view_scene_version_ = ~0ull, mat_view_revision_ = ~0ull, mat_view_thumbs_ = ~0ull;
     uint64_t joints_revision_ = ~0ull;
     uint64_t sensors_revision_ = ~0ull;
     bool click_armed_ = false;
@@ -1413,6 +1429,7 @@ struct EditorHost::State : DocumentHost {
     std::string hovered_path_;  // the body under the pointer, outlined as hovered
     bool hover_due_ = false;    // the pointer moved over the viewport since the last hover pick
     float hover_x_ = 0.0f, hover_y_ = 0.0f;
+    float drop_x_ = -1.0f, drop_y_ = -1.0f;  // where the last pick for a dragged material looked
     bool mode_heatmap_ = false;   // the Residual view turned the heatmap on
     bool mode_contacts_ = false;  // the Contact view turned the contact markers on
     std::array<PaneView, kViewPanes> views_{};
@@ -1430,7 +1447,9 @@ struct EditorHost::State : DocumentHost {
     math::Transform xform_before_;
     math::Transform xform_after_;
     bool mat_gesture_active_ = false;
-    std::string mat_gesture_path_;
+    std::string mat_gesture_path_;  // the target of a material without a name, else empty
+    std::string mat_gesture_name_;  // the named material the gesture edits
+    MaterialBinding mat_gesture_bind_;
     scene::RenderMaterial mat_before_{};
     bool gizmo_using_prev_ = false;
     // An IK drag: the link's pose in the gizmo's frame and at the press, the gizmo while held, the
@@ -1560,6 +1579,7 @@ EditorHost::State::State(const std::vector<std::string>& args, nuka_world_handle
     profile_.emplace(opt_.profile);
     OpenLog();
     thumbnails_ = std::make_unique<ThumbnailCache>(profile_->Dir() / "thumbnails" / "assets");
+    map_thumbnails_ = std::make_unique<ThumbnailCache>(profile_->Dir() / "thumbnails" / "maps", kMapThumb, kMapThumb);
     if (opt_.locale.empty()) opt_.locale = profile_->Setting("ui", "locale", "");
     autosave_seconds_ = profile_->SettingNumber("editor", "autosave_seconds", kAutosaveSeconds);
     script_host_.SetBudget(profile_->SettingNumber("script", "budget_s", script_host_.Budget()));
@@ -3644,8 +3664,9 @@ const std::vector<std::string>& EditorHost::State::InstancePaths() {
 std::vector<uint8_t> EditorHost::State::InstanceFlags() {
     const std::vector<std::string>& paths = InstancePaths();
     const std::vector<std::string> selected = SelectionPaths();
-    const std::vector<std::string> hovered =
-        hovered_path_.empty() ? std::vector<std::string>{} : std::vector<std::string>{hovered_path_};
+    // A material dragged over the viewport outlines the parts it would land on instead.
+    std::vector<std::string> hovered = ui_state_.material_drop;
+    if (hovered.empty() && !hovered_path_.empty()) hovered.push_back(hovered_path_);
     // The overlays see through the robot's meshes.
     const RobotOverlays& o = ui_state_.robot.overlays;
     const std::vector<render::RenderInstance>& instances = ShownWorld().instances;
@@ -4246,6 +4267,7 @@ void EditorHost::State::RegisterActions() {
     RegisterRandomizeActions();
     RegisterDatasetActions();
     RegisterTrainActions();
+    RegisterMaterialActions();
     RegisterScriptActions();
     ui_.RegisterActions(actions_);
 }
@@ -5761,6 +5783,259 @@ json::Value EditorHost::State::ObserveJson() const {
                    {"arrows", std::move(arrows)}});
 }
 
+// Materials go by their names: list and read them, make one from a preset or a copy, set its
+// fields and maps, rename or delete it, assign it to nodes and give a part a copy of its own.
+void EditorHost::State::RegisterMaterialActions() {
+    const auto has_scene = [this] { return loaded_ != nullptr; };
+    const auto no_node = [this](const std::string& path) {
+        return loaded_->scene.Tree().NodeOf(path) ? std::string() : "no node at '" + path + "'";
+    };
+    // A material as the actions report it: the fields an edit names, its friction and its users.
+    const auto describe = [this](const scene::MaterialRecord& rec) {
+        json::Value v = MaterialToJson(scene::RenderMaterialOf(rec));
+        v.Set("name", json::Value::Str(rec.name));
+        v.Set("friction", json::Value::Float(rec.friction_mu));
+        v.Set("users", json::Value::Int(MaterialUsers(loaded_->scene, rec.id)));
+        return v;
+    };
+    // `material` names one; else the one the drawn parts at `path` (else the Material section's
+    // part) share. Returns why there is none.
+    const auto resolve = [this, no_node](const json::Value& args, std::string* name) -> std::string {
+        if (const json::Value* m = args.Find("material")) {
+            *name = m->AsString();
+            if (FindMaterial(loaded_->scene, *name) == scene::kInvalidMaterial) return "no material '" + *name + "'";
+            return std::string();
+        }
+        const std::string path = StrArg(args, "path", MaterialTargetPath());
+        if (path.empty()) return "name a material or a path";
+        if (const std::string error = no_node(path); !error.empty()) return error;
+        std::vector<scene::MaterialId> ids;
+        for (const MaterialPart& p : ShapesUnder(*loaded_, doc_.Records(), path, /*rendering=*/true)) {
+            const scene::MaterialId id = loaded_->scene.GetShape(p.shape).material_id;
+            if (std::find(ids.begin(), ids.end(), id) == ids.end()) ids.push_back(id);
+        }
+        if (ids.empty()) return "'" + path + "' draws no part";
+        if (ids.size() > 1u)
+            return "the parts at '" + path + "' have " + std::to_string(ids.size()) + " materials; name one";
+        if (ids.front() == scene::kInvalidMaterial)
+            return "'" + path + "' has the default material; material.make_unique gives it one of its own";
+        *name = loaded_->scene.GetMaterial(ids.front()).name;
+        return std::string();
+    };
+    // The material fields of `in`, with "friction"; a map is an image file (or one inside a file
+    // as "file#offset+length") made absolute, "" for none. Returns why a field is wrong.
+    const auto fields = [](const json::Value& in, json::Value* out) -> std::string {
+        const json::Value known = MaterialToJson(scene::RenderMaterial{});
+        const auto is_map = [](const std::string& key) {
+            return std::find(std::begin(kMaterialMaps), std::end(kMaterialMaps), key) != std::end(kMaterialMaps);
+        };
+        *out = json::Value::Object();
+        for (const auto& [key, value] : in.Items()) {
+            if (key == "material" || key == "path") continue;
+            if (!known.Has(key) && key != "friction") return "no material field '" + key + "'";
+            if (!is_map(key) || value.AsString().empty()) {
+                out->Set(key, value);
+                continue;
+            }
+            const std::string& text = value.AsString();
+            const size_t inner = text.find('#');
+            const std::string file = text.substr(0, inner);
+            if (!fs::is_regular_file(Utf8Path(file))) return "no image at '" + file + "'";
+            out->Set(key, json::Value::Str(NormalPath(file) + (inner == std::string::npos ? "" : text.substr(inner))));
+        }
+        return std::string();
+    };
+    // One transaction sets the fields of material `name` that `args` holds.
+    const auto set = [this, fields](const std::string& name, const json::Value& args) {
+        json::Value look;
+        if (const std::string error = fields(args, &look); !error.empty()) return ActionResult::Fail(error);
+        json::Value after = Object({{"material", json::Value::Str(name)}});
+        for (const auto& [key, value] : look.Items())
+            if (key != "friction") after.Set(key, value);
+        EditTxn txn{"Edit Material", {}};
+        if (after.Items().size() > 1u) txn.ops.push_back(EditOp{"", "material", json::Value(), after});
+        if (const json::Value* friction = look.Find("friction"))
+            txn.ops.push_back(EditOp{"", "material_friction", json::Value(),
+                                     Object({{"material", json::Value::Str(name)}, {"friction", *friction}})});
+        if (txn.ops.empty()) return ActionResult::Fail("name a field to set");
+        return SubmitTxn(txn);
+    };
+
+    actions_.Add({"material.list", "List Materials", "material", "", ShortcutScope::Global, has_scene, {},
+                  [this, describe](const json::Value&) {
+                      json::Value list = json::Value::Array();
+                      for (const scene::MaterialRecord& rec : loaded_->scene.Materials()) list.PushBack(describe(rec));
+                      return Ok(std::move(list));
+                  },
+                  "", true});
+    actions_.Add({"material.get", "Get Material", "material", "", ShortcutScope::Global, has_scene, {},
+                  [this, describe, resolve](const json::Value& args) {
+                      std::string name;
+                      const std::string error = resolve(args, &name);
+                      if (!error.empty()) return ActionResult::Fail(error);
+                      return Ok(describe(loaded_->scene.GetMaterial(FindMaterial(loaded_->scene, name))));
+                  },
+                  "", true});
+    // The parts the world draws at or under `path` (else the selection) and their materials, "" for
+    // the default one.
+    actions_.Add({"material.slots", "List Material Slots", "material", "", ShortcutScope::Global, has_scene, {},
+                  [this, no_node](const json::Value& args) {
+                      const std::string path = StrArg(args, "path", SelectedPath());
+                      if (path.empty()) return ActionResult::Fail("select a node or name a path");
+                      if (const std::string error = no_node(path); !error.empty()) return ActionResult::Fail(error);
+                      json::Value list = json::Value::Array();
+                      for (const MaterialPart& p : ShapesUnder(*loaded_, doc_.Records(), path, /*rendering=*/true)) {
+                          const scene::MaterialId id = loaded_->scene.GetShape(p.shape).material_id;
+                          const std::string name =
+                              id == scene::kInvalidMaterial ? std::string() : loaded_->scene.GetMaterial(id).name;
+                          list.PushBack(
+                              Object({{"path", json::Value::Str(p.path)}, {"material", json::Value::Str(name)}}));
+                      }
+                      return Ok(std::move(list));
+                  },
+                  "", true});
+    // A copy of `from`, else `preset`'s look (plastic, metal, rubber, glass, emissive or textured),
+    // with `fields` over it; `assign`, a path or a list of them, takes it at once.
+    actions_.Add({"material.create", "New Material", "material", "", ShortcutScope::Global, has_scene, {},
+                  [this, fields](const json::Value& args) {
+                      const std::string preset = StrArg(args, "preset"), from = StrArg(args, "from");
+                      json::Value look = json::Value::Object();
+                      if (!preset.empty()) {
+                          look = MaterialPreset(preset, Resource("assets/editor/textures"));
+                          if (look.IsNull())
+                              return ActionResult::Fail("no preset '" + preset + "'; there are plastic, metal, " +
+                                                        "rubber, glass, emissive and textured");
+                      }
+                      if (!from.empty() && FindMaterial(loaded_->scene, from) == scene::kInvalidMaterial)
+                          return ActionResult::Fail("no material '" + from + "'");
+                      if (const json::Value* extra = args.Find("fields")) {
+                          json::Value checked;
+                          if (const std::string error = fields(*extra, &checked); !error.empty())
+                              return ActionResult::Fail(error);
+                          json::Value merged = json::Value::Object();
+                          for (const auto& [key, value] : look.Items())
+                              if (!checked.Has(key)) merged.Set(key, value);
+                          for (const auto& [key, value] : checked.Items()) merged.Set(key, value);
+                          look = std::move(merged);
+                      }
+                      std::string base = StrArg(args, "name");
+                      if (base.empty()) base = from;
+                      if (base.empty() && !preset.empty()) {
+                          base = preset;
+                          base[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(base[0])));
+                      }
+                      if (base.empty()) base = "Material";
+                      const std::string name = UniqueMaterialName(loaded_->scene, base);
+                      json::Value made = Object({{"name", json::Value::Str(name)}});
+                      if (!from.empty()) made.Set("from", json::Value::Str(from));
+                      if (!look.Items().empty()) made.Set("fields", look);
+                      EditTxn txn{"New Material", {EditOp{"", "material_new", json::Value(), made}}};
+                      std::vector<std::string> assign;
+                      if (const json::Value* a = args.Find("assign"))
+                          assign = a->IsArray() ? StrListArg(args, "assign") : std::vector<std::string>{a->AsString()};
+                      for (const std::string& path : assign)
+                          txn.ops.push_back(EditOp{path, "material_assign", json::Value(), json::Value::Str(name)});
+                      ActionResult result = SubmitTxn(txn);
+                      if (result.ok) result.value = Object({{"material", json::Value::Str(name)}});
+                      return result;
+                  },
+                  "", true});
+    // Material fields by the names material.get reports, maps as image paths and "friction".
+    actions_.Add({"material.set", "Set Material", "material", "", ShortcutScope::Global, has_scene, {},
+                  [resolve, set](const json::Value& args) {
+                      std::string name;
+                      const std::string error = resolve(args, &name);
+                      if (!error.empty()) return ActionResult::Fail(error);
+                      return set(name, args);
+                  },
+                  "", true});
+    // Picks an image for the `map` slot (albedo_map, roughness_map, metallic_map, normal_map or
+    // emissive_map) in a file dialog.
+    actions_.Add({"material.choose_map", "Choose Material Map", "material", "", ShortcutScope::Global, has_scene, {},
+                  [resolve, set](const json::Value& args) {
+                      std::string name;
+                      const std::string error = resolve(args, &name);
+                      if (!error.empty()) return ActionResult::Fail(error);
+                      const std::string map = StrArg(args, "map");
+                      if (std::find(std::begin(kMaterialMaps), std::end(kMaterialMaps), map) == std::end(kMaterialMaps))
+                          return ActionResult::Fail(
+                              "map is albedo_map, roughness_map, metallic_map, normal_map or emissive_map");
+                      const std::string file =
+                          OpenFileDialog(nui::Tr("Choose Map"), nui::Tr("Images"), "*.png;*.jpg;*.jpeg;*.tga;*.bmp");
+                      if (file.empty()) return ActionResult::Fail("no image chosen");
+                      return set(name, Object({{map.c_str(), json::Value::Str(file)}}));
+                  },
+                  "", true});
+    actions_.Add({"material.rename", "Rename Material", "material", "", ShortcutScope::Global, has_scene, {},
+                  [this, resolve](const json::Value& args) {
+                      std::string name;
+                      const std::string error = resolve(args, &name);
+                      if (!error.empty()) return ActionResult::Fail(error);
+                      const json::Value to = json::Value::Str(StrArg(args, "name"));
+                      const json::Value after = Object({{"material", json::Value::Str(name)}, {"name", to}});
+                      return SubmitTxn(EditTxn{"Rename Material", {EditOp{"", "material_rename", {}, after}}});
+                  },
+                  "", true});
+    // What used the material takes `replace` ("" for the default one); one in use needs it.
+    actions_.Add({"material.delete", "Delete Material", "material", "", ShortcutScope::Global, has_scene, {},
+                  [this, resolve](const json::Value& args) {
+                      std::string name;
+                      const std::string error = resolve(args, &name);
+                      if (!error.empty()) return ActionResult::Fail(error);
+                      json::Value after = Object({{"material", json::Value::Str(name)}});
+                      if (const json::Value* replace = args.Find("replace")) after.Set("replace", *replace);
+                      return SubmitTxn(EditTxn{"Delete Material", {EditOp{"", "material_delete", {}, after}}});
+                  },
+                  "", true});
+    // Every shape at or under `paths`, else `path`, else the selection, takes `material` ("" for the
+    // default one).
+    actions_.Add({"material.assign", "Assign Material", "material", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      const json::Value* material = args.Find("material");
+                      if (material == nullptr) return ActionResult::Fail("name the material, \"\" for the default one");
+                      const json::Value name = json::Value::Str(material->AsString());
+                      EditTxn txn{"Assign Material", {}};
+                      for (const std::string& path : TargetPaths(args))
+                          txn.ops.push_back(EditOp{path, "material_assign", json::Value(), name});
+                      if (txn.ops.empty()) return ActionResult::Fail("select a node or name a path");
+                      return SubmitTxn(txn);
+                  },
+                  "", true});
+    // The part at `path` (else the Material section's) takes a copy of its material of its own.
+    actions_.Add({"material.make_unique", "Make Material Unique", "material", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      const std::string path = StrArg(args, "path", MaterialTargetPath());
+                      if (path.empty()) return ActionResult::Fail("select a part or name a path");
+                      ActionResult result = SubmitTxn(EditTxn{"Make Unique", {EditOp{path, "material_unique"}}});
+                      if (!result.ok) return result;
+                      const MaterialPart part = ShapesUnder(*loaded_, doc_.Records(), path, false).front();
+                      const scene::MaterialId id = loaded_->scene.GetShape(part.shape).material_id;
+                      result.value = Object({{"material", json::Value::Str(loaded_->scene.GetMaterial(id).name)}});
+                      return result;
+                  },
+                  "", true});
+    // Selects the shapes that draw with `material`, and lists them.
+    actions_.Add({"material.select_users", "Select Material Users", "material", "", ShortcutScope::Global, has_scene,
+                  {},
+                  [this](const json::Value& args) {
+                      const std::string name = StrArg(args, "material");
+                      const scene::MaterialId id = FindMaterial(loaded_->scene, name);
+                      if (id == scene::kInvalidMaterial) return ActionResult::Fail("no material '" + name + "'");
+                      std::vector<std::string> paths;
+                      for (const auto& [entity, shape] : doc_.Records().shape)
+                          if (loaded_->scene.GetShape(shape).material_id == id) paths.push_back(PathOfEntity(entity));
+                      if (paths.empty()) return ActionResult::Fail("no shape uses '" + name + "'");
+                      std::sort(paths.begin(), paths.end());
+                      const json::Value select = Object({{"path", json::Value::Str(paths.front())},
+                                                         {"paths", StrList(paths)},
+                                                         {"mode", json::Value::Str("range")}});
+                      ActionResult result = actions_.Run("scene.select", select, "material.select_users", frame_index_);
+                      if (result.ok) result.value = Object({{"paths", StrList(paths)}});
+                      return result;
+                  },
+                  "", true});
+}
+
 void EditorHost::State::RegisterSensorActions() {
     const auto has_scene = [this] { return loaded_ != nullptr; };
     // `index` or `sensor` (a name) picks a sensor, else the selected one; -1 when none matches.
@@ -6097,9 +6372,9 @@ void EditorHost::State::RegisterAssemblyActions() {
                       std::string path = StrArg(args, "path");
                       if (path.empty())
                           path = OpenFileDialog(nui::Tr("Attach Asset"), nui::Tr("Assets"),
-                                                "*.urdf;*.xml;*.usd;*.usda;*.stl;*.obj;*.nks");
+                                                "*.urdf;*.xml;*.usd;*.usda;*.stl;*.obj;*.dae;*.gltf;*.glb;*.nks");
                       if (path.empty()) return ActionResult::Fail("no asset chosen");
-                      const ImportAnalysis analysis = AnalyzeImport(path, StrArg(args, "profile", a.profile));
+                      const ImportAnalysis analysis = AnalyzeImport(path, ImportOptionsOf(args, a.profile));
                       a.path = path;
                       a.profile = analysis.profile.empty() ? a.profile : analysis.profile;
                       a.mount.clear();
@@ -6168,9 +6443,9 @@ void EditorHost::State::RegisterAssemblyActions() {
                       const std::string name = StrArg(args, "name", PathText(Utf8Path(path).stem()));
                       json::Value after = attach_op(args);
                       if (after.Find("frame") == nullptr) after.Set("frame", TransformToJson(math::Transform::Identity()));
-                      after.Set("asset", Object({{"path", json::Value::Str(path)},
-                                                 {"profile", json::Value::Str(StrArg(args, "profile", "strict"))},
-                                                 {"name", json::Value::Str(name)}}));
+                      json::Value asset = Object({{"path", json::Value::Str(path)}, {"name", json::Value::Str(name)}});
+                      SetImportOptions(asset, ImportOptionsOf(args));
+                      after.Set("asset", std::move(asset));
                       return attached(SubmitTxn(EditTxn{"Attach " + name, {EditOp{"", "attach", json::Value(), std::move(after)}}}));
                   }});
     // Opening it on a selected link makes that link the parent.
@@ -6858,7 +7133,7 @@ void EditorHost::State::RegisterSceneActions() {
 void EditorHost::State::RegisterAssetActions() {
     actions_.Add({"file.import_analyze", "Analyze Asset", "file", "", ShortcutScope::Global, {}, {},
                   [](const json::Value& args) {
-                      return Ok(AnalysisToJson(AnalyzeImport(StrArg(args, "path"), StrArg(args, "profile", "strict"))));
+                      return Ok(AnalysisToJson(AnalyzeImport(StrArg(args, "path"), ImportOptionsOf(args))));
                   },
                   "", true});
     // Without `mode` the wizard opens on the asset; "auto" adds a clean asset to the open
@@ -6868,29 +7143,31 @@ void EditorHost::State::RegisterAssetActions() {
                       std::string path = StrArg(args, "path");
                       if (path.empty())
                           path = OpenFileDialog(nui::Tr("Import Asset"), nui::Tr("Assets"),
-                                                "*.urdf;*.xml;*.usd;*.usda;*.stl;*.obj;*.nks");
+                                                "*.urdf;*.xml;*.usd;*.usda;*.stl;*.obj;*.dae;*.gltf;*.glb;*.nks");
                       if (path.empty()) return ActionResult::Fail("no asset chosen");
                       if (!fs::exists(Utf8Path(path))) return ActionResult::Fail("no file at " + path);
                       const std::string mode = StrArg(args, "mode");
                       if (mode != "" && mode != "auto" && mode != "add" && mode != "open")
                           return ActionResult::Fail("the mode is auto, add or open");
-                      const std::string profile = StrArg(args, "profile", "strict");
+                      const ImportOptions options = ImportOptionsOf(args);
                       const json::Value* pose = args.Find("pose");
                       if (mode.empty() || mode == "auto") {
-                          const ImportAnalysis a = AnalyzeImport(path, profile);
+                          const ImportAnalysis a = AnalyzeImport(path, options);
                           if (mode.empty() || !loaded_ || !Importable(a) || !a.diagnostics.empty())
                               return ShowImport(a, pose != nullptr ? *pose : json::Value());
                       }
                       if (mode == "open") {
                           if (borrowed_) return Spawn({path});
-                          const json::Value resolved = Object({{"path", json::Value::Str(path)}, {"mode", json::Value::Str(mode)},
-                                                               {"profile", json::Value::Str(profile)},
-                                                               {"discard", json::Value::Bool(BoolArg(args, "discard", false))}});
+                          json::Value resolved = Object({{"path", json::Value::Str(path)},
+                                                         {"mode", json::Value::Str(mode)},
+                                                         {"discard",
+                                                          json::Value::Bool(BoolArg(args, "discard", false))}});
+                          SetImportOptions(resolved, options);
                           ActionResult asked;
                           if (!Confirmed("file.import", resolved, &asked)) return asked;
                           ui_state_.import.path.clear();
                           if (AssetKindOf(path) == AssetKind::Scene) return OpenDocument(path, path);
-                          const ImportAnalysis a = AnalyzeImport(path, profile);
+                          const ImportAnalysis a = AnalyzeImport(path, options);
                           if (!Importable(a)) return ActionResult::Fail(ImportError(a));
                           const std::string file = cache_.File("import.nks");
                           scene::nks::Save(*a.scene, file);
@@ -6898,9 +7175,9 @@ void EditorHost::State::RegisterAssetActions() {
                       }
                       if (!loaded_) return ActionResult::Fail("no document is open to add to");
                       const std::string name = StrArg(args, "name", PathText(Utf8Path(path).stem()));
-                      json::Value after = Object({{"path", json::Value::Str(path)}, {"profile", json::Value::Str(profile)},
-                                                  {"name", json::Value::Str(name)},
+                      json::Value after = Object({{"path", json::Value::Str(path)}, {"name", json::Value::Str(name)},
                                                   {"ground", json::Value::Bool(BoolArg(args, "ground", true))}});
+                      SetImportOptions(after, options);
                       if (pose != nullptr && !pose->IsNull()) after.Set("pose", *pose);
                       const ActionResult r = SubmitTxn(EditTxn{"Import " + name, {EditOp{"", "import", json::Value(), after}}});
                       if (r.ok) ui_state_.import.path.clear();
@@ -6936,6 +7213,16 @@ void EditorHost::State::RegisterAssetActions() {
                       assets_stale_ = true;
                       return Ok();
                   }});
+    // Shows the Assets panel's `page`: files or materials.
+    actions_.Add({"assets.page", "Show Assets Page", "assets", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value& args) {
+                      const std::string page = StrArg(args, "page");
+                      if (page != "files" && page != "materials")
+                          return ActionResult::Fail("page is files or materials");
+                      ui_state_.assets.materials = page == "materials";
+                      return Ok();
+                  },
+                  "", true});
     // The cards as the panel lists them; `pictures` asks for their pictures as the panel does.
     actions_.Add({"assets.list", "List Assets", "assets", "", ShortcutScope::Global, {}, {},
                   [this](const json::Value& args) {
@@ -6971,6 +7258,10 @@ ActionResult EditorHost::State::ShowImport(const ImportAnalysis& a, const json::
     }
     w.path = a.path;
     w.analysis = analysis;
+    std::string packages;
+    for (const json::Value& p : analysis.At("package_paths").Elements())
+        packages += (packages.empty() ? "" : ";") + p.AsString();
+    std::snprintf(w.packages, sizeof(w.packages), "%s", packages.c_str());
     w.pose = pose;
     w.add_allowed = loaded_ != nullptr;
     w.appear = true;
@@ -7040,6 +7331,97 @@ void EditorHost::State::RefreshProperties() {
     props_paths_ = std::move(paths);
     props_scene_version_ = ui_state_.scene_version;
     props_revision_ = doc_.Revision();
+}
+
+// The Materials view follows the selection, its active part, every document change and the map
+// pictures; a seeded selection re-seeds the Material fields unless a drag edits them.
+void EditorHost::State::RefreshMaterials() {
+    MaterialView& v = ui_state_.materials;
+    const std::string path = loaded_ ? SelectedPath() : std::string();
+    const uint64_t thumbs = map_thumbnails_->Version();
+    if (path == mat_view_path_ && v.active == mat_view_active_ && ui_state_.scene_version == mat_view_scene_version_ &&
+        doc_.Revision() == mat_view_revision_ && thumbs == mat_view_thumbs_)
+        return;
+    const int active = path == mat_view_path_ ? v.active : 0;
+    const uint64_t version = v.version + 1u;
+    v = MaterialView{};
+    v.version = version;
+    mat_view_path_ = path;
+    mat_view_scene_version_ = ui_state_.scene_version;
+    mat_view_revision_ = doc_.Revision();
+    mat_view_thumbs_ = thumbs;
+    mat_view_active_ = 0;
+    if (!loaded_) return;
+    const scene::SceneIR& s = loaded_->scene;
+    const auto color = [](const scene::MaterialRecord& rec, float* out) {
+        out[0] = rec.base_color.x;
+        out[1] = rec.base_color.y;
+        out[2] = rec.base_color.z;
+        out[3] = rec.alpha;
+    };
+    // A ball is drawn again when the material's fields or its map files change.
+    const auto ball_key = [](const scene::RenderMaterial& rm) {
+        std::string key = MaterialToJson(rm).Dump(0);
+        for (const auto field : kMaterialMapFields) {
+            const std::string& map = rm.*field;
+            if (map.empty()) continue;
+            const AssetFile file = AssetAt(map.substr(0, map.find('#')), "");
+            key += "\n" + std::to_string(file.bytes) + " " + std::to_string(file.stamp);
+        }
+        return key;
+    };
+    for (const scene::MaterialRecord& rec : s.Materials()) {
+        MaterialItem item;
+        item.name = rec.name;
+        color(rec, item.base_color);
+        const scene::RenderMaterial rm = scene::RenderMaterialOf(rec);
+        for (const auto field : kMaterialMapFields) item.textured = item.textured || !(rm.*field).empty();
+        item.users = MaterialUsers(s, rec.id);
+        item.ball = map_thumbnails_->Ball(rm, ball_key(rm), kBallThumb);
+        v.materials.push_back(std::move(item));
+    }
+    if (path.empty()) return;
+    for (const MaterialPart& part : ShapesUnder(*loaded_, doc_.Records(), path, /*rendering=*/true)) {
+        MaterialPartItem item;
+        item.path = part.path;
+        item.name = FileName(part.path);
+        if (const scene::MaterialId id = s.GetShape(part.shape).material_id; id != scene::kInvalidMaterial) {
+            item.material = s.GetMaterial(id).name;
+            color(s.GetMaterial(id), item.base_color);
+        }
+        v.parts.push_back(std::move(item));
+    }
+    v.active = mat_view_active_ = v.parts.empty() ? 0 : std::min(active, static_cast<int>(v.parts.size()) - 1);
+    if (!v.parts.empty() && !v.parts[static_cast<size_t>(v.active)].material.empty()) {
+        v.name = v.parts[static_cast<size_t>(v.active)].material;
+        const scene::MaterialId id = FindMaterial(s, v.name);
+        const scene::RenderMaterial rm = scene::RenderMaterialOf(s.GetMaterial(id));
+        v.users = MaterialUsers(s, id);
+        v.friction = s.GetMaterial(id).friction_mu;
+        for (size_t k = 0; k < 5u; ++k) v.maps[k] = MapItem(rm.*kMaterialMapFields[k]);
+        v.roughness_channel = rm.roughness_channel;
+        v.metallic_channel = rm.metallic_channel;
+        v.uv_scale = rm.uv_scale;
+        v.triplanar = rm.triplanar;
+    }
+    if (ui_state_.selected_entity == last_seeded_ && !mat_gesture_active_) SeedMaterial();
+}
+
+// A map slot as the Material section shows it; an image inside a file reads "file › embedded image".
+MaterialMapItem EditorHost::State::MapItem(const std::string& path) {
+    MaterialMapItem item;
+    item.path = path;
+    if (path.empty()) return item;
+    const size_t inner = path.find('#');
+    AssetFile asset = AssetAt(path.substr(0, inner), "");
+    item.shown = asset.name;
+    if (inner != std::string::npos) {
+        asset.path += path.substr(inner);
+        item.shown += std::string(" \xE2\x80\xBA ") + nui::Tr("embedded image");
+    }
+    asset.kind = AssetKind::Image;
+    item.thumbnail = map_thumbnails_->Thumbnail(asset);
+    return item;
 }
 
 // A click picks the body the id pass shows under the pointer, seeing through locked nodes;
@@ -8559,6 +8941,7 @@ void EditorHost::State::SeedInspector(scene::EntityId e) {
     InspectorState& ins = ui_state_.inspector;
     ins = InspectorState{};
     if (!loaded_ || e == scene::kInvalidEntity) return;
+    SeedMaterial();
     const render::RenderInstance* inst = PoseInstance(*loaded_, doc_.Records(), e);
     if (inst == nullptr) return;
     ins.valid   = true;
@@ -8569,16 +8952,34 @@ void EditorHost::State::SeedInspector(scene::EntityId e) {
     ins.pos[0] = p.x; ins.pos[1] = p.y; ins.pos[2] = p.z;
     const math::Vec3 rd = EulerDegFromQuat(world.rotation);
     ins.rot_deg[0] = rd.x; ins.rot_deg[1] = rd.y; ins.rot_deg[2] = rd.z;
-    const MaterialBinding mb = ResolveMaterial(*loaded_, doc_.Records(), e);
-    if (mb.valid) {
-        const scene::RenderMaterial& m = loaded_->sim->GetRenderWorld().materials[mb.render_slot];
-        ins.has_material = true;
-        for (int k = 0; k < 4; ++k) ins.base_color[k] = m.base_color[k];
-        ins.roughness = m.roughness; ins.metallic = m.metallic;
-        for (int k = 0; k < 3; ++k) ins.emissive[k] = m.emissive[k];
-        ins.sheen = m.sheen; ins.transmission = m.transmission; ins.ior = m.ior;
-        for (int k = 0; k < 3; ++k) ins.absorption[k] = m.absorption[k];
-    }
+}
+
+// The Material fields show the material the section edits.
+void EditorHost::State::SeedMaterial() {
+    InspectorState& ins = ui_state_.inspector;
+    const MaterialBinding mb = MaterialTarget();
+    ins.has_material = mb.valid;
+    if (!mb.valid) return;
+    const scene::RenderMaterial m = BoundMaterial(*loaded_, mb);
+    for (int k = 0; k < 4; ++k) ins.base_color[k] = m.base_color[k];
+    ins.roughness = m.roughness; ins.metallic = m.metallic;
+    for (int k = 0; k < 3; ++k) ins.emissive[k] = m.emissive[k];
+    ins.sheen = m.sheen; ins.transmission = m.transmission; ins.ior = m.ior;
+    for (int k = 0; k < 3; ++k) ins.absorption[k] = m.absorption[k];
+}
+
+// What the Material section edits: the active part's material (none for the default one), else
+// the selection's own.
+MaterialBinding EditorHost::State::MaterialTarget() const {
+    const MaterialView& v = ui_state_.materials;
+    if (v.parts.empty()) return ResolveMaterial(*loaded_, doc_.Records(), ui_state_.selected_entity);
+    if (v.name.empty()) return MaterialBinding{};
+    return BindMaterial(*loaded_, FindMaterial(loaded_->scene, v.name));
+}
+
+std::string EditorHost::State::MaterialTargetPath() const {
+    const MaterialView& v = ui_state_.materials;
+    return v.parts.empty() ? SelectedPath() : v.parts[static_cast<size_t>(v.active)].path;
 }
 
 // Inspector edits preview live each changed frame; the commit frame submits one transaction.
@@ -8586,8 +8987,8 @@ void EditorHost::State::ApplyInspectorEdits() {
     if (!loaded_) return;
     InspectorState& ins = ui_state_.inspector;
     const scene::EntityId e = ui_state_.selected_entity;
-    if (!ins.valid || e == scene::kInvalidEntity) return;
-    if (ins.transform_changed || ins.transform_commit) {
+    if (e == scene::kInvalidEntity) return;
+    if (ins.valid && (ins.transform_changed || ins.transform_commit)) {
         math::Transform edited;
         edited.position = math::Vec3{ins.pos[0], ins.pos[1], ins.pos[2]};
         edited.rotation = QuatFromEulerDeg(math::Vec3{ins.rot_deg[0], ins.rot_deg[1], ins.rot_deg[2]});
@@ -8609,26 +9010,29 @@ void EditorHost::State::ApplyInspectorEdits() {
         ins.transform_commit = false;
     }
     if (ins.has_material && (ins.material_changed || ins.material_commit)) {
-        const MaterialBinding mb = ResolveMaterial(*loaded_, doc_.Records(), e);
-        scene::RenderMaterial m;
-        if (mb.render_slot != render::kNoId && mb.render_slot < loaded_->sim->GetRenderWorld().MaterialCount())
-            m = loaded_->sim->GetRenderWorld().materials[mb.render_slot];
         if (!mat_gesture_active_) {
             mat_gesture_active_ = true;
-            mat_gesture_path_ = PathOfEntity(e);
-            mat_before_ = m;
+            mat_gesture_bind_ = MaterialTarget();
+            mat_gesture_name_ = ui_state_.materials.parts.empty() ? std::string() : ui_state_.materials.name;
+            mat_gesture_path_ = mat_gesture_name_.empty() ? PathOfEntity(e) : std::string();
+            mat_before_ = BoundMaterial(*loaded_, mat_gesture_bind_);
         }
+        scene::RenderMaterial m = mat_before_;
         for (int k = 0; k < 4; ++k) m.base_color[k] = ins.base_color[k];
         m.opacity = ins.base_color[3];
         m.roughness = ins.roughness; m.metallic = ins.metallic;
         for (int k = 0; k < 3; ++k) m.emissive[k] = ins.emissive[k];
         m.sheen = ins.sheen; m.transmission = ins.transmission; m.ior = ins.ior;
         for (int k = 0; k < 3; ++k) m.absorption[k] = ins.absorption[k];
-        ApplyMaterialEdit(*loaded_, mb, m, /*commit=*/false);
+        ApplyMaterialEdit(*loaded_, mat_gesture_bind_, m, /*commit=*/false);
         if (ins.material_commit) {
-            Queue("edit.apply", TxnToJson(EditTxn{"Material", {EditOp{mat_gesture_path_, "material",
-                                                                       MaterialToJson(mat_before_), MaterialToJson(m)}}}),
-                  "ui");
+            // A named material is edited by its name, so every part that shares it follows.
+            EditOp op{mat_gesture_path_, "material", MaterialToJson(mat_before_), MaterialToJson(m)};
+            if (!mat_gesture_name_.empty()) {
+                op.before.Set("material", json::Value::Str(mat_gesture_name_));
+                op.after.Set("material", json::Value::Str(mat_gesture_name_));
+            }
+            Queue("edit.apply", TxnToJson(EditTxn{"Material", {op}}), "ui");
             mat_gesture_active_ = false;
         }
         ins.material_changed = false;
@@ -8847,6 +9251,7 @@ void EditorHost::State::Frame(bool step_physics) {
     if (loaded_ && (hidden_stale_ || ui_state_.hidden != applied_hidden_)) ApplyHidden();
     RefreshAssets();
     RefreshProperties();
+    RefreshMaterials();
 
     io.DisplaySize = ImVec2(static_cast<float>(present_->Report().width),
                             static_cast<float>(present_->Report().height));
@@ -9024,6 +9429,7 @@ void EditorHost::State::Frame(bool step_physics) {
             DragGrab(render_camera, mouse_x, mouse_y);
         }
         // An Alt-drag with the Select tool boxes; its release selects what the box shows, Shift adding.
+        // An Alt-click picks the part under the pointer itself, not its body.
         if (loaded_ && ui_state_.tool == ViewportTool::Select && ev.type == window::WindowEvent::Type::MouseButton &&
             ev.button == 0u) {
             if (ev.pressed && ev.Held(window::modifier::kAlt) && !over_ui && !scene_ctrl && !ui_state_.gizmo.active) {
@@ -9034,7 +9440,20 @@ void EditorHost::State::Frame(bool step_physics) {
                 ui_state_.select_box = false;
                 const render::PickResult pick = PickBox(render_camera, ui_state_.select_box_from[0],
                                                         ui_state_.select_box_from[1], mouse_x, mouse_y);
-                Queue("scene.select", BoxSelectArgs(pick, ev.Held(window::modifier::kShift)), "viewport");
+                const bool shift = ev.Held(window::modifier::kShift);
+                const float moved = std::fabs(mouse_x - ui_state_.select_box_from[0]) +
+                                    std::fabs(mouse_y - ui_state_.select_box_from[1]);
+                if (moved > kClickSlop) {
+                    Queue("scene.select", BoxSelectArgs(pick, shift), "viewport");
+                } else if (pick.center != ~0u) {
+                    SwitchEnv(picked_env_);
+                    const std::string part = PathOfEntity(ShownWorld().instances[pick.center].entity);
+                    const char* mode = shift ? "toggle" : "replace";
+                    Queue("scene.select", Object({{"path", json::Value::Str(part)}, {"mode", json::Value::Str(mode)}}),
+                          "viewport");
+                } else if (!shift) {
+                    Queue("scene.select", json::Value::Object(), "viewport");
+                }
             }
         } else if (ui_state_.select_box && ev.type == window::WindowEvent::Type::MouseMove) {
             ui_state_.select_box_to[0] = mouse_x;
@@ -9076,6 +9495,28 @@ void EditorHost::State::Frame(bool step_physics) {
         hovered_path_ = hit == ~0u || !here ? std::string() : CarrierPath(hit);
     }
     ui_state_.robot.hovered = hovered_path_.empty() ? -1 : FindLink(hovered_path_);
+    // A material card dragged over the viewport lands on the part under the pointer, or on the
+    // whole selection when that part is in it.
+    const ImGuiPayload* dragged = ImGui::GetDragDropPayload();
+    const ImVec2 pointer = ImGui::GetIO().MousePos;
+    if (loaded_ && dragged != nullptr && dragged->IsDataType(kMaterialPayload) &&
+        ui_.Viewport().Contains(pointer.x, pointer.y)) {
+        if (pointer.x != drop_x_ || pointer.y != drop_y_) {
+            drop_x_ = pointer.x;
+            drop_y_ = pointer.y;
+            const uint32_t hit = PickBox(render_camera, pointer.x, pointer.y, pointer.x, pointer.y).center;
+            std::vector<std::string>& drop = ui_state_.material_drop;
+            drop.clear();
+            if (hit != ~0u && picked_env_ == ui_state_.env_index % ui_state_.envs.count) {
+                const std::string part = PathOfEntity(ShownWorld().instances[hit].entity);
+                const std::vector<std::string> selected = SelectionPaths();
+                drop = selected.size() > 1u && UnderAny(part, selected) ? selected : std::vector<std::string>{part};
+            }
+        }
+    } else {
+        ui_state_.material_drop.clear();
+        drop_x_ = -1.0f;
+    }
 
     ApplyInspectorEdits();
 

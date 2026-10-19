@@ -211,6 +211,12 @@ add_library(nuka_toml INTERFACE)
 target_include_directories(nuka_toml SYSTEM INTERFACE
     ${CMAKE_SOURCE_DIR}/external/tomlplusplus)
 
+# --- cgltf 1.15 (MIT, external/cgltf/LICENSE): glTF 2.0 mesh import. Header-only INTERFACE
+# target; ONE TU (import/gltf_mesh_loader.cpp) defines CGLTF_IMPLEMENTATION.
+add_library(nuka_cgltf INTERFACE)
+target_include_directories(nuka_cgltf SYSTEM INTERFACE
+    ${CMAKE_SOURCE_DIR}/external/cgltf)
+
 # --- Dear ImGui + SDL3: vendored ImGui (external/imgui/NUKA_VENDOR.md) and the SDL3
 # window layer, built only for the editor or Vulkan validation so the core build never fetches them.
 if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)

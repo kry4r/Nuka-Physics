@@ -16,7 +16,8 @@ namespace nuka::render {
 
 // Decode `path` into an rt::Texture. `srgb` flags an albedo image (the sampler
 // linearises it on read; roughness/normal maps pass srgb=false). Returns an empty
-// texture (Empty()==true) if the file is missing or fails to decode.
+// texture (Empty()==true) if the file is missing or fails to decode. A path may end
+// in "#offset+length" to decode that byte range of the file.
 rt::Texture LoadTexture(const std::string& path, bool srgb);
 
 // Decode an equirectangular environment map. A `.hdr` (Radiance RGBE) loads as

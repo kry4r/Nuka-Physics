@@ -634,6 +634,8 @@ void DecodeMaterialTextures(RenderWorld& world) {
         world.textures.Intern(m.albedo_map, true, &LoadTexture);
         world.textures.Intern(m.roughness_map, false, &LoadTexture);
         world.textures.Intern(m.normal_map, false, &LoadTexture);
+        world.textures.Intern(m.metallic_map, false, &LoadTexture);
+        world.textures.Intern(m.emissive_map, true, &LoadTexture);
     }
 }
 

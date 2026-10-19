@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <optional>
 #include <stdexcept>
@@ -53,13 +54,49 @@ math::Transform ParseOrigin(const tinyxml2::XMLElement* element) {
     return result;
 }
 
-std::filesystem::path ResolveMeshPath(const std::filesystem::path& urdf,
-                                      const std::string& filename) {
+// Where package://<pkg>/... looks: the folders "<pkg>=<dir>" entries name, then the other entries and
+// ROS_PACKAGE_PATH's as search roots.
+struct PackageLookup {
+    std::unordered_map<std::string, std::filesystem::path> named;
+    std::vector<std::filesystem::path> roots;
+};
+
+PackageLookup PackageRoots(const std::vector<std::string>& paths) {
+    PackageLookup lookup;
+    for (const std::string& p : paths) {
+        const size_t eq = p.find('=');
+        if (eq == std::string::npos) lookup.roots.emplace_back(p);
+        else lookup.named[p.substr(0u, eq)] = p.substr(eq + 1u);
+    }
+#ifdef _WIN32
+    constexpr char kListSeparator = ';';
+#else
+    constexpr char kListSeparator = ':';
+#endif
+    if (const char* env = std::getenv("ROS_PACKAGE_PATH")) {
+        std::istringstream list(env);
+        for (std::string root; std::getline(list, root, kListSeparator);)
+            if (!root.empty()) lookup.roots.emplace_back(root);
+    }
+    return lookup;
+}
+
+std::filesystem::path ResolveMeshPath(const std::filesystem::path& urdf, const std::string& filename,
+                                      const PackageLookup& packages) {
     namespace fs = std::filesystem;
     if (filename.empty()) throw std::runtime_error("URDF: mesh filename is empty");
     if (filename.rfind("package://", 0u) == 0u) {
         const fs::path package_path = filename.substr(10u);
         if (package_path.empty()) throw std::runtime_error("URDF: mesh package path is empty");
+        const auto named = packages.named.find(package_path.begin()->string());
+        if (named != packages.named.end()) {
+            const fs::path inside = named->second / package_path.lexically_relative(*package_path.begin());
+            if (fs::is_regular_file(inside)) return inside;
+        }
+        // A search root holds the package, or is the package itself; else the package is a folder above.
+        for (const fs::path& root : packages.roots)
+            for (const fs::path& base : {root, root.parent_path()})
+                if (fs::is_regular_file(base / package_path)) return base / package_path;
         for (fs::path root = urdf.parent_path(); !root.empty(); root = root.parent_path()) {
             const fs::path inside = root / package_path;
             if (fs::is_regular_file(inside)) return inside;
@@ -79,12 +116,11 @@ std::filesystem::path ResolveMeshPath(const std::filesystem::path& urdf,
     return resolved;
 }
 
-void LoadUrdfMesh(const tinyxml2::XMLElement* element, const std::filesystem::path& urdf,
-                  scene::CollisionShapeRecord& shape) {
-    if (shape.type != scene::ShapeType::TriMesh) return;
+MeshGeometry LoadUrdfMesh(const tinyxml2::XMLElement* element, const std::filesystem::path& urdf,
+                          const PackageLookup& packages) {
     const char* filename = element->Attribute("filename");
     if (filename == nullptr) throw std::runtime_error("URDF: mesh has no filename");
-    MeshGeometry mesh = LoadMeshFile(ResolveMeshPath(urdf, filename).string());
+    MeshGeometry mesh = LoadMeshFile(ResolveMeshPath(urdf, filename, packages).string());
     math::Vec3 scale{1.0f, 1.0f, 1.0f};
     if (const char* value = element->Attribute("scale")) scale = ParseVec3(value);
     if (!std::isfinite(scale.x) || !std::isfinite(scale.y) || !std::isfinite(scale.z) ||
@@ -107,6 +143,10 @@ void LoadUrdfMesh(const tinyxml2::XMLElement* element, const std::filesystem::pa
     if (scale.x * scale.y * scale.z < 0.0f)
         for (size_t i = 0u; i + 2u < mesh.indices.size(); i += 3u)
             std::swap(mesh.indices[i + 1u], mesh.indices[i + 2u]);
+    return mesh;
+}
+
+void AssignMesh(MeshGeometry&& mesh, scene::CollisionShapeRecord& shape) {
     shape.mesh_vertices = std::move(mesh.vertices);
     shape.mesh_indices = std::move(mesh.indices);
     shape.mesh_normals = std::move(mesh.normals);
@@ -150,8 +190,30 @@ scene::DecomposeMode DecomposeModeFromToken(const char* token) {
 // Public API
 // ---------------------------------------------------------------------------
 
-static scene::SceneIR ParseUrdf(tinyxml2::XMLElement* robot, const std::string& path) {
+scene::MaterialRecord PartMaterial(const MeshPart& part, const std::string& name) {
+    scene::MaterialRecord m;
+    m.name = name;
+    m.base_color = math::Vec3{part.color[0], part.color[1], part.color[2]};
+    m.alpha = part.color[3];
+    m.metallic = part.metallic;
+    m.roughness = part.roughness;
+    m.emissive = math::Vec3{part.emissive[0], part.emissive[1], part.emissive[2]};
+    m.albedo_map = part.albedo_map;
+    m.roughness_map = part.roughness_map;
+    m.metallic_map = part.metallic_map;
+    m.normal_map = part.normal_map;
+    m.emissive_map = part.emissive_map;
+    m.roughness_channel = part.roughness_channel;
+    m.metallic_channel = part.metallic_channel;
+    m.triplanar = m.albedo_map.empty() && m.roughness_map.empty() && m.metallic_map.empty() &&
+                  m.normal_map.empty() && m.emissive_map.empty();
+    return m;
+}
+
+static scene::SceneIR ParseUrdf(tinyxml2::XMLElement* robot, const std::string& path,
+                                const UrdfImportOptions& options) {
     scene::SceneIR scene;
+    const PackageLookup packages = PackageRoots(options.package_paths);
 
     // Map from link name -> BodyId for joint resolution
     std::unordered_map<std::string, scene::BodyId> link_map;
@@ -173,6 +235,14 @@ static scene::SceneIR ParseUrdf(tinyxml2::XMLElement* robot, const std::string& 
         std::istringstream ss(rgba);
         ss >> mrec.base_color.x >> mrec.base_color.y >> mrec.base_color.z >> mrec.alpha;
         const scene::MaterialId mid = scene.AddMaterial(std::move(mrec));
+        material_names[name] = mid;
+        return mid;
+    };
+    // A mesh file's colored run shares one MaterialRecord per "<file stem>/<material>".
+    const auto part_material = [&](const std::string& file, const MeshPart& part) {
+        const std::string name = file + "/" + part.material;
+        if (const auto found = material_names.find(name); found != material_names.end()) return found->second;
+        const scene::MaterialId mid = scene.AddMaterial(PartMaterial(part, name));
         material_names[name] = mid;
         return mid;
     };
@@ -232,7 +302,7 @@ static scene::SceneIR ParseUrdf(tinyxml2::XMLElement* robot, const std::string& 
             scene::CollisionShapeRecord shape;
             shape.body_id = body_id;
             shape.type = UrdfGeomType(shape_elem->Name());
-            LoadUrdfMesh(shape_elem, path, shape);
+            if (shape.type == scene::ShapeType::TriMesh) AssignMesh(LoadUrdfMesh(shape_elem, path, packages), shape);
 
             if (shape.type == scene::ShapeType::Box) {
                 const char* size_attr = shape_elem->Attribute("size");
@@ -309,7 +379,8 @@ static scene::SceneIR ParseUrdf(tinyxml2::XMLElement* robot, const std::string& 
             scene::CollisionShapeRecord shape;
             shape.body_id = body_id;
             shape.type = UrdfGeomType(shape_elem->Name());
-            LoadUrdfMesh(shape_elem, path, shape);
+            MeshGeometry mesh;
+            if (shape.type == scene::ShapeType::TriMesh) mesh = LoadUrdfMesh(shape_elem, path, packages);
             shape.contype = 0;       // visual-only: no collision (facade -> VisualMesh)
             shape.conaffinity = 0;
             shape.name = visual->Attribute("name") ? visual->Attribute("name") : "";
@@ -331,10 +402,22 @@ static scene::SceneIR ParseUrdf(tinyxml2::XMLElement* robot, const std::string& 
 
             shape.local_transform = ParseOrigin(visual->FirstChildElement("origin"));
 
-            if (auto* mat = visual->FirstChildElement("material")) {
+            auto* mat = visual->FirstChildElement("material");
+            if (mat != nullptr) {
                 if (const auto mid = resolve_material(mat, link_name + "_vis_mat")) shape.material_id = *mid;
             }
-
+            // Without its own material a visual keeps the mesh file's colors, one shape per material run.
+            if (mat == nullptr && !mesh.parts.empty()) {
+                const std::string file = std::filesystem::path(shape_elem->Attribute("filename")).stem().string();
+                for (size_t p = 0; p < mesh.parts.size(); ++p) {
+                    scene::CollisionShapeRecord part = shape;
+                    AssignMesh(ExtractPart(mesh, p), part);
+                    if (mesh.parts[p].has_color) part.material_id = part_material(file, mesh.parts[p]);
+                    scene.AddCollisionShape(std::move(part));
+                }
+                continue;
+            }
+            AssignMesh(std::move(mesh), shape);
             scene.AddCollisionShape(std::move(shape));
         }
     }
@@ -395,6 +478,11 @@ static scene::SceneIR ParseUrdf(tinyxml2::XMLElement* robot, const std::string& 
                 limit->QueryFloatAttribute("upper", &jrec.upper_limit) == tinyxml2::XML_SUCCESS;
             (void)limit->QueryFloatAttribute("effort", &effort_limit);
         }
+        // <dynamics damping="..." friction="..."/>: viscous damping and Coulomb friction.
+        if (auto* dynamics = joint->FirstChildElement("dynamics")) {
+            dynamics->QueryFloatAttribute("damping", &jrec.damping);
+            dynamics->QueryFloatAttribute("friction", &jrec.frictionloss);
+        }
 
         if (auto* mimic = joint->FirstChildElement("mimic")) {
             const char* source = mimic->Attribute("joint");
@@ -436,6 +524,13 @@ static scene::SceneIR ParseUrdf(tinyxml2::XMLElement* robot, const std::string& 
         scene.AddExcludePair(a->second, b->second);
     }
 
+    // A fixed base makes every link no joint carries static, as the cook takes no joint to the world.
+    if (options.fix_base) {
+        std::vector<uint8_t> carried(scene.RigidBodyCount(), 0u);
+        for (const scene::JointRecord& joint : scene.Joints()) carried[joint.child_body] = 1u;
+        for (scene::BodyId b = 0; b < scene.RigidBodyCount(); ++b)
+            if (carried[b] == 0u) scene.GetBodyMut(b).is_static = true;
+    }
     return scene;
 }
 
@@ -456,20 +551,23 @@ bool Listed(const std::string& value, const std::string& list) {
 
 void ValidateUrdf(Element* robot, UrdfImportResult& result) {
     const std::unordered_map<std::string, std::pair<std::string, std::string>> schema{
-        {"robot", {"name", "link joint"}}, {"link", {"name", "inertial collision visual"}},
+        {"robot", {"name", "link joint material"}}, {"link", {"name", "inertial collision visual"}},
         {"inertial", {"", "origin mass inertia"}}, {"mass", {"value", ""}},
         {"inertia", {"ixx iyy izz ixy ixz iyz", ""}}, {"origin", {"xyz rpy", ""}},
-        {"collision", {"", "origin geometry"}}, {"visual", {"name", "origin geometry"}},
-        {"geometry", {"", "box sphere mesh"}}, {"box", {"size", ""}},
-        {"sphere", {"radius", ""}}, {"mesh", {"filename scale", ""}},
-        {"joint", {"name type", "parent child origin axis limit"}},
+        {"collision", {"", "origin geometry"}}, {"visual", {"name", "origin geometry material"}},
+        {"geometry", {"", "box sphere cylinder capsule mesh"}}, {"box", {"size", ""}},
+        {"sphere", {"radius", ""}}, {"cylinder", {"radius length", ""}}, {"capsule", {"radius length", ""}},
+        {"mesh", {"filename scale", ""}}, {"material", {"name", "color"}}, {"color", {"rgba", ""}},
+        {"joint", {"name type", "parent child origin axis limit dynamics mimic"}},
         {"parent", {"link", ""}}, {"child", {"link", ""}},
-        {"axis", {"xyz", ""}}, {"limit", {"lower upper", ""}}
+        {"axis", {"xyz", ""}}, {"limit", {"lower upper effort", ""}},
+        {"dynamics", {"damping friction", ""}}, {"mimic", {"joint multiplier offset", ""}}
     };
     const std::unordered_map<std::string, std::string> required_attributes{
         {"robot", "name"}, {"link", "name"}, {"joint", "name type"}, {"mass", "value"},
-        {"inertia", "ixx iyy izz"}, {"box", "size"}, {"sphere", "radius"},
-        {"mesh", "filename"}, {"axis", "xyz"}, {"parent", "link"}, {"child", "link"}
+        {"inertia", "ixx iyy izz"}, {"box", "size"}, {"sphere", "radius"}, {"cylinder", "radius length"},
+        {"capsule", "radius length"}, {"mesh", "filename"}, {"axis", "xyz"}, {"parent", "link"},
+        {"child", "link"}, {"mimic", "joint"}, {"color", "rgba"}
     };
     const std::unordered_map<std::string, std::string> required_children{
         {"link", "inertial"}, {"inertial", "mass inertia"}, {"joint", "parent child"},
@@ -502,8 +600,8 @@ void ValidateUrdf(Element* robot, UrdfImportResult& result) {
                          "Unrepresented attribute: " + key);
                 continue;
             }
-            if (Listed(key, "name type link filename")) continue;
-            const size_t count = Listed(key, "xyz rpy size scale") ? 3u : 1u;
+            if (Listed(key, "name type link filename joint")) continue;
+            const size_t count = key == "rgba" ? 4u : Listed(key, "xyz rpy size scale") ? 3u : 1u;
             std::istringstream input(a->Value());
             std::vector<double> values(count);
             bool valid = true;
@@ -520,10 +618,13 @@ void ValidateUrdf(Element* robot, UrdfImportResult& result) {
             if (Listed(key, "ixy ixz iyz") && values[0] != 0.0)
                 Diagnose(result, e, UrdfDiagnosticKind::Unsupported, "URDF_FULL_INERTIA_UNSUPPORTED",
                          "Nonzero inertia cross terms are not represented");
-            if (Listed(key, "value ixx iyy izz radius size") &&
+            if (Listed(key, "value ixx iyy izz radius length size") &&
                 std::any_of(values.begin(), values.end(), [](double v) { return static_cast<float>(v) <= 0.0f; }))
                 Diagnose(result, e, UrdfDiagnosticKind::Invalid, "URDF_POSITIVE_VALUE_REQUIRED",
                          "Expected strictly positive value(s): " + key);
+            if (Listed(key, "effort damping friction") && values[0] < 0.0)
+                Diagnose(result, e, UrdfDiagnosticKind::Invalid, "URDF_NONNEGATIVE_VALUE_REQUIRED",
+                         "Expected a nonnegative value: " + key);
             if (Listed(key, "value ixx iyy izz") &&
                 !std::isfinite(1.0f / static_cast<float>(values[0])))
                 Diagnose(result, e, UrdfDiagnosticKind::Invalid, "URDF_INVERSE_NONFINITE",
@@ -535,8 +636,10 @@ void ValidateUrdf(Element* robot, UrdfImportResult& result) {
             if (key == "scale" && std::any_of(values.begin(), values.end(), [](double v) { return static_cast<float>(v) == 0.0f; }))
                 Diagnose(result, e, UrdfDiagnosticKind::Invalid, "URDF_SCALE_INVALID", "Mesh scale cannot be zero");
             if (std::string(e->Name()) == "axis" && key == "xyz") {
+                // Fixed and floating joints ignore their axis, so any value there is fine.
+                const char* joint_type = e->Parent()->ToElement()->Attribute("type");
                 const double squared = values[0] * values[0] + values[1] * values[1] + values[2] * values[2];
-                if (std::abs(squared - 1.0) > 1e-5)
+                if (std::abs(squared - 1.0) > 1e-5 && !(joint_type && Listed(joint_type, "fixed floating")))
                     Diagnose(result, e, UrdfDiagnosticKind::Invalid, "URDF_AXIS_INVALID", "Strict joint axis must have unit length");
             }
         }
@@ -635,7 +738,7 @@ void ValidateUrdf(Element* robot, UrdfImportResult& result) {
 }
 } // namespace
 
-UrdfImportResult ImportUrdf(const std::string& path, UrdfImportProfile profile) {
+UrdfImportResult ImportUrdf(const std::string& path, UrdfImportProfile profile, const UrdfImportOptions& options) {
     UrdfImportResult result;
     result.profile = profile;
     tinyxml2::XMLDocument doc;
@@ -657,7 +760,7 @@ UrdfImportResult ImportUrdf(const std::string& path, UrdfImportProfile profile) 
     for (auto& diagnostic : result.diagnostics) diagnostic.source = path;
     if (profile == UrdfImportProfile::Strict && !result.diagnostics.empty()) return result;
     try {
-        result.scene = ParseUrdf(robot, path);
+        result.scene = ParseUrdf(robot, path, options);
         bool finite_mesh = true;
         for (const auto& shape : result.scene->Shapes()) {
             for (const auto* stream : {&shape.mesh_vertices, &shape.mesh_normals, &shape.mesh_uvs})
@@ -675,14 +778,14 @@ UrdfImportResult ImportUrdf(const std::string& path, UrdfImportProfile profile) 
     return result;
 }
 
-scene::SceneIR LoadUrdf(const std::string& path) {
+scene::SceneIR LoadUrdf(const std::string& path, const UrdfImportOptions& options) {
     tinyxml2::XMLDocument doc;
     if (const tinyxml2::XMLError err = doc.LoadFile(path.c_str()); err != tinyxml2::XML_SUCCESS)
         throw std::runtime_error("URDF: failed to load file: " + path + " (" +
                                  tinyxml2::XMLDocument::ErrorIDToName(err) + ")");
     auto* robot = doc.FirstChildElement("robot");
     if (!robot) throw std::runtime_error("URDF: missing <robot> root element in " + path);
-    return ParseUrdf(robot, path);
+    return ParseUrdf(robot, path, options);
 }
 
 } // namespace nuka::import

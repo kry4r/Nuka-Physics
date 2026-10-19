@@ -11,8 +11,8 @@
 // no reordering, no float reassociation. A fixed input file therefore yields a
 // byte-identical vertex/index array on every load.
 //
-// Self-written only: plain C++17/C++20 std + std::filesystem. No third-party
-// mesh libraries (no assimp / tinyobj / etc.).
+// STL / OBJ / COLLADA readers are self-written (COLLADA on tinyxml2); glTF goes
+// through the vendored cgltf reader (external/cgltf, MIT). No assimp / tinyobj.
 // ---------------------------------------------------------------------------
 
 #include <cstdint>
@@ -20,6 +20,27 @@
 #include <vector>
 
 namespace nuka::import {
+
+/// A run of triangles drawn with one material: a glTF primitive or a COLLADA
+/// <triangles material=...> block. Map paths are absolute; an image inside a file
+/// (a .glb buffer) is named "file#offset+length".
+struct MeshPart {
+    std::uint32_t first_index = 0;  // offset into MeshGeometry::indices
+    std::uint32_t index_count = 0;
+    std::string material;           // the file's material name ("" when it names none)
+    bool has_color = false;
+    float color[4] = {1.0f, 1.0f, 1.0f, 1.0f};  // base color RGBA when has_color
+    float metallic = 0.0f;
+    float roughness = 0.5f;
+    float emissive[3] = {0.0f, 0.0f, 0.0f};
+    std::string albedo_map;
+    std::string roughness_map;
+    std::string metallic_map;
+    std::string normal_map;
+    std::string emissive_map;
+    std::uint32_t roughness_channel = 0;  // 0 R, 1 G, 2 B
+    std::uint32_t metallic_channel = 0;
+};
 
 /// Flat triangle geometry. The element types match
 /// nuka::scene::CollisionShapeRecord::mesh_vertices / mesh_indices exactly so
@@ -29,6 +50,7 @@ struct MeshGeometry {
     std::vector<float>    normals;   // x,y,z per-vertex normals, 1:1 with vertices (may be empty)
     std::vector<float>    uvs;       // u,v per-vertex coordinates, 1:1 with vertices (may be empty)
     std::vector<uint32_t> indices;   // triangle indices (3 per triangle)
+    std::vector<MeshPart> parts;     // material runs over indices; empty for STL / OBJ
 
     /// Number of vertices (vertices.size() / 3).
     std::size_t VertexCount() const { return vertices.size() / 3; }
@@ -57,7 +79,26 @@ MeshGeometry LoadStl(const std::string& path);
 /// Throws std::runtime_error on a missing or malformed file.
 MeshGeometry LoadObj(const std::string& path);
 
-/// Dispatch by lowercased file extension (".stl", ".obj").
+/// Load a glTF 2.0 file (.gltf with external or embedded buffers, or .glb).
+/// Every mesh the default scene instances is flattened in node order with its
+/// world transform baked in, and +Y up becomes +Z up. Each triangle, strip or
+/// fan primitive becomes one part carrying its material's PBR factors and maps;
+/// points and lines are skipped. UVs are stored v up (v' = 1 - v). Throws
+/// std::runtime_error on an unreadable or Draco-compressed file.
+MeshGeometry LoadGltf(const std::string& path);
+
+/// Load a COLLADA file: <triangles>, <polylist>, <polygons>, <tristrips> and
+/// <trifans> under the visual scene's nodes (matrix / translate / rotate /
+/// scale, instance_node), scaled to meters by <unit meter>. <up_axis> is ignored
+/// as ROS tools do. Each primitive becomes one part colored by its bound
+/// effect's diffuse color or texture. Throws std::runtime_error on a malformed file.
+MeshGeometry LoadDae(const std::string& path);
+
+/// The triangles of `mesh.parts[part]` as their own mesh, vertices renumbered
+/// in first-use order; the result has no parts.
+MeshGeometry ExtractPart(const MeshGeometry& mesh, std::size_t part);
+
+/// Dispatch by lowercased file extension (".stl", ".obj", ".gltf", ".glb", ".dae").
 /// Throws std::runtime_error on an unsupported extension.
 MeshGeometry LoadMeshFile(const std::string& path);
 

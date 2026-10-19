@@ -111,6 +111,10 @@ rt::Material RenderMaterialToRt(const scene::RenderMaterial& m,
     out.albedo_tex = textures.Resolve(m.albedo_map, true);
     out.roughness_tex = textures.Resolve(m.roughness_map, false);
     out.normal_tex = textures.Resolve(m.normal_map, false);
+    out.metallic_tex = textures.Resolve(m.metallic_map, false);
+    out.emissive_tex = textures.Resolve(m.emissive_map, true);
+    out.roughness_channel = m.roughness_channel;
+    out.metallic_channel = m.metallic_channel;
     out.uv_scale = m.uv_scale > 0.0f ? m.uv_scale : 1.0f;
     out.triplanar = m.triplanar ? 1u : 0u;
     out.weave = m.weave.pattern;

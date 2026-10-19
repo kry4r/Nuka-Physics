@@ -727,12 +727,12 @@ void Host::DrawNotifications(ImDrawList* list, const ImVec2& min, const ImVec2& 
     for (auto it = toasts_.rbegin(); it != toasts_.rend(); ++it) {
         const double age = now - it->born;
         const double life = it->level == Level::Err ? 8.0 : 4.0;
-        const float fade = static_cast<float>(std::clamp((life - age) / 0.4, 0.0, 1.0));
-        const float slide = static_cast<float>(std::clamp(age / 0.15, 0.0, 1.0));
+        // Toasts fade in and out in place, so a quick run of them leaves the stack still.
+        const float fade = static_cast<float>(std::clamp(std::min(age / 0.15, (life - age) / 0.4), 0.0, 1.0));
         const float text_w = width - 2.0f * pad - 22.0f * s;
         const ImVec2 tsize = font->CalcTextSizeA(px, FLT_MAX, text_w, it->text.c_str());
         const float h = std::max(tsize.y, px) + 2.0f * pad;
-        const float x0 = right - width + (1.0f - slide) * 24.0f * s;
+        const float x0 = right - width;
         const ImVec2 a(x0, bottom - h), b(x0 + width, bottom);
         if (a.y < min.y) break;
         const ImVec4 tone = ToneColor(LevelTone(it->level));

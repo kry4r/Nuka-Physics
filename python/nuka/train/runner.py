@@ -126,7 +126,7 @@ def run(job_path: str) -> int:
             args["checkpoint"] = job["checkpoint"]
         runner.run(args)
         # rl_games leaves its env open; the world and device go before the interpreter does.
-        observer.algo.vec_env.close()
+        observer.close()
     except BaseException as exc:
         traceback.print_exc()
         report.update(state="failed", error=f"{type(exc).__name__}: {exc}", observe=None, ended=time.time())

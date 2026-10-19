@@ -23,6 +23,16 @@ layout(set = 0, binding = 1) uniform sampler2D uShadowMap;
 // Every material image map as one layer, raw texels (albedo still sRGB-encoded).
 layout(set = 0, binding = 2) uniform sampler2DArray uMaps;
 
+// Per material, its map layers in uMaps and how they project; the push block's mr.w picks one.
+struct MaterialMaps {
+    vec4 layers;   // albedo, roughness, normal, metallic layers (-1 none)
+    vec4 extra;    // x emissive layer, y roughness channel, z metallic channel (0 R, 1 G, 2 B)
+    vec4 mapping;  // x 1 projects triplanar, y the UV scale or tiles per metre
+};
+layout(std430, set = 0, binding = 3) readonly buffer MaterialMapsBlock {
+    MaterialMaps slots[];
+} materials;
+
 // The sky's radiance along a world direction (+Z up), the sun left out.
 vec3 SkyRadiance(vec3 dir) {
     if (dir.z >= 0.0) return mix(scene.sky_horizon.rgb, scene.sky_zenith.rgb, sqrt(dir.z));
@@ -95,6 +105,26 @@ vec3 TriplanarNormal(float layer, vec3 p, vec3 n, vec3 w) {
 
 vec3 SrgbToLinear(vec3 c) {
     return mix(pow((c + 0.055) / 1.055, vec3(2.4)), c / 12.92, lessThanEqual(c, vec3(0.04045)));
+}
+
+// A map layer's texel at texture coordinate st, and one channel of it (0 R, 1 G, 2 B).
+vec4 Map(float layer, vec2 st) {
+    return texture(uMaps, vec3(st, layer));
+}
+
+float MapChannel(vec4 c, float channel) {
+    return channel > 1.5 ? c.b : channel > 0.5 ? c.g : c.r;
+}
+
+// A tangent frame about unit normal n from the screen derivatives of the position and the v-up UV.
+mat3 CotangentFrame(vec3 n, vec3 p, vec2 uv) {
+    const vec3 dp1 = dFdx(p), dp2 = dFdy(p);
+    const vec2 duv1 = dFdx(uv), duv2 = dFdy(uv);
+    const vec3 dp2perp = cross(dp2, n), dp1perp = cross(n, dp1);
+    const vec3 t = dp2perp * duv1.x + dp1perp * duv2.x;
+    const vec3 b = dp2perp * duv1.y + dp1perp * duv2.y;
+    const float scale = inversesqrt(max(max(dot(t, t), dot(b, b)), 1e-20));
+    return mat3(t * scale, b * scale, n);
 }
 
 // Linear HDR to the display: the ACES fit then the sRGB curve, as mesh_pbr.frag ends.

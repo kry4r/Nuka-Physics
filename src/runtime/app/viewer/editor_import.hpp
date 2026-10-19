@@ -14,7 +14,7 @@
 
 namespace nuka::runtime::app::viewer {
 
-enum class AssetKind : uint8_t { Unknown, Scene, Urdf, Mjcf, Usd, Mesh };
+enum class AssetKind : uint8_t { Unknown, Scene, Urdf, Mjcf, Usd, Mesh, Image };
 
 // By extension; an .xml file is MJCF when its root element is <mujoco>.
 AssetKind AssetKindOf(const std::string& path);
@@ -44,12 +44,25 @@ struct ImportAnalysis {
     std::string path;
     AssetKind kind = AssetKind::Unknown;
     std::string profile;  // "strict" or "legacy"; URDF only
+    bool fix_base = false;  // URDF only
+    std::vector<std::string> package_paths;  // URDF only
     std::vector<ImportDiagnostic> diagnostics;
     std::optional<scene::SceneIR> scene;  // absent when the file does not load
     ImportStats stats;
 };
 
-ImportAnalysis AnalyzeImport(const std::string& path, const std::string& profile);
+// How a URDF reads: its profile, and whether the base is fixed or packages are searched elsewhere.
+struct ImportOptions {
+    std::string profile = "strict";
+    bool fix_base = false;
+    std::vector<std::string> package_paths;
+};
+// From an action's or an op's `profile`, `fix_base` and `package_paths` fields; `fallback` is the profile
+// when the fields name none.
+ImportOptions ImportOptionsOf(const scene::json::Value& fields, const std::string& fallback = "strict");
+void SetImportOptions(scene::json::Value& fields, const ImportOptions& options);
+
+ImportAnalysis AnalyzeImport(const std::string& path, const ImportOptions& options);
 // A loaded asset imports unless a diagnostic is an error; the message names the first one.
 bool Importable(const ImportAnalysis& analysis);
 std::string ImportError(const ImportAnalysis& analysis);

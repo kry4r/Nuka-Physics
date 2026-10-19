@@ -675,6 +675,8 @@ public:
     std::function<void(uint64_t)> on_activate;
     std::function<void(uint64_t)> context_menu;  // draws the popup body
     std::function<void(uint64_t dragged, uint64_t onto)> on_drop;
+    // Other drags a row takes: called with the row as the last item, to open its own drop target.
+    std::function<void(uint64_t)> drop_target;
     ModelPtr<std::string> filter;
     int open_depth = 1;  // levels expanded the first time the tree shows
     float height = 0.0f;

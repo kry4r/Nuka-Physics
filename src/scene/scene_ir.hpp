@@ -212,13 +212,21 @@ struct MaterialRecord {
     // (default) reconstructs the identical untextured RenderMaterial. uv_scale
     // tiles the maps; triplanar projects them in body-local space for geometry
     // without authored UVs (boxes / terrain / particle surfaces).
+    // A path may end in "#offset+length" to name image bytes inside a file (a .glb).
     std::string albedo_map;
     std::string roughness_map;
     std::string normal_map;
+    std::string metallic_map;
+    std::string emissive_map;
+    uint32_t roughness_channel             = 0;  // 0 R, 1 G, 2 B; glTF packs roughness in G
+    uint32_t metallic_channel              = 0;  // 0 R, 1 G, 2 B; glTF packs metallic in B
     float uv_scale                         = 1.0f;
     bool  triplanar                        = true;
     ClothWeave weave;
 };
+
+// The render half of `rec`, as the scene's projection gives it.
+RenderMaterial RenderMaterialOf(const MaterialRecord& rec);
 
 // Scene-level HDR environment backing the offline beauty render (equirect
 // background + sky-dome light). `hdri` empty (default) keeps the procedural
@@ -585,6 +593,10 @@ public:
     // Remove one script record (ids re-densify, facade re-projects). False when
     // `id` is invalid.
     bool RemoveScript(ScriptId id);
+
+    // Remove one material: what used it takes `replace` (an id from before the removal,
+    // or kInvalidMaterial) and later ids shift down one. False when `id` is invalid.
+    bool RemoveMaterial(MaterialId id, MaterialId replace);
 
     // Remove one collision shape; later shapes re-densify and <pair> overrides naming it
     // drop. False when `id` is invalid.

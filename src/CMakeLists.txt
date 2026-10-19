@@ -191,12 +191,12 @@ add_custom_command(
     VERBATIM
 )
 
-# The present path's mesh.vert variant with the per-vertex colour stream.
+# The present path's mesh.vert variant with the per-vertex colour and UV streams.
 set(NUKA_RASTER_MESH_COLOR_VERT_SPV "${CMAKE_CURRENT_BINARY_DIR}/render/raster/shaders/mesh_color.vert.spv")
 add_custom_command(
     OUTPUT "${NUKA_RASTER_MESH_COLOR_VERT_SPV}"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/render/raster/shaders"
-    COMMAND "${GLSLC_EXECUTABLE}" -DNUKA_VERTEX_COLOR -DNUKA_LOCAL_FRAME "${NUKA_RASTER_MESH_VERT}"
+    COMMAND "${GLSLC_EXECUTABLE}" -DNUKA_VERTEX_COLOR -DNUKA_LOCAL_FRAME -DNUKA_UV_STREAM "${NUKA_RASTER_MESH_VERT}"
             -o "${NUKA_RASTER_MESH_COLOR_VERT_SPV}"
     DEPENDS "${NUKA_RASTER_MESH_VERT}"
     VERBATIM
@@ -449,6 +449,7 @@ if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)
         runtime/app/viewer/editor_training.cpp
         runtime/app/viewer/file_dialog.cpp
         runtime/app/viewer/imgui_layer.cpp
+        runtime/app/viewer/material_panel.cpp
         runtime/app/viewer/randomize_panel.cpp
         runtime/app/viewer/robot_hud.cpp
         runtime/app/viewer/robot_panel.cpp
@@ -482,6 +483,8 @@ add_library(nuka_import STATIC
     import/usd_importer.cpp
     import/usd_crate_reader.cpp
     import/mesh_file_loader.cpp
+    import/gltf_mesh_loader.cpp
+    import/dae_mesh_loader.cpp
     # M2c: .nks scene Save/Load. Lives here (not nuka_scene) because Load resolves
     # "imports" via LoadMjcf/LoadUsd/LoadUrdf + Compose; nuka_import already links
     # nuka_scene so it sees the json/nka/asset_ref surface.
@@ -498,6 +501,8 @@ target_link_libraries(nuka_import
     PUBLIC
         nuka_scene
         tinyxml2::tinyxml2
+    PRIVATE
+        nuka_cgltf
 )
 
 nuka_set_warnings(nuka_import)
@@ -1276,6 +1281,7 @@ if(CMAKE_CUDA_COMPILER)
             runtime/app/viewer/editor_edits.cpp
             runtime/app/viewer/editor_document.cpp
             runtime/app/viewer/editor_import.cpp
+            runtime/app/viewer/editor_materials.cpp
             runtime/app/viewer/editor_collision.cpp
             runtime/app/viewer/editor_sensors.cpp
             runtime/app/viewer/editor_randomize.cpp

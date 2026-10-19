@@ -51,11 +51,11 @@ TEST(MjcfMassPipeline, PreservesMassSourcesFromImportThroughCook) {
     EXPECT_FLOAT_EQ(cooked.bodies.masses[explicit_body], 2.5f);
     EXPECT_EQ(cooked.bodies.inertias[explicit_body], Vec3(0.1f, 0.2f, 0.3f));
 
-    // Geom-derived inertia is not implemented; stay massless rather than leaking
-    // the unrelated SceneIR construction placeholder into cooked physics.
+    // Without <inertial> the 0.2 x 0.4 x 0.6 m box at density 500 gives the mass and inertia.
     EXPECT_EQ(scene.GetShape(0).body_id, geom_only);
-    EXPECT_FLOAT_EQ(scene.GetBody(geom_only).mass, 0.0f);
-    EXPECT_EQ(scene.GetBody(geom_only).inertia, Vec3::Zero());
-    EXPECT_FLOAT_EQ(cooked.bodies.masses[geom_only], 0.0f);
-    EXPECT_EQ(cooked.bodies.inertias[geom_only], Vec3::Zero());
+    const Vec3 box_inertia(1.04f, 0.8f, 0.4f);
+    EXPECT_NEAR(scene.GetBody(geom_only).mass, 24.0f, 1e-5f);
+    EXPECT_NEAR((scene.GetBody(geom_only).inertia - box_inertia).Length(), 0.0f, 1e-5f);
+    EXPECT_NEAR(cooked.bodies.masses[geom_only], 24.0f, 1e-5f);
+    EXPECT_NEAR((cooked.bodies.inertias[geom_only] - box_inertia).Length(), 0.0f, 1e-5f);
 }

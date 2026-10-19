@@ -884,6 +884,22 @@ void ImGuiLayer::BuildStage(nui::VStack& root) {
         Queue("edit.reparent", Args({{"path", json::Value::Str(stage_items_->Path(dragged))},
                                      {"parent", json::Value::Str(stage_items_->Path(onto))}}));
     };
+    // A material dropped on a node row goes to every part under it, or under the whole selection
+    // when the row is one of several selected.
+    tree.drop_target = [this](uint64_t item) {
+        if (stage_items_->Sensor(item) >= 0 || stage_items_->Path(item).empty()) return;
+        if (!ImGui::BeginDragDropTarget()) return;
+        if (const ImGuiPayload* drop = ImGui::AcceptDragDropPayload(kMaterialPayload)) {
+            const std::string name(static_cast<const char*>(drop->Data), static_cast<size_t>(drop->DataSize));
+            const std::vector<nuka::scene::EntityId>& sel = frame_.ui->selection;
+            const bool whole =
+                sel.size() > 1u && std::find(sel.begin(), sel.end(), stage_items_->Entity(item)) != sel.end();
+            json::Value args = Args({{"material", json::Value::Str(name)}});
+            if (!whole) args.Set("path", json::Value::Str(stage_items_->Path(item)));
+            Queue("material.assign", std::move(args));
+        }
+        ImGui::EndDragDropTarget();
+    };
     tree.context_menu = [this](uint64_t item) {
         ViewerUiState& ui = *frame_.ui;
         if (const int sensor = stage_items_->Sensor(item); sensor >= 0) {
@@ -976,15 +992,37 @@ void ImGuiLayer::BuildProperties(nui::VStack& root) {
         f->on_commit = [this](const nui::Vec3&, const nui::Vec3&) { frame_.ui->inspector.transform_commit = true; };
     }
 
+    // The selection's parts, each with its material; the active one's material shows below.
+    auto& parts = Fold(root.Add<nui::Collapsible>("Materials", true, icon::kSwatches), "materials");
+    parts.visible_if = [this, selected] { return selected() && frame_.ui->materials.parts.size() > 1u; };
+    parts.Add<nui::Custom>([this] { DrawMaterialParts(); });
+
+    const auto has_material = [this] { return frame_.ui->inspector.has_material; };
+    const auto named = [this] { return !frame_.ui->materials.name.empty(); };
     auto& material = Fold(root.Add<nui::Collapsible>("Material", true, icon::kPalette), "material");
-    material.visible_if = [this, editable] { return editable() && frame_.ui->inspector.has_material; };
+    material.visible_if = [this, selected] {
+        return selected() && (!frame_.ui->materials.parts.empty() || frame_.ui->inspector.has_material);
+    };
+    material.Add<nui::Custom>([this] { DrawMaterialHeader(); });
     auto& mgrid = material.Add<nui::PropertyGrid>();
+    mgrid.visible_if = has_material;
     auto& base = mgrid.Add<nui::ColorField>("Base color", Floats4(ins.base_color), true, false);
     auto& rough = mgrid.Add<nui::FloatField>("Roughness", nui::Ref(&ins.roughness), 0.01f, 0.0f, 1.0f);
     auto& metal = mgrid.Add<nui::FloatField>("Metallic", nui::Ref(&ins.metallic), 0.01f, 0.0f, 1.0f);
     auto& emissive = mgrid.Add<nui::ColorField>("Emissive", Rgb(ins.emissive), false, true);
-    material.Add<nui::Separator>("Offline beauty");
+    // Friction lives on the material too, so every shape that shares it grips alike.
+    MaterialView& materials = frame_.ui->materials;
+    auto& friction = mgrid.Add<nui::FloatField>("Friction", nui::Ref(&materials.friction), 0.01f, 0.0f, 2.0f);
+    friction.visible_if = named;
+    friction.on_commit = [this](const float&, const float& after) {
+        Queue("material.set", Args({{"material", json::Value::Str(frame_.ui->materials.name)},
+                                    {"friction", json::Value::Float(after)}}));
+    };
+    material.Add<nui::Separator>("Maps").visible_if = named;
+    material.Add<nui::Custom>([this] { DrawMaterialMaps(); }).visible_if = named;
+    material.Add<nui::Separator>("Offline beauty").visible_if = has_material;
     auto& rgrid = material.Add<nui::PropertyGrid>();
+    rgrid.visible_if = has_material;
     auto& transmission = rgrid.Add<nui::FloatField>("Transmission", nui::Ref(&ins.transmission), 0.01f, 0.0f, 1.0f);
     auto& ior = rgrid.Add<nui::FloatField>("IOR", nui::Ref(&ins.ior), 0.01f, 1.0f, 2.5f);
     auto& sheen = rgrid.Add<nui::FloatField>("Sheen", nui::Ref(&ins.sheen), 0.01f, 0.0f, 1.0f);

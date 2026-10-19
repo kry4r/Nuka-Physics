@@ -27,6 +27,7 @@
 layout(location = 0) in vec3 inPosition;  // object-space position
 layout(location = 1) in vec3 inNormal;    // object-space normal
 layout(location = 2) in vec3 inColor;     // per-vertex tint of the material colour
+layout(location = 3) in vec2 inUv;        // texture coordinates, v up the image
 
 #include "light_limits.glsl"  // NUKA_MAX_LIGHTS -- single source, == C++ kMaxUboLights
 const int kMaxLights = NUKA_MAX_LIGHTS;
@@ -76,7 +77,7 @@ void main() {
     vec4 world = model * vec4(inPosition, 1.0);
     vWorldPos = world.xyz;
     vWorldNormal = mat3(model) * inNormal;
-    vUv = vec2(0.0, 0.0);
+    vUv = inUv;
     vLocalPos = inPosition;
     vLocalToWorld = mat3(model);
     vBaseColor = vec4(pc.base_color.rgb * inColor, pc.base_color.a);

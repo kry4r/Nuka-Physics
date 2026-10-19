@@ -9,6 +9,7 @@
 #include "runtime/app/viewer/dataset_view.hpp"
 #include "runtime/app/viewer/demo_view.hpp"
 #include "runtime/app/viewer/editor_actions.hpp"
+#include "runtime/app/viewer/material_view.hpp"
 #include "runtime/app/viewer/nui/nui.hpp"
 #include "runtime/app/viewer/policy_view.hpp"
 #include "runtime/app/viewer/property_schema.hpp"
@@ -102,9 +103,15 @@ struct AssetCard {
     std::string path;
     std::string name;
     std::string root;
-    std::string kind;       // "scene", "urdf", "mjcf", "usd" or "mesh"
+    std::string kind;       // "scene", "urdf", "mjcf", "usd", "mesh" or "image"
     std::string thumbnail;  // a PPM, or empty while it is drawn
 };
+
+// The drag payloads of an Assets card, the file's path: an image card drags onto a material's
+// map slot, every other card onto the viewport. A material card drags its name onto parts.
+inline constexpr const char* kAssetPayload = "NUKA_ASSET";
+inline constexpr const char* kImagePayload = "NUKA_IMAGE";
+inline constexpr const char* kMaterialPayload = "NUKA_MATERIAL";
 
 // The Assets panel: its folders (examples, the document's own, then the user's) and their files.
 struct AssetBrowser {
@@ -116,6 +123,7 @@ struct AssetBrowser {
     std::string kind;       // the kind shown; empty shows every kind
     char filter[128] = {0};
     bool shown = false;     // UI-set: the panel drew this frame, so pictures are wanted
+    bool materials = false;  // the Materials page shows instead of the files
 };
 
 // The import wizard over one file's analysis; an empty `path` keeps it closed.
@@ -124,6 +132,7 @@ struct ImportWizard {
     nui::json::Value analysis;  // AnalysisToJson
     nui::json::Value pose;      // where a drop placed it; null keeps the origin
     char name[128] = {0};
+    char packages[512] = {0};  // package_paths joined by ';'
     bool ground = true;
     bool open_as_new = false;  // otherwise the asset joins the open document
     bool add_allowed = false;  // a document is open to add to
@@ -330,6 +339,9 @@ struct ViewerUiState {
     std::string load_error;
 
     InspectorState inspector;
+    MaterialView materials;
+    // Host-set: the paths a material dragged over the viewport goes to, outlined as hovered.
+    std::vector<std::string> material_drop;
     GizmoState gizmo;
     ViewportTool tool = ViewportTool::Select;
     float perturb_gain = 1.0f;   // the grab spring's stiffness over its default
@@ -559,6 +571,18 @@ private:
     void DrawSensorInspector();
     // A sensor row's popup body: rename it or remove it.
     void SensorContextMenu(int index);
+    // The selection's parts in Properties, each with its material; a click makes it the edited one.
+    void DrawMaterialParts();
+    // The edited material's name and sharing, and the buttons that split it or start a new one.
+    void DrawMaterialHeader();
+    // The edited material's maps, each slot taking a dropped image, and how they are laid on.
+    void DrawMaterialMaps();
+    // A combo that gives the part at `path` another material.
+    void MaterialCombo(const char* id, const std::string& current, const std::string& path);
+    // The Assets panel's Materials page: the document's materials as balls to drag onto parts.
+    void DrawMaterialLibrary();
+    // Takes a material dropped on the viewport: the parts the host found under the pointer get it.
+    void DrawMaterialDrop();
     ViewProjector Projector(const ImVec2& vmin, const ImVec2& vmax) const;
     // The viewport's top-right tools (RT preview, Render, layout, shading) and the box of a box selection.
     void DrawViewTools(const ImVec2& vmin, const ImVec2& vmax);
@@ -572,7 +596,8 @@ private:
     void DrawBookmarkBar(const ImVec2& vmin, const ImVec2& vmax);
     // The panes' dividers, the active one's border and each pane's camera, mode and maximize header.
     void DrawPaneHeaders(const ImVec2& cmin, const ImVec2& cmax, const ImVec2& pane, float gap);
-    // While an asset card is dragged, the viewport takes the drop at the ground under the pointer.
+    // While an asset card is dragged, the viewport takes the drop at the ground under the pointer;
+    // a material card goes to the part under it.
     void DrawAssetDrop();
     // The texture of a PPM file, reloaded when the file changes; null without the file.
     ImTextureData* Thumbnail(const std::string& file);
@@ -650,6 +675,16 @@ private:
     uint64_t label_version_ = ~0ull;
     char new_label_[128] = {0};  // the Stage menu's new label field
     char sensor_name_[128] = {0};
+    // The material rename field, taken again when the edited material's name changes.
+    char material_name_[128] = {0};
+    std::string material_name_seed_ = "\n";  // the name it was taken from
+    char material_filter_[64] = {0};  // the material combo's filter
+    char library_filter_[128] = {0};  // the Materials page's search
+    std::string library_selected_;    // the Materials page's highlighted card
+    char library_rename_[128] = {0};
+    std::string library_delete_;      // a material in use whose deletion asks what replaces it
+    std::string library_replace_;     // what its users take, "" for the default material
+    bool library_delete_open_ = false;
     float tuner_gains_[3] = {};      // the tuner's kp, damping and force limit fields
     int tuner_active_ = -1;          // the field being dragged, which keeps its own value
     // A dope sheet drag: the clip as it was at the press, the keys it moves and the press point.

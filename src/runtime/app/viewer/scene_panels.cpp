@@ -36,8 +36,6 @@ using namespace shell;
 
 namespace {
 
-constexpr const char* kAssetPayload = "NUKA_ASSET";
-
 struct KindSpec {
     const char* kind;
     const char* label;
@@ -46,7 +44,8 @@ struct KindSpec {
 // The last kind is a file no importer reads, which the Assets panel never lists.
 const KindSpec kKinds[] = {{"scene", "Scene", icon::kScene},  {"urdf", "URDF", icon::kRobot},
                            {"mjcf", "MJCF", icon::kRobot},    {"usd", "USD", icon::kPackage},
-                           {"mesh", "Mesh", icon::kMeshShape}, {"unknown", "File", icon::kFile}};
+                           {"mesh", "Mesh", icon::kMeshShape}, {"image", "Image", icon::kImage},
+                           {"unknown", "File", icon::kFile}};
 
 const KindSpec& KindOf(const std::string& kind) {
     return *std::find_if(std::begin(kKinds), std::end(kKinds), [&](const KindSpec& k) { return kind == k.kind; });
@@ -131,6 +130,15 @@ void ImGuiLayer::BuildAssets(nui::VStack& root) {
         b.shown = true;
         const float s = nui::Scale();
         const ImGuiStyle& style = ImGui::GetStyle();
+        // Two pages: the files under the asset folders, and the document's materials.
+        if (draw::Chip("files", Iconed(icon::kFolder, Tr("Files")), !b.materials)) b.materials = false;
+        ImGui::SameLine(0.0f, 4.0f * s);
+        if (draw::Chip("materials", Iconed(icon::kSwatches, Tr("Materials")), b.materials)) b.materials = true;
+        ImGui::SameLine();
+        if (b.materials) {
+            DrawMaterialLibrary();
+            return;
+        }
         const float kind_w = 120.0f * s;
         const float buttons = 2.0f * (ImGui::GetFrameHeight() + 2.0f * s + style.ItemSpacing.x);
         ImGui::SetNextItemWidth(std::max(ImGui::GetContentRegionAvail().x - buttons - kind_w - style.ItemSpacing.x, 60.0f * s));
@@ -209,18 +217,20 @@ void ImGuiLayer::BuildAssets(nui::VStack& root) {
                     if (k >= shown.size()) break;
                     const AssetCard& c = b.cards[shown[k]];
                     const KindSpec& kind = KindOf(c.kind);
+                    const bool image = c.kind == "image";
                     if (col != 0u) ImGui::SameLine();
                     ImGui::PushID(c.path.c_str());
                     const ImVec2 p = ImGui::GetCursorScreenPos(), q(p.x + card_w, p.y + card_h);
                     ImGui::InvisibleButton("##card", ImVec2(card_w, card_h));
                     const bool hot = ImGui::IsItemHovered();
-                    if (hot && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                    if (hot && !image && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
                         Queue("file.import", Args({{"path", json::Value::Str(c.path)}}));
                     if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip)) ImGui::SetTooltip("%s", c.path.c_str());
                     if (ImGui::BeginDragDropSource()) {
-                        ImGui::SetDragDropPayload(kAssetPayload, c.path.data(), c.path.size());
+                        ImGui::SetDragDropPayload(image ? kImagePayload : kAssetPayload, c.path.data(), c.path.size());
                         ImGui::TextUnformatted(Iconed(kind.glyph, c.name.c_str()).c_str());
-                        ImGui::TextColored(theme::kFgDim, "%s", Tr("Drop on the viewport to add it"));
+                        const char* drop = image ? "Drop on a material's map slot" : "Drop on the viewport to add it";
+                        ImGui::TextColored(theme::kFgDim, "%s", Tr(drop));
                         ImGui::EndDragDropSource();
                     }
                     if (ImGui::BeginPopupContextItem("##card_menu")) {
@@ -229,10 +239,13 @@ void ImGuiLayer::BuildAssets(nui::VStack& root) {
                             if (mode != nullptr) args.Set("mode", json::Value::Str(mode));
                             Queue("file.import", std::move(args));
                         };
-                        if (ImGui::MenuItemEx(Tr("Import..."), icon::kImport)) run_import(nullptr);
-                        if (ImGui::MenuItemEx(Tr("Add to Scene"), icon::kAdd, nullptr, false, frame_.ui->has_scene)) run_import("add");
-                        if (ImGui::MenuItemEx(Tr("Open as New Scene"), icon::kOpen)) run_import("open");
-                        ImGui::Separator();
+                        if (!image) {
+                            if (ImGui::MenuItemEx(Tr("Import..."), icon::kImport)) run_import(nullptr);
+                            if (ImGui::MenuItemEx(Tr("Add to Scene"), icon::kAdd, nullptr, false, frame_.ui->has_scene))
+                                run_import("add");
+                            if (ImGui::MenuItemEx(Tr("Open as New Scene"), icon::kOpen)) run_import("open");
+                            ImGui::Separator();
+                        }
                         if (ImGui::MenuItemEx(Tr("Copy Path"), icon::kCopy)) ImGui::SetClipboardText(c.path.c_str());
                         ImGui::EndPopup();
                     }
@@ -264,7 +277,9 @@ void ImGuiLayer::BuildAssets(nui::VStack& root) {
 
 void ImGuiLayer::DrawAssetDrop() {
     const ImGuiPayload* payload = ImGui::GetDragDropPayload();
-    if (payload == nullptr || !payload->IsDataType(kAssetPayload) || !viewport_.Valid()) return;
+    if (payload == nullptr || !viewport_.Valid()) return;
+    const bool material = payload->IsDataType(kMaterialPayload);
+    if (!material && !payload->IsDataType(kAssetPayload)) return;
     const float s = nui::Scale();
     const ImVec2 vmin(viewport_.x, viewport_.y), vmax(viewport_.x + viewport_.width, viewport_.y + viewport_.height);
     ImGui::SetNextWindowPos(vmin);
@@ -282,7 +297,10 @@ void ImGuiLayer::DrawAssetDrop() {
         const bool over = ImGui::BeginDragDropTarget();
         draw::Chamfer(list, ImVec2(vmin.x + 6.0f * s, vmin.y + 6.0f * s), ImVec2(vmax.x - 6.0f * s, vmax.y - 6.0f * s), 10.0f * s,
                       U32(theme::Alpha(theme::kAccent, over ? 0.06f : 0.02f)), U32(theme::Alpha(theme::kAccent, over ? 0.8f : 0.35f)));
-        if (over) {
+        if (over && material) {
+            DrawMaterialDrop();
+            ImGui::EndDragDropTarget();
+        } else if (over) {
             const ImVec2 m = ImGui::GetMousePos();
             const Ray ray = frame_.camera->ScreenRay(viewport_.LocalX(m.x), viewport_.LocalY(m.y), viewport_.pixels.width,
                                                      viewport_.pixels.height);
@@ -332,14 +350,32 @@ void ImGuiLayer::DrawImportWizard() {
     const json::Value& a = w.analysis;
     const std::string kind = a.At("kind").AsString();
     const std::string profile = a.At("profile").AsString();
+    const bool fix_base = a.At("fix_base").AsBool();
     const bool ok = a.At("ok").AsBool();
     const json::Value& stats = a.At("stats");
     const json::Value& diagnostics = a.At("diagnostics");
     size_t errors = 0u, warnings = 0u;
     for (const json::Value& d : diagnostics.Elements()) (d.At("severity").AsString() == "error" ? errors : warnings) += 1u;
-    // Analyzing again under the other profile keeps the wizard's name and choices.
-    const auto analyze = [&](const char* next) {
-        json::Value args = Args({{"path", json::Value::Str(w.path)}, {"profile", json::Value::Str(next)}});
+    // The package field's ';'-separated entries.
+    const auto packages = [&] {
+        json::Value list = json::Value::Array();
+        std::string entry;
+        for (const char* c = w.packages;; ++c) {
+            if (*c != ';' && *c != '\0') {
+                entry += *c;
+                continue;
+            }
+            entry.erase(0, entry.find_first_not_of(' '));
+            entry.erase(entry.find_last_not_of(' ') + 1);
+            if (!entry.empty()) list.PushBack(json::Value::Str(entry));
+            entry.clear();
+            if (*c == '\0') return list;
+        }
+    };
+    // Analyzing again under other options keeps the wizard's name and choices.
+    const auto analyze = [&](const std::string& next, bool fix) {
+        json::Value args = Args({{"path", json::Value::Str(w.path)}, {"profile", json::Value::Str(next)},
+                                 {"fix_base", json::Value::Bool(fix)}, {"package_paths", packages()}});
         if (!w.pose.IsNull()) args.Set("pose", w.pose);
         Queue("file.import", std::move(args));
     };
@@ -438,7 +474,7 @@ void ImGuiLayer::DrawImportWizard() {
     if (!ok && kind == "urdf" && profile == "strict") {
         ImGui::TextColored(theme::kFgMuted, "%s", Tr("The legacy profile accepts the forms older exporters write."));
         ImGui::SameLine();
-        if (ImGui::SmallButton(Tr("Retry with Legacy"))) analyze("legacy");
+        if (ImGui::SmallButton(Tr("Retry with Legacy"))) analyze("legacy", fix_base);
     }
     ImGui::Dummy(ImVec2(0.0f, 6.0f * s));
 
@@ -452,8 +488,20 @@ void ImGuiLayer::DrawImportWizard() {
             nui::Segmented profiles({"Strict", "Legacy"}, nui::Ref(&choice));
             profiles.id = "profile";
             profiles.tips = {"Reject deprecated and ambiguous forms", "Accept the forms older exporters write"};
-            profiles.on_change = [&](int v) { analyze(v == 1 ? "legacy" : "strict"); };
+            profiles.on_change = [&](int v) { analyze(v == 1 ? "legacy" : "strict", fix_base); };
             profiles.Draw();
+            OptionLabel("Base");
+            bool fixed = fix_base;
+            if (ImGui::Checkbox(Tr("Fix to the world"), &fixed)) analyze(profile, fixed);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", Tr("Links no joint carries become static"));
+            OptionLabel("Packages");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::InputTextWithHint("##packages", Tr("name=folder; search folder"), w.packages, sizeof(w.packages),
+                                         ImGuiInputTextFlags_EnterReturnsTrue) ||
+                ImGui::IsItemDeactivatedAfterEdit())
+                analyze(profile, fix_base);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", Tr("Where package:// mesh paths look; Enter checks again"));
         }
         OptionLabel("Destination");
         nui::Segmented destinations({"Add to Scene", "Open as New Scene"}, nui::Ref(&dest));
@@ -491,6 +539,8 @@ void ImGuiLayer::DrawImportWizard() {
         json::Value args = Args({{"path", json::Value::Str(w.path)},
                                  {"mode", json::Value::Str(add ? "add" : "open")},
                                  {"profile", json::Value::Str(profile)},
+                                 {"fix_base", json::Value::Bool(fix_base)},
+                                 {"package_paths", packages()},
                                  {"name", json::Value::Str(w.name)},
                                  {"ground", json::Value::Bool(w.ground)}});
         if (add && !w.pose.IsNull()) args.Set("pose", w.pose);

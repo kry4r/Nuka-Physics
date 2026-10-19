@@ -163,6 +163,7 @@ void main() {
     float metallic  = clamp(vMr.x, 0.0, 1.0);
     float roughness = clamp(vMr.y, 0.04, 1.0);  // floor to avoid a singular highlight
     float opacity   = clamp(vMr.z, 0.0, 1.0);
+    vec3  emissive  = vEmissive.rgb;
 
     vec3 n = normalize(vWorldNormal);
     vec3 v = normalize(scene.camera_pos.xyz - vWorldPos);
@@ -170,17 +171,36 @@ void main() {
     // the viewer so both winding orders shade consistently (deterministic).
     if (dot(n, v) < 0.0) n = -n;
 #ifdef NUKA_VIEW_MODES
-    // The viewport passes the material's map layers (albedo, roughness, normal; -1 none) and its
-    // tiles per metre in ground_shadow; they project triplanar in the instance's frame.
-    if (pc.ground_shadow.w > 0.0) {
-        const vec3 nl = transpose(vLocalToWorld) * n;
-        const vec3 w = TriplanarWeights(nl);
-        const vec3 p = vLocalPos * pc.ground_shadow.w;
-        if (pc.ground_shadow.x >= 0.0) albedo *= SrgbToLinear(Triplanar(pc.ground_shadow.x, p, w).rgb);
-        if (pc.ground_shadow.y >= 0.0)
-            roughness = clamp(roughness * Triplanar(pc.ground_shadow.y, p, w).r, 0.04, 1.0);
-        if (pc.ground_shadow.z >= 0.0)
-            n = normalize(vLocalToWorld * TriplanarNormal(pc.ground_shadow.z, p, nl, w));
+    // mr.w names the draw's material maps: slot + 1 (0 none), negative when the mesh has no UVs. They
+    // read the mesh's UVs, or project triplanar in the instance's frame.
+    const int maps_slot = int(abs(pc.mr.w) + 0.5) - 1;
+    if (maps_slot >= 0) {
+        const MaterialMaps mm = materials.slots[maps_slot];
+        if (mm.mapping.x > 0.5 || pc.mr.w < 0.0) {
+            const vec3 nl = transpose(vLocalToWorld) * n;
+            const vec3 w = TriplanarWeights(nl);
+            const vec3 p = vLocalPos * mm.mapping.y;
+            if (mm.layers.x >= 0.0) albedo *= SrgbToLinear(Triplanar(mm.layers.x, p, w).rgb);
+            if (mm.layers.y >= 0.0)
+                roughness = clamp(roughness * MapChannel(Triplanar(mm.layers.y, p, w), mm.extra.y), 0.04, 1.0);
+            if (mm.layers.w >= 0.0)
+                metallic = clamp(metallic * MapChannel(Triplanar(mm.layers.w, p, w), mm.extra.z), 0.0, 1.0);
+            if (mm.extra.x >= 0.0) emissive *= SrgbToLinear(Triplanar(mm.extra.x, p, w).rgb);
+            if (mm.layers.z >= 0.0) n = normalize(vLocalToWorld * TriplanarNormal(mm.layers.z, p, nl, w));
+        } else {
+            // UVs run v up; the layers store the image's top row first.
+            const vec2 uv = vUv * mm.mapping.y;
+            const vec2 st = vec2(uv.x, 1.0 - uv.y);
+            if (mm.layers.x >= 0.0) albedo *= SrgbToLinear(Map(mm.layers.x, st).rgb);
+            if (mm.layers.y >= 0.0)
+                roughness = clamp(roughness * MapChannel(Map(mm.layers.y, st), mm.extra.y), 0.04, 1.0);
+            if (mm.layers.w >= 0.0)
+                metallic = clamp(metallic * MapChannel(Map(mm.layers.w, st), mm.extra.z), 0.0, 1.0);
+            if (mm.extra.x >= 0.0) emissive *= SrgbToLinear(Map(mm.extra.x, st).rgb);
+            if (mm.layers.z >= 0.0) {
+                n = normalize(CotangentFrame(n, vWorldPos, uv) * (Map(mm.layers.z, st).xyz * 2.0 - 1.0));
+            }
+        }
     }
 #endif
     float n_dot_v = max(dot(n, v), 1e-4);
@@ -261,7 +281,7 @@ void main() {
     }
 #endif
 
-    vec3 color = lo + ambient + vEmissive.rgb;
+    vec3 color = lo + ambient + emissive;
 
 #ifndef NUKA_VIEW_MODES
     // Procedural CONTACT SHADOW (M10 grounded look). Only the ground disc carries

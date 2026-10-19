@@ -48,8 +48,6 @@
     {"expect": {"undo": 1}, "same_as": "m1"},
     {"action": "file.import", "args": {"path": "${scenario_dir}/../../examples/assets/bdx/open_duck_mini_v2.xml", "mode": "add"},
      "expect_error": true},
-    {"action": "file.import", "args": {"path": "${scenario_dir}/../../examples/scenes/complete_robot.xml", "mode": "add",
-     "name": "hinged"}, "expect_error": true},
     {"action": "file.import", "args": {"path": "${scenario_dir}/../../tests/data/mounted_loads.xml", "mode": "add",
      "name": "arm", "pose": {"pos": [-1.0, 0.5, 0.0], "quat": [1.0, 0.0, 0.0, 0.0]}}, "expect_error": true},
     {"expect": {"undo": 1}, "same_as": "m1"},

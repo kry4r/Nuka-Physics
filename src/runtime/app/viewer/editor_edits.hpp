@@ -88,6 +88,9 @@ void ApplyTransformEdit(EditorScene& es, const EntityRecordIndex& idx,
 void ApplyMaterialEdit(EditorScene& es, const MaterialBinding& bind,
                        const scene::RenderMaterial& mat, bool commit);
 
+// Writes the render fields of `mat` into the record; its name and friction stay.
+void WriteMaterialRecord(const scene::RenderMaterial& mat, scene::MaterialRecord* rec);
+
 // Euler<->quat (intrinsic XYZ, degrees) for the inspector's rotation rows.
 math::Quat QuatFromEulerDeg(const math::Vec3& deg);
 math::Vec3 EulerDegFromQuat(const math::Quat& q);
