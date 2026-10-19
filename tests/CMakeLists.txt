@@ -393,7 +393,7 @@ add_executable(nuka_import_test
     scene/test_scene_cooker.cpp
     scene/test_contact_metadata_cook.cpp
     scene/test_filter_precedence.cpp
-    # importers (mjcf / urdf / usd / usdc / mesh)
+    # importers (mjcf / urdf / usd / mesh)
     import/test_mjcf_importer.cpp
     import/test_mjcf_mass_pipeline.cpp
     import/test_mjcf_contact_filtering.cpp
@@ -401,7 +401,7 @@ add_executable(nuka_import_test
     import/test_urdf_importer.cpp
     import/test_usd_importer.cpp
     import/test_usd_mesh_geometry.cpp
-    # v0.8 C7a: the self-written USDC (crate) reader on the REAL newton cup.
+    # The USD importer on the REAL newton cup (a usda wrapper over a USDC crate).
     import/test_usdc_cup.cpp
     import/test_decompose_attribute.cpp
     import/test_mesh_file_loader.cpp
@@ -430,6 +430,8 @@ target_link_libraries(nuka_import_test
         nuka_import
         nuka_scene
         nuka_cooker
+        # test_usd_importer.cpp includes the stage adapter, which speaks OpenUSD types.
+        usd
         GTest::gtest_main
 )
 

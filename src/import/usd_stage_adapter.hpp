@@ -1,7 +1,9 @@
 #pragma once
 // ---------------------------------------------------------------------------
-// nuka::import - isolated USD stage adapter boundary
+// nuka::import - USD stage adapter: OpenUSD opens and composes every USD format
 // ---------------------------------------------------------------------------
+
+#include <pxr/usd/usd/stage.h>
 
 #include <string>
 
@@ -15,19 +17,11 @@ enum class UsdStageFormat {
     UsdzPackage
 };
 
-struct UsdStageData {
-    UsdStageFormat format = UsdStageFormat::Unknown;
-    std::string path;
-    std::string text;
-};
-
+// The USD flavour a path's extension names, case-insensitively; a ".usd" holds either text or crate.
 UsdStageFormat DetectUsdStageFormat(const std::string& path);
 
-// True iff the file begins with the USDC crate magic ("PXR-USDC"). A ".usd"
-// file may be either ASCII or a crate, so callers that must distinguish the
-// binary crate use this content sniff rather than the extension alone.
-bool IsUsdcCrateFile(const std::string& path);
-
-UsdStageData LoadUsdStageData(const std::string& path);
+// Opens `path` in any format OpenUSD reads (usda, usdc, usdz, plus plugins such as abc and drc) with
+// every payload loaded. Throws std::runtime_error with OpenUSD's messages when it fails to open or compose.
+pxr::UsdStageRefPtr OpenUsdStage(const std::string& path);
 
 } // namespace nuka::import

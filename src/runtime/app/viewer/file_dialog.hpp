@@ -15,6 +15,11 @@
 
 namespace nuka::runtime::app::viewer {
 
+// The editor's open filters: everything an import reads, and the files that open as a scene.
+inline constexpr const char* kAssetFileGlob =
+    "*.urdf;*.xml;*.usd;*.usda;*.usdc;*.usdz;*.abc;*.drc;*.stl;*.obj;*.dae;*.gltf;*.glb;*.nks";
+inline constexpr const char* kSceneFileGlob = "*.nks;*.urdf;*.xml;*.usd;*.usda;*.usdc;*.usdz";
+
 // Open the OS file-open dialog (`filter_label` + `filter_glob` = one filter, e.g.
 // "Nuka scenes", "*.nks"). Returns the chosen path, or "" on cancel / no dialog.
 std::string OpenFileDialog(const char* title, const char* filter_label,

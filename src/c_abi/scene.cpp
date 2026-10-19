@@ -105,7 +105,7 @@ bool LoadByExtension(const std::string& path, nuka::scene::SceneIR* out) {
         *out = nuka::import::LoadUrdf(path);
         return true;
     }
-    if (ext == ".usd" || ext == ".usda") {
+    if (nuka::import::IsUsdPath(path)) {
         *out = nuka::import::LoadUsd(path);
         return true;
     }

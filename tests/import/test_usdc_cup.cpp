@@ -1,14 +1,12 @@
 // ---------------------------------------------------------------------------
-// v0.8 C7a: the self-written USDC (crate) reader on the REAL newton-assets cup.
+// The USD importer on the REAL newton-assets cup: a usda wrapper referencing a USDC crate.
 //
-// Validates that .nuka-assets/.../cup/{model.usda -> mesh.usd} parses through
-// the from-scratch crate reader (NO OpenUSD SDK) into the expected mesh, with
-// parser-INDEPENDENT oracles that genuinely bite:
+// Validates that .nuka-assets/.../cup/{model.usda -> mesh.usd} imports through OpenUSD into
+// the expected mesh, with parser-INDEPENDENT oracles that genuinely bite:
 //   * point count + bbox + hand-pinned vertex values (from a raw hex dump),
-//     UNSCALED (direct crate read) and SCALED (full importer, scale baked),
-//   * topology invariants: sum(faceVertexCounts) == len(faceVertexIndices),
-//     every index in [0, nPoints), all faces are quads,
-//   * watertight / 2-manifold: every edge shared by exactly 2 faces (a buggy
+//     UNSCALED (the crate alone) and SCALED (the wrapper, its scale baked),
+//   * topology invariants: 1794 quads -> 3588 triangles, every index in [0, nPoints),
+//   * watertight / 2-manifold: every edge shared by exactly 2 triangles (a buggy
 //     integer decode FAILS this -- a cup is a closed surface),
 //   * D1: two loads are byte-identical; two cooks are byte-identical,
 //   * the cup cooks to a COLLIDABLE convex hull (the C7b grasp-gate need).
@@ -20,7 +18,6 @@
 // the asset IS present every assertion above runs.
 // ---------------------------------------------------------------------------
 
-#include "import/usd_crate_reader.hpp"
 #include "import/usd_importer.hpp"
 #include "scene/cooker.hpp"
 #include "scene/scene_ir.hpp"
@@ -94,18 +91,19 @@ protected:
 };
 
 // ---------------------------------------------------------------------------
-// Direct crate read: counts, bbox, hand-pinned UNSCALED vertices.
+// The crate alone: counts, bbox, hand-pinned UNSCALED vertices.
 // ---------------------------------------------------------------------------
 TEST_F(UsdcCup, DirectCrateReadCountsAndPinnedVerts) {
-    const auto mesh = nuka::import::ReadUsdcMesh(kMeshUsd, "/Model");
-
-    EXPECT_EQ(mesh.prim_path, "/Model");
-    ASSERT_EQ(mesh.PointCount(), 1796u);
-    ASSERT_EQ(mesh.face_vertex_indices.size(), 7176u);
-    ASSERT_EQ(mesh.face_vertex_counts.size(), 1794u);
+    const auto scene = nuka::import::LoadUsd(kMeshUsd);
+    const auto* shape = FirstMeshShape(scene);
+    ASSERT_NE(shape, nullptr);
+    EXPECT_EQ(shape->name, "Model");
+    const std::vector<float>& points = shape->mesh_vertices;
+    ASSERT_EQ(points.size(), 1796u * 3u);
+    ASSERT_EQ(shape->mesh_indices.size(), 3588u * 3u);
 
     // UNSCALED bbox is the unit envelope [-1,1]^3.
-    const Bbox b = BboxOf(mesh.points);
+    const Bbox b = BboxOf(points);
     for (int a = 0; a < 3; ++a) {
         EXPECT_NEAR(b.lo[a], -1.0f, 1e-3f) << "axis " << a;
         EXPECT_NEAR(b.hi[a], 1.0f, 1e-3f) << "axis " << a;
@@ -113,14 +111,14 @@ TEST_F(UsdcCup, DirectCrateReadCountsAndPinnedVerts) {
 
     // Hand-pinned vertices read straight from a raw hex dump at the resolved
     // points payload (parser-independent ground truth).
-    EXPECT_NEAR(mesh.points[0], -0.7071071863f, 1e-6f);
-    EXPECT_NEAR(mesh.points[1], -0.7071071863f, 1e-6f);
-    EXPECT_NEAR(mesh.points[2], -1.0000017881f, 1e-6f);
-    EXPECT_NEAR(mesh.points[3], -0.7071071863f, 1e-6f);  // v1.x
-    EXPECT_NEAR(mesh.points[5], -0.9027777910f, 1e-6f);  // v1.z
+    EXPECT_NEAR(points[0], -0.7071071863f, 1e-6f);
+    EXPECT_NEAR(points[1], -0.7071071863f, 1e-6f);
+    EXPECT_NEAR(points[2], -1.0000017881f, 1e-6f);
+    EXPECT_NEAR(points[3], -0.7071071863f, 1e-6f);  // v1.x
+    EXPECT_NEAR(points[5], -0.9027777910f, 1e-6f);  // v1.z
     // last vertex (index 1795).
-    EXPECT_NEAR(mesh.points[1795 * 3 + 0], 0.7071051598f, 1e-6f);
-    EXPECT_NEAR(mesh.points[1795 * 3 + 2], 0.9999995232f, 1e-6f);
+    EXPECT_NEAR(points[1795 * 3 + 0], 0.7071051598f, 1e-6f);
+    EXPECT_NEAR(points[1795 * 3 + 2], 0.9999995232f, 1e-6f);
 }
 
 // ---------------------------------------------------------------------------
@@ -128,37 +126,25 @@ TEST_F(UsdcCup, DirectCrateReadCountsAndPinnedVerts) {
 // array fails one of these. NONE of these are loosened.
 // ---------------------------------------------------------------------------
 TEST_F(UsdcCup, TopologyInvariantsAndWatertight) {
-    const auto mesh = nuka::import::ReadUsdcMesh(kMeshUsd, "/Model");
-    const int nPoints = static_cast<int>(mesh.PointCount());
-
-    // sum(faceVertexCounts) == len(faceVertexIndices).
-    long sum_counts = 0;
-    for (int c : mesh.face_vertex_counts) {
-        EXPECT_EQ(c, 4) << "cup is an all-quad mesh";  // genuinely all quads
-        sum_counts += c;
-    }
-    EXPECT_EQ(sum_counts, static_cast<long>(mesh.face_vertex_indices.size()));
+    const auto scene = nuka::import::LoadUsd(kMeshUsd);
+    const auto* shape = FirstMeshShape(scene);
+    ASSERT_NE(shape, nullptr);
+    const uint32_t nPoints = static_cast<uint32_t>(shape->mesh_vertices.size() / 3u);
+    const std::vector<uint32_t>& tris = shape->mesh_indices;
+    // 1794 all-quad faces fan into exactly two triangles each.
+    ASSERT_EQ(tris.size(), 1794u * 2u * 3u);
 
     // every index in [0, nPoints).
-    int idx_min = nPoints, idx_max = -1;
-    for (int i : mesh.face_vertex_indices) {
-        idx_min = std::min(idx_min, i);
-        idx_max = std::max(idx_max, i);
-    }
-    EXPECT_GE(idx_min, 0);
-    EXPECT_LT(idx_max, nPoints);
+    EXPECT_LT(*std::max_element(tris.begin(), tris.end()), nPoints);
 
-    // Watertight / 2-manifold: every undirected edge shared by exactly 2 faces.
-    std::map<std::pair<int, int>, int> edges;
-    size_t cur = 0;
-    for (int c : mesh.face_vertex_counts) {
-        for (int k = 0; k < c; ++k) {
-            const int a = mesh.face_vertex_indices[cur + static_cast<size_t>(k)];
-            const int b =
-                mesh.face_vertex_indices[cur + static_cast<size_t>((k + 1) % c)];
+    // Watertight / 2-manifold: every undirected edge shared by exactly 2 triangles.
+    std::map<std::pair<uint32_t, uint32_t>, int> edges;
+    for (size_t t = 0; t + 2 < tris.size(); t += 3) {
+        for (size_t k = 0; k < 3; ++k) {
+            const uint32_t a = tris[t + k];
+            const uint32_t b = tris[t + (k + 1) % 3];
             edges[{std::min(a, b), std::max(a, b)}] += 1;
         }
-        cur += static_cast<size_t>(c);
     }
     int non_manifold = 0;
     for (const auto& [edge, count] : edges) {
@@ -171,7 +157,7 @@ TEST_F(UsdcCup, TopologyInvariantsAndWatertight) {
 }
 
 // ---------------------------------------------------------------------------
-// Full importer path (model.usda -> crate ref graft -> scale bake), with the
+// Full importer path (model.usda -> crate reference -> scale bake), with the
 // hand-pinned SCALED vertex values and the few-cm cup bbox.
 // ---------------------------------------------------------------------------
 TEST_F(UsdcCup, ImporterScaleBakedAndPinnedVerts) {

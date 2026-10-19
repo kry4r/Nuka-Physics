@@ -84,6 +84,10 @@ if(WIN32)
   file(GLOB NUKA_CUDART_DLLS "${CUDAToolkit_BIN_DIR}/cudart64_*.dll"
                              "${CUDAToolkit_BIN_DIR}/x64/cudart64_*.dll")
   install(FILES ${NUKA_CUDART_DLLS} DESTINATION nuka)
+  # The USD runtime the engine build stages beside nuka.dll: its libraries and plugin tree.
+  file(GLOB NUKA_USD_DLLS "${NUKA_BUILD_DIR}/src/nukausd_*.dll" "${NUKA_BUILD_DIR}/src/tbb.dll")
+  install(FILES ${NUKA_USD_DLLS} DESTINATION nuka)
+  install(DIRECTORY "${NUKA_BUILD_DIR}/src/usd" DESTINATION nuka)
 endif()
 # Typed stubs, for IDEs and the editor's completion, come from the installed modules; they
 # import as top-level modules so that a nuka installed elsewhere cannot shadow them.

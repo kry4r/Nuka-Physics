@@ -53,7 +53,7 @@ WorldRecord& WorldRecord::operator=(WorldRecord&&) noexcept = default;
 
 namespace {
 
-// Ingest .nks/.xml(MJCF)/.urdf/.usda by extension into a SceneIR. KEPT verbatim
+// Ingest .nks/.xml(MJCF)/.urdf/OpenUSD by extension into a SceneIR. KEPT verbatim
 // (the ~12 World.create_from_scene consumers -- go2_float.usda / h1_reduced_train
 // .xml / go2_stand.usda -- depend on it; recon KEEP note). NOT narrowed.
 bool LoadSceneByExtension(const char* scene_path, scene::SceneIR* out_scene) {
@@ -74,7 +74,7 @@ bool LoadSceneByExtension(const char* scene_path, scene::SceneIR* out_scene) {
         *out_scene = import::LoadUrdf(scene_path);
         return true;
     }
-    if (extension == ".usd" || extension == ".usda") {
+    if (import::IsUsdPath(scene_path)) {
         *out_scene = import::LoadUsd(scene_path);
         return true;
     }

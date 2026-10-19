@@ -180,6 +180,8 @@ FetchContent_Declare(
 set(tinyxml2_BUILD_TESTING OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(tinyxml2)
 
+include(cmake/NukaOpenUSD.cmake)
+
 # --- V-HACD (v0.7 p06): cook-time convex decomposition -----------------------
 # Vendored as the single-header v4.1 release under external/vhacd/ (BSD
 # 3-Clause; see external/vhacd/LICENSE). The implementation is compiled into a

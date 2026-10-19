@@ -1,22 +1,30 @@
 // ---------------------------------------------------------------------------
-// nuka::import - USD / USDA importer implementation
+// nuka::import - USD importer: reads the stage OpenUSD composed into SceneIR
 // ---------------------------------------------------------------------------
 
 #include "import/usd_importer.hpp"
 
-#include "import/usd_crate_reader.hpp"
 #include "import/usd_stage_adapter.hpp"
 #include "math/quat.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
 
+#include <pxr/base/gf/matrix4d.h>
+#include <pxr/base/gf/vec3d.h>
+#include <pxr/base/gf/vec3f.h>
+#include <pxr/base/gf/vec3h.h>
+#include <pxr/base/vt/array.h>
+#include <pxr/base/vt/value.h>
+#include <pxr/usd/sdf/path.h>
+#include <pxr/usd/usd/attribute.h>
+#include <pxr/usd/usd/prim.h>
+#include <pxr/usd/usd/primRange.h>
+#include <pxr/usd/usd/relationship.h>
+#include <pxr/usd/usdGeom/xformCache.h>
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
-#include <cstring>
-#include <filesystem>
-#include <iterator>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -27,7 +35,8 @@ namespace nuka::import {
 
 namespace {
 
-struct UsdPrim {
+// Everything the scene builder reads from one composed prim; unauthored values keep these defaults.
+struct PrimData {
     std::string type;
     std::string name;
     std::string path;
@@ -41,9 +50,8 @@ struct UsdPrim {
     float mass = 1.0f;
     math::Vec3 diagonal_inertia = {1.0f, 1.0f, 1.0f};
     math::Vec3 translate = math::Vec3::Zero();
-    math::Vec3 scale = {1.0f, 1.0f, 1.0f};   // xformOp:scale (baked into grafted mesh)
-    // xformOp:rotateXYZ Euler angles (degrees, applied X then Y then Z). Baked
-    // into the grafted mesh alongside translate/scale via the full TRS chain.
+    math::Vec3 scale = {1.0f, 1.0f, 1.0f};
+    // xformOp:rotateXYZ Euler angles (degrees, applied X then Y then Z).
     math::Vec3 rotate_xyz = math::Vec3::Zero();
     float cube_size = 1.0f;
     float radius = 0.5f;
@@ -82,9 +90,7 @@ struct UsdPrim {
     float force_limit = 0.0f;
     float sample_rate_hz = 0.0f;
 
-    // -- NukaSensor lidar / depth payload -----------------------------------
-    // Lidar/range fan + range, or depth image size; defaults match SensorDesc so
-    // an absent attribute keeps the descriptor default.
+    // NukaSensor lidar / depth payload; defaults match SensorDesc.
     float sensor_h_fov = 0.0f;           // horizontal fan extent (rad)
     float sensor_v_fov = 0.0f;           // vertical fan extent (rad)
     int sensor_h_res = 0;                // horizontal ray count
@@ -94,38 +100,15 @@ struct UsdPrim {
     int sensor_width = 0;                // depth image width
     int sensor_height = 0;               // depth image height
 
-    // -- Mesh geometry (def Mesh; #32) --------------------------------------
-    // Parsed straight from the USD attributes; triangulation to mesh_indices is
-    // done at SceneIR-build time. mesh_points is flat x,y,z triples in file
-    // order (no dedup).
-    std::vector<float> mesh_points;            // point3f[] points
-    std::vector<int> face_vertex_indices;      // int[] faceVertexIndices
-    std::vector<int> face_vertex_counts;       // int[] faceVertexCounts (per-face vert count)
-
-    // -- references (#32) ---------------------------------------------------
-    // (prepend|append)? references = @relpath@</PrimPath>. The relpath is
-    // resolved against the file the reference is authored in; the referenced
-    // subtree is grafted under this prim with this prim's xformOp:scale baked
-    // into the grafted mesh points.
-    std::string reference_asset;               // relpath inside the @...@
-    std::string reference_prim_path;           // the </...> target prim path
+    // Mesh geometry, triangulated at SceneIR-build time: flat x,y,z points in authored order.
+    std::vector<float> mesh_points;
+    std::vector<int> face_vertex_indices;
+    std::vector<int> face_vertex_counts;
+    pxr::GfMatrix4d world{1.0};          // a Mesh's full local-to-world transform
 };
 
-std::string Trim(std::string_view text) {
-    size_t begin = 0;
-    while (begin < text.size() && std::isspace(static_cast<unsigned char>(text[begin]))) {
-        ++begin;
-    }
-    size_t end = text.size();
-    while (end > begin && std::isspace(static_cast<unsigned char>(text[end - 1]))) {
-        --end;
-    }
-    return std::string(text.substr(begin, end - begin));
-}
-
-bool StartsWith(std::string_view text, std::string_view prefix) {
-    return text.size() >= prefix.size() && text.substr(0, prefix.size()) == prefix;
-}
+// Time-sampled data (Alembic, animated USD) imports at its first sample.
+const pxr::UsdTimeCode kTime = pxr::UsdTimeCode::EarliestTime();
 
 std::string Lowercase(std::string_view text) {
     std::string out(text);
@@ -135,480 +118,155 @@ std::string Lowercase(std::string_view text) {
     return out;
 }
 
-bool ParseDefLine(const std::string& line, std::string& type, std::string& name) {
-    if (!StartsWith(line, "def ")) {
-        return false;
-    }
-    std::istringstream stream(line);
-    std::string def_token;
-    stream >> def_token >> type;
-    const size_t first_quote = line.find('"');
-    const size_t second_quote = line.find('"', first_quote + 1);
-    if (first_quote == std::string::npos || second_quote == std::string::npos) {
-        return false;
-    }
-    name = line.substr(first_quote + 1, second_quote - first_quote - 1);
-    return !type.empty() && !name.empty();
+bool StartsWith(std::string_view text, std::string_view prefix) {
+    return text.size() >= prefix.size() && text.substr(0, prefix.size()) == prefix;
 }
 
-void ApplyApiSchemas(const std::string& line, UsdPrim& prim) {
-    if (line.find("apiSchemas") == std::string::npos) {
-        return;
+// The authored value of `name` on `prim`; empty when the attribute is absent or never authored.
+pxr::VtValue Authored(const pxr::UsdPrim& prim, const char* name) {
+    pxr::VtValue value;
+    const pxr::UsdAttribute attr = prim.GetAttribute(pxr::TfToken(name));
+    if (attr && attr.HasAuthoredValue()) {
+        attr.Get(&value, kTime);
     }
-    prim.has_rigid_body_api =
-        prim.has_rigid_body_api || line.find("PhysicsRigidBodyAPI") != std::string::npos;
-    prim.has_collision_api =
-        prim.has_collision_api || line.find("PhysicsCollisionAPI") != std::string::npos;
+    return value;
 }
 
-bool ParseBoolValue(const std::string& line, std::string_view key, bool& value) {
-    if (line.find(key) == std::string::npos) {
+template <typename T>
+bool Read(const pxr::UsdPrim& prim, const char* name, T& out) {
+    const pxr::VtValue value = pxr::VtValue::Cast<T>(Authored(prim, name));
+    if (value.IsEmpty()) {
         return false;
     }
-    const size_t equals = line.find('=');
-    if (equals == std::string::npos) {
-        return false;
-    }
-    const std::string rhs = Lowercase(Trim(std::string_view(line).substr(equals + 1)));
-    const std::string token = rhs.substr(0, rhs.find_first_of(" \t()"));
-    if (StartsWith(rhs, "true") || token == "1") {
-        value = true;
-        return true;
-    }
-    if (StartsWith(rhs, "false") || token == "0") {
-        value = false;
-        return true;
-    }
-    return false;
-}
-
-bool ParseFloatValue(const std::string& line, std::string_view key, float& value) {
-    if (line.find(key) == std::string::npos) {
-        return false;
-    }
-    const size_t equals = line.find('=');
-    if (equals == std::string::npos) {
-        return false;
-    }
-    std::istringstream stream(Trim(std::string_view(line).substr(equals + 1)));
-    stream >> value;
-    return !stream.fail();
-}
-
-bool ParseIntValue(const std::string& line, std::string_view key, int& value) {
-    if (line.find(key) == std::string::npos) {
-        return false;
-    }
-    const size_t equals = line.find('=');
-    if (equals == std::string::npos) {
-        return false;
-    }
-    std::istringstream stream(Trim(std::string_view(line).substr(equals + 1)));
-    stream >> value;
-    return !stream.fail();
-}
-
-bool ParseVec3Value(const std::string& line, std::string_view key, math::Vec3& value) {
-    if (line.find(key) == std::string::npos) {
-        return false;
-    }
-    const size_t open = line.find('(');
-    const size_t close = line.find(')', open + 1);
-    if (open == std::string::npos || close == std::string::npos) {
-        return false;
-    }
-    std::string tuple = line.substr(open + 1, close - open - 1);
-    std::replace(tuple.begin(), tuple.end(), ',', ' ');
-    std::istringstream stream(tuple);
-    stream >> value.x >> value.y >> value.z;
-    return !stream.fail();
-}
-
-bool ParseRelationship(const std::string& line, std::string_view key, std::string& path) {
-    if (line.find(key) == std::string::npos) {
-        return false;
-    }
-    const size_t open = line.find('<');
-    const size_t close = line.find('>', open + 1);
-    if (open == std::string::npos || close == std::string::npos) {
-        return false;
-    }
-    path = line.substr(open + 1, close - open - 1);
-    return !path.empty();
-}
-
-bool ParseTokenValue(const std::string& line, std::string_view key, std::string& value) {
-    if (line.find(key) == std::string::npos) {
-        return false;
-    }
-    const size_t first_quote = line.find('"');
-    const size_t second_quote = line.find('"', first_quote + 1);
-    if (first_quote == std::string::npos || second_quote == std::string::npos) {
-        return false;
-    }
-    value = line.substr(first_quote + 1, second_quote - first_quote - 1);
-    return !value.empty();
-}
-
-// Extract the substring between the value-opening '[' and the matching final
-// ']' on a (possibly multi-line-joined) logical line. Returns false if no
-// balanced value-bracket pair is present.
-//
-// The search for the opening '[' starts AFTER the '=' so it never matches the
-// '[]' of the SDF array-type token (e.g. `int[] faceVertexIndices = [ ... ]`):
-// matching the first '[' in the whole line would otherwise capture the type
-// token's bracket and leak `] faceVertexIndices = [ ...` into the body, which
-// poisons the strict int reader. When there is no '=' (no value authored) we
-// fall back to the first '[' so a value-less declaration still reports "no body"
-// cleanly rather than mis-parsing.
-bool ExtractBracketBody(const std::string& line, std::string& body) {
-    const size_t equals = line.find('=');
-    const size_t search_from = (equals == std::string::npos) ? 0 : equals + 1;
-    const size_t open = line.find('[', search_from);
-    if (open == std::string::npos) {
-        return false;
-    }
-    const size_t close = line.rfind(']');
-    if (close == std::string::npos || close < open) {
-        return false;
-    }
-    body = line.substr(open + 1, close - open - 1);
+    out = value.UncheckedGet<T>();
     return true;
 }
 
-// Parse the body of a `point3f[] points = [ (x,y,z), (x,y,z), ... ]` array into
-// flat x,y,z triples appended to out (file order, no dedup). Tuples are
-// delimited by parentheses; commas inside and between tuples are treated as
-// whitespace. Returns false (and leaves out untouched) on a malformed tuple.
-bool ParseVec3Array(const std::string& body, std::vector<float>& out) {
-    std::vector<float> parsed;
-    size_t pos = 0;
-    while (true) {
-        const size_t open = body.find('(', pos);
-        if (open == std::string::npos) {
-            break;
-        }
-        const size_t close = body.find(')', open + 1);
-        if (close == std::string::npos) {
-            return false;
-        }
-        std::string tuple = body.substr(open + 1, close - open - 1);
-        std::replace(tuple.begin(), tuple.end(), ',', ' ');
-        std::istringstream stream(tuple);
-        float x = 0.0f;
-        float y = 0.0f;
-        float z = 0.0f;
-        stream >> x >> y >> z;
-        if (stream.fail()) {
-            return false;
-        }
-        parsed.push_back(x);
-        parsed.push_back(y);
-        parsed.push_back(z);
-        pos = close + 1;
+bool Read(const pxr::UsdPrim& prim, const char* name, float& out) {
+    double value = 0.0;
+    if (!Read<double>(prim, name, value)) {
+        return false;
     }
-    out.insert(out.end(), parsed.begin(), parsed.end());
+    out = static_cast<float>(value);
     return true;
 }
 
-// Parse the body of an `int[] ... = [ i, j, k, ... ]` array into ints appended
-// to out (file order). Commas are treated as whitespace.
-bool ParseIntArray(const std::string& body, std::vector<int>& out) {
-    std::string normalized = body;
-    std::replace(normalized.begin(), normalized.end(), ',', ' ');
-    std::istringstream stream(normalized);
-    std::vector<int> parsed;
-    int value = 0;
-    while (stream >> value) {
-        parsed.push_back(value);
-    }
-    if (stream.bad()) {
+template <typename V>
+bool AsVec3(const pxr::VtValue& value, math::Vec3& out) {
+    if (!value.IsHolding<V>()) {
         return false;
     }
-    out.insert(out.end(), parsed.begin(), parsed.end());
+    const V& v = value.UncheckedGet<V>();
+    out = {static_cast<float>(v[0]), static_cast<float>(v[1]), static_cast<float>(v[2])};
     return true;
 }
 
-// Parse `(prepend|append)? references = @relpath@</PrimPath>` from a (logical)
-// line. The asset path lives between the two '@' delimiters; the target prim
-// path is the </...> relationship that follows.
-bool ParseReference(const std::string& line, std::string& asset, std::string& prim_path) {
-    if (line.find("references") == std::string::npos) {
-        return false;
-    }
-    const size_t first_at = line.find('@');
-    if (first_at == std::string::npos) {
-        return false;
-    }
-    const size_t second_at = line.find('@', first_at + 1);
-    if (second_at == std::string::npos) {
-        return false;
-    }
-    asset = Trim(line.substr(first_at + 1, second_at - first_at - 1));
-    if (asset.empty()) {
-        return false;
-    }
-    const size_t open = line.find('<', second_at + 1);
-    const size_t close = (open == std::string::npos) ? std::string::npos
-                                                     : line.find('>', open + 1);
-    if (open != std::string::npos && close != std::string::npos) {
-        prim_path = line.substr(open + 1, close - open - 1);
+bool Read(const pxr::UsdPrim& prim, const char* name, math::Vec3& out) {
+    const pxr::VtValue value = Authored(prim, name);
+    return AsVec3<pxr::GfVec3f>(value, out) || AsVec3<pxr::GfVec3d>(value, out) ||
+           AsVec3<pxr::GfVec3h>(value, out);
+}
+
+bool Read(const pxr::UsdPrim& prim, const char* name, std::string& out) {
+    const pxr::VtValue value = Authored(prim, name);
+    if (value.IsHolding<pxr::TfToken>()) {
+        out = value.UncheckedGet<pxr::TfToken>().GetString();
+    } else if (value.IsHolding<std::string>()) {
+        out = value.UncheckedGet<std::string>();
     } else {
-        prim_path.clear();
+        return false;
     }
-    return true;
+    return !out.empty();
 }
 
-// Route a (logical) line's mesh-array / reference content into the prim. This is
-// additive to ApplyPropertyLine (the scalar/relationship handler) -- a points /
-// faceVertex* / references line carries none of the scalar keys, so calling both
-// is safe.
-void ApplyMeshAndReferenceLine(const std::string& line, UsdPrim& prim) {
-    std::string body;
-    if (line.find("point3f[] points") != std::string::npos ||
-        line.find("float3[] points") != std::string::npos) {
-        if (ExtractBracketBody(line, body)) {
-            (void)ParseVec3Array(body, prim.mesh_points);
-        }
-        return;
-    }
-    if (line.find("faceVertexIndices") != std::string::npos) {
-        if (ExtractBracketBody(line, body)) {
-            (void)ParseIntArray(body, prim.face_vertex_indices);
-        }
-        return;
-    }
-    if (line.find("faceVertexCounts") != std::string::npos) {
-        if (ExtractBracketBody(line, body)) {
-            (void)ParseIntArray(body, prim.face_vertex_counts);
-        }
-        return;
-    }
-    if (line.find("references") != std::string::npos) {
-        std::string asset;
-        std::string ref_prim;
-        if (ParseReference(line, asset, ref_prim)) {
-            prim.reference_asset = asset;
-            prim.reference_prim_path = ref_prim;
-        }
+// The first target of relationship `name`, as an absolute prim path.
+void ReadTarget(const pxr::UsdPrim& prim, const char* name, std::string& out) {
+    pxr::SdfPathVector targets;
+    const pxr::UsdRelationship rel = prim.GetRelationship(pxr::TfToken(name));
+    if (rel && rel.GetTargets(&targets) && !targets.empty()) {
+        out = targets.front().GetString();
     }
 }
 
-void ApplyPropertyLine(const std::string& line, UsdPrim& prim) {
-    ApplyApiSchemas(line, prim);
-    (void)ParseBoolValue(line, "physics:rigidBodyEnabled", prim.rigid_body_enabled);
-    (void)ParseBoolValue(line, "physics:kinematicEnabled", prim.kinematic_enabled);
-    (void)ParseBoolValue(line, "physics:excludeFromArticulation", prim.exclude_from_articulation);
-    (void)ParseBoolValue(line, "physics:jointEnabled", prim.joint_enabled);
-    (void)ParseFloatValue(line, "physics:mass", prim.mass);
-    (void)ParseVec3Value(line, "physics:diagonalInertia", prim.diagonal_inertia);
-    (void)ParseVec3Value(line, "xformOp:translate", prim.translate);
-    (void)ParseVec3Value(line, "xformOp:scale", prim.scale);
-    (void)ParseVec3Value(line, "xformOp:rotateXYZ", prim.rotate_xyz);
-    (void)ParseFloatValue(line, "double size", prim.cube_size);
-    (void)ParseFloatValue(line, "float size", prim.cube_size);
-    (void)ParseFloatValue(line, "double radius", prim.radius);
-    (void)ParseFloatValue(line, "float radius", prim.radius);
-    (void)ParseFloatValue(line, "double height", prim.height);
-    (void)ParseFloatValue(line, "float height", prim.height);
-    (void)ParseVec3Value(line, "inputs:diffuseColor", prim.color);
-    (void)ParseVec3Value(line, "inputs:color", prim.color);
-    (void)ParseFloatValue(line, "inputs:alpha", prim.alpha);
-    (void)ParseFloatValue(line, "inputs:roughness", prim.roughness);
-    (void)ParseFloatValue(line, "inputs:metallic", prim.metallic);
-    // UsdPhysics PhysicsMaterialAPI: a scalar friction coefficient on a Material
-    // prim. Mapped to MaterialRecord.friction_mu so the cooker can resolve it.
-    if (ParseFloatValue(line, "physics:dynamicFriction", prim.friction_mu)) {
-        prim.has_friction = true;
+PrimData ReadPrim(const pxr::UsdPrim& prim, pxr::UsdGeomXformCache& xforms) {
+    PrimData d;
+    d.type = prim.GetTypeName().GetString();
+    d.name = prim.GetName().GetString();
+    d.path = prim.GetPath().GetString();
+    d.parent_path = prim.GetParent().GetPath().GetString();
+    for (const pxr::TfToken& api : prim.GetAppliedSchemas()) {
+        d.has_rigid_body_api = d.has_rigid_body_api || api == "PhysicsRigidBodyAPI";
+        d.has_collision_api = d.has_collision_api || api == "PhysicsCollisionAPI";
     }
-    (void)ParseFloatValue(line, "inputs:intensity", prim.intensity);
-    (void)ParseFloatValue(line, "inputs:exposure", prim.exposure);
-    if (ParseFloatValue(line, "focalLength", prim.focal_length)) {
-        prim.has_focal_length = true;
+    Read(prim, "physics:rigidBodyEnabled", d.rigid_body_enabled);
+    Read(prim, "physics:kinematicEnabled", d.kinematic_enabled);
+    Read(prim, "physics:excludeFromArticulation", d.exclude_from_articulation);
+    Read(prim, "physics:jointEnabled", d.joint_enabled);
+    Read(prim, "physics:mass", d.mass);
+    Read(prim, "physics:diagonalInertia", d.diagonal_inertia);
+    Read(prim, "xformOp:translate", d.translate);
+    Read(prim, "xformOp:scale", d.scale);
+    Read(prim, "xformOp:rotateXYZ", d.rotate_xyz);
+    Read(prim, "size", d.cube_size);
+    Read(prim, "radius", d.radius);
+    Read(prim, "height", d.height);
+    if (!Read(prim, "inputs:color", d.color)) {
+        Read(prim, "inputs:diffuseColor", d.color);
     }
-    (void)ParseFloatValue(line, "verticalAperture", prim.vertical_aperture);
-    (void)ParseFloatValue(line, "clippingRange:min", prim.near_clip);
-    (void)ParseFloatValue(line, "clippingRange:max", prim.far_clip);
-    (void)ParseRelationship(line, "physics:body0", prim.body0_path);
-    (void)ParseRelationship(line, "physics:body1", prim.body1_path);
-    (void)ParseRelationship(line, "nuka:joint", prim.joint_path);
-    (void)ParseRelationship(line, "nuka:body", prim.body_path);
-    (void)ParseTokenValue(line, "physics:axis", prim.axis_token);
-    (void)ParseTokenValue(line, "token axis", prim.geometry_axis_token);
-    (void)ParseTokenValue(line, "nuka:type", prim.nuka_type);
-    // USD `uniform token purpose = "render"|"proxy"|"guide"` (default unset).
-    // guide/proxy geometry is skipped at SceneIR build; render forces a geom to
-    // be visual-only (non-colliding). ParseTokenValue keys on the quoted value,
-    // so a bare token decl with no value leaves purpose empty (the default).
-    (void)ParseTokenValue(line, "uniform token purpose", prim.purpose);
-    // nuka:decompose:max_pieces (int) must be tried before nuka:decompose
-    // (token) since the former line contains the latter as a substring; the
-    // token parser requires quotes (absent on the int line) so it is harmless,
-    // but parse the int form explicitly first for clarity.
-    (void)ParseIntValue(line, "nuka:decompose:max_pieces", prim.decompose_max_pieces);
-    if (line.find("nuka:decompose:max_pieces") == std::string::npos) {
-        (void)ParseTokenValue(line, "nuka:decompose", prim.decompose_mode);
+    Read(prim, "inputs:alpha", d.alpha);
+    Read(prim, "inputs:roughness", d.roughness);
+    Read(prim, "inputs:metallic", d.metallic);
+    d.has_friction = Read(prim, "physics:dynamicFriction", d.friction_mu);
+    Read(prim, "inputs:intensity", d.intensity);
+    Read(prim, "inputs:exposure", d.exposure);
+    d.has_focal_length = Read(prim, "focalLength", d.focal_length);
+    Read(prim, "verticalAperture", d.vertical_aperture);
+    Read(prim, "clippingRange:min", d.near_clip);
+    Read(prim, "clippingRange:max", d.far_clip);
+    ReadTarget(prim, "physics:body0", d.body0_path);
+    ReadTarget(prim, "physics:body1", d.body1_path);
+    ReadTarget(prim, "nuka:joint", d.joint_path);
+    ReadTarget(prim, "nuka:body", d.body_path);
+    Read(prim, "physics:axis", d.axis_token);
+    Read(prim, "axis", d.geometry_axis_token);
+    Read(prim, "nuka:type", d.nuka_type);
+    Read(prim, "purpose", d.purpose);
+    Read(prim, "nuka:decompose", d.decompose_mode);
+    Read(prim, "nuka:decompose:max_pieces", d.decompose_max_pieces);
+    d.has_lower_limit = Read(prim, "physics:lowerLimit", d.lower_limit);
+    d.has_upper_limit = Read(prim, "physics:upperLimit", d.upper_limit);
+    d.has_initial_position = Read(prim, "nuka:initialPosition", d.initial_position);
+    Read(prim, "nuka:gain", d.gain);
+    Read(prim, "nuka:forceLimit", d.force_limit);
+    Read(prim, "nuka:sampleRate", d.sample_rate_hz);
+    Read(prim, "nuka:horizontalFov", d.sensor_h_fov);
+    Read(prim, "nuka:verticalFov", d.sensor_v_fov);
+    Read(prim, "nuka:horizontalResolution", d.sensor_h_res);
+    Read(prim, "nuka:verticalResolution", d.sensor_v_res);
+    Read(prim, "nuka:minRange", d.sensor_min_range);
+    Read(prim, "nuka:maxRange", d.sensor_max_range);
+    Read(prim, "nuka:width", d.sensor_width);
+    Read(prim, "nuka:height", d.sensor_height);
+    if (d.type == "Mesh") {
+        pxr::VtArray<pxr::GfVec3f> points;
+        pxr::VtArray<int> indices;
+        pxr::VtArray<int> counts;
+        prim.GetAttribute(pxr::TfToken("points")).Get(&points, kTime);
+        prim.GetAttribute(pxr::TfToken("faceVertexIndices")).Get(&indices, kTime);
+        prim.GetAttribute(pxr::TfToken("faceVertexCounts")).Get(&counts, kTime);
+        d.mesh_points.reserve(points.size() * 3u);
+        for (const pxr::GfVec3f& p : points) {
+            d.mesh_points.insert(d.mesh_points.end(), {p[0], p[1], p[2]});
+        }
+        d.face_vertex_indices.assign(indices.begin(), indices.end());
+        d.face_vertex_counts.assign(counts.begin(), counts.end());
+        d.world = xforms.GetLocalToWorldTransform(prim);
     }
-    if (ParseFloatValue(line, "physics:lowerLimit", prim.lower_limit)) {
-        prim.has_lower_limit = true;
-    }
-    if (ParseFloatValue(line, "physics:upperLimit", prim.upper_limit)) {
-        prim.has_upper_limit = true;
-    }
-    if (ParseFloatValue(line, "nuka:initialPosition", prim.initial_position)) {
-        prim.has_initial_position = true;
-    }
-    (void)ParseFloatValue(line, "nuka:gain", prim.gain);
-    (void)ParseFloatValue(line, "nuka:forceLimit", prim.force_limit);
-    (void)ParseFloatValue(line, "nuka:sampleRate", prim.sample_rate_hz);
-    // NukaSensor lidar/depth attributes (additive; absent -> descriptor default).
-    (void)ParseFloatValue(line, "nuka:horizontalFov", prim.sensor_h_fov);
-    (void)ParseFloatValue(line, "nuka:verticalFov", prim.sensor_v_fov);
-    (void)ParseIntValue(line, "nuka:horizontalResolution", prim.sensor_h_res);
-    (void)ParseIntValue(line, "nuka:verticalResolution", prim.sensor_v_res);
-    (void)ParseFloatValue(line, "nuka:minRange", prim.sensor_min_range);
-    (void)ParseFloatValue(line, "nuka:maxRange", prim.sensor_max_range);
-    (void)ParseIntValue(line, "nuka:width", prim.sensor_width);
-    (void)ParseIntValue(line, "nuka:height", prim.sensor_height);
-    // Mesh geometry arrays + references (#32) -- additive, see helper note.
-    ApplyMeshAndReferenceLine(line, prim);
+    return d;
 }
 
-std::string JoinPath(const std::string& parent, const std::string& name) {
-    if (parent.empty() || parent == "/") {
-        return "/" + name;
-    }
-    return parent + "/" + name;
-}
-
-// Net bracket balance of a string: (count of '[') - (count of ']').
-int BracketBalance(const std::string& text) {
-    int balance = 0;
-    for (const char c : text) {
-        if (c == '[') {
-            ++balance;
-        } else if (c == ']') {
-            --balance;
-        }
-    }
-    return balance;
-}
-
-// Resolve a reference asset path (relative or absolute) against the directory of
-// the file that authored the reference.
-std::string ResolveReferencePath(const std::string& base_dir, const std::string& asset) {
-    std::filesystem::path p(asset);
-    if (p.is_absolute() || base_dir.empty()) {
-        return p.lexically_normal().string();
-    }
-    return (std::filesystem::path(base_dir) / p).lexically_normal().string();
-}
-
-// Forward declaration: parsing a file may recurse into referenced files, whose
-// references are resolved against THEIR own directory.
-std::vector<UsdPrim> ParseUsdaFileWithReferences(const std::string& base_dir,
-                                                  const std::string& text);
-
-// Parse USDA text into a flat prim list. Multi-line bracketed array values
-// (point3f[] points, int[] faceVertex*) are joined into a single logical line
-// before being handed to the (additive) property handlers, so the single-line
-// path is just the degenerate "opens and closes on one physical line" case.
-std::vector<UsdPrim> ParseUsdaText(const std::string& text) {
-    constexpr size_t kNoPendingPrim = static_cast<size_t>(-1);
-    std::vector<UsdPrim> prims;
-    std::vector<size_t> stack;
-    size_t pending_prim = kNoPendingPrim;
-
-    std::istringstream input(text);
-    std::string raw_line;
-    while (std::getline(input, raw_line)) {
-        std::string line = Trim(raw_line);
-        if (line.empty() || StartsWith(line, "#")) {
-            continue;
-        }
-
-        // Multi-line array join: if this line opens more '[' than it closes, an
-        // array value spans subsequent physical lines -- accumulate them (as one
-        // space-joined logical line) until the brackets balance. Brackets only
-        // appear inside property values, never in the structural '{'/'}' prim
-        // nesting, so this never swallows a scope close.
-        int balance = BracketBalance(line);
-        while (balance > 0 && std::getline(input, raw_line)) {
-            const std::string continuation = Trim(raw_line);
-            balance += BracketBalance(continuation);
-            line += ' ';
-            line += continuation;
-        }
-
-        std::string prim_type;
-        std::string prim_name;
-        if (ParseDefLine(line, prim_type, prim_name)) {
-            const std::string parent_path = stack.empty() ? std::string{} : prims[stack.back()].path;
-            UsdPrim prim;
-            prim.type = std::move(prim_type);
-            prim.name = std::move(prim_name);
-            prim.parent_path = parent_path;
-            prim.path = JoinPath(parent_path, prim.name);
-            prims.push_back(std::move(prim));
-            pending_prim = prims.size() - 1;
-            ApplyPropertyLine(line, prims[pending_prim]);
-            if (line.find('{') != std::string::npos) {
-                stack.push_back(pending_prim);
-                pending_prim = kNoPendingPrim;
-            }
-            continue;
-        }
-
-        if (pending_prim != kNoPendingPrim) {
-            ApplyPropertyLine(line, prims[pending_prim]);
-        } else if (!stack.empty()) {
-            ApplyPropertyLine(line, prims[stack.back()]);
-        }
-        if (line.find('{') != std::string::npos && pending_prim != kNoPendingPrim) {
-            stack.push_back(pending_prim);
-            pending_prim = kNoPendingPrim;
-        }
-        if (line.find('}') != std::string::npos && !stack.empty()) {
-            stack.pop_back();
-        }
-    }
-    return prims;
-}
-
-// A general affine: 3x3 linear part L (row-major) plus translation t. Composes
-// arbitrary USD xformOp TRS stacks (translate * rotate * scale) up an ancestor
-// chain -- non-uniform scale + rotation can NOT be a math::Transform (rigid).
-struct Affine {
-    float l[9] = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f};
-    math::Vec3 t = math::Vec3::Zero();
-
-    static Affine Identity() { return Affine{}; }
-
-    // Apply to a point: L*p + t.
-    math::Vec3 Apply(const math::Vec3& p) const {
-        return math::Vec3{l[0] * p.x + l[1] * p.y + l[2] * p.z + t.x,
-                          l[3] * p.x + l[4] * p.y + l[5] * p.z + t.y,
-                          l[6] * p.x + l[7] * p.y + l[8] * p.z + t.z};
-    }
-};
-
-// Compose a*b (apply b first, then a): a.L*b.L and a.L*b.t + a.t.
-Affine Compose(const Affine& a, const Affine& b) {
-    Affine r;
-    for (int row = 0; row < 3; ++row) {
-        for (int col = 0; col < 3; ++col) {
-            r.l[row * 3 + col] = a.l[row * 3 + 0] * b.l[0 * 3 + col] +
-                                 a.l[row * 3 + 1] * b.l[1 * 3 + col] +
-                                 a.l[row * 3 + 2] * b.l[2 * 3 + col];
-        }
-    }
-    r.t = a.Apply(b.t);
-    return r;
-}
-
-// One prim's local TRS affine = translate * rotateXYZ * scale (USD column order:
-// scale applied first). rotateXYZ Euler degrees, intrinsic X then Y then Z.
-Affine LocalTrs(const UsdPrim& prim) {
+// A prim's local rotation from its rotateXYZ Euler (degrees, R = Rz*Ry*Rx).
+math::Quat LocalRotation(const PrimData& prim) {
     constexpr float kDegToRad = 0.017453292519943295f;  // pi / 180
     const math::Quat qx =
         math::Quat::FromAxisAngle({1.0f, 0.0f, 0.0f}, prim.rotate_xyz.x * kDegToRad);
@@ -616,198 +274,20 @@ Affine LocalTrs(const UsdPrim& prim) {
         math::Quat::FromAxisAngle({0.0f, 1.0f, 0.0f}, prim.rotate_xyz.y * kDegToRad);
     const math::Quat qz =
         math::Quat::FromAxisAngle({0.0f, 0.0f, 1.0f}, prim.rotate_xyz.z * kDegToRad);
-    const math::Quat q = (qz * qy * qx).Normalized();  // R = Rz*Ry*Rx
-    // Rotation 3x3 from the quaternion's basis-vector images.
-    const math::Vec3 ex = q.Rotate({1.0f, 0.0f, 0.0f});
-    const math::Vec3 ey = q.Rotate({0.0f, 1.0f, 0.0f});
-    const math::Vec3 ez = q.Rotate({0.0f, 0.0f, 1.0f});
-    Affine out;
-    // L = R * diag(scale): columns of R scaled by the matching scale component.
-    out.l[0] = ex.x * prim.scale.x; out.l[1] = ey.x * prim.scale.y; out.l[2] = ez.x * prim.scale.z;
-    out.l[3] = ex.y * prim.scale.x; out.l[4] = ey.y * prim.scale.y; out.l[5] = ez.y * prim.scale.z;
-    out.l[6] = ex.z * prim.scale.x; out.l[7] = ey.z * prim.scale.y; out.l[8] = ez.z * prim.scale.z;
-    out.t = prim.translate;
+    return (qz * qy * qx).Normalized();
+}
+
+// Mesh points in world space, for a mesh no rigid body carries.
+std::vector<float> WorldPoints(const PrimData& prim) {
+    std::vector<float> out(prim.mesh_points.size());
+    for (size_t i = 0; i + 2 < out.size(); i += 3) {
+        const pxr::GfVec3d p = prim.world.Transform(
+            pxr::GfVec3d(prim.mesh_points[i], prim.mesh_points[i + 1], prim.mesh_points[i + 2]));
+        out[i] = static_cast<float>(p[0]);
+        out[i + 1] = static_cast<float>(p[1]);
+        out[i + 2] = static_cast<float>(p[2]);
+    }
     return out;
-}
-
-// A prim's local rotation quaternion from its rotateXYZ Euler (degrees, R=Rz*Ry*Rx),
-// so a primitive collision shape carries its authored orientation, not only translate.
-math::Quat LocalRotation(const UsdPrim& prim) {
-    constexpr float kDegToRad = 0.017453292519943295f;  // pi / 180
-    const math::Quat qx =
-        math::Quat::FromAxisAngle({1.0f, 0.0f, 0.0f}, prim.rotate_xyz.x * kDegToRad);
-    const math::Quat qy =
-        math::Quat::FromAxisAngle({0.0f, 1.0f, 0.0f}, prim.rotate_xyz.y * kDegToRad);
-    const math::Quat qz =
-        math::Quat::FromAxisAngle({0.0f, 0.0f, 1.0f}, prim.rotate_xyz.z * kDegToRad);
-    return (qz * qy * qx).Normalized();  // R = Rz*Ry*Rx
-}
-
-// Bake a full affine into a flat x,y,z vertex array in place. The identity affine
-// is an exact no-op (preserves byte-identical geometry for untransformed refs).
-void BakeAffineIntoPoints(std::vector<float>& points, const Affine& xf) {
-    static const Affine kIdentity = Affine::Identity();
-    if (std::memcmp(xf.l, kIdentity.l, sizeof(xf.l)) == 0 &&
-        xf.t.x == 0.0f && xf.t.y == 0.0f && xf.t.z == 0.0f) {
-        return;
-    }
-    const size_t triples = points.size() / 3u;
-    for (size_t i = 0; i < triples; ++i) {
-        const math::Vec3 p{points[i * 3u + 0u], points[i * 3u + 1u],
-                           points[i * 3u + 2u]};
-        const math::Vec3 q = xf.Apply(p);
-        points[i * 3u + 0u] = q.x;
-        points[i * 3u + 1u] = q.y;
-        points[i * 3u + 2u] = q.z;
-    }
-}
-
-// Graft a referenced prim subtree under a referencing prim. `ref_prims` is the
-// fully-parsed (and reference-resolved) prim list of the referenced file;
-// `target_path` is the </PrimPath> selected from it. The selected prim and all
-// of its descendants are appended to `out` with their paths re-rooted under
-// `host.path`, and `effective_xform` (the host's full local-to-world TRS up the
-// ancestor chain -- see ComputeEffectiveTransform) is baked into every grafted
-// Mesh prim's points.
-void GraftReference(const UsdPrim& host,
-                    const Affine& effective_xform,
-                    const std::vector<UsdPrim>& ref_prims,
-                    const std::string& target_path,
-                    std::vector<UsdPrim>& out) {
-    // Find the selected root prim by exact path match.
-    const UsdPrim* root = nullptr;
-    for (const auto& prim : ref_prims) {
-        if (prim.path == target_path) {
-            root = &prim;
-            break;
-        }
-    }
-    if (root == nullptr) {
-        return;
-    }
-
-    // Remap a referenced-file path onto the host: the selected root maps to the
-    // host's own path; descendants keep their suffix below the root.
-    const std::string& root_path = root->path;
-    const auto remap = [&](const std::string& path) -> std::string {
-        if (path == root_path) {
-            return host.path;
-        }
-        // path begins with root_path + "/" for descendants.
-        return host.path + path.substr(root_path.size());
-    };
-
-    for (const auto& prim : ref_prims) {
-        const bool is_root = prim.path == root_path;
-        const bool is_descendant =
-            prim.path.size() > root_path.size() &&
-            prim.path.compare(0, root_path.size(), root_path) == 0 &&
-            prim.path[root_path.size()] == '/';
-        if (!is_root && !is_descendant) {
-            continue;
-        }
-        UsdPrim grafted = prim;
-        grafted.path = remap(prim.path);
-        grafted.parent_path = is_root ? host.parent_path : remap(prim.parent_path);
-        // Bake the host's full effective (accumulated ancestor) TRS transform
-        // into the grafted mesh vertices.
-        BakeAffineIntoPoints(grafted.mesh_points, effective_xform);
-        out.push_back(std::move(grafted));
-    }
-}
-
-// The full effective local-to-world transform for `prim`: the prim's own TRS
-// (translate * rotateXYZ * scale) pre-multiplied by every ancestor Xform's TRS up
-// the hierarchy (world = A_root * ... * A_parent * A_prim). USD applies a mesh's
-// whole ancestor transform chain; the cup authors its transform on the parent
-// Xform while the reference sits on the child Mesh, so a self-only transform
-// would be identity. Composes arbitrary rotate/translate/non-uniform-scale, not
-// scale alone.
-Affine ComputeEffectiveTransform(const UsdPrim& prim,
-                                 const std::vector<UsdPrim>& prims) {
-    std::unordered_map<std::string, const UsdPrim*> by_path;
-    by_path.reserve(prims.size());
-    for (const auto& p : prims) {
-        by_path[p.path] = &p;
-    }
-    Affine xform = LocalTrs(prim);
-    std::string parent = prim.parent_path;
-    while (!parent.empty() && parent != "/") {
-        const auto it = by_path.find(parent);
-        if (it == by_path.end()) {
-            break;
-        }
-        // Ancestor is applied AFTER the accumulated child transform: world = A_anc * acc.
-        xform = Compose(LocalTrs(*it->second), xform);
-        parent = it->second->parent_path;
-    }
-    return xform;
-}
-
-// Synthesize a single Mesh UsdPrim from a crate-reader result so the SAME
-// graft/SceneIR-build path the ASCII importer uses applies unchanged. The prim's
-// path/name/parent are derived from the crate's resolved Mesh path.
-UsdPrim CrateMeshToUsdPrim(const CrateMesh& mesh) {
-    UsdPrim ref_mesh;
-    ref_mesh.type = "Mesh";
-    ref_mesh.path = mesh.prim_path;
-    const size_t slash = mesh.prim_path.find_last_of('/');
-    ref_mesh.name = (slash == std::string::npos) ? mesh.prim_path
-                                                 : mesh.prim_path.substr(slash + 1);
-    ref_mesh.parent_path =
-        (slash == std::string::npos || slash == 0) ? "/"
-                                                   : mesh.prim_path.substr(0, slash);
-    ref_mesh.mesh_points = mesh.points;
-    ref_mesh.face_vertex_indices = mesh.face_vertex_indices;
-    ref_mesh.face_vertex_counts = mesh.face_vertex_counts;
-    return ref_mesh;
-}
-
-std::vector<UsdPrim> ParseUsdaFileWithReferences(const std::string& base_dir,
-                                                 const std::string& text) {
-    std::vector<UsdPrim> prims = ParseUsdaText(text);
-
-    // Resolve references: for each prim carrying a reference, load + parse the
-    // referenced file (resolved against THIS file's directory; its own
-    // references resolve against ITS directory), select the target subtree, and
-    // graft it under the referencing prim with the host's (accumulated) scale
-    // baked in.
-    std::vector<UsdPrim> grafted;
-    for (const auto& prim : prims) {
-        if (prim.reference_asset.empty()) {
-            continue;
-        }
-        const std::string resolved = ResolveReferencePath(base_dir, prim.reference_asset);
-        const Affine effective_xform = ComputeEffectiveTransform(prim, prims);
-
-        // A USDC (crate) binary reference target (the newton-assets cup's
-        // ./mesh.usd; v0.8 C7a): parse the crate's Mesh geometry with the
-        // self-written reader and synthesize a single ref Mesh prim at the
-        // referenced prim path, so the SAME GraftReference + transform-bake +
-        // SceneIR-build path the ASCII reference graft uses applies unchanged.
-        // Detect by the crate MAGIC (not the extension): the cup's binary file
-        // is named "mesh.usd", and a ".usd" file may be either ASCII or crate.
-        if (DetectUsdStageFormat(resolved) == UsdStageFormat::UsdcCrate ||
-            IsUsdcCrateFile(resolved)) {
-            const CrateMesh mesh = ReadUsdcMesh(resolved, prim.reference_prim_path);
-            // GraftReference selects the prim whose path == reference_prim_path.
-            const std::vector<UsdPrim> ref_prims = {CrateMeshToUsdPrim(mesh)};
-            GraftReference(prim, effective_xform, ref_prims, prim.reference_prim_path, grafted);
-            continue;
-        }
-
-        const UsdStageData stage = LoadUsdStageData(resolved);  // other binary -> throws
-        const std::string ref_dir = std::filesystem::path(resolved).parent_path().string();
-        const std::vector<UsdPrim> ref_prims =
-            ParseUsdaFileWithReferences(ref_dir, stage.text);
-        GraftReference(prim, effective_xform, ref_prims, prim.reference_prim_path, grafted);
-    }
-    if (!grafted.empty()) {
-        prims.insert(prims.end(),
-                     std::make_move_iterator(grafted.begin()),
-                     std::make_move_iterator(grafted.end()));
-    }
-    return prims;
 }
 
 scene::BodyId FindNearestBodyAncestor(
@@ -828,18 +308,17 @@ scene::BodyId FindNearestBodyAncestor(
     return scene::kInvalidBody;
 }
 
-bool IsRigidBodyPrim(const UsdPrim& prim) {
+bool IsRigidBodyPrim(const PrimData& prim) {
     return prim.has_rigid_body_api && prim.rigid_body_enabled;
 }
 
-bool MeshHasGeometry(const UsdPrim& prim) {
+bool MeshHasGeometry(const PrimData& prim) {
     return prim.type == "Mesh" && !prim.mesh_points.empty();
 }
 
-bool ShapeTypeFromUsdPrim(const UsdPrim& prim, scene::ShapeType& shape_type) {
-    // A def Mesh that carries geometry is always a TriMesh shape, even without a
-    // PhysicsCollisionAPI (cup-like USD assets have no physics APIs; #32). All
-    // other primitive shapes still require the collision API as before.
+bool ShapeTypeFromPrim(const PrimData& prim, scene::ShapeType& shape_type) {
+    // A Mesh carrying geometry is always a TriMesh shape, even without a PhysicsCollisionAPI;
+    // the primitive shapes need the collision API.
     if (MeshHasGeometry(prim)) {
         shape_type = scene::ShapeType::TriMesh;
         return true;
@@ -870,10 +349,8 @@ bool ShapeTypeFromUsdPrim(const UsdPrim& prim, scene::ShapeType& shape_type) {
     return false;
 }
 
-// Fan-triangulate a USD face list into a flat triangle-index array. counts is
-// the per-face vertex count (3 -> 1 tri pass-through; 4 -> 2 tris; N -> N-2).
-// When counts is empty the indices are treated as already-triangulated triples.
-// Deterministic: file order, no reordering.
+// Fan-triangulates a USD face list into triangle indices in authored order; without counts the
+// indices are already triangles.
 std::vector<uint32_t> FanTriangulate(const std::vector<int>& indices,
                                      const std::vector<int>& counts) {
     std::vector<uint32_t> out;
@@ -906,7 +383,7 @@ std::vector<uint32_t> FanTriangulate(const std::vector<int>& indices,
     return out;
 }
 
-bool IsJointPrim(const UsdPrim& prim) {
+bool IsJointPrim(const PrimData& prim) {
     return (StartsWith(prim.type, "Physics") || StartsWith(prim.type, "Physx")) &&
            prim.type.find("Joint") != std::string::npos;
 }
@@ -1004,7 +481,7 @@ constexpr float kUsdLuxToNuka = 1.0f / 1000.0f;
 //   vFOV = 2 * atan(verticalAperture / (2 * focalLength)).
 // Aperture and focal length share units (mm), so the ratio is unitless. Falls
 // back to a fixed default only when focalLength was not authored.
-float CameraVFovDegreesFromUsd(const UsdPrim& prim) {
+float CameraVFovDegreesFromUsd(const PrimData& prim) {
     if (!prim.has_focal_length || prim.focal_length <= 0.0f ||
         prim.vertical_aperture <= 0.0f) {
         return kDefaultCameraVFovDegrees;
@@ -1025,7 +502,7 @@ scene::LightType LightTypeFromUsdType(const std::string& type) {
     return scene::LightType::Point;
 }
 
-scene::SceneIR BuildSceneFromUsdPrims(const std::vector<UsdPrim>& prims) {
+scene::SceneIR BuildSceneFromPrims(const std::vector<PrimData>& prims) {
     scene::SceneIR scene;
     std::unordered_map<std::string, scene::BodyId> body_map;
     std::unordered_map<std::string, scene::JointId> joint_map;
@@ -1070,35 +547,32 @@ scene::SceneIR BuildSceneFromUsdPrims(const std::vector<UsdPrim>& prims) {
             continue;
         }
         scene::ShapeType shape_type = scene::ShapeType::Box;
-        if (!ShapeTypeFromUsdPrim(prim, shape_type)) {
+        if (!ShapeTypeFromPrim(prim, shape_type)) {
             continue;
         }
+        scene::CollisionShapeRecord shape;
+        shape.name = prim.name;
+        // Carry the prim's authored ORIENTATION (rotateXYZ), not only translate, so
+        // a rotated capsule axis / tilted box collides in its true pose.
+        shape.local_transform = math::Transform{prim.translate, LocalRotation(prim)};
         scene::BodyId body_id = FindNearestBodyAncestor(prim.parent_path, body_map);
-        if (body_id == scene::kInvalidBody) {
-            // A geometry-bearing Mesh with no rigid-body ancestor (cup-like USD
-            // with no physics APIs; #32) gets an implicit static body so the
-            // shape has a target. Other shapes without a body are skipped as
-            // before. Static is fine -- a later demo step adds a freejoint to
-            // make the cup dynamic.
+        const bool implicit = body_id == scene::kInvalidBody;
+        if (implicit) {
+            // A mesh no rigid body carries (a geometry-only asset) rides an implicit static body
+            // at the origin, with its whole local-to-world transform baked into the points.
             if (!MeshHasGeometry(prim)) {
                 continue;
             }
             scene::RigidBodyRecord implicit_body;
             implicit_body.name = prim.name + "_body";
             implicit_body.parent_id = scene::kInvalidBody;
-            implicit_body.local_transform =
-                math::Transform{prim.translate, math::Quat::Identity()};
             implicit_body.is_static = true;
             body_id = scene.AddRigidBody(std::move(implicit_body));
             body_map[prim.path] = body_id;
+            shape.local_transform = math::Transform{};
         }
-        scene::CollisionShapeRecord shape;
-        shape.name = prim.name;
         shape.body_id = body_id;
         shape.type = shape_type;
-        // Carry the prim's authored ORIENTATION (rotateXYZ), not only translate, so
-        // a rotated capsule axis / tilted box collides in its true pose.
-        shape.local_transform = math::Transform{prim.translate, LocalRotation(prim)};
         // render-purpose geometry is visual-only: turn collision off so the
         // SceneIR facade projects it to a VisualMeshComponent (M2b).
         if (purpose == "render") {
@@ -1130,9 +604,7 @@ scene::SceneIR BuildSceneFromUsdPrims(const std::vector<UsdPrim>& prims) {
                 shape.decompose_max_pieces =
                     static_cast<uint32_t>(prim.decompose_max_pieces);
             }
-            // Mesh geometry (#32): points -> flat vertices (file order, no
-            // dedup); faceVertexIndices + faceVertexCounts -> fan triangulation.
-            shape.mesh_vertices = prim.mesh_points;
+            shape.mesh_vertices = implicit ? WorldPoints(prim) : prim.mesh_points;
             shape.mesh_indices =
                 FanTriangulate(prim.face_vertex_indices, prim.face_vertex_counts);
         }
@@ -1246,45 +718,18 @@ scene::SceneIR BuildSceneFromUsdPrims(const std::vector<UsdPrim>& prims) {
 } // namespace
 
 scene::SceneIR LoadUsd(const std::string& path) {
-    // A directly-loaded USDC crate (.usdc, or a .usd whose bytes are crate) is
-    // read by the self-written crate reader -- the SAME reader the reference path
-    // uses. Routing it here makes a crate file load identically whether it is the
-    // top-level asset or a reference target, instead of throwing on a file the
-    // engine can read. Detect by MAGIC (a ".usd" may be ASCII or crate).
-    if (DetectUsdStageFormat(path) == UsdStageFormat::UsdcCrate ||
-        IsUsdcCrateFile(path)) {
-        // Empty target -> the reader picks the first Mesh prim.
-        const CrateMesh mesh = ReadUsdcMesh(path, std::string{});
-        auto scene = BuildSceneFromUsdPrims({CrateMeshToUsdPrim(mesh)});
-        if (scene.RigidBodyCount() == 0u) {
-            bool has_mesh_geometry = false;
-            for (const auto& shape : scene.Shapes()) {
-                if (!shape.mesh_vertices.empty()) {
-                    has_mesh_geometry = true;
-                    break;
-                }
-            }
-            if (!has_mesh_geometry) {
-                throw std::runtime_error("USD: crate file yielded no mesh geometry: " + path);
-            }
-        }
-        return scene;
+    const pxr::UsdStageRefPtr stage = OpenUsdStage(path);
+    pxr::UsdGeomXformCache xforms(kTime);
+    std::vector<PrimData> prims;
+    for (const pxr::UsdPrim& prim : stage->Traverse(pxr::UsdTraverseInstanceProxies())) {
+        prims.push_back(ReadPrim(prim, xforms));
     }
+    auto scene = BuildSceneFromPrims(prims);
 
-    const UsdStageData stage = LoadUsdStageData(path);
-    const std::string base_dir = std::filesystem::path(path).parent_path().string();
-    auto scene = BuildSceneFromUsdPrims(ParseUsdaFileWithReferences(base_dir, stage.text));
-
-    // A valid USD scene must yield either rigid bodies (physics scenes) OR at
-    // least one mesh shape (cup-like geometry-only assets; #32). It is an error
-    // only when it yields NEITHER.
-    bool has_mesh_geometry = false;
-    for (const auto& shape : scene.Shapes()) {
-        if (!shape.mesh_vertices.empty()) {
-            has_mesh_geometry = true;
-            break;
-        }
-    }
+    // A USD scene must yield rigid bodies (a physics scene) or at least one mesh shape (a
+    // geometry-only asset).
+    const bool has_mesh_geometry = std::any_of(scene.Shapes().begin(), scene.Shapes().end(),
+                                               [](const auto& s) { return !s.mesh_vertices.empty(); });
     if (scene.RigidBodyCount() == 0u && !has_mesh_geometry) {
         throw std::runtime_error(
             "USD: no enabled UsdPhysics rigid bodies and no mesh geometry found in " + path);

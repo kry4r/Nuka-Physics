@@ -474,14 +474,13 @@ if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)
 endif()
 
 # ---------------------------------------------------------------------------
-# nuka_import – MJCF and URDF importers
+# nuka_import – MJCF, URDF and USD importers
 # ---------------------------------------------------------------------------
 add_library(nuka_import STATIC
     import/mjcf_importer.cpp
     import/urdf_importer.cpp
     import/usd_stage_adapter.cpp
     import/usd_importer.cpp
-    import/usd_crate_reader.cpp
     import/mesh_file_loader.cpp
     import/gltf_mesh_loader.cpp
     import/dae_mesh_loader.cpp
@@ -503,7 +502,20 @@ target_link_libraries(nuka_import
         tinyxml2::tinyxml2
     PRIVATE
         nuka_cgltf
+        usd
+        usdGeom
+        sdf
+        tf
+        vt
+        gf
 )
+# nuka.dll, the tools built here and the tests load the USD runtime staged beside them.
+set(usd_runtime_dirs "${CMAKE_CURRENT_BINARY_DIR}")
+if(NK_BUILD_TESTS)
+    list(APPEND usd_runtime_dirs "${CMAKE_BINARY_DIR}/tests")
+endif()
+nuka_stage_usd_runtime(nuka_usd_runtime ${usd_runtime_dirs})
+add_dependencies(nuka_import nuka_usd_runtime)
 
 nuka_set_warnings(nuka_import)
 

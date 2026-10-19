@@ -58,7 +58,7 @@ class Scene:
     @classmethod
     def load(cls, path: str) -> "Scene":
         """Load a scene from ``path`` (dispatch by extension: .nks / .xml / .mjcf
-        / .urdf / .usd / .usda). ``.nks`` resolves its ``imports`` internally."""
+        / .urdf / any OpenUSD format). ``.nks`` resolves its ``imports`` internally."""
         return cls(_ExtScene.load(str(path)))
 
     def compose(

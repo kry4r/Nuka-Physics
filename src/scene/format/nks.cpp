@@ -2041,12 +2041,12 @@ SceneIR ApplyImports(SceneIR scene, const Value& imports,
         SceneIR addon;
         if (ext == ".xml") {
             addon = nuka::import::LoadMjcf(src.string());
-        } else if (ext == ".usda" || ext == ".usd" || ext == ".usdc") {
-            addon = nuka::import::LoadUsd(src.string());
         } else if (ext == ".urdf") {
             addon = nuka::import::LoadUrdf(src.string());
         } else if (ext == ".nks") {
             addon = Load(src.string());
+        } else if (nuka::import::IsUsdPath(src.string())) {
+            addon = nuka::import::LoadUsd(src.string());
         } else {
             throw std::runtime_error("nks import: unsupported extension: " + ext);
         }

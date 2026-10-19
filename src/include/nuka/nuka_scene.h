@@ -18,7 +18,7 @@
 //   .nks                -> scene::nks::Load  (resolves `imports` internally)
 //   .xml | .mjcf        -> import::LoadMjcf
 //   .urdf               -> import::LoadUrdf
-//   .usd | .usda        -> import::LoadUsd
+//   OpenUSD formats     -> import::LoadUsd  (.usd .usda .usdc .usdz, plugins: .abc .drc)
 // reusing the SAME LoadSceneByExtension dispatch world.cpp's create path uses.
 //
 // NODE ADDRESSING -- by STRING PATH, no node handle. Every editing entry takes
@@ -63,7 +63,7 @@ typedef struct nuka_scene_t* nuka_scene_handle;
 // ---------------------------------------------------------------------------
 
 // Load a scene from `path`, dispatching by file extension (.nks / .xml / .mjcf
-// / .urdf / .usd / .usda). The loaded SceneIR is owned by the returned handle.
+// / .urdf / any OpenUSD format). The loaded SceneIR is owned by the returned handle.
 // Returns INVALID_ARG on a NULL path or an unrecognized extension,
 // FILE_NOT_FOUND if the file is missing, PARSE_ERROR on malformed input.
 // Zeroes *out on any failure.

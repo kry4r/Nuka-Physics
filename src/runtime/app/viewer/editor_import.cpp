@@ -202,9 +202,9 @@ AssetKind AssetKindOf(const std::string& path) {
     const std::string ext = Lower(PathText(Utf8Path(path).extension()));
     if (ext == ".nks") return AssetKind::Scene;
     if (ext == ".urdf") return AssetKind::Urdf;
-    if (ext == ".usd" || ext == ".usda" || ext == ".usdc") return AssetKind::Usd;
     if (ext == ".stl" || ext == ".obj" || ext == ".dae" || ext == ".gltf" || ext == ".glb") return AssetKind::Mesh;
     if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tga" || ext == ".bmp") return AssetKind::Image;
+    if (import::IsUsdPath(path)) return AssetKind::Usd;
     if (ext != ".xml") return AssetKind::Unknown;
     const std::string root = RootElement(path);
     return root == "mujoco" ? AssetKind::Mjcf : root == "robot" ? AssetKind::Urdf : AssetKind::Unknown;

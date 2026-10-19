@@ -61,8 +61,11 @@ namespace {
 void check(nuka_result_t r, const char* what) {
     if (r != NUKA_RESULT_OK) {
         const char* msg = nuka_result_message(r);
+        // The engine's own exception text, e.g. which USD joint or file the import stopped on.
+        const std::string detail = nuka_last_error_message();
         throw std::runtime_error(std::string(what) + " failed: " +
-                                 (msg ? msg : "?") + " (" + std::to_string((int)r) + ")");
+                                 (msg ? msg : "?") + " (" + std::to_string((int)r) + ")" +
+                                 (detail.empty() ? "" : ": " + detail));
     }
 }
 
@@ -3442,7 +3445,7 @@ NB_MODULE(_nuka_ext, m) {
         .def_static("load", &Scene::load, nb::arg("path"),
                     nb::rv_policy::take_ownership,
                     "Load a scene from `path`, dispatching by file extension "
-                    "(.nks / .xml / .mjcf / .urdf / .usd / .usda). .nks resolves "
+                    "(.nks / .xml / .mjcf / .urdf / any OpenUSD format). .nks resolves "
                     "its `imports` internally. Raises on a missing file, an "
                     "unknown extension, or malformed input.")
         .def("compose", &Scene::compose, nb::arg("addon"),

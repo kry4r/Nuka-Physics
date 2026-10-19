@@ -19,6 +19,7 @@ core.*
 
 # Local runs, downloaded utilities, and session notes
 /.nuka-runs/
+/.nuka-deps/
 /logs/
 /tools/ffmpeg/
 /.after.md

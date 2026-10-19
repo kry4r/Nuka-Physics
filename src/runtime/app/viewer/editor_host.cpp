@@ -6372,7 +6372,7 @@ void EditorHost::State::RegisterAssemblyActions() {
                       std::string path = StrArg(args, "path");
                       if (path.empty())
                           path = OpenFileDialog(nui::Tr("Attach Asset"), nui::Tr("Assets"),
-                                                "*.urdf;*.xml;*.usd;*.usda;*.stl;*.obj;*.dae;*.gltf;*.glb;*.nks");
+                                                kAssetFileGlob);
                       if (path.empty()) return ActionResult::Fail("no asset chosen");
                       const ImportAnalysis analysis = AnalyzeImport(path, ImportOptionsOf(args, a.profile));
                       a.path = path;
@@ -6599,7 +6599,7 @@ void EditorHost::State::RegisterFileActions() {
     const auto open = [this](const std::string& id, const json::Value& args) {
         std::string path = StrArg(args, "path");
         if (path.empty())
-            path = OpenFileDialog(nui::Tr("Open Scene"), nui::Tr("Scenes"), "*.nks;*.urdf;*.xml;*.usd;*.usda");
+            path = OpenFileDialog(nui::Tr("Open Scene"), nui::Tr("Scenes"), kSceneFileGlob);
         if (path.empty()) return ActionResult::Fail("no scene chosen");
         if (!fs::exists(Utf8Path(path))) return ActionResult::Fail("no file at " + path);
         if (borrowed_) return Spawn({path});
@@ -6634,7 +6634,7 @@ void EditorHost::State::RegisterFileActions() {
                   [this](const json::Value& args) {
                       std::string path = StrArg(args, "path");
                       if (path.empty() && !BoolArg(args, "empty", false))
-                          path = OpenFileDialog(nui::Tr("Open Scene"), nui::Tr("Scenes"), "*.nks;*.urdf;*.xml;*.usd;*.usda");
+                          path = OpenFileDialog(nui::Tr("Open Scene"), nui::Tr("Scenes"), kSceneFileGlob);
                       return Spawn(path.empty() ? std::vector<std::string>{} : std::vector<std::string>{path});
                   }});
     actions_.Add({"file.revert", "Revert", "file", "", ShortcutScope::Global,
@@ -7143,7 +7143,7 @@ void EditorHost::State::RegisterAssetActions() {
                       std::string path = StrArg(args, "path");
                       if (path.empty())
                           path = OpenFileDialog(nui::Tr("Import Asset"), nui::Tr("Assets"),
-                                                "*.urdf;*.xml;*.usd;*.usda;*.stl;*.obj;*.dae;*.gltf;*.glb;*.nks");
+                                                kAssetFileGlob);
                       if (path.empty()) return ActionResult::Fail("no asset chosen");
                       if (!fs::exists(Utf8Path(path))) return ActionResult::Fail("no file at " + path);
                       const std::string mode = StrArg(args, "mode");
