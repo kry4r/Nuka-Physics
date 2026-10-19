@@ -3,6 +3,7 @@
 // nuka.train.runner writes them.
 
 #include "scene/format/json.hpp"
+#include "runtime/app/viewer/train_view.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -29,5 +30,11 @@ scene::json::Value RunStatus(const std::filesystem::path& dir, uint32_t pid = 0u
 std::string RunPolicy(const scene::json::Value& checkpoints, const std::string& kind);
 // A name for a run that starts now: "run-YYYYMMDD-HHMMSS".
 std::string RunName();
+// The Training panel's row of a run's RunStatus.
+TrainRunRow RunRow(const scene::json::Value& status);
+// Appends the rows of a run's metrics.jsonl past `series->next` to its columns.
+void ReadSeries(const std::filesystem::path& metrics, TrainSeries* series);
+// The saves of a run's checkpoints.jsonl rows.
+std::vector<TrainSave> RunSaves(const scene::json::Value& checkpoints);
 
 }  // namespace nuka::runtime::app::viewer

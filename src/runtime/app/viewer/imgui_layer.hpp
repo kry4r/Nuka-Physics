@@ -327,6 +327,7 @@ struct ViewerUiState {
     LabelView labels;
     DatasetView dataset;
     TrainView train;
+    TrainPanel training;
 
     // Queued for the next frame top, so recording the UI never changes the world.
     std::vector<ActionCall> actions;
@@ -515,6 +516,14 @@ private:
     // Render jitters, physics ranges and parameter ranges, each edit applied on release.
     void BuildRandomize(nui::VStack& root);
     void DrawRandomizePanel();
+    // The Training panel's pages: the task's settings, the runs, their curves and the selected run's saves.
+    void BuildTraining(nui::VStack& root);
+    void DrawTrainTask();
+    void DrawTrainRuns();
+    void DrawTrainDashboard();
+    void DrawTrainSaves();
+    // A combo that picks the run the Dashboard and the Checkpoints page show.
+    void TrainRunPicker();
     // The selection's semantic label in Properties, with the inherited one as the hint.
     void DrawSemanticField();
     // The Stage menu's Semantic Label submenu for the node at `path`.
@@ -674,6 +683,13 @@ private:
     // The Randomize panel's copy of the settings, taken again when they change.
     RandomizeConfig randomize_edit_;
     uint64_t randomize_edit_version_ = ~0ull;
+    // The Training panel's copy of the configuration by "group.key", taken again when it changes; an
+    // ints value being typed holds its text.
+    std::unordered_map<std::string, nui::json::Value> train_edit_;
+    uint64_t train_edit_version_ = ~0ull;
+    char train_run_name_[64] = {0};  // the Runs page's name field
+    char train_python_[512] = {0};   // the Runs page's interpreter field
+    std::string train_python_seed_ = "\n";  // the interpreter it was taken from
     DatasetForm dataset_form_;
     bool dataset_form_open_ = false;  // the window was open last frame
     // The semantic field's text, taken again when the selection or the labels change.

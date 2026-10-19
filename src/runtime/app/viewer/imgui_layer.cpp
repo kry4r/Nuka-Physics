@@ -94,14 +94,17 @@ const PanelSpec kPanels[] = {{"stage", "Stage", icon::kStage},       {"property"
                              {"demos", "Demos", icon::kRecord},
                              {"sensors", "Sensors", icon::kLive},
                              {"randomize", "Randomize", icon::kShuffle},
+                             {"training", "Training", icon::kTraining},
                              {"script", "Script", icon::kScript},    {"console", "Console", icon::kConsole},
                              {"nui", "UI Inspector", icon::kInspector}};
 
-// Panels per dock column; the first of each column is its selected tab.
+// Panels per dock column; the first of each column is its selected tab. `right_share` is the right
+// column's share of the width the left column leaves.
 struct LayoutPreset {
     const char* name;
     const char* label;
     std::vector<const char*> left, right, bottom;
+    float right_share = 0.28f;
 };
 const LayoutPreset kLayouts[] = {
     {"authoring", "Authoring", {"stage", "file"}, {"property", "camera"},
@@ -111,8 +114,8 @@ const LayoutPreset kLayouts[] = {
      {"console", "timeline", "stats", "assets", "sensors"}},
     {"data", "Data", {"file", "stage"}, {"sensors", "randomize", "stats", "camera", "property"},
      {"assets", "console", "script", "timeline"}},
-    {"training", "Training", {"stats", "stage"}, {"policy", "demos", "randomize", "joints", "camera"},
-     {"console", "script", "assets", "timeline"}},
+    {"training", "Training", {"stats", "stage"}, {"training", "policy", "camera"},
+     {"console", "script", "assets", "timeline"}, 0.36f},
 };
 
 const LayoutPreset* FindLayout(std::string_view name) {
@@ -463,6 +466,8 @@ const std::vector<ImGuiLayer::BuiltinExtension>& ImGuiLayer::Builtins() {
         {"nuka.sensors", "Sensors", "Preview each sensor's images, ranges and readings as the simulation runs.", {"sensors"}},
         {"nuka.randomize", "Randomize", "Randomize looks, masses, gravity and parameters from a seed, again on reset.",
          {"randomize"}},
+        {"nuka.training", "Training", "Configure a task, start and watch runs, plot them and play their saves.",
+         {"training"}},
         {"nuka.script", "Script", "The Python script editor and the console.", {"script", "console"}},
         {"nuka.ui_inspector", "UI Inspector", "The nui component tree, for extension authors.", {"nui"}},
     };
@@ -478,6 +483,7 @@ void ImGuiLayer::AddBuiltinPanel(const std::string& panel_id) {
                                 &ImGuiLayer::BuildDemos,
                                 &ImGuiLayer::BuildSensors,
                                 &ImGuiLayer::BuildRandomize,
+                                &ImGuiLayer::BuildTraining,
                                 &ImGuiLayer::BuildScript, &ImGuiLayer::BuildConsole,    &ImGuiLayer::BuildInspector};
     const size_t i = static_cast<size_t>(
         std::find_if(std::begin(kPanels), std::end(kPanels), [&](const PanelSpec& p) { return panel_id == p.id; }) -
@@ -1536,6 +1542,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
     viewport_ = {};
     viewport_hovered_ = false;
     ui_state.assets.shown = false;
+    ui_state.training.shown = false;
     InspectorState& ins = ui_state.inspector;
     ins.transform_changed = ins.transform_commit = ins.material_changed = ins.material_commit = false;
     if (ui_state.drive_dirty.size() != ui_state.drive_targets.size())
@@ -1687,7 +1694,7 @@ void ImGuiLayer::DockLayout(ImGuiID dockspace) {
     ImGui::DockBuilderSetNodeSize(dockspace, vp->WorkSize);
     ImGuiID center = dockspace;
     dock_left_ = ImGui::DockBuilderSplitNode(center, ImGuiDir_Left, 0.20f, nullptr, &center);
-    dock_right_ = ImGui::DockBuilderSplitNode(center, ImGuiDir_Right, 0.28f, nullptr, &center);
+    dock_right_ = ImGui::DockBuilderSplitNode(center, ImGuiDir_Right, preset.right_share, nullptr, &center);
     dock_bottom_ = ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.30f, nullptr, &center);
     std::lock_guard<std::recursive_mutex> lock(host_.Mutex());
     for (const PanelSpec& p : kPanels)

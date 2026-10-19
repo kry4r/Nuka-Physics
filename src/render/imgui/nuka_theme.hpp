@@ -203,5 +203,11 @@ inline constexpr const char kTag[] = "\xEE\x91\xB8";
 inline constexpr const char kDatabase[] = "\xEE\x87\x9E";
 inline constexpr const char kImage[] = "\xEE\x8B\x8A";
 inline constexpr const char kSwatches[] = "\xEE\x96\xB8";
+inline constexpr const char kTraining[] = "\xEE\x82\xB6";   // barbell
+inline constexpr const char kTrophy[] = "\xEE\x99\xBE";
+inline constexpr const char kRocket[] = "\xEE\x8F\xBE";     // rocket-launch
+inline constexpr const char kListChecks[] = "\xEE\xAB\x9C";
+inline constexpr const char kFlag[] = "\xEE\xA8\xB8";       // flag-checkered
+inline constexpr const char kTrendUp[] = "\xEE\x92\xAE";
 
 }  // namespace nuka::render::imgui::icon

@@ -53,6 +53,7 @@ class Run:
                        "frames": 0, "fps": None, "reward": None, "length": None, "best_reward": None,
                        "checkpoints": 0, "last_policy": None, "observe": None, "started": time.time(),
                        "updated": None, "ended": None, "error": None}
+        self.periodic = -1
 
     def update(self, **fields) -> None:
         self.status.update(fields, updated=time.time())
@@ -78,11 +79,17 @@ class Run:
         policies.mkdir(exist_ok=True)
         nkml = policies / (pth.stem + ".nkml")
         obs_dim, act_dim = export(pth, nkml)
-        kind = "best" if pth.stem == self.status["name"] else (
-            "final" if algo.epoch_num >= algo.max_epochs else "epoch")
+        epoch = int(algo.epoch_num)
+        kind = "best" if pth.stem == self.status["name"] else "epoch"
+        # The last epoch's periodic save comes before the final one.
+        if kind == "epoch" and epoch >= algo.max_epochs:
+            if algo.save_freq > 0 and epoch % algo.save_freq == 0 and self.periodic != epoch:
+                self.periodic = epoch
+            else:
+                kind = "final"
         done = algo.game_rewards.current_size > 0
         self._append("checkpoints.jsonl", {
-            "checkpoint": str(pth), "policy": str(nkml), "kind": kind, "epoch": int(algo.epoch_num),
+            "checkpoint": str(pth), "policy": str(nkml), "kind": kind, "epoch": epoch,
             "frames": self.status["frames"], "reward": float(algo.game_rewards.get_mean()[0]) if done else None,
             "obs": int(obs_dim), "actions": int(act_dim), "time": time.time()})
         self.update(checkpoints=self.status["checkpoints"] + 1, last_policy=str(nkml))

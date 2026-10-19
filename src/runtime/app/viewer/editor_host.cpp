@@ -1022,6 +1022,10 @@ struct EditorHost::State : DocumentHost {
     // Shows the watched run's newest frame, its arrows and its progress; ends when the run or the world goes.
     void StepObserve();
     json::Value ObserveJson() const;
+    // Feeds the Training panel while it shows, or at once when `now`: the configuration when the document
+    // or its scene changed, and every second the runs, the selected run's log and saves and the curves.
+    void RefreshTraining(bool now);
+    json::Value TrainPanelJson() const;
     // Drops sensor `index` in one undo step and clears its selection.
     ActionResult RemoveSensor(int index);
     void RegisterTeleopActions();
@@ -1314,6 +1318,10 @@ struct EditorHost::State : DocumentHost {
         uint32_t pid = 0u;
     };
     std::optional<TrainRun> train_run_;
+    // When the Training panel reads the runs next, and the document and scene its configuration is of.
+    Clock::time_point train_panel_due_{};
+    std::string train_panel_doc_ = "\n";
+    uint64_t train_panel_scene_ = ~0ull;
     // The run the viewport watches and the layout its frames were asked for.
     struct Observing {
         std::unique_ptr<TrainObserve> link;
@@ -5332,6 +5340,11 @@ void EditorHost::State::RegisterDatasetActions() {
                   }});
 }
 
+namespace {
+// The Training panel's pages by their train.panel names, in TrainPage's order.
+constexpr const char* kTrainPages[] = {"task", "runs", "dashboard", "checkpoints"};
+}  // namespace
+
 std::string EditorHost::State::TrainExchange(const json::Value& request, json::Value* response) {
     if (!script_host_.Valid()) return "training needs the editor's Python";
     const std::string req = cache_.File("train_request.json"), resp = cache_.File("train_response.json");
@@ -5397,10 +5410,16 @@ ActionResult EditorHost::State::TrainConfig(const json::Value& edits, const std:
                                         {"layout", TrainLayout()}});
     json::Value out;
     if (const std::string why = TrainExchange(request, &out); !why.empty()) return ActionResult::Fail(why);
+    if (store)
+        for (const json::Value& e : out.At("errors").Elements())
+            if (e.Find("rejected") != nullptr && edits.Find(e.At("path").AsString()) != nullptr)
+                return ActionResult::Fail(e.At("path").AsString() + ": " + e.At("message").AsString());
+    // The Training panel shows each configuration taken; a refused edit leaves it as it was.
+    TrainPanel& panel = ui_state_.training;
+    panel.config = out;
+    panel.config_error.clear();
+    ++panel.config_version;
     if (!store) return Ok(std::move(out));
-    for (const json::Value& e : out.At("errors").Elements())
-        if (e.Find("rejected") != nullptr && edits.Find(e.At("path").AsString()) != nullptr)
-            return ActionResult::Fail(e.At("path").AsString() + ": " + e.At("message").AsString());
     fs::create_directories(file.parent_path());
     std::ofstream(file, std::ios::binary | std::ios::trunc)
         << Object({{"task", out.At("task")}, {"config", out.At("changed")}}).Dump(2);
@@ -5462,6 +5481,7 @@ void EditorHost::State::RegisterTrainActions() {
                       trainer_.reset();
                       json::Value out;
                       if (const std::string why = Trainer(&out); !why.empty()) return ActionResult::Fail(why);
+                      ui_state_.training.python = out;
                       return Ok(std::move(out));
                   },
                   "", true});
@@ -5614,6 +5634,61 @@ void EditorHost::State::RegisterTrainActions() {
                           return ActionResult::Fail("envs: 1 to " + std::to_string(kMaxGridEnvs) + " environments");
                       return StartObserve(dir, static_cast<uint32_t>(envs), BoolArg(args, "follow", false));
                   }});
+    // Opens run `name`'s folder (else the one started last, else the newest) in the file browser.
+    actions_.Add({"train.reveal", "Show Run in Folder", "train", "", ShortcutScope::Global, {}, {},
+                  [this, no_run](const json::Value& args) {
+                      const fs::path dir = TrainRunDir(args);
+                      if (dir.empty()) return no_run(args);
+#ifdef _WIN32
+                      const std::vector<std::string> argv{"explorer", PathText(fs::path(dir).make_preferred())};
+#else
+                      const std::vector<std::string> argv{"xdg-open", PathText(dir)};
+#endif
+                      std::string error;
+                      if (SpawnDetached(argv, &error) == 0u) return ActionResult::Fail(error);
+                      return Ok(Object({{"dir", json::Value::Str(PathText(dir))}}));
+                  },
+                  "", true});
+    // Opens the Training panel at `page` (task, runs, dashboard or checkpoints) on run `run`, with the runs
+    // `compare` drawn over it on the Dashboard; reports what the panel shows.
+    actions_.Add({"train.panel", "Training Panel", "train", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value& args) {
+                      TrainPanel& p = ui_state_.training;
+                      const auto listed = [this](const std::string& name) {
+                          return !name.empty() && fs::is_regular_file(TrainRunsDir() / Utf8Path(name) / "job.json");
+                      };
+                      if (args.Find("page") != nullptr) {
+                          const std::string page = StrArg(args, "page");
+                          const auto at = std::find(std::begin(kTrainPages), std::end(kTrainPages), page);
+                          if (at == std::end(kTrainPages))
+                              return ActionResult::Fail("page: task, runs, dashboard or checkpoints");
+                          p.page = static_cast<TrainPage>(at - std::begin(kTrainPages));
+                      }
+                      if (args.Find("run") != nullptr) {
+                          const std::string run = StrArg(args, "run");
+                          if (!listed(run)) return ActionResult::Fail("no run named '" + run + "'");
+                          p.selected = run;
+                      }
+                      if (const json::Value* compare = args.Find("compare")) {
+                          std::vector<std::string> names;
+                          for (const json::Value& name : compare->Elements()) {
+                              if (!listed(name.AsString()))
+                                  return ActionResult::Fail("no run named '" + name.AsString() + "'");
+                              names.push_back(name.AsString());
+                          }
+                          p.compare = std::move(names);
+                      }
+                      {
+                          std::lock_guard<std::recursive_mutex> lock(ui_.Nui().Mutex());
+                          nui::Panel* panel = ui_.Nui().FindPanel("training");
+                          if (panel == nullptr) return ActionResult::Fail("the nuka.training extension is disabled");
+                          panel->open = true;
+                          panel->focus_request = true;
+                      }
+                      RefreshTraining(true);
+                      return Ok(TrainPanelJson());
+                  },
+                  "", true});
 }
 
 ActionResult EditorHost::State::StartObserve(const fs::path& dir, uint32_t envs, bool follow) {
@@ -5801,6 +5876,101 @@ json::Value EditorHost::State::ObserveJson() const {
                    {"reward", t.has_reward ? json::Value::Float(t.reward) : json::Value::Null()},
                    {"terrain", ground},
                    {"arrows", std::move(arrows)}});
+}
+
+void EditorHost::State::RefreshTraining(bool now) {
+    TrainPanel& p = ui_state_.training;
+    if (!p.shown && !now) return;
+    // Another document has its own configuration and runs.
+    if (doc_path_ != train_panel_doc_) {
+        train_panel_doc_ = doc_path_;
+        train_panel_scene_ = ~0ull;
+        train_panel_due_ = {};
+        p.selected.clear();
+        p.compare.clear();
+        p.series.clear();
+    }
+    if (!loaded_) {
+        if (p.config.IsObject() || !p.config_error.empty()) {
+            p.config = json::Value::Null();
+            p.config_error.clear();
+            ++p.config_version;
+        }
+        train_panel_scene_ = ~0ull;
+    } else if (ui_state_.scene_version != train_panel_scene_) {
+        train_panel_scene_ = ui_state_.scene_version;
+        json::Value out;
+        if (!p.tasks.IsArray() && TrainExchange(Object({{"op", json::Value::Str("tasks")}}), &out).empty())
+            p.tasks = out.At("tasks");
+        if (!p.python.IsObject()) {
+            const std::string why = Trainer(&out);
+            p.python = why.empty() ? out
+                                   : Object({{"python", json::Value::Str("")}, {"ready", json::Value::Bool(false)},
+                                             {"error", json::Value::Str(why)}});
+        }
+        const ActionResult config = TrainConfig(json::Value::Object(), std::string(), false);
+        if (!config.ok) {
+            p.config = json::Value::Null();
+            p.config_error = config.error;
+            ++p.config_version;
+        }
+    }
+    const Clock::time_point t = Clock::now();
+    if (!now && t < train_panel_due_) return;
+    train_panel_due_ = t + std::chrono::seconds(1);
+    const fs::path root = TrainRunsDir();
+    const std::vector<fs::path> folders = RunFolders(root);
+    p.runs.clear();
+    for (auto dir = folders.rbegin(); dir != folders.rend(); ++dir)
+        p.runs.push_back(RunRow(RunStatus(*dir, train_run_ && train_run_->dir == *dir ? train_run_->pid : 0u)));
+    p.training = train_run_ && ProcessAlive(train_run_->pid) ? PathText(train_run_->dir.filename()) : std::string();
+    const auto listed = [&](const std::string& name) {
+        return std::any_of(p.runs.begin(), p.runs.end(), [&](const TrainRunRow& r) { return r.name == name; });
+    };
+    if (!listed(p.selected)) p.selected = p.runs.empty() ? std::string() : p.runs.front().name;
+    std::erase_if(p.compare, [&](const std::string& name) { return name == p.selected || !listed(name); });
+    // The curves read on from where they stopped.
+    std::vector<TrainSeries> series;
+    std::vector<std::string> drawn = p.compare;
+    if (!p.selected.empty()) drawn.insert(drawn.begin(), p.selected);
+    for (const std::string& name : drawn) {
+        const auto old =
+            std::find_if(p.series.begin(), p.series.end(), [&](const TrainSeries& s) { return s.run == name; });
+        TrainSeries s = old != p.series.end() ? std::move(*old) : TrainSeries{name};
+        ReadSeries(root / Utf8Path(name) / "metrics.jsonl", &s);
+        series.push_back(std::move(s));
+    }
+    p.series = std::move(series);
+    const fs::path dir = root / Utf8Path(p.selected);
+    p.log = p.selected.empty() ? std::string() : TailText(dir / "log.txt", 40);
+    p.saves = p.selected.empty() ? std::vector<TrainSave>() : RunSaves(ReadJsonLines(dir / "checkpoints.jsonl"));
+}
+
+json::Value EditorHost::State::TrainPanelJson() const {
+    const TrainPanel& p = ui_state_.training;
+    json::Value compare = json::Value::Array(), series = json::Value::Array();
+    for (const std::string& name : p.compare) compare.PushBack(json::Value::Str(name));
+    for (const TrainSeries& s : p.series)
+        series.PushBack(Object({{"run", json::Value::Str(s.run)},
+                                {"rows", json::Value::Int(static_cast<int64_t>(s.epoch.size()))}}));
+    int64_t changed = 0, problems = 0;
+    if (p.config.IsObject()) {
+        for (const auto& [group, values] : p.config.At("changed").Items())
+            changed += static_cast<int64_t>(values.Items().size());
+        problems = static_cast<int64_t>(p.config.At("errors").Size());
+    }
+    return Object({{"page", json::Value::Str(kTrainPages[static_cast<size_t>(p.page)])},
+                   {"run", json::Value::Str(p.selected)},
+                   {"compare", std::move(compare)},
+                   {"runs", json::Value::Int(static_cast<int64_t>(p.runs.size()))},
+                   {"training", json::Value::Str(p.training)},
+                   {"series", std::move(series)},
+                   {"saves", json::Value::Int(static_cast<int64_t>(p.saves.size()))},
+                   {"log_lines", json::Value::Int(std::count(p.log.begin(), p.log.end(), '\n'))},
+                   {"config_version", json::Value::Int(static_cast<int64_t>(p.config_version))},
+                   {"changed", json::Value::Int(changed)},
+                   {"problems", json::Value::Int(problems)},
+                   {"python_ready", json::Value::Bool(p.python.IsObject() && p.python.At("ready").AsBool())}});
 }
 
 // Materials go by their names: list and read them, make one from a preset or a copy, set its
@@ -9398,6 +9568,7 @@ void EditorHost::State::Frame(bool step_physics) {
     RefreshAssets();
     RefreshProperties();
     RefreshMaterials();
+    RefreshTraining(false);
 
     io.DisplaySize = ImVec2(static_cast<float>(present_->Report().width),
                             static_cast<float>(present_->Report().height));
