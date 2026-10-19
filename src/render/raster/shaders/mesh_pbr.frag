@@ -24,6 +24,10 @@ struct GpuLight {
     vec4 position;   // xyz = world-space position (point lights);    w = range (unused)
     vec4 color;      // rgb = color * intensity (radiance);           w = unused
 };
+#ifdef NUKA_VIEW_MODES
+// The realtime viewport's block appends the sky, the sun and the view rect.
+#include "viewport_scene.glsl"
+#else
 layout(set = 0, binding = 0) uniform SceneUbo {
     mat4     view_proj;
     vec4     camera_pos;     // xyz = world-space eye
@@ -40,6 +44,7 @@ layout(set = 0, binding = 0) uniform SceneUbo {
 // shadows are OFF); sampled ONLY when scene.shadow_params.x > 0 so the gated
 // determinism path is byte-identical (the branch below is never taken).
 layout(set = 0, binding = 1) uniform sampler2D uShadowMap;
+#endif
 
 layout(location = 0) in vec3 vWorldPos;
 layout(location = 1) in vec3 vWorldNormal;
@@ -48,6 +53,10 @@ layout(location = 3) in vec4 vBaseColor;
 layout(location = 4) in vec4 vMr;        // x metallic, y roughness, z opacity
 layout(location = 5) in vec4 vEmissive;  // rgb emissive
 layout(location = 6) in vec4 vLightClip; // position in the sun's clip space
+#ifdef NUKA_VIEW_MODES
+layout(location = 7) in vec3 vLocalPos;
+layout(location = 8) flat in mat3 vLocalToWorld;
+#endif
 
 // Per-draw push block (must match mesh.vert byte-for-byte). The fragment only
 // reads ground_shadow: a soft procedural CONTACT SHADOW the renderer fills for
@@ -160,6 +169,20 @@ void main() {
     // Two-sided: faces with cull off can present a back-facing normal; flip toward
     // the viewer so both winding orders shade consistently (deterministic).
     if (dot(n, v) < 0.0) n = -n;
+#ifdef NUKA_VIEW_MODES
+    // The viewport passes the material's map layers (albedo, roughness, normal; -1 none) and its
+    // tiles per metre in ground_shadow; they project triplanar in the instance's frame.
+    if (pc.ground_shadow.w > 0.0) {
+        const vec3 nl = transpose(vLocalToWorld) * n;
+        const vec3 w = TriplanarWeights(nl);
+        const vec3 p = vLocalPos * pc.ground_shadow.w;
+        if (pc.ground_shadow.x >= 0.0) albedo *= SrgbToLinear(Triplanar(pc.ground_shadow.x, p, w).rgb);
+        if (pc.ground_shadow.y >= 0.0)
+            roughness = clamp(roughness * Triplanar(pc.ground_shadow.y, p, w).r, 0.04, 1.0);
+        if (pc.ground_shadow.z >= 0.0)
+            n = normalize(vLocalToWorld * TriplanarNormal(pc.ground_shadow.z, p, nl, w));
+    }
+#endif
     float n_dot_v = max(dot(n, v), 1e-4);
 
     // F0: 0.04 dielectric baseline, lerped toward the albedo for metals.
@@ -198,7 +221,11 @@ void main() {
         // Directional lights (the sun) are occluded by the shadow map; point
         // lights are not shadowed (the map is the sun's ortho view). When shadows
         // are OFF, SunShadow() returns 1.0 so this is an exact no-op (G2-safe).
+#ifdef NUKA_VIEW_MODES
+        float shadow = (L.direction.w > 0.5) ? SunVisibility(vWorldPos, n_dot_l) : 1.0;
+#else
         float shadow = (L.direction.w > 0.5) ? SunShadow(n_dot_l) : 1.0;
+#endif
         lo += (diff + spec) * radiance * n_dot_l * shadow;
     }
 
@@ -224,9 +251,19 @@ void main() {
     float gloss           = 1.0 - roughness;
     vec3  form_floor      = ambient_color * (0.035 + 0.05 * gloss * gloss);
     vec3  ambient         = diffuse_ambient + spec_ambient + form_floor;
+#ifdef NUKA_VIEW_MODES
+    // Under the viewport sky, diffuse light comes from the hemisphere and the specular from the
+    // sky in the reflected direction, blurred toward the irradiance as the surface roughens.
+    if (scene.sky_zenith.w > 0.5) {
+        const vec3 sky_spec = mix(SkyRadiance(reflect(-v, n)), ambient_color, roughness * roughness);
+        const vec2 env = EnvBrdf(roughness, n_dot_v);
+        ambient = ambient_color * albedo * (1.0 - metallic) + sky_spec * (f0 * env.x + env.y);
+    }
+#endif
 
     vec3 color = lo + ambient + vEmissive.rgb;
 
+#ifndef NUKA_VIEW_MODES
     // Procedural CONTACT SHADOW (M10 grounded look). Only the ground disc carries
     // a non-zero radius; for every other draw pc.ground_shadow.z == 0 so this whole
     // block is skipped and the fragment is byte-identical to the pre-M10 oracle.
@@ -237,6 +274,7 @@ void main() {
         occ = occ * occ;  // tighten the core, soften the skirt
         color *= (1.0 - pc.ground_shadow.w * occ);
     }
+#endif
 
     // Atmospheric HAZE (Go2-terrain demo: the Isaac-Lab look). Exponential
     // distance fog fading the fragment toward a bright horizon colour by the

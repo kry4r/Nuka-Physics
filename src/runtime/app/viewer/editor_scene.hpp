@@ -44,12 +44,17 @@ struct EditorScene {
 std::unique_ptr<EditorScene> AttachEditorScene(nuka_world_handle world, const std::string& path,
                                                SceneCache& cache);
 
-// Rebuilds the world from the edited document, carrying state over by body name. False
-// (logged) when the world refused it, leaving world and binding unchanged.
-bool RecookEditorScene(EditorScene& es, SceneCache& cache);
+// The document keeps material image maps absolute, since its cached rebuilds and autosaves live
+// apart from the file they were authored against; a saved copy gets them relative to its own file.
+void AnchorMaps(nuka::scene::SceneIR& scene, const std::string& scene_path);
+void RelativeMaps(nuka::scene::SceneIR& scene, const std::string& scene_path);
+
+// Rebuilds the world from the edited document, carrying state over by body name. Returns why
+// (also logged) when the world refused it, leaving world and binding unchanged; empty on success.
+std::string RecookEditorScene(EditorScene& es, SceneCache& cache);
 
 // The same rebuild with `envs` environments, every one from the scene's initial state.
-bool ResizeEditorEnvs(EditorScene& es, SceneCache& cache, uint32_t envs);
+std::string ResizeEditorEnvs(EditorScene& es, SceneCache& cache, uint32_t envs);
 
 // Restores the initial physical state and the drive targets captured at bind time.
 bool ResetWorldPhysics(nuka_world_handle world, const std::vector<float>& rest_targets);

@@ -39,6 +39,9 @@ typedef struct nuka_version_t {
 
 nuka_version_t nuka_get_version(void);
 const char* nuka_result_message(nuka_result_t result);
+// The text of the exception behind the last failed call on this thread, "" when there is none.
+// Reading it clears it; the pointer stays valid until the next read on the same thread.
+const char* nuka_last_error_message(void);
 
 typedef struct nuka_device_desc_t {
     uint32_t gpu_index;

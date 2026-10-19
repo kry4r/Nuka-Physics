@@ -62,6 +62,11 @@ layout(location = 3) out vec4 vBaseColor;
 layout(location = 4) out vec4 vMr;
 layout(location = 5) out vec4 vEmissive;
 layout(location = 6) out vec4 vLightClip;   // position in the sun's clip space (shadows)
+#ifdef NUKA_LOCAL_FRAME
+// The instance's own frame, where the viewport projects image maps.
+layout(location = 7) out vec3 vLocalPos;
+layout(location = 8) flat out mat3 vLocalToWorld;
+#endif
 
 void main() {
     vec4 world = pc.model * vec4(inPosition, 1.0);
@@ -70,6 +75,10 @@ void main() {
     // 3x3 is orthonormal, so the inverse-transpose equals the 3x3 itself.
     vWorldNormal = mat3(pc.model) * inNormal;
     vUv = vec2(0.0, 0.0);
+#ifdef NUKA_LOCAL_FRAME
+    vLocalPos = inPosition;
+    vLocalToWorld = mat3(pc.model);
+#endif
     vBaseColor = pc.base_color;
 #ifdef NUKA_VERTEX_COLOR
     vBaseColor.rgb *= inColor;

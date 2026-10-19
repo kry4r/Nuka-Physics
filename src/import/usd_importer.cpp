@@ -55,6 +55,7 @@ struct UsdPrim {
     bool has_friction = false;           // physics:dynamicFriction authored?
     float friction_mu = 1.0f;            // UsdPhysics PhysicsMaterialAPI friction
     float intensity = 1.0f;
+    float exposure = 0.0f;               // UsdLux inputs:exposure (stops)
     float focal_length = 50.0f;
     bool has_focal_length = false;        // UsdGeomCamera focalLength authored?
     // UsdGeomCamera verticalAperture (mm); USD default 15.2908 == 0.602362"*25.4.
@@ -421,6 +422,7 @@ void ApplyPropertyLine(const std::string& line, UsdPrim& prim) {
         prim.has_friction = true;
     }
     (void)ParseFloatValue(line, "inputs:intensity", prim.intensity);
+    (void)ParseFloatValue(line, "inputs:exposure", prim.exposure);
     if (ParseFloatValue(line, "focalLength", prim.focal_length)) {
         prim.has_focal_length = true;
     }
@@ -990,6 +992,10 @@ scene::DecomposeMode DecomposeModeFromToken(const std::string& token) {
 // UsdGeomCamera -- USD has no implied FOV without focal length + aperture.
 constexpr float kDefaultCameraVFovDegrees = 45.0f;
 
+// UsdLux intensity (times 2^exposure) per Nuka radiance unit: an Isaac Lab sun of 3000 is a
+// Nuka sun of 3.
+constexpr float kUsdLuxToNuka = 1.0f / 1000.0f;
+
 // Vertical FOV (degrees) from a UsdGeomCamera, per the physCamera convention:
 //   vFOV = 2 * atan(verticalAperture / (2 * focalLength)).
 // Aperture and focal length share units (mm), so the ratio is unitless. Falls
@@ -1166,7 +1172,7 @@ scene::SceneIR BuildSceneFromUsdPrims(const std::vector<UsdPrim>& prims) {
             scene::CameraRecord camera;
             camera.name = prim.name;
             camera.attached_body = FindNearestBodyAncestor(prim.parent_path, body_map);
-            camera.local_transform = math::Transform{prim.translate, math::Quat::Identity()};
+            camera.local_transform = math::Transform{prim.translate, LocalRotation(prim)};
             camera.vertical_fov_degrees = CameraVFovDegreesFromUsd(prim);
             camera.near_clip = prim.near_clip;
             camera.far_clip = prim.far_clip;
@@ -1175,9 +1181,9 @@ scene::SceneIR BuildSceneFromUsdPrims(const std::vector<UsdPrim>& prims) {
             scene::LightRecord light;
             light.name = prim.name;
             light.type = LightTypeFromUsdType(prim.type);
-            light.local_transform = math::Transform{prim.translate, math::Quat::Identity()};
+            light.local_transform = math::Transform{prim.translate, LocalRotation(prim)};
             light.color = prim.color;
-            light.intensity = prim.intensity;
+            light.intensity = prim.intensity * std::exp2(prim.exposure) * kUsdLuxToNuka;
             scene.AddLight(std::move(light));
         } else if (prim.type == "NukaActuator") {
             const auto joint_it = joint_map.find(prim.joint_path);

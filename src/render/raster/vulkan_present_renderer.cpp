@@ -27,6 +27,7 @@
 #include <fstream>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace nuka::render {
@@ -49,6 +50,8 @@ namespace {
 constexpr VkFormat   kDepthFormat = VK_FORMAT_D32_SFLOAT;
 constexpr VkFormat   kIdFormat = VK_FORMAT_R32_UINT;
 constexpr uint32_t   kFramesInFlight = 2u;
+// The sun shadow map's side in texels.
+constexpr uint32_t   kShadowMapSize = 2048u;
 // An id-pass texel: the instance row + 1 (0 is empty space) under the selected and hovered bits.
 constexpr uint32_t   kIdSelected = 0x80000000u, kIdHovered = 0x40000000u, kIdMask = 0x3FFFFFFFu;
 // The Residual and Contact views' clay albedo.
@@ -158,14 +161,54 @@ Mat4 Perspective(float fov_y_radians, float aspect, float z_near, float z_far) {
     return r;
 }
 
-// Mirrors the offscreen renderer's PushBlock + SceneUbo byte-for-byte (the
+// Vulkan depth 0 at the near plane and 1 at the far one, as the offscreen sun fit.
+Mat4 Orthographic(float l, float r, float b, float t, float n, float f) {
+    Mat4 m = Mat4::Identity();
+    m.m[0] = 2.0f / (r - l);
+    m.m[5] = 2.0f / (t - b);
+    m.m[10] = 1.0f / (n - f);
+    m.m[12] = -(r + l) / (r - l);
+    m.m[13] = -(t + b) / (t - b);
+    m.m[14] = n / (n - f);
+    return m;
+}
+
+// Gauss-Jordan in double, so a deep perspective's far plane survives the round trip.
+Mat4 Inverse(const Mat4& a) {
+    double m[4][8];
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            m[r][c] = a.m[c * 4 + r];
+            m[r][c + 4] = r == c ? 1.0 : 0.0;
+        }
+    }
+    for (int c = 0; c < 4; ++c) {
+        int pivot = c;
+        for (int r = c + 1; r < 4; ++r)
+            if (std::abs(m[r][c]) > std::abs(m[pivot][c])) pivot = r;
+        std::swap(m[c], m[pivot]);
+        const double d = m[c][c];
+        for (double& v : m[c]) v /= d;
+        for (int r = 0; r < 4; ++r) {
+            if (r == c) continue;
+            const double f = m[r][c];
+            for (int k = 0; k < 8; ++k) m[r][k] -= f * m[c][k];
+        }
+    }
+    Mat4 out;
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c) out.m[c * 4 + r] = static_cast<float>(m[r][c + 4]);
+    return out;
+}
+
+// Mirrors the offscreen renderer's PushBlock and SceneUbo prefix byte-for-byte (the
 // mesh.vert / mesh_pbr.frag shaders are shared, so the layouts MUST agree).
 struct PushBlock {
     float model[16];
     float base_color[4];
     float mr[4];            // x metallic, y roughness, z opacity, w pad
     float emissive[4];      // rgb emissive, a pad
-    float ground_shadow[4]; // xy contact centre, z radius (0=off), w strength
+    float ground_shadow[4]; // a viewport draw's map layers and tiling, or the id pass's texel
 };
 static_assert(sizeof(PushBlock) == 128, "PushBlock must match the shared push range");
 
@@ -185,6 +228,71 @@ void MaterialColor(uint32_t material_id, float out[4]) {
     out[3] = 1.0f;
 }
 
+// The maps array's layer edge: the largest image's, rounded up to a power of two and capped so the
+// whole array stays near 96 MB.
+uint32_t MapLayerSize(const std::vector<rt::Texture>& images) {
+    uint32_t largest = 1u;
+    for (const rt::Texture& t : images) largest = std::max({largest, t.width, t.height});
+    uint32_t cap = 1024u;
+    while (cap > 128u && uint64_t{cap} * cap * 4u * images.size() > (uint64_t{96} << 20)) cap /= 2u;
+    uint32_t size = 1u;
+    while (size < std::min(largest, cap)) size *= 2u;
+    return size;
+}
+
+// An RGBA8 layer `size` texels a side from a raw [0,1] image: a wrapping bilinear lookup,
+// supersampled where the image is larger than the layer.
+void ResampleLayer(const rt::Texture& tex, uint32_t size, uint8_t* out) {
+    const uint32_t ch = tex.channels;
+    const int64_t w = tex.width, h = tex.height;
+    const auto fetch = [&](int64_t x, int64_t y, float rgba[4]) {
+        const float* t = &tex.texels[static_cast<size_t>(((y % h + h) % h) * w + (x % w + w) % w) * ch];
+        rgba[0] = t[0];
+        rgba[1] = ch >= 3u ? t[1] : t[0];
+        rgba[2] = ch >= 3u ? t[2] : t[0];
+        rgba[3] = ch == 2u || ch == 4u ? t[ch - 1u] : 1.0f;
+    };
+    const uint32_t kx = (tex.width + size - 1u) / size, ky = (tex.height + size - 1u) / size;
+    const float weight = 1.0f / static_cast<float>(kx * ky);
+    for (uint32_t y = 0; y < size; ++y) {
+        for (uint32_t x = 0; x < size; ++x) {
+            float sum[4] = {};
+            for (uint32_t sy = 0; sy < ky; ++sy) {
+                for (uint32_t sx = 0; sx < kx; ++sx) {
+                    const float fx = (x + (sx + 0.5f) / kx) / size * static_cast<float>(w) - 0.5f;
+                    const float fy = (y + (sy + 0.5f) / ky) / size * static_cast<float>(h) - 0.5f;
+                    const float x0 = std::floor(fx), y0 = std::floor(fy);
+                    const float tx = fx - x0, ty = fy - y0;
+                    const int64_t ix = static_cast<int64_t>(x0), iy = static_cast<int64_t>(y0);
+                    float a[4], b[4], c[4], d[4];
+                    fetch(ix, iy, a); fetch(ix + 1, iy, b); fetch(ix, iy + 1, c); fetch(ix + 1, iy + 1, d);
+                    for (int k = 0; k < 4; ++k)
+                        sum[k] += (a[k] + (b[k] - a[k]) * tx) * (1.0f - ty) + (c[k] + (d[k] - c[k]) * tx) * ty;
+                }
+            }
+            uint8_t* o = out + (static_cast<size_t>(y) * size + x) * 4u;
+            for (int k = 0; k < 4; ++k)
+                o[k] = static_cast<uint8_t>(std::clamp(sum[k] * weight, 0.0f, 1.0f) * 255.0f + 0.5f);
+        }
+    }
+}
+
+// The next mip of a square RGBA8 layer `edge` texels a side, each texel the mean of four.
+std::vector<uint8_t> HalveLayer(const std::vector<uint8_t>& src, uint32_t edge) {
+    const uint32_t half = edge / 2u;
+    std::vector<uint8_t> out(static_cast<size_t>(half) * half * 4u);
+    const auto at = [&](uint32_t x, uint32_t y, uint32_t k) {
+        return uint32_t{src[(static_cast<size_t>(y) * edge + x) * 4u + k]};
+    };
+    for (uint32_t y = 0; y < half; ++y)
+        for (uint32_t x = 0; x < half; ++x)
+            for (uint32_t k = 0; k < 4u; ++k)
+                out[(static_cast<size_t>(y) * half + x) * 4u + k] = static_cast<uint8_t>(
+                    (at(2 * x, 2 * y, k) + at(2 * x + 1, 2 * y, k) + at(2 * x, 2 * y + 1, k) +
+                     at(2 * x + 1, 2 * y + 1, k) + 2u) / 4u);
+    return out;
+}
+
 // Sizes SceneUbo.lights[]; MUST equal the GLSL NUKA_MAX_LIGHTS in
 // render/raster/shaders/light_limits.glsl (the single shader-side source).
 constexpr int kMaxUboLights = 8;
@@ -201,22 +309,43 @@ struct SceneUbo {
     int32_t  counts[4];
     float    fog[4];               // rgb haze, w density (0 => fog OFF)
     GpuLight lights[kMaxUboLights];
-    float    light_view_proj[16];  // sun world->clip (shadows; unused here)
-    float    shadow_params[4];     // x strength (0 => OFF), y bias, z texel, w pad
+    float    light_view_proj[16];  // sun world->clip, fitted per frame by FitSunShadow
+    float    shadow_params[4];     // x strength (0 => OFF), y bias, z texel, w PCF spacing
+    // viewport_scene.glsl's tail past the offscreen block.
+    float    inv_view_proj[16];
+    float    viewport[4];          // the view's framebuffer x, y, width, height
+    float    sky_zenith[4];        // w 1 when the sky lights the scene
+    float    sky_horizon[4];
+    float    sky_ground[4];        // w the ground grid's height
+    float    sun[4];               // xyz toward the first directional light; w the disc's cosine radius
+    float    sun_color[4];
 };
-static_assert(sizeof(SceneUbo) == 608, "SceneUbo must match the std140 shader block");
+static_assert(sizeof(SceneUbo) == 768, "SceneUbo must match the std140 shader block");
 
-// Build the per-frame SceneUbo (camera + light rig). Same default 3-point rig +
-// hemispheric ambient as the offscreen renderer (kept in sync deliberately).
-SceneUbo BuildSceneUbo(const RenderWorld& world, const Mat4& view_proj,
-                       const math::Vec3& eye) {
+// The viewport sun disc's cosine radius (0.6 degrees).
+constexpr float kSunDiscCos = 0.99995f;
+
+void CopyRgb(float* dst, const float* src, float w) {
+    dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = w;
+}
+
+// Build a view's SceneUbo (camera, light rig, fog, sky). Without a sun or scene lights it keeps
+// the offscreen renderer's 3-point rig and hemispheric ambient.
+SceneUbo BuildSceneUbo(const RenderWorld& world, const Mat4& view_proj, const math::Vec3& eye,
+                       const RasterOptions& options, const SceneViewport& rect) {
     SceneUbo ubo{};
     std::memcpy(ubo.view_proj, view_proj.m.data(), sizeof(ubo.view_proj));
     ubo.camera_pos[0] = eye.x; ubo.camera_pos[1] = eye.y;
     ubo.camera_pos[2] = eye.z; ubo.camera_pos[3] = 1.0f;
-    ubo.ambient[0] = 0.20f; ubo.ambient[1] = 0.23f; ubo.ambient[2] = 0.28f; ubo.ambient[3] = 0.0f;
-    ubo.ambient_ground[0] = 0.09f; ubo.ambient_ground[1] = 0.08f;
-    ubo.ambient_ground[2] = 0.07f; ubo.ambient_ground[3] = 0.0f;
+    if (options.use_sun_light) {
+        CopyRgb(ubo.ambient, options.sun_ambient_sky, 0.0f);
+        CopyRgb(ubo.ambient_ground, options.sun_ambient_ground, 0.0f);
+    } else {
+        ubo.ambient[0] = 0.20f; ubo.ambient[1] = 0.23f; ubo.ambient[2] = 0.28f; ubo.ambient[3] = 0.0f;
+        ubo.ambient_ground[0] = 0.09f; ubo.ambient_ground[1] = 0.08f;
+        ubo.ambient_ground[2] = 0.07f; ubo.ambient_ground[3] = 0.0f;
+    }
+    CopyRgb(ubo.fog, options.fog_color, options.fog_density);
     auto set_dir = [](GpuLight& l, const math::Vec3& dir, float r, float g, float b) {
         const math::Vec3 d = dir.Normalized();
         l.direction[0] = d.x; l.direction[1] = d.y; l.direction[2] = d.z; l.direction[3] = 1.0f;
@@ -252,12 +381,32 @@ SceneUbo BuildSceneUbo(const RenderWorld& world, const Mat4& view_proj,
             }
             ++n;
         }
+    } else if (options.use_sun_light) {
+        const float* d = options.sun_direction;
+        const float* c = options.sun_color;
+        set_dir(ubo.lights[n++], {d[0], d[1], d[2]}, c[0], c[1], c[2]);
     } else {
         set_dir(ubo.lights[n++], {0.5f, -0.6f, 0.75f}, 3.2f, 3.1f, 2.9f);
         set_dir(ubo.lights[n++], {-0.7f, 0.3f, 0.4f}, 0.8f, 0.9f, 1.1f);
         set_dir(ubo.lights[n++], {0.1f, 0.8f, 0.5f}, 1.0f, 0.95f, 0.85f);
     }
     ubo.counts[0] = n;
+    // The first directional light is the sun the sky draws and the shadow map follows.
+    for (int i = 0; i < n; ++i) {
+        if (ubo.lights[i].direction[3] < 0.5f) continue;
+        CopyRgb(ubo.sun, ubo.lights[i].direction, options.viewport_sky ? kSunDiscCos : 0.0f);
+        CopyRgb(ubo.sun_color, ubo.lights[i].color, 0.0f);
+        break;
+    }
+    if (options.viewport_sky) {
+        CopyRgb(ubo.sky_zenith, options.sky_top, 1.0f);
+        CopyRgb(ubo.sky_horizon, options.sky_bottom, 0.0f);
+        CopyRgb(ubo.sky_ground, options.ground_color, options.viewport_grid_height);
+    }
+    const Mat4 inv = Inverse(view_proj);
+    std::memcpy(ubo.inv_view_proj, inv.m.data(), sizeof(ubo.inv_view_proj));
+    ubo.viewport[0] = static_cast<float>(rect.x); ubo.viewport[1] = static_cast<float>(rect.y);
+    ubo.viewport[2] = static_cast<float>(rect.width); ubo.viewport[3] = static_cast<float>(rect.height);
     return ubo;
 }
 
@@ -427,12 +576,21 @@ struct PresentRenderer::Impl {
 
     Image          depth;
 
-    // set 0, binding 1 (the shared mesh_pbr.frag's uShadowMap): a persistent 1x1
-    // dummy depth texture. Shadows are OFF in the present path (shadow_params.x==0)
-    // so it is never sampled; it exists only to COMPLETE the descriptor set the
-    // shared fragment shader statically declares. Extent-independent -> created once.
-    Image          shadow_dummy;
+    // set 0, binding 1: the sun's shadow map. shadow_pass redraws it when a Lit view casts shadows
+    // and leaves it in DEPTH_STENCIL_READ_ONLY_OPTIMAL; extent-independent, so created once.
+    Image          shadow_map;
     VkSampler      shadow_sampler = VK_NULL_HANDLE;
+    VkRenderPass   shadow_pass = VK_NULL_HANDLE;
+    VkFramebuffer  shadow_framebuffer = VK_NULL_HANDLE;
+
+    // set 0, binding 2: each texture-library image as one layer of a mipmapped RGBA8 array, rebuilt
+    // when the library changes; a single white layer while it is empty.
+    Image          maps;
+    VkSampler      maps_sampler = VK_NULL_HANDLE;
+    uint64_t       maps_version = 0u;
+    uint32_t       map_layers = 0u;  // the library images that got a layer
+    // Per material: its albedo, roughness and normal map layers (-1 none) and tiles per metre.
+    std::vector<std::array<float, 4>> material_maps;
 
     // The id pass renders kId* texels at swapchain size with its own depth, for the selection
     // outline and Pick; outline.frag samples it through outline_set.
@@ -463,12 +621,21 @@ struct PresentRenderer::Impl {
     VkPipeline       wire_pipeline = VK_NULL_HANDLE;
     VkPipeline       id_pipeline = VK_NULL_HANDLE;
     VkPipeline       outline_pipeline = VK_NULL_HANDLE;
+    // A Lit view's sky and ground grid (one full-view triangle each) and the sun's depth.
+    VkPipeline       sky_pipeline = VK_NULL_HANDLE;
+    VkPipeline       ground_pipeline = VK_NULL_HANDLE;
+    VkPipeline       shadow_pipeline = VK_NULL_HANDLE;
     bool             wireframe_capable_ = false;
+    bool             anisotropy_capable_ = false;
     VkShaderModule   vert_module = VK_NULL_HANDLE;
     VkShaderModule   frag_module = VK_NULL_HANDLE;
     VkShaderModule   id_frag_module = VK_NULL_HANDLE;
     VkShaderModule   fullscreen_vert_module = VK_NULL_HANDLE;
     VkShaderModule   outline_frag_module = VK_NULL_HANDLE;
+    VkShaderModule   sky_frag_module = VK_NULL_HANDLE;
+    VkShaderModule   ground_frag_module = VK_NULL_HANDLE;
+    VkShaderModule   shadow_vert_module = VK_NULL_HANDLE;
+    VkShaderModule   shadow_instanced_vert_module = VK_NULL_HANDLE;
     VkCommandPool    command_pool = VK_NULL_HANDLE;
 
     // Instanced pipeline reading model matrices from a pose slot at set 1; built by
@@ -479,6 +646,7 @@ struct PresentRenderer::Impl {
     VkPipeline            wire_instanced_pipeline = VK_NULL_HANDLE;
     VkPipeline            id_instanced_pipeline = VK_NULL_HANDLE;
     VkPipeline            ghost_instanced_pipeline = VK_NULL_HANDLE;  // see-through instances
+    VkPipeline            shadow_instanced_pipeline = VK_NULL_HANDLE;
     VkDescriptorSetLayout ssbo_set_layout = VK_NULL_HANDLE;  // borrowed (not owned)
 
     // Per-frame-in-flight SceneUbo buffer + descriptor set (one per frame so the
@@ -562,6 +730,7 @@ struct PresentRenderer::Impl {
         VkPhysicalDeviceFeatures supported_features{};
         vkGetPhysicalDeviceFeatures(physical, &supported_features);
         wireframe_capable_ = supported_features.fillModeNonSolid == VK_TRUE;
+        anisotropy_capable_ = supported_features.samplerAnisotropy == VK_TRUE;
 
         // STEP 2: surface.
         auto raw = window_surface->CreateSurface(
@@ -588,7 +757,9 @@ struct PresentRenderer::Impl {
         // long-running viewer (CreatePipeline used to recreate them unconditionally
         // while DestroySwapchainDependents never freed them).
         CreateShaderModules();
-        CreateShadowDummy();
+        CreateShadowMap();
+        CreateMapSampler();
+        UploadMaps({});
         CreateOutlineLayout();
         NegotiateSurface();
         CreateSwapchain();
@@ -625,14 +796,19 @@ struct PresentRenderer::Impl {
         if (vert_module != VK_NULL_HANDLE) vkDestroyShaderModule(device, vert_module, nullptr);
         if (frag_module != VK_NULL_HANDLE) vkDestroyShaderModule(device, frag_module, nullptr);
         if (instanced_vert_module != VK_NULL_HANDLE) vkDestroyShaderModule(device, instanced_vert_module, nullptr);
-        for (VkShaderModule m : {id_frag_module, fullscreen_vert_module, outline_frag_module})
+        for (VkShaderModule m : {id_frag_module, fullscreen_vert_module, outline_frag_module, sky_frag_module,
+                                 ground_frag_module, shadow_vert_module, shadow_instanced_vert_module})
             vkDestroyShaderModule(device, m, nullptr);
         vkDestroyPipelineLayout(device, outline_layout, nullptr);
         vkDestroyDescriptorPool(device, outline_pool, nullptr);
         vkDestroyDescriptorSetLayout(device, outline_set_layout, nullptr);
         vkDestroySampler(device, id_sampler, nullptr);
         if (shadow_sampler != VK_NULL_HANDLE) vkDestroySampler(device, shadow_sampler, nullptr);
-        DestroyImage(shadow_dummy);
+        vkDestroyFramebuffer(device, shadow_framebuffer, nullptr);
+        vkDestroyRenderPass(device, shadow_pass, nullptr);
+        DestroyImage(shadow_map);
+        vkDestroySampler(device, maps_sampler, nullptr);
+        DestroyImage(maps);
         if (command_pool != VK_NULL_HANDLE) vkDestroyCommandPool(device, command_pool, nullptr);
         // ORDERED teardown (the VkSurfaceKHR is owned by window_surface but was
         // created against the renderer's VkInstance): the surface MUST be destroyed
@@ -1072,16 +1248,19 @@ struct PresentRenderer::Impl {
         id_frag_module = CreateShaderModule(dir + "/mesh_id.frag.spv");
         fullscreen_vert_module = CreateShaderModule(dir + "/fullscreen.vert.spv");
         outline_frag_module = CreateShaderModule(dir + "/outline.frag.spv");
+        sky_frag_module = CreateShaderModule(dir + "/viewport_sky.frag.spv");
+        ground_frag_module = CreateShaderModule(dir + "/viewport_ground.frag.spv");
+        shadow_vert_module = CreateShaderModule(dir + "/viewport_shadow.vert.spv");
+        shadow_instanced_vert_module = CreateShaderModule(dir + "/viewport_shadow_instanced.vert.spv");
     }
 
-    // 1x1 dummy depth texture + sampler bound at set 0 binding 1 so the shared
-    // mesh_pbr.frag's uShadowMap is always a valid descriptor (shadows OFF here,
-    // so it is never read). Created once; the layout transition uses a one-shot
-    // command buffer. Mirrors the offscreen renderer's EnsureShadowSampler.
-    void CreateShadowDummy() {
-        shadow_dummy = MakeImage(kDepthFormat, {1u, 1u},
-                                 VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                                 VK_IMAGE_ASPECT_DEPTH_BIT);
+    // The sun's shadow map with its sampler, depth-only pass and framebuffer. The map starts in
+    // DEPTH_STENCIL_READ_ONLY_OPTIMAL, the layout the pass leaves it in, so a frame without shadows
+    // still binds a valid image.
+    void CreateShadowMap() {
+        shadow_map = MakeImage(kDepthFormat, {kShadowMapSize, kShadowMapSize},
+                               VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                               VK_IMAGE_ASPECT_DEPTH_BIT);
 
         VkSamplerCreateInfo si{};
         si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -1096,6 +1275,54 @@ struct PresentRenderer::Impl {
         CheckVk(vkCreateSampler(device, &si, nullptr, &shadow_sampler),
                 "vkCreateSampler(present-shadow)");
 
+        VkAttachmentDescription attachment{};
+        attachment.format = kDepthFormat;
+        attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+        attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        attachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+        VkAttachmentReference depth_ref{0u, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+        VkSubpassDescription subpass{};
+        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subpass.pDepthStencilAttachment = &depth_ref;
+        // The previous frame's sampling ends before the pass writes; the new depth is visible to the
+        // views' fragment shaders after it.
+        std::array<VkSubpassDependency, 2> deps{};
+        deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+        deps[0].dstSubpass = 0u;
+        deps[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        deps[0].dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        deps[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        deps[0].dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        deps[1].srcSubpass = 0u;
+        deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+        deps[1].srcStageMask = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        deps[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        deps[1].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        deps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        VkRenderPassCreateInfo info{};
+        info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        info.attachmentCount = 1u;
+        info.pAttachments = &attachment;
+        info.subpassCount = 1u;
+        info.pSubpasses = &subpass;
+        info.dependencyCount = static_cast<uint32_t>(deps.size());
+        info.pDependencies = deps.data();
+        CheckVk(vkCreateRenderPass(device, &info, nullptr, &shadow_pass), "vkCreateRenderPass(shadow)");
+        VkFramebufferCreateInfo fb{};
+        fb.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        fb.renderPass = shadow_pass;
+        fb.attachmentCount = 1u;
+        fb.pAttachments = &shadow_map.view;
+        fb.width = kShadowMapSize;
+        fb.height = kShadowMapSize;
+        fb.layers = 1u;
+        CheckVk(vkCreateFramebuffer(device, &fb, nullptr, &shadow_framebuffer), "vkCreateFramebuffer(shadow)");
+
         // One-shot UNDEFINED -> DEPTH_STENCIL_READ_ONLY transition so sampling is legal.
         VkCommandBuffer cmd = BeginOneShot();
         VkImageMemoryBarrier barrier{};
@@ -1104,7 +1331,7 @@ struct PresentRenderer::Impl {
         barrier.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
         barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.image = shadow_dummy.image;
+        barrier.image = shadow_map.image;
         barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
         barrier.subresourceRange.levelCount = 1u;
         barrier.subresourceRange.layerCount = 1u;
@@ -1114,6 +1341,152 @@ struct PresentRenderer::Impl {
                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
                              1, &barrier);
         EndOneShotAndWait(cmd);
+    }
+
+    // Trilinear, repeating and, where the device offers it, anisotropic.
+    void CreateMapSampler() {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(physical, &props);
+        VkSamplerCreateInfo si{};
+        si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        si.magFilter = VK_FILTER_LINEAR;
+        si.minFilter = VK_FILTER_LINEAR;
+        si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        si.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        si.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.anisotropyEnable = anisotropy_capable_ ? VK_TRUE : VK_FALSE;
+        si.maxAnisotropy = std::min(8.0f, props.limits.maxSamplerAnisotropy);
+        si.maxLod = VK_LOD_CLAMP_NONE;
+        CheckVk(vkCreateSampler(device, &si, nullptr, &maps_sampler), "vkCreateSampler(present maps)");
+    }
+
+    // Uploads each source as one layer of `maps` with its mip chain; none uploads one white texel.
+    void UploadMaps(const std::vector<rt::Texture>& sources) {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(physical, &props);
+        map_layers = std::min(static_cast<uint32_t>(sources.size()), props.limits.maxImageArrayLayers);
+        const uint32_t layers = std::max(map_layers, 1u);
+        const uint32_t size = map_layers == 0u ? 1u : MapLayerSize(sources);
+        uint32_t mips = 1u;
+        while ((size >> mips) != 0u) ++mips;
+        // chain[mip * layers + layer]; the staging copy holds each mip's layers in turn.
+        std::vector<std::vector<uint8_t>> chain(static_cast<size_t>(mips) * layers);
+        for (uint32_t l = 0; l < layers; ++l) {
+            chain[l].assign(static_cast<size_t>(size) * size * 4u, 255u);
+            if (l < map_layers) ResampleLayer(sources[l], size, chain[l].data());
+            for (uint32_t m = 1; m < mips; ++m)
+                chain[m * layers + l] = HalveLayer(chain[(m - 1u) * layers + l], size >> (m - 1u));
+        }
+        size_t total = 0;
+        for (const std::vector<uint8_t>& level : chain) total += level.size();
+        GpuBuffer staging = CreateHostBuffer(total, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        void* mapped = nullptr;
+        CheckVk(vkMapMemory(device, staging.memory, 0, total, 0, &mapped), "vkMapMemory(present maps)");
+        std::vector<VkBufferImageCopy> regions(mips);
+        size_t offset = 0;
+        for (uint32_t m = 0; m < mips; ++m) {
+            regions[m].bufferOffset = offset;
+            regions[m].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, m, 0u, layers};
+            regions[m].imageExtent = {size >> m, size >> m, 1u};
+            for (uint32_t l = 0; l < layers; ++l) {
+                const std::vector<uint8_t>& level = chain[m * layers + l];
+                std::memcpy(static_cast<uint8_t*>(mapped) + offset, level.data(), level.size());
+                offset += level.size();
+            }
+        }
+        vkUnmapMemory(device, staging.memory);
+
+        VkImageCreateInfo info{};
+        info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        info.imageType = VK_IMAGE_TYPE_2D;
+        info.format = VK_FORMAT_R8G8B8A8_UNORM;
+        info.extent = {size, size, 1u};
+        info.mipLevels = mips;
+        info.arrayLayers = layers;
+        info.samples = VK_SAMPLE_COUNT_1_BIT;
+        info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        CheckVk(vkCreateImage(device, &info, nullptr, &maps.image), "vkCreateImage(present maps)");
+        VkMemoryRequirements req{};
+        vkGetImageMemoryRequirements(device, maps.image, &req);
+        VkMemoryAllocateInfo alloc{};
+        alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        alloc.allocationSize = req.size;
+        alloc.memoryTypeIndex = FindMemoryType(physical, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        CheckVk(vkAllocateMemory(device, &alloc, nullptr, &maps.memory), "vkAllocateMemory(present maps)");
+        CheckVk(vkBindImageMemory(device, maps.image, maps.memory, 0), "vkBindImageMemory(present maps)");
+        VkImageViewCreateInfo view{};
+        view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        view.image = maps.image;
+        view.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        view.format = info.format;
+        view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, mips, 0u, layers};
+        CheckVk(vkCreateImageView(device, &view, nullptr, &maps.view), "vkCreateImageView(present maps)");
+
+        VkCommandBuffer cmd = BeginOneShot();
+        VkImageMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = maps.image;
+        barrier.subresourceRange = view.subresourceRange;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
+                             0, nullptr, 1, &barrier);
+        vkCmdCopyBufferToImage(cmd, staging.buffer, maps.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, mips,
+                               regions.data());
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+                             nullptr, 0, nullptr, 1, &barrier);
+        EndOneShotAndWait(cmd);
+        Destroy(staging);
+    }
+
+    // Points every scene set's binding 2 at the maps array.
+    void WriteMapsDescriptors() {
+        const VkDescriptorImageInfo info{maps_sampler, maps.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        for (const UboSlot& slot : ubo_slots) {
+            VkWriteDescriptorSet write{};
+            write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            write.dstSet = slot.set;
+            write.dstBinding = 2u;
+            write.descriptorCount = 1u;
+            write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            write.pImageInfo = &info;
+            vkUpdateDescriptorSets(device, 1u, &write, 0u, nullptr);
+        }
+    }
+
+    // Re-uploads the maps array when the world's texture library changed, then resolves each
+    // material's layers and tiling for the push block (triplanar materials only).
+    void SyncMaps(const RenderWorld& world) {
+        if (world.textures.Version() != maps_version) {
+            vkDeviceWaitIdle(device);
+            DestroyImage(maps);
+            UploadMaps(world.textures.Images());
+            WriteMapsDescriptors();
+            maps_version = world.textures.Version();
+        }
+        const auto layer = [&](const std::string& path, bool srgb) {
+            const int id = world.textures.Resolve(path, srgb);
+            return id >= 0 && static_cast<uint32_t>(id) < map_layers ? static_cast<float>(id) : -1.0f;
+        };
+        material_maps.resize(world.materials.size());
+        for (size_t i = 0; i < world.materials.size(); ++i) {
+            const scene::RenderMaterial& m = world.materials[i];
+            std::array<float, 4>& maps_of = material_maps[i];
+            maps_of = {layer(m.albedo_map, true), layer(m.roughness_map, false), layer(m.normal_map, false), 0.0f};
+            if (m.triplanar && (maps_of[0] >= 0.0f || maps_of[1] >= 0.0f || maps_of[2] >= 0.0f))
+                maps_of[3] = m.uv_scale;
+        }
     }
 
     // The fixed-function state the present pipelines differ in.
@@ -1128,6 +1501,7 @@ struct PresentRenderer::Impl {
         bool             depth_test = true;
         bool             depth_write = true;
         bool             blend = false;  // straight-alpha over
+        bool             depth_bias = false;  // the shadow map's slope-scaled offset
     };
 
     void CreatePipeline() {
@@ -1138,10 +1512,9 @@ struct PresentRenderer::Impl {
         // recreates -> no per-resize module leak.
 
         // Set 0: binding 0 = per-frame SceneUbo (camera + light rig); binding 1 =
-        // the shadow map sampler. BOTH match the offscreen renderer's layout (the
-        // shared mesh_pbr.frag statically declares the sampler at binding 1, so the
-        // present set must provide it even though shadows are OFF here).
-        std::array<VkDescriptorSetLayoutBinding, 2> set_bindings{};
+        // the shadow map sampler, both as in the offscreen renderer's layout; binding 2
+        // = the material maps array, read only by the viewport's shaders.
+        std::array<VkDescriptorSetLayoutBinding, 3> set_bindings{};
         set_bindings[0].binding = 0u;
         set_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         set_bindings[0].descriptorCount = 1u;
@@ -1150,6 +1523,8 @@ struct PresentRenderer::Impl {
         set_bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         set_bindings[1].descriptorCount = 1u;
         set_bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        set_bindings[2] = set_bindings[1];
+        set_bindings[2].binding = 2u;
         VkDescriptorSetLayoutCreateInfo set_info{};
         set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         set_info.bindingCount = static_cast<uint32_t>(set_bindings.size());
@@ -1198,6 +1573,20 @@ struct PresentRenderer::Impl {
         outline.depth_test = outline.depth_write = false;
         outline.blend = true;
         outline_pipeline = MakePipeline(outline, "vkCreateGraphicsPipelines(present-outline)");
+
+        // The sky fills a Lit view behind the scene; the ground grid writes its plane's depth. The
+        // shadow pipeline has no fragment stage, as shadow_pass has no colour attachment.
+        PipelineSpec sky{fullscreen_vert_module, sky_frag_module, pipeline_layout, present_pass};
+        sky.mesh = false;
+        sky.depth_test = sky.depth_write = false;
+        sky_pipeline = MakePipeline(sky, "vkCreateGraphicsPipelines(present-sky)");
+        PipelineSpec ground = sky;
+        ground.frag = ground_frag_module;
+        ground.depth_test = ground.depth_write = true;
+        ground_pipeline = MakePipeline(ground, "vkCreateGraphicsPipelines(present-ground)");
+        PipelineSpec shadow{shadow_vert_module, VK_NULL_HANDLE, pipeline_layout, shadow_pass};
+        shadow.depth_bias = true;
+        shadow_pipeline = MakePipeline(shadow, "vkCreateGraphicsPipelines(present-shadow)");
     }
 
     // POLYGON_MODE_LINE where the device enables fillModeNonSolid, else a fill.
@@ -1215,6 +1604,8 @@ struct PresentRenderer::Impl {
         stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
         stages[1].module = spec.frag;
         stages[1].pName = "main";
+        // Without a fragment stage the pipeline writes depth alone.
+        const bool color = spec.frag != VK_NULL_HANDLE;
 
         // Position, normal and colour, one float3 stream each.
         std::array<VkVertexInputBindingDescription, 3> bindings{};
@@ -1245,6 +1636,9 @@ struct PresentRenderer::Impl {
         rasterization.cullMode = spec.cull;
         rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
         rasterization.lineWidth = 1.0f;  // 1.0 needs no wideLines feature
+        rasterization.depthBiasEnable = spec.depth_bias ? VK_TRUE : VK_FALSE;
+        rasterization.depthBiasConstantFactor = 1.25f;
+        rasterization.depthBiasSlopeFactor = 1.75f;
 
         VkPipelineMultisampleStateCreateInfo multisample{};
         multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
@@ -1268,7 +1662,7 @@ struct PresentRenderer::Impl {
         blend_attachment.alphaBlendOp = VK_BLEND_OP_ADD;
         VkPipelineColorBlendStateCreateInfo color_blend{};
         color_blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-        color_blend.attachmentCount = 1u;
+        color_blend.attachmentCount = color ? 1u : 0u;
         color_blend.pAttachments = &blend_attachment;
 
         std::array<VkDynamicState, 2> dynamic_states{VK_DYNAMIC_STATE_VIEWPORT,
@@ -1280,7 +1674,7 @@ struct PresentRenderer::Impl {
 
         VkGraphicsPipelineCreateInfo info{};
         info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-        info.stageCount = static_cast<uint32_t>(stages.size());
+        info.stageCount = color ? 2u : 1u;
         info.pStages = stages.data();
         info.pVertexInputState = &vertex_input;
         info.pInputAssemblyState = &input_assembly;
@@ -1343,13 +1737,17 @@ struct PresentRenderer::Impl {
         ghost.depth_write = false;
         ghost.blend = true;
         ghost_instanced_pipeline = MakePipeline(ghost, "vkCreateGraphicsPipelines(present-instanced-ghost)");
+        PipelineSpec shadow{shadow_instanced_vert_module, VK_NULL_HANDLE, instanced_pipeline_layout, shadow_pass};
+        shadow.depth_bias = true;
+        shadow_instanced_pipeline = MakePipeline(shadow, "vkCreateGraphicsPipelines(present-instanced-shadow)");
         spec.frag = id_frag_module;
         spec.pass = id_pass;
         id_instanced_pipeline = MakePipeline(spec, "vkCreateGraphicsPipelines(present-instanced-id)");
     }
 
     void DestroyInstancedPipelines() {
-        DestroyPipelines({&instanced_pipeline, &wire_instanced_pipeline, &id_instanced_pipeline, &ghost_instanced_pipeline});
+        DestroyPipelines({&instanced_pipeline, &wire_instanced_pipeline, &id_instanced_pipeline,
+                          &ghost_instanced_pipeline, &shadow_instanced_pipeline});
         vkDestroyPipelineLayout(device, instanced_pipeline_layout, nullptr);
         instanced_pipeline_layout = VK_NULL_HANDLE;
     }
@@ -1359,7 +1757,7 @@ struct PresentRenderer::Impl {
         const uint32_t slot_count = static_cast<uint32_t>(ubo_slots.size());
         const std::array<VkDescriptorPoolSize, 2> sizes{{
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, slot_count},
-            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, slot_count}}};
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2u * slot_count}}};
         VkDescriptorPoolCreateInfo pool_info{};
         pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         pool_info.maxSets = slot_count;
@@ -1381,7 +1779,7 @@ struct PresentRenderer::Impl {
             VkDescriptorBufferInfo buffer_info{slot.buffer, 0u, sizeof(SceneUbo)};
             VkDescriptorImageInfo shadow_info{};
             shadow_info.sampler = shadow_sampler;
-            shadow_info.imageView = shadow_dummy.view;
+            shadow_info.imageView = shadow_map.view;
             shadow_info.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
             std::array<VkWriteDescriptorSet, 2> writes{};
             writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -1399,6 +1797,7 @@ struct PresentRenderer::Impl {
             vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(),
                                    0u, nullptr);
         }
+        WriteMapsDescriptors();
     }
 
     void CreateSyncObjects() {
@@ -1442,7 +1841,7 @@ struct PresentRenderer::Impl {
         // Every pipeline is built against present_pass or id_pass; destroy them before their
         // layouts so a swapchain recreate rebuilds them all.
         DestroyPipelines({&pipeline, &wire_pipeline, &id_pipeline, &outline_pipeline, &debug_pipeline,
-                          &ghost_pipeline});
+                          &ghost_pipeline, &sky_pipeline, &ground_pipeline, &shadow_pipeline});
         if (pipeline_layout != VK_NULL_HANDLE) { vkDestroyPipelineLayout(device, pipeline_layout, nullptr); pipeline_layout = VK_NULL_HANDLE; }
         // INT-F1: the instanced pipelines + their layout go too; the instanced_vert_module
         // + the BORROWED ssbo_set/layout survive.
@@ -1688,6 +2087,8 @@ struct PresentRenderer::Impl {
         float     opacity = 1.0f;
         float     emissive[3] = {0.0f, 0.0f, 0.0f};
         float     shade = 0.0f;  // the view mode mesh_view.frag reads from emissive.a
+        // The material's albedo, roughness and normal map layers (-1 none) and tiles per metre (0 none).
+        float     maps[4] = {-1.0f, -1.0f, -1.0f, 0.0f};
         // INT-F1: the ORIGINAL index into world.instances (== the scatter SSBO row).
         // Used as firstInstance so gl_InstanceIndex selects the right SSBO mat4 on
         // the instanced path (the draw loop skips geometry-less instances, so the
@@ -1781,12 +2182,15 @@ struct PresentRenderer::Impl {
         std::vector<InstanceDraw> env_draws;  // env_instances, rows after the instances
         SceneViewport rect;
         SceneUbo ubo{};
+        math::Vec3 focus{};          // the camera's target, the sun's shadow map centres on it
+        float focus_distance = 0.0f;  // from the eye to it
     };
 
     PreparedView Prepare(const RenderWorld& world, const RasterOptions& options) {
         // Bring the device-local geometry cache up to date (uploads only on a
         // geometry-set change). Per-frame work below is just transforms + materials.
         SyncMeshCache(world);
+        SyncMaps(world);
 
         // -- build per-instance draws from the cached geometry + scene AABB.
         PreparedView view;
@@ -1826,6 +2230,10 @@ struct PresentRenderer::Impl {
                 draw.emissive[0] = mat.emissive[0];
                 draw.emissive[1] = mat.emissive[1];
                 draw.emissive[2] = mat.emissive[2];
+                if (options.view_mode == ViewMode::Lit) {
+                    const std::array<float, 4>& maps_of = material_maps[inst.render_material_id];
+                    std::copy(maps_of.begin(), maps_of.end(), draw.maps);
+                }
             }
             ApplyViewMode(options.view_mode, has_material ? inst.render_material_id : kNoId, draw);
             return true;
@@ -1859,7 +2267,9 @@ struct PresentRenderer::Impl {
         const float fov_y = cam.fov_degrees * 3.14159265358979323846f / 180.0f;
         const Mat4 view_matrix = LookAt(cam.eye, cam.target, cam.up);
         const Mat4 proj = Perspective(fov_y, aspect, cam.near_clip, cam.far_clip);
-        view.ubo = BuildSceneUbo(world, Multiply(proj, view_matrix), cam.eye);
+        view.ubo = BuildSceneUbo(world, Multiply(proj, view_matrix), cam.eye, options, view.rect);
+        view.focus = cam.target;
+        view.focus_distance = (cam.eye - cam.target).Length();
         return view;
     }
 
@@ -1894,7 +2304,7 @@ struct PresentRenderer::Impl {
     // pass, and the id pass writes each instance's kId* texel, skipping unpickable ones.
     enum class DrawPass : uint8_t { Scene, SeeThrough, Id };
 
-    void RecordDraws(VkCommandBuffer cmd, const PreparedView& view, const std::vector<InstanceDraw>& draws,
+    void RecordDraws(VkCommandBuffer cmd, const SceneViewport& rect, const std::vector<InstanceDraw>& draws,
                      VkPipeline pipe, VkPipelineLayout layout, VkDescriptorSet ubo_set, const PresentInterop* pose,
                      const std::vector<uint8_t>& flags, DrawPass pass) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
@@ -1903,7 +2313,7 @@ struct PresentRenderer::Impl {
             const VkDescriptorSet slot_set = reinterpret_cast<VkDescriptorSet>(pose->set);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1u, 1u, &slot_set, 0u, nullptr);
         }
-        SetViewport(cmd, view.rect);
+        SetViewport(cmd, rect);
         for (const InstanceDraw& draw : draws) {
             const uint8_t f = draw.instance_row < flags.size() ? flags[draw.instance_row] : uint8_t{0};
             const bool see_through = (f & kInstanceSeeThrough) != 0;
@@ -1924,6 +2334,8 @@ struct PresentRenderer::Impl {
                 const uint32_t id = (draw.instance_row + 1u) | ((f & kInstanceSelected) != 0 ? kIdSelected : 0u) |
                                     ((f & kInstanceHovered) != 0 ? kIdHovered : 0u);
                 std::memcpy(push.ground_shadow, &id, sizeof(id));
+            } else {
+                std::memcpy(push.ground_shadow, draw.maps, sizeof(push.ground_shadow));
             }
             vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0u,
                                sizeof(PushBlock), &push);
@@ -1955,15 +2367,15 @@ struct PresentRenderer::Impl {
         for (size_t i = 0; i < views.size(); ++i) {
             if (views[i].rect.Empty()) continue;
             if (pose != nullptr) {
-                RecordDraws(cmd, views[i], views[i].draws, id_instanced_pipeline, instanced_pipeline_layout, sets[i],
-                            pose, flags, DrawPass::Id);
+                RecordDraws(cmd, views[i].rect, views[i].draws, id_instanced_pipeline, instanced_pipeline_layout,
+                            sets[i], pose, flags, DrawPass::Id);
             } else {
-                RecordDraws(cmd, views[i], views[i].draws, id_pipeline, pipeline_layout, sets[i], nullptr, flags,
-                            DrawPass::Id);
+                RecordDraws(cmd, views[i].rect, views[i].draws, id_pipeline, pipeline_layout, sets[i], nullptr,
+                            flags, DrawPass::Id);
             }
             if (!views[i].env_draws.empty())
-                RecordDraws(cmd, views[i], views[i].env_draws, id_pipeline, pipeline_layout, sets[i], nullptr, flags,
-                            DrawPass::Id);
+                RecordDraws(cmd, views[i].rect, views[i].env_draws, id_pipeline, pipeline_layout, sets[i], nullptr,
+                            flags, DrawPass::Id);
         }
         vkCmdEndRenderPass(cmd);
     }
@@ -1982,6 +2394,116 @@ struct PresentRenderer::Impl {
         push.rect[3] = static_cast<int32_t>(rect.height);
         vkCmdPushConstants(cmd, outline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0u, sizeof(push), &push);
         vkCmdDraw(cmd, 3u, 1u, 0u, 0u);
+    }
+
+    // One full-view triangle under the view's set: the sky or the ground grid.
+    void RecordFullscreen(VkCommandBuffer cmd, VkPipeline pipe, VkDescriptorSet set, const SceneViewport& rect) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0u, 1u, &set, 0u, nullptr);
+        SetViewport(cmd, rect);
+        vkCmdDraw(cmd, 3u, 1u, 0u, 0u);
+    }
+
+    // An overlay list (debug, ghost or extra instances) with the model on the push constant, under
+    // the viewport already bound; an empty list is skipped.
+    void RecordOverlay(VkCommandBuffer cmd, const RenderWorld& world, const std::vector<RenderInstance>& overlay_list,
+                       VkPipeline overlay_pipeline, VkDescriptorSet ubo_set) {
+        if (overlay_list.empty() || overlay_pipeline == VK_NULL_HANDLE) return;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, overlay_pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0u, 1u, &ubo_set, 0u, nullptr);
+        for (const RenderInstance& inst : overlay_list) {
+            if (inst.mesh_id == kNoId || inst.mesh_id >= world.meshes.Count()) continue;
+            if (inst.mesh_id >= mesh_cache.size()) continue;
+            const MeshCacheEntry& cached = mesh_cache[inst.mesh_id];
+            if (cached.index_count == 0u) continue;
+            PushBlock push{};
+            const Mat4 model = TransformToMatrix(inst.world_xform);
+            std::memcpy(push.model, model.m.data(), sizeof(push.model));
+            push.base_color[0] = 0.8f; push.base_color[1] = 0.8f;
+            push.base_color[2] = 0.8f; push.base_color[3] = 1.0f;
+            push.mr[0] = 0.0f; push.mr[1] = 1.0f; push.mr[2] = 1.0f; push.mr[3] = 0.0f;
+            if (inst.render_material_id != kNoId && inst.render_material_id < world.materials.size()) {
+                const scene::RenderMaterial& mat = world.materials[inst.render_material_id];
+                std::memcpy(push.base_color, mat.base_color, sizeof(push.base_color));
+                push.mr[0] = mat.metallic; push.mr[1] = mat.roughness; push.mr[2] = mat.opacity;
+                push.emissive[0] = mat.emissive[0]; push.emissive[1] = mat.emissive[1];
+                push.emissive[2] = mat.emissive[2];
+            }
+            vkCmdPushConstants(cmd, pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0u,
+                               sizeof(PushBlock), &push);
+            std::array<VkBuffer, 3> vbuffers{cached.pos.buffer, cached.nrm.buffer, cached.col.buffer};
+            std::array<VkDeviceSize, 3> offsets{0u, 0u, 0u};
+            vkCmdBindVertexBuffers(cmd, 0u, 3u, vbuffers.data(), offsets.data());
+            vkCmdBindIndexBuffer(cmd, cached.idx.buffer, 0u, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(cmd, cached.index_count, 1u, 0u, 0, 0u);
+        }
+    }
+
+    // Fits the sun's shadow map around the first shadowed Lit view's focus and hands it to every
+    // shadowed Lit view; returns that view, or -1 when none casts shadows.
+    static int FitSunShadow(const std::vector<RasterOptions>& options, std::vector<PreparedView>& views) {
+        int caster = -1;
+        Mat4 light_view_proj;
+        float bias = 0.0f;
+        for (size_t i = 0; i < views.size(); ++i) {
+            PreparedView& view = views[i];
+            const math::Vec3 sun{view.ubo.sun[0], view.ubo.sun[1], view.ubo.sun[2]};
+            if (options[i].view_mode != ViewMode::Lit || options[i].shadow_strength <= 0.0f || view.rect.Empty() ||
+                sun.LengthSq() == 0.0f)
+                continue;
+            if (caster < 0) {
+                caster = static_cast<int>(i);
+                const float radius = std::clamp(view.focus_distance * 0.9f + 1.0f, 2.0f, 80.0f);
+                const float depth = radius * 3.0f + 10.0f;
+                const bool overhead = std::abs(sun.z) > 0.99f;
+                const math::Vec3 up{0.0f, overhead ? 1.0f : 0.0f, overhead ? 0.0f : 1.0f};
+                const Mat4 rotation = LookAt({0.0f, 0.0f, 0.0f}, sun * -1.0f, up);
+                const math::Vec3& c = view.focus;
+                const auto row = [&](int r) {
+                    return rotation.m[r] * c.x + rotation.m[4 + r] * c.y + rotation.m[8 + r] * c.z;
+                };
+                // The focus in light space, snapped to whole texels so the shadows hold still as the camera moves.
+                const float texel = 2.0f * radius / static_cast<float>(kShadowMapSize);
+                const float x = std::floor(row(0) / texel) * texel, y = std::floor(row(1) / texel) * texel;
+                const float z = -row(2);
+                const Mat4 ortho = Orthographic(x - radius, x + radius, y - radius, y + radius, z - depth, z + depth);
+                light_view_proj = Multiply(ortho, rotation);
+                bias = 1.5f * texel / (2.0f * depth);
+            }
+            std::memcpy(view.ubo.light_view_proj, light_view_proj.m.data(), sizeof(view.ubo.light_view_proj));
+            view.ubo.shadow_params[0] = options[i].shadow_strength;
+            view.ubo.shadow_params[1] = bias;
+            view.ubo.shadow_params[2] = 1.0f / static_cast<float>(kShadowMapSize);
+            view.ubo.shadow_params[3] = options[i].shadow_filter_radius;
+        }
+        return caster;
+    }
+
+    // The sun's depth from the caster view's instances, env instances and extra instances.
+    void RecordShadowPass(VkCommandBuffer cmd, const RenderWorld& world, const PreparedView& view, VkDescriptorSet set,
+                          const std::vector<uint8_t>& flags, const PresentInterop* pose) {
+        VkClearValue clear{};
+        clear.depthStencil = {1.0f, 0u};
+        VkRenderPassBeginInfo rp{};
+        rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        rp.renderPass = shadow_pass;
+        rp.framebuffer = shadow_framebuffer;
+        rp.renderArea = {{0, 0}, {kShadowMapSize, kShadowMapSize}};
+        rp.clearValueCount = 1u;
+        rp.pClearValues = &clear;
+        vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+        const SceneViewport rect{true, 0u, 0u, kShadowMapSize, kShadowMapSize};
+        if (pose != nullptr) {
+            RecordDraws(cmd, rect, view.draws, shadow_instanced_pipeline, instanced_pipeline_layout, set, pose, flags,
+                        DrawPass::Scene);
+        } else {
+            RecordDraws(cmd, rect, view.draws, shadow_pipeline, pipeline_layout, set, nullptr, flags, DrawPass::Scene);
+        }
+        if (!view.env_draws.empty())
+            RecordDraws(cmd, rect, view.env_draws, shadow_pipeline, pipeline_layout, set, nullptr, flags,
+                        DrawPass::Scene);
+        RecordOverlay(cmd, world, world.extra_instances, shadow_pipeline, set);
+        vkCmdEndRenderPass(cmd);
     }
 
     static bool Marked(const std::vector<uint8_t>& flags) {
@@ -2033,11 +2555,11 @@ struct PresentRenderer::Impl {
         SceneViewport shot{};
         for (size_t i = 0; i < view_count; ++i) {
             prepared.push_back(Prepare(world, views[i]));
-            const UboSlot& slot = ubo_slots[frame * kMaxSceneViews + i];
-            UploadUbo(slot, prepared.back().ubo);
-            sets.push_back(slot.set);
+            sets.push_back(ubo_slots[frame * kMaxSceneViews + i].set);
             shot = Bounds(shot, prepared.back().rect);
         }
+        const int shadow_view = FitSunShadow(views, prepared);
+        for (size_t i = 0; i < view_count; ++i) UploadUbo(ubo_slots[frame * kMaxSceneViews + i], prepared[i].ubo);
 
         const bool do_capture =
             (capture_frame_ >= 0 && draw_counter_ == static_cast<uint64_t>(capture_frame_));
@@ -2068,6 +2590,8 @@ struct PresentRenderer::Impl {
         // push-constant pipelines draw the host transforms.
         const PresentInterop* pose =
             interop != nullptr && instanced_pipeline != VK_NULL_HANDLE ? interop : nullptr;
+        if (shadow_view >= 0)
+            RecordShadowPass(cmd, world, prepared[shadow_view], sets[shadow_view], options.instance_flags, pose);
         // The id pass feeds the selection outline and runs only while something is marked.
         const bool outline = !shot.Empty() && Marked(options.instance_flags);
         if (outline) RecordIdPass(cmd, prepared, sets, options.instance_flags, pose);
@@ -2089,68 +2613,35 @@ struct PresentRenderer::Impl {
         rp.pClearValues = clears.data();
         vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
 
-        // The overlays draw AFTER the opaque scene: the ghost behind it, then the debug
-        // overlay (collider wireframes + contact markers) THROUGH it. Model rides the push
-        // constant (no interop SSBO) and the view's viewport stays bound; an empty list is skipped.
-        const auto draw_overlay = [&](const std::vector<RenderInstance>& overlay_list, VkPipeline overlay_pipeline,
-                                      VkDescriptorSet ubo_set) {
-            if (overlay_list.empty() || overlay_pipeline == VK_NULL_HANDLE) return;
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, overlay_pipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
-                                    0u, 1u, &ubo_set, 0u, nullptr);
-            for (const RenderInstance& inst : overlay_list) {
-                if (inst.mesh_id == kNoId || inst.mesh_id >= world.meshes.Count()) continue;
-                if (inst.mesh_id >= mesh_cache.size()) continue;
-                const MeshCacheEntry& cached = mesh_cache[inst.mesh_id];
-                if (cached.index_count == 0u) continue;
-                PushBlock push{};
-                const Mat4 model = TransformToMatrix(inst.world_xform);
-                std::memcpy(push.model, model.m.data(), sizeof(push.model));
-                push.base_color[0] = 0.8f; push.base_color[1] = 0.8f;
-                push.base_color[2] = 0.8f; push.base_color[3] = 1.0f;
-                push.mr[0] = 0.0f; push.mr[1] = 1.0f; push.mr[2] = 1.0f; push.mr[3] = 0.0f;
-                if (inst.render_material_id != kNoId &&
-                    inst.render_material_id < world.materials.size()) {
-                    const scene::RenderMaterial& mat = world.materials[inst.render_material_id];
-                    std::memcpy(push.base_color, mat.base_color, sizeof(push.base_color));
-                    push.mr[0] = mat.metallic; push.mr[1] = mat.roughness; push.mr[2] = mat.opacity;
-                    push.emissive[0] = mat.emissive[0]; push.emissive[1] = mat.emissive[1];
-                    push.emissive[2] = mat.emissive[2];
-                }
-                vkCmdPushConstants(cmd, pipeline_layout,
-                                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0u,
-                                   sizeof(PushBlock), &push);
-                std::array<VkBuffer, 3> vbuffers{cached.pos.buffer, cached.nrm.buffer, cached.col.buffer};
-                std::array<VkDeviceSize, 3> offsets{0u, 0u, 0u};
-                vkCmdBindVertexBuffers(cmd, 0u, 3u, vbuffers.data(), offsets.data());
-                vkCmdBindIndexBuffer(cmd, cached.idx.buffer, 0u, VK_INDEX_TYPE_UINT32);
-                vkCmdDrawIndexed(cmd, cached.index_count, 1u, 0u, 0, 0u);
-            }
-        };
+        // A Lit view's sky goes down first and its ground grid before the scene. The overlays draw
+        // AFTER the opaque scene: the ghost behind it, then the debug overlay (collider wireframes +
+        // contact markers) THROUGH it.
         for (size_t i = 0; i < prepared.size(); ++i) {
             const PreparedView& view = prepared[i];
             if (view.rect.Empty()) continue;
             const bool wire = views[i].view_mode == ViewMode::Wireframe;
+            if (views[i].viewport_sky) RecordFullscreen(cmd, sky_pipeline, sets[i], view.rect);
+            if (views[i].viewport_grid) RecordFullscreen(cmd, ground_pipeline, sets[i], view.rect);
             if (pose != nullptr) {
-                RecordDraws(cmd, view, view.draws, wire ? wire_instanced_pipeline : instanced_pipeline,
+                RecordDraws(cmd, view.rect, view.draws, wire ? wire_instanced_pipeline : instanced_pipeline,
                             instanced_pipeline_layout, sets[i], pose, options.instance_flags, DrawPass::Scene);
             } else {
-                RecordDraws(cmd, view, view.draws, wire ? wire_pipeline : pipeline, pipeline_layout, sets[i], nullptr,
-                            options.instance_flags, DrawPass::Scene);
+                RecordDraws(cmd, view.rect, view.draws, wire ? wire_pipeline : pipeline, pipeline_layout, sets[i],
+                            nullptr, options.instance_flags, DrawPass::Scene);
             }
             if (!view.env_draws.empty())
-                RecordDraws(cmd, view, view.env_draws, wire ? wire_pipeline : pipeline, pipeline_layout, sets[i],
+                RecordDraws(cmd, view.rect, view.env_draws, wire ? wire_pipeline : pipeline, pipeline_layout, sets[i],
                             nullptr, options.instance_flags, DrawPass::Scene);
-            draw_overlay(world.extra_instances, wire ? wire_pipeline : pipeline, sets[i]);
+            RecordOverlay(cmd, world, world.extra_instances, wire ? wire_pipeline : pipeline, sets[i]);
             if (see_through && pose != nullptr) {
-                RecordDraws(cmd, view, view.draws, ghost_instanced_pipeline, instanced_pipeline_layout, sets[i], pose,
-                            options.instance_flags, DrawPass::SeeThrough);
+                RecordDraws(cmd, view.rect, view.draws, ghost_instanced_pipeline, instanced_pipeline_layout, sets[i],
+                            pose, options.instance_flags, DrawPass::SeeThrough);
             } else if (see_through) {
-                RecordDraws(cmd, view, view.draws, ghost_pipeline, pipeline_layout, sets[i], nullptr,
+                RecordDraws(cmd, view.rect, view.draws, ghost_pipeline, pipeline_layout, sets[i], nullptr,
                             options.instance_flags, DrawPass::SeeThrough);
             }
-            draw_overlay(world.ghost_instances, ghost_pipeline, sets[i]);
-            draw_overlay(world.debug_instances, debug_pipeline, sets[i]);
+            RecordOverlay(cmd, world, world.ghost_instances, ghost_pipeline, sets[i]);
+            RecordOverlay(cmd, world, world.debug_instances, debug_pipeline, sets[i]);
         }
 
         // The scene alone is read between two passes; the second loads it back for the overlay.

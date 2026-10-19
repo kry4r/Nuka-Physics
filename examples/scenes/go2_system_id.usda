@@ -407,6 +407,8 @@ def Xform "World"
     def Camera "track"
     {
         double3 xformOp:translate = (0.85, -1.45, 0.92)
+        float3 xformOp:rotateXYZ = (71.3, 0, 30.4)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
         float focalLength = 24
         float clippingRange:min = 0.01
         float clippingRange:max = 100
@@ -414,7 +416,9 @@ def Xform "World"
 
     def DistantLight "sun"
     {
+        float3 xformOp:rotateXYZ = (40, 0, -35)
+        uniform token[] xformOpOrder = ["xformOp:rotateXYZ"]
         color3f inputs:color = (1, 0.95, 0.9)
-        float inputs:intensity = 500
+        float inputs:intensity = 3000
     }
 }

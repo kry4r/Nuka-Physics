@@ -60,8 +60,9 @@ class DocumentHost {
 public:
     virtual ~DocumentHost() = default;
     virtual void PushParam(const ParamWrite& write) = 0;
-    // Rebuilds the world from the document with the worker parked; false when refused.
-    virtual bool Rebuild(const std::string& label) = 0;
+    // Rebuilds the world from the document with the worker parked; returns why it was refused,
+    // empty when it took.
+    virtual std::string Rebuild(const std::string& label) = 0;
     virtual void ScriptsChanged() = 0;
 };
 

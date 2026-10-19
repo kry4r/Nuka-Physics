@@ -656,11 +656,13 @@ struct VulkanRasterRenderer::Impl {
 
         VkPhysicalDeviceFeatures features{};
         // PRESENT enables fillModeNonSolid (when offered) so the viewer's see-through
-        // collider debug pass can rasterize wireframe; OFFSCREEN keeps zero features.
+        // collider debug pass can rasterize wireframe, and anisotropic filtering for its
+        // material maps; OFFSCREEN keeps zero features.
         if (present_capable) {
             VkPhysicalDeviceFeatures supported{};
             vkGetPhysicalDeviceFeatures(physical, &supported);
             features.fillModeNonSolid = supported.fillModeNonSolid;
+            features.samplerAnisotropy = supported.samplerAnisotropy;
         }
         VkDeviceCreateInfo create_info{};
         create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;

@@ -251,6 +251,9 @@ struct RtView {
 enum class ViewLayout : uint8_t { Single, Split, Quad };
 inline constexpr uint32_t kViewPanes = 4u;
 
+// Whether the Lit view draws its ground grid: under scenes without a floor of their own, always or never.
+enum class GroundGrid : uint8_t { Auto, On, Off };
+
 // A pane the layout shows, as its header names it; the host lists them in layout order.
 struct ViewPane {
     uint32_t index = 0u;  // which of the kViewPanes views it draws
@@ -280,6 +283,10 @@ struct ViewerUiState {
 
     bool show_colliders = false;
     bool show_contacts = false;
+    // The Lit view's sun shadows, distance fog and ground grid.
+    bool shadows = true;
+    bool fog = false;
+    GroundGrid ground_grid = GroundGrid::Auto;
     nuka::render::ViewMode view_mode = nuka::render::ViewMode::Lit;  // the active pane's
     ViewLayout view_layout = ViewLayout::Single;
     uint32_t active_view = 0u;  // the pane input, the gizmo and the HUD go to

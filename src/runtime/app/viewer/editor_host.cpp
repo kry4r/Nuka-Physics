@@ -14,6 +14,7 @@
 #include "render/raster/interop_transform_ssbo.hpp"
 #include "render/raster/vulkan_present_renderer.hpp"
 #include "render/render_world.hpp"
+#include "render/scene_asset.hpp"
 #include "render/viewer_resources.hpp"
 #include "render/window/window_surface.hpp"
 #include "runtime/app/viewer/camera_controller.hpp"
@@ -961,7 +962,7 @@ struct EditorHost::State : DocumentHost {
     void StartShell();
     void StartChecks();
     void PushParam(const ParamWrite& write) override;
-    bool Rebuild(const std::string& label) override;
+    std::string Rebuild(const std::string& label) override;
     void ScriptsChanged() override { SyncScripts(); }
     ApplyResult ApplyTxn(const EditTxn& txn);
     void Reselect(const std::vector<std::string>& paths);
@@ -1054,6 +1055,14 @@ struct EditorHost::State : DocumentHost {
     render::RasterOptions ViewOptions(const CameraController& camera);
     // The present options for pane `rect` through `camera` in `mode`, without instance flags.
     render::RasterOptions ViewOptions(const CameraController& camera, const SceneViewportRect& rect, render::ViewMode mode);
+    // A Lit view's daylight sky, sun, shadows and fog, under the scene's own sky and lights.
+    void LightView(render::RasterOptions& opts);
+    // Whether the Lit view draws its ground grid; under GroundGrid::Auto, when no shown instance is a floor.
+    bool GroundGridShown();
+    // The grid's height: the shown scene's bottom when that is below z = 0.
+    float GroundGridHeight();
+    // Rescans the shown instances for a floor and their bottom once the scene or its instances change.
+    void RefreshFloor();
     // Each shown instance's node path, and its selected, hovered and locked flags.
     const std::vector<std::string>& InstancePaths();
     std::vector<uint8_t> InstanceFlags();
@@ -1254,7 +1263,7 @@ struct EditorHost::State : DocumentHost {
     void PushEdits();
     void DrawWorld(const render::RenderWorld& rw, const std::vector<render::RasterOptions>& views);
     void PrintSummary();
-    void SetLoadError(const std::string& path);
+    void SetLoadError(const std::string& path, const std::string& reason);
     void CreateWorld(const std::string& path);
     void ApplyLoad(const std::string& path);
     void Attach(const std::string& path);
@@ -1396,6 +1405,11 @@ struct EditorHost::State : DocumentHost {
     float click_x_ = 0.0f, click_y_ = 0.0f;
     std::vector<std::string> instance_paths_;  // by shown instance; cleared when instances change
     uint64_t instance_paths_version_ = ~0ull;
+    // Whether a shown instance is a floor and the lowest shown point, by scene version and instance count.
+    bool scene_floor_ = false;
+    float scene_bottom_ = 0.0f;
+    uint64_t floor_version_ = ~0ull;
+    size_t floor_instances_ = 0u;
     std::string hovered_path_;  // the body under the pointer, outlined as hovered
     bool hover_due_ = false;    // the pointer moved over the viewport since the last hover pick
     float hover_x_ = 0.0f, hover_y_ = 0.0f;
@@ -2911,7 +2925,81 @@ render::RasterOptions EditorHost::State::ViewOptions(const CameraController& cam
             opts.background = {byte(background.x), byte(background.y), byte(background.z), 255u};
     }
     opts.view_mode = mode;
+    if (mode == render::ViewMode::Lit) LightView(opts);
     return opts;
+}
+
+void EditorHost::State::LightView(render::RasterOptions& opts) {
+    const auto rgb = [](float* dst, float r, float g, float b) { dst[0] = r; dst[1] = g; dst[2] = b; };
+    opts.viewport_sky = opts.use_sun_light = true;
+    rgb(opts.sky_top, 0.33f, 0.46f, 0.66f);
+    rgb(opts.sky_bottom, 0.70f, 0.75f, 0.80f);
+    rgb(opts.ground_color, 0.13f, 0.13f, 0.125f);
+    rgb(opts.sun_ambient_sky, 0.32f, 0.37f, 0.45f);
+    rgb(opts.sun_ambient_ground, 0.14f, 0.13f, 0.12f);
+    rgb(opts.sun_direction, 0.45f, -0.40f, 0.80f);
+    rgb(opts.sun_color, 2.9f, 2.8f, 2.6f);
+    opts.shadow_strength = 0.85f;
+    if (loaded_) render::ApplySceneEnvironment(opts, loaded_->scene.Environment());
+    if (!ui_state_.shadows) opts.shadow_strength = 0.0f;
+    opts.fog_density = ui_state_.fog ? 0.02f : 0.0f;
+    std::copy(opts.sky_bottom, opts.sky_bottom + 3, opts.fog_color);
+    opts.viewport_grid = GroundGridShown();
+    opts.viewport_grid_height = GroundGridHeight();
+}
+
+// Whether an instance spans a floor (2 m or more across in x and y, and under half as tall), and
+// the lowest point of every instance in `bottom`.
+static bool ScanFloor(const render::RenderWorld& w, float* bottom) {
+    constexpr float kInf = std::numeric_limits<float>::infinity();
+    std::vector<std::array<math::Vec3, 2>> bounds(w.meshes.Count(), {math::Vec3{kInf, kInf, kInf},
+                                                                     math::Vec3{-kInf, -kInf, -kInf}});
+    std::vector<char> known(w.meshes.Count(), 0);
+    const auto grow = [](std::array<math::Vec3, 2>& box, const math::Vec3& p) {
+        box[0] = {std::min(box[0].x, p.x), std::min(box[0].y, p.y), std::min(box[0].z, p.z)};
+        box[1] = {std::max(box[1].x, p.x), std::max(box[1].y, p.y), std::max(box[1].z, p.z)};
+    };
+    const auto spans = [&](const render::RenderInstance& inst) {
+        if (inst.mesh_id == render::kNoId || inst.mesh_id >= w.meshes.Count()) return false;
+        std::array<math::Vec3, 2>& local = bounds[inst.mesh_id];
+        if (!known[inst.mesh_id]) {
+            known[inst.mesh_id] = 1;
+            const std::vector<float>& p = w.meshes.Geometry(inst.mesh_id).positions;
+            for (size_t v = 0; v + 2 < p.size(); v += 3) grow(local, {p[v], p[v + 1], p[v + 2]});
+        }
+        if (local[0].x > local[1].x) return false;
+        std::array<math::Vec3, 2> box{math::Vec3{kInf, kInf, kInf}, math::Vec3{-kInf, -kInf, -kInf}};
+        for (int k = 0; k < 8; ++k)
+            grow(box, inst.world_xform.TransformPoint({local[k & 1].x, local[(k >> 1) & 1].y, local[k >> 2].z}));
+        *bottom = std::min(*bottom, box[0].z);
+        const float across = std::min(box[1].x - box[0].x, box[1].y - box[0].y);
+        return across >= 2.0f && box[1].z - box[0].z < across * 0.5f;
+    };
+    bool floor = false;
+    for (const render::RenderInstance& inst : w.instances) floor = spans(inst) || floor;
+    for (const render::RenderInstance& inst : w.env_instances) floor = spans(inst) || floor;
+    return floor;
+}
+
+bool EditorHost::State::GroundGridShown() {
+    if (ui_state_.ground_grid != GroundGrid::Auto) return ui_state_.ground_grid == GroundGrid::On;
+    RefreshFloor();
+    return !scene_floor_;
+}
+
+float EditorHost::State::GroundGridHeight() {
+    RefreshFloor();
+    return scene_bottom_;
+}
+
+void EditorHost::State::RefreshFloor() {
+    const render::RenderWorld& w = ShownWorld();
+    const size_t count = w.instances.size() + w.env_instances.size();
+    if (floor_version_ == ui_state_.scene_version && floor_instances_ == count) return;
+    floor_version_ = ui_state_.scene_version;
+    floor_instances_ = count;
+    scene_bottom_ = 0.0f;
+    scene_floor_ = ScanFloor(w, &scene_bottom_);
 }
 
 void EditorHost::State::StepRt(const CameraController& camera) {
@@ -3702,8 +3790,8 @@ json::Value EditorHost::State::ViewJson(uint32_t index) {
                    {"fov", json::Value::Float(camera.fov_degrees)}});
 }
 
-void EditorHost::State::SetLoadError(const std::string& path) {
-    ui_state_.load_error = "Could not load scene: " + path + ". Check the application log for details.";
+void EditorHost::State::SetLoadError(const std::string& path, const std::string& reason) {
+    ui_state_.load_error = "Could not load scene: " + path + ". " + reason;
     std::snprintf(ui_state_.load_path, sizeof(ui_state_.load_path), "%s", path.c_str());
 }
 
@@ -3735,12 +3823,12 @@ void EditorHost::State::ApplyLoad(const std::string& path) {
                          "nuka_world_rebuild_from_scene");
     } catch (const std::exception& e) {
         Emit(stderr, std::string("[nuka_editor] load failed: ") + e.what() + "\n");
-        SetLoadError(path);
+        SetLoadError(path, e.what());
         return;
     }
     // The scene's cameras and lidars render from here on; every rebuild re-attaches them.
     if (const nuka_result_t r = nuka_world_attach_scene_sensors(world_, nullptr, nullptr); r != NUKA_RESULT_OK)
-        Emit(stderr, std::string("[nuka_editor] scene sensors not attached: ") + nuka_result_message(r) + "\n");
+        Emit(stderr, "[nuka_editor] scene sensors not attached: " + ResultText(r) + "\n");
     ApplyUnload();
     Attach(path);
 }
@@ -3750,7 +3838,7 @@ void EditorHost::State::Attach(const std::string& path) {
         loaded_ = AttachEditorScene(world_, path, cache_);
     } catch (const std::exception& e) {
         Emit(stderr, std::string("[nuka_editor] attach failed: ") + e.what() + "\n");
-        SetLoadError(path);
+        SetLoadError(path, e.what());
         return;
     }
     OnLoaded(path);
@@ -3896,7 +3984,7 @@ void EditorHost::State::PushParam(const ParamWrite& write) {
 
 // Runs with the worker parked. The rebuilt world continues the timeline from this tick, and
 // the transport resumes because the binding starts paused while the UI still plays.
-bool EditorHost::State::Rebuild(const std::string& label) {
+std::string EditorHost::State::Rebuild(const std::string& label) {
     entity_drag_.Cancel();
     present_->WaitIdle();
     const uint64_t tick = worker_.Tick();
@@ -3904,10 +3992,10 @@ bool EditorHost::State::Rebuild(const std::string& label) {
     // Moves queued this frame land before the state migrates by body name.
     for (const PoseWrite& write : loaded_->sim->TakePoseWrites())
         ApplyPoseWrite(world_, loaded_->Layout(), sent_env_, write);
-    if (!RecookEditorScene(*loaded_, cache_)) return false;
+    if (std::string why = RecookEditorScene(*loaded_, cache_); !why.empty()) return why;
     OnRebound(tick, sim_time);
     doc_.AddBranch(TimelineBranch{tick, Generation(), label});
-    return true;
+    return {};
 }
 
 // Runs with the worker parked. Selection follows the node the edit created or moved, else
@@ -3988,7 +4076,9 @@ ActionResult EditorHost::State::RunAction(const std::string& id, const json::Val
 }
 
 ActionResult EditorHost::State::SaveScene(const std::string& path) {
-    scene::nks::Save(loaded_->scene, path);
+    scene::SceneIR saved = loaded_->scene;
+    RelativeMaps(saved, path);
+    scene::nks::Save(saved, path);
     doc_.MarkSaved();
     DropAutosave();
     doc_path_ = NormalPath(path);
@@ -7199,17 +7289,18 @@ void EditorHost::State::RegisterSimActions() {
                           return ActionResult::Fail("count: 1 to " + std::to_string(kMaxEnvs) + " environments");
                       const auto n = static_cast<uint32_t>(count);
                       if (n == ui_state_.envs.count) return Ok(EnvsJson());
-                      bool ok = false;
+                      std::string why;
                       worker_.Exclusive([&] {
                           entity_drag_.Cancel();
                           present_->WaitIdle();
-                          ok = ResizeEditorEnvs(*loaded_, cache_, n);
-                          if (!ok) return;
+                          why = ResizeEditorEnvs(*loaded_, cache_, n);
+                          if (!why.empty()) return;
                           ui_state_.env_index %= n;
                           OnRebound(0u, 0.0);
                           doc_.AddBranch(TimelineBranch{0u, Generation(), std::to_string(n) + " environments"});
                       });
-                      if (!ok) return ActionResult::Fail("the world refused " + std::to_string(n) + " environments");
+                      if (!why.empty())
+                          return ActionResult::Fail("the world refused " + std::to_string(n) + " environments: " + why);
                       return Ok(EnvsJson());
                   }});
     // A viewport tool toggles against Select; `on` sets it.
@@ -7384,6 +7475,31 @@ void EditorHost::State::RegisterViewActions() {
                   [this](const json::Value&) {
                       ui_state_.show_colliders = ui_state_.show_contacts = false;
                       return Ok();
+                  }});
+    actions_.Add({"view.shadows", "Sun Shadows", "view", "", ShortcutScope::Global, {},
+                  [this] { return ui_state_.shadows; },
+                  [this](const json::Value& args) {
+                      ui_state_.shadows = BoolArg(args, "on", !ui_state_.shadows);
+                      return Ok();
+                  }});
+    actions_.Add({"view.fog", "Distance Fog", "view", "", ShortcutScope::Global, {},
+                  [this] { return ui_state_.fog; },
+                  [this](const json::Value& args) {
+                      ui_state_.fog = BoolArg(args, "on", !ui_state_.fog);
+                      return Ok();
+                  }});
+    // The Lit view's ground grid: mode auto (under scenes without a floor), on or off; a bare call
+    // flips what is shown.
+    actions_.Add({"view.ground_grid", "Ground Grid", "view", "", ShortcutScope::Global, {},
+                  [this] { return GroundGridShown(); },
+                  [this](const json::Value& args) {
+                      const std::string mode = StrArg(args, "mode", GroundGridShown() ? "off" : "on");
+                      if (mode == "auto") ui_state_.ground_grid = GroundGrid::Auto;
+                      else if (mode == "on") ui_state_.ground_grid = GroundGrid::On;
+                      else if (mode == "off") ui_state_.ground_grid = GroundGrid::Off;
+                      else return ActionResult::Fail("the mode is auto, on or off");
+                      return Ok(Object({{"mode", json::Value::Str(mode)},
+                                        {"shown", json::Value::Bool(GroundGridShown())}}));
                   }});
     // The next drawn frame is written as a PPM.
     actions_.Add({"view.screenshot", "Screenshot", "view", "", ShortcutScope::Global, {}, {},

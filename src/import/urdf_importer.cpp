@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <sstream>
@@ -156,6 +157,27 @@ static scene::SceneIR ParseUrdf(tinyxml2::XMLElement* robot, const std::string& 
     // Dedup map for synthesized visual materials (URDF <material name=> is a
     // named, potentially shared, color) -> the MaterialId it was first added as.
     std::unordered_map<std::string, scene::MaterialId> material_names;
+    // A <material> with a color becomes a MaterialRecord shared by name; a bare <material name="x"/>
+    // takes the color declared under that name, at robot level or by an earlier visual.
+    const auto resolve_material = [&](tinyxml2::XMLElement* mat,
+                                      const std::string& fallback) -> std::optional<scene::MaterialId> {
+        const char* mname = mat->Attribute("name");
+        const std::string name = mname ? mname : fallback;
+        if (const auto found = material_names.find(name); found != material_names.end()) return found->second;
+        auto* color = mat->FirstChildElement("color");
+        const char* rgba = color != nullptr ? color->Attribute("rgba") : nullptr;
+        if (rgba == nullptr) return std::nullopt;
+        scene::MaterialRecord mrec;
+        mrec.name = name;
+        std::istringstream ss(rgba);
+        ss >> mrec.base_color.x >> mrec.base_color.y >> mrec.base_color.z >> mrec.alpha;
+        const scene::MaterialId mid = scene.AddMaterial(std::move(mrec));
+        material_names[name] = mid;
+        return mid;
+    };
+    for (auto* mat = robot->FirstChildElement("material"); mat != nullptr;
+         mat = mat->NextSiblingElement("material"))
+        resolve_material(mat, "material");
 
     // -- Parse <link> elements ------------------------------------------------
     for (auto* link = robot->FirstChildElement("link");
@@ -308,32 +330,8 @@ static scene::SceneIR ParseUrdf(tinyxml2::XMLElement* robot, const std::string& 
 
             shape.local_transform = ParseOrigin(visual->FirstChildElement("origin"));
 
-            // Inline visual material color -> synthesized MaterialRecord. URDF
-            // <material name="..."><color rgba="r g b a"/></material>. A bare
-            // <material name="x"/> reference (no color) is skipped (no color to
-            // carry); duplicate names are deduped by reusing the existing record.
             if (auto* mat = visual->FirstChildElement("material")) {
-                if (auto* color = mat->FirstChildElement("color")) {
-                    if (const char* rgba = color->Attribute("rgba")) {
-                        std::istringstream ss(rgba);
-                        scene::MaterialRecord mrec;
-                        const char* mname = mat->Attribute("name");
-                        mrec.name = mname ? mname : (link_name + "_vis_mat");
-                        ss >> mrec.base_color.x >> mrec.base_color.y
-                           >> mrec.base_color.z >> mrec.alpha;
-                        const auto found = material_names.find(mrec.name);
-                        if (found != material_names.end()) {
-                            shape.material_id = found->second;
-                        } else {
-                            const scene::MaterialId mid =
-                                scene.AddMaterial(std::move(mrec));
-                            material_names[mat->Attribute("name")
-                                               ? mat->Attribute("name")
-                                               : (link_name + "_vis_mat")] = mid;
-                            shape.material_id = mid;
-                        }
-                    }
-                }
+                if (const auto mid = resolve_material(mat, link_name + "_vis_mat")) shape.material_id = *mid;
             }
 
             scene.AddCollisionShape(std::move(shape));
@@ -678,8 +676,9 @@ UrdfImportResult ImportUrdf(const std::string& path, UrdfImportProfile profile) 
 
 scene::SceneIR LoadUrdf(const std::string& path) {
     tinyxml2::XMLDocument doc;
-    if (doc.LoadFile(path.c_str()) != tinyxml2::XML_SUCCESS)
-        throw std::runtime_error("URDF: failed to load file: " + path);
+    if (const tinyxml2::XMLError err = doc.LoadFile(path.c_str()); err != tinyxml2::XML_SUCCESS)
+        throw std::runtime_error("URDF: failed to load file: " + path + " (" +
+                                 tinyxml2::XMLDocument::ErrorIDToName(err) + ")");
     auto* robot = doc.FirstChildElement("robot");
     if (!robot) throw std::runtime_error("URDF: missing <robot> root element in " + path);
     return ParseUrdf(robot, path);

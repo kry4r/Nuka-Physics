@@ -652,14 +652,14 @@ ApplyResult EditorDocument::Apply(const EditTxn& txn) {
     if (entry.forward.ops.empty()) return result;
     entry.rebuild = out.rebuild;
     entry.focus = out.focus;
-    if (entry.rebuild && !host_->Rebuild(txn.label)) {
+    if (const std::string why = entry.rebuild ? host_->Rebuild(txn.label) : std::string(); !why.empty()) {
         // The world kept its scene: take back the live previews, then the document.
         ReplayProperties(entry.inverse, false);
         es_->scene = std::move(entry.before);
         records_.Build(es_->scene);
         host_->ScriptsChanged();
         result.ok = false;
-        result.error = "the world refused the rebuild; the edit was rolled back";
+        result.error = "the world refused the rebuild (" + why + "); the edit was rolled back";
         return result;
     }
     // A rebuild cooked the written values already.
@@ -710,11 +710,12 @@ ApplyResult EditorDocument::Restore(const Entry& entry, bool forward) {
     }
     scene::SceneIR prior = std::exchange(es_->scene, forward ? entry.after : entry.before);
     records_.Build(es_->scene);
-    if (entry.rebuild && !host_->Rebuild((forward ? "redo " : "undo ") + txn.label)) {
+    const std::string why = entry.rebuild ? host_->Rebuild((forward ? "redo " : "undo ") + txn.label) : std::string();
+    if (!why.empty()) {
         es_->scene = std::move(prior);
         records_.Build(es_->scene);
         result.ok = false;
-        result.error = "the world refused the rebuild";
+        result.error = "the world refused the rebuild (" + why + ")";
         return result;
     }
     ReplayProperties(txn, entry.rebuild);

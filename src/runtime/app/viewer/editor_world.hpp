@@ -38,6 +38,9 @@ struct WorldLayout {
 // Throws std::runtime_error when a query fails; `what` names the call.
 void CheckResult(nuka_result_t result, const char* what);
 
+// A failed call's result message, followed by the text of the exception behind it when it threw.
+std::string ResultText(nuka_result_t result);
+
 // One element of a field, `row` elements in.
 template <class T>
 T DownloadRow(nuka_world_handle world, nuka_state_field_t field, size_t row) {

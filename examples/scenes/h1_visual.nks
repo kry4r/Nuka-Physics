@@ -9244,12 +9244,12 @@
     {
       "name": "imu-angular-velocity",
       "type": "imu",
-      "attached_body": 4294967295,
+      "attached_body": 11,
       "local": {
         "pos": [
-          0.0,
-          0.0,
-          0.0
+          -0.0445200019,
+          -0.0189100001,
+          0.277559996
         ],
         "quat": [
           1.0,
@@ -9263,12 +9263,12 @@
     {
       "name": "imu-linear-acceleration",
       "type": "imu",
-      "attached_body": 4294967295,
+      "attached_body": 11,
       "local": {
         "pos": [
-          0.0,
-          0.0,
-          0.0
+          -0.0445200019,
+          -0.0189100001,
+          0.277559996
         ],
         "quat": [
           1.0,

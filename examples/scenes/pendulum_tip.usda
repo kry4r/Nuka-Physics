@@ -62,6 +62,6 @@ def Xform "World"
     def DistantLight "sun"
     {
         color3f inputs:color = (1, 0.95, 0.9)
-        float inputs:intensity = 500
+        float inputs:intensity = 3000
     }
 }

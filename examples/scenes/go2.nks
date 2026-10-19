@@ -465,7 +465,7 @@
         {
           "name": "geom_7",
           "collision_shape": {
-            "type": "box",
+            "type": "sphere",
             "local": {
               "pos": [
                 0.293000013,
@@ -484,7 +484,7 @@
               0.0,
               0.0
             ],
-            "radius": 0.5,
+            "radius": 0.0469999984,
             "half_height": 0.5,
             "material_id": 4294967295,
             "contype": 1,

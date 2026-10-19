@@ -67,6 +67,9 @@ layout(location = 2) out vec2 vUv;
 layout(location = 3) out vec4 vBaseColor;
 layout(location = 4) out vec4 vMr;
 layout(location = 5) out vec4 vEmissive;
+// The instance's own frame, where the viewport projects image maps.
+layout(location = 7) out vec3 vLocalPos;
+layout(location = 8) flat out mat3 vLocalToWorld;
 
 void main() {
     mat4 model = instances.model[gl_InstanceIndex];
@@ -74,6 +77,8 @@ void main() {
     vWorldPos = world.xyz;
     vWorldNormal = mat3(model) * inNormal;
     vUv = vec2(0.0, 0.0);
+    vLocalPos = inPosition;
+    vLocalToWorld = mat3(model);
     vBaseColor = vec4(pc.base_color.rgb * inColor, pc.base_color.a);
     vMr = pc.mr;
     vEmissive = pc.emissive;

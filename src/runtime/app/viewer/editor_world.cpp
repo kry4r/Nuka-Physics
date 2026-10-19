@@ -132,7 +132,13 @@ render::MeshGeometry TerrainMesh(const terrain::HeightField& hf) {
 
 void CheckResult(nuka_result_t result, const char* what) {
     if (result != NUKA_RESULT_OK)
-        throw std::runtime_error(std::string(what) + ": " + nuka_result_message(result));
+        throw std::runtime_error(std::string(what) + ": " + ResultText(result));
+}
+
+std::string ResultText(nuka_result_t result) {
+    const std::string detail = nuka_last_error_message();
+    const std::string text = nuka_result_message(result);
+    return detail.empty() ? text : text + ": " + detail;
 }
 
 bool ResolvePose(const render::PoseSource& source, const std::vector<math::Transform>& links,

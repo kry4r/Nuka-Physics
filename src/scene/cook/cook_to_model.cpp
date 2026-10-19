@@ -177,8 +177,10 @@ uint32_t BucketFor(const CookedBlob& blob, uint32_t shape_row,
     nk::ModelMaterialBucket source(profile), row;
     if (!nk::CanonicalizeContactProfileForUpload(source, &row)) {
         throw std::runtime_error(
-            "CookToModel: contact profile requires finite values, nonnegative friction, "
-            "condim 1/3, and nonnegative margin/gap");
+            "CookToModel: contact profile of shape row " + std::to_string(shape_row) + " (condim " +
+            std::to_string(profile.condim) + ", friction " + std::to_string(profile.mu1) + ", margin " +
+            std::to_string(profile.margin) + ", gap " + std::to_string(profile.gap) +
+            ") requires finite values, nonnegative friction, condim 1/3, and nonnegative margin/gap");
     }
     for (uint32_t b = 0; b < buckets.size(); ++b) {
         if (std::memcmp(buckets[b].values, row.values, sizeof(row.values)) == 0) return b;

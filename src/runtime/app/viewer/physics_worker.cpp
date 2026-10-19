@@ -98,7 +98,7 @@ SensorReading ReadSensor(nuka_world_handle world, uint32_t index, uint32_t plane
     }
     if (r != NUKA_RESULT_OK) {
         out.values.clear();
-        out.error = nuka_result_message(r);
+        out.error = ResultText(r);
     }
     return out;
 }
@@ -519,7 +519,7 @@ bool PhysicsWorker::Apply(const TickCommand& cmd) {
                         nuka_world_set_param(bind_.world, cmd.index, cmd.element, cmd.values[0]);
                     r.error = result != NUKA_RESULT_OK;
                     if (r.error)
-                        r.text = std::string("[nuka_editor] parameter write refused: ") + nuka_result_message(result) + "\n";
+                        r.text = "[nuka_editor] parameter write refused: " + ResultText(result) + "\n";
                     Report(std::move(r));
                     return false;
                 }
@@ -639,7 +639,7 @@ bool PhysicsWorker::Apply(const TickCommand& cmd) {
                                                               image.rgb.data(), image.rgb.size(), nullptr);
             if (r != NUKA_RESULT_OK) {
                 image.rgb.clear();
-                image.error = nuka_result_message(r);
+                image.error = ResultText(r);
             }
             std::lock_guard<std::mutex> lock(beauty_mu_);
             beauty_ = std::move(image);
@@ -960,7 +960,7 @@ IkReport RunIk(nuka_world_handle world, uint32_t links_per_env, const TickComman
     request.target_count = static_cast<uint32_t>(cmd.ik_targets.size());
     nuka_ik_result_t result{report.q.data(), report.position_error.data(), report.rotation_error.data(), 0u, 0u, 0u};
     const nuka_result_t r = nuka_world_solve_ik(world, &request, &result);
-    if (r != NUKA_RESULT_OK) report.error = nuka_result_message(r);
+    if (r != NUKA_RESULT_OK) report.error = ResultText(r);
     report.iterations = result.iterations;
     report.joints = result.joints;
     report.at_limit = result.at_limit;

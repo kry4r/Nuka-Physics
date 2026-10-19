@@ -10,6 +10,13 @@
 #include <string>
 
 namespace nuka::c_abi {
+namespace {
+
+// The text of the last exception mapped on this thread, kept until nuka_last_error_message takes it.
+thread_local std::string g_last_error;
+thread_local std::string g_taken_error;
+
+}  // namespace
 
 HandleTable<nuka_device_t, DeviceRecord>& DeviceTable() {
     static HandleTable<nuka_device_t, DeviceRecord> table;
@@ -32,8 +39,9 @@ nuka_result_t MapStatusToResult(phi::Status status) noexcept {
 }
 
 nuka_result_t MapExceptionToResult(const std::exception& error) noexcept {
-    if (dynamic_cast<const std::invalid_argument*>(&error)) return NUKA_RESULT_INVALID_ARG;
     const std::string message = error.what();
+    g_last_error = message;
+    if (dynamic_cast<const std::invalid_argument*>(&error)) return NUKA_RESULT_INVALID_ARG;
     if (message.find("cuda") != std::string::npos ||
         message.find("CUDA") != std::string::npos) {
         return NUKA_RESULT_CUDA_ERROR;
@@ -76,6 +84,12 @@ const char* nuka_result_message(nuka_result_t result) {
         case NUKA_RESULT_INTERNAL: return "internal error";
         default: return "unknown result";
     }
+}
+
+const char* nuka_last_error_message(void) {
+    nuka::c_abi::g_taken_error = std::move(nuka::c_abi::g_last_error);
+    nuka::c_abi::g_last_error.clear();
+    return nuka::c_abi::g_taken_error.c_str();
 }
 
 } // extern "C"

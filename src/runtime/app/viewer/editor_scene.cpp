@@ -1,16 +1,34 @@
 #include "runtime/app/viewer/editor_scene.hpp"
 
 #include "render/render_world.hpp"
+#include "runtime/app/viewer/editor_profile.hpp"
 #include "scene/format/nks.hpp"
 
 #include <chrono>
 #include <cstdio>
 #include <exception>
+#include <filesystem>
+#include <string>
 #include <system_error>
 #include <utility>
 
 namespace nuka::runtime::app::viewer {
 namespace {
+
+// Applies `rewrite` to every material's image map paths, touching only the records it changes.
+template <typename Rewrite>
+void RewriteMaps(scene::SceneIR& scene, Rewrite rewrite) {
+    for (size_t i = 0; i < scene.Materials().size(); ++i) {
+        const scene::MaterialRecord& m = scene.Materials()[i];
+        std::string albedo = rewrite(m.albedo_map), roughness = rewrite(m.roughness_map);
+        std::string normal = rewrite(m.normal_map);
+        if (albedo == m.albedo_map && roughness == m.roughness_map && normal == m.normal_map) continue;
+        scene::MaterialRecord& rec = scene.GetMaterialMut(m.id);
+        rec.albedo_map = std::move(albedo);
+        rec.roughness_map = std::move(roughness);
+        rec.normal_map = std::move(normal);
+    }
+}
 
 // Binds the world's current layout: render world, terrain, rest drive targets.
 void BindWorld(EditorScene& es) {
@@ -30,24 +48,41 @@ void BindWorld(EditorScene& es) {
 
 // Saves the document to the cache, rebuilds the world from that file and binds the result.
 template <typename Rebuild>
-bool RebuildFromDocument(EditorScene& es, SceneCache& cache, Rebuild rebuild) {
+std::string RebuildFromDocument(EditorScene& es, SceneCache& cache, Rebuild rebuild) {
     try {
         const std::string file = cache.NextFile();
         scene::nks::Save(es.scene, file);
         const nuka_result_t result = rebuild(file.c_str());
         if (result != NUKA_RESULT_OK) {
-            std::fprintf(stderr, "[nuka_editor] rebuild refused: %s\n", nuka_result_message(result));
-            return false;
+            const std::string why = ResultText(result);
+            std::fprintf(stderr, "[nuka_editor] rebuild refused: %s\n", why.c_str());
+            return why;
         }
         BindWorld(es);
-        return true;
+        return {};
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[nuka_editor] rebuild failed: %s\n", e.what());
-        return false;
+        return e.what();
     }
 }
 
 }  // namespace
+
+void AnchorMaps(scene::SceneIR& scene, const std::string& scene_path) {
+    const std::filesystem::path dir = Utf8Path(NormalPath(scene_path)).parent_path();
+    RewriteMaps(scene, [&](const std::string& map) {
+        return map.empty() || Utf8Path(map).is_absolute() ? map : PathText((dir / Utf8Path(map)).lexically_normal());
+    });
+}
+
+void RelativeMaps(scene::SceneIR& scene, const std::string& scene_path) {
+    const std::filesystem::path dir = Utf8Path(NormalPath(scene_path)).parent_path();
+    RewriteMaps(scene, [&](const std::string& map) {
+        if (map.empty() || Utf8Path(map).is_relative()) return map;
+        const std::u8string relative = Utf8Path(map).lexically_relative(dir).generic_u8string();
+        return relative.empty() ? map : std::string(relative.begin(), relative.end());
+    });
+}
 
 SceneCache::SceneCache()
     : dir_(std::filesystem::temp_directory_path() / "nuka_editor" /
@@ -76,16 +111,17 @@ std::unique_ptr<EditorScene> AttachEditorScene(nuka_world_handle world, const st
     const std::string file = cache.NextFile();
     CheckResult(nuka_world_export_scene(world, file.c_str()), "nuka_world_export_scene");
     es->scene = scene::nks::Load(file);
+    AnchorMaps(es->scene, path);
     BindWorld(*es);
     return es;
 }
 
-bool RecookEditorScene(EditorScene& es, SceneCache& cache) {
+std::string RecookEditorScene(EditorScene& es, SceneCache& cache) {
     return RebuildFromDocument(es, cache,
                                [&](const char* file) { return nuka_world_rebuild_from_scene(es.world, file, 0u); });
 }
 
-bool ResizeEditorEnvs(EditorScene& es, SceneCache& cache, uint32_t envs) {
+std::string ResizeEditorEnvs(EditorScene& es, SceneCache& cache, uint32_t envs) {
     return RebuildFromDocument(es, cache,
                                [&](const char* file) { return nuka_world_rebuild_with_envs(es.world, file, envs); });
 }

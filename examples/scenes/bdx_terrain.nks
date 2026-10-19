@@ -4217,12 +4217,12 @@
   {
    "name": "upvector",
    "type": "frame_pose",
-   "attached_body": 4294967295,
+   "attached_body": 0,
    "local": {
     "pos": [
-     0.0,
-     0.0,
-     0.0
+     -0.0799999982,
+     -0.0,
+     0.0500000007
     ],
     "quat": [
      1.0,
@@ -4236,12 +4236,12 @@
   {
    "name": "forwardvector",
    "type": "frame_pose",
-   "attached_body": 4294967295,
+   "attached_body": 0,
    "local": {
     "pos": [
-     0.0,
-     0.0,
-     0.0
+     -0.0799999982,
+     -0.0,
+     0.0500000007
     ],
     "quat": [
      1.0,
@@ -4255,12 +4255,12 @@
   {
    "name": "global_linvel",
    "type": "frame_pose",
-   "attached_body": 4294967295,
+   "attached_body": 0,
    "local": {
     "pos": [
-     0.0,
-     0.0,
-     0.0
+     -0.0799999982,
+     -0.0,
+     0.0500000007
     ],
     "quat": [
      1.0,
@@ -4274,12 +4274,12 @@
   {
    "name": "global_angvel",
    "type": "frame_pose",
-   "attached_body": 4294967295,
+   "attached_body": 0,
    "local": {
     "pos": [
-     0.0,
-     0.0,
-     0.0
+     -0.0799999982,
+     -0.0,
+     0.0500000007
     ],
     "quat": [
      1.0,
@@ -4293,12 +4293,12 @@
   {
    "name": "position",
    "type": "frame_pose",
-   "attached_body": 4294967295,
+   "attached_body": 0,
    "local": {
     "pos": [
-     0.0,
-     0.0,
-     0.0
+     -0.0799999982,
+     -0.0,
+     0.0500000007
     ],
     "quat": [
      1.0,
@@ -4312,12 +4312,12 @@
   {
    "name": "orientation",
    "type": "frame_pose",
-   "attached_body": 4294967295,
+   "attached_body": 0,
    "local": {
     "pos": [
-     0.0,
-     0.0,
-     0.0
+     -0.0799999982,
+     -0.0,
+     0.0500000007
     ],
     "quat": [
      1.0,
@@ -4331,16 +4331,16 @@
   {
    "name": "right_foot_global_linvel",
    "type": "frame_pose",
-   "attached_body": 4294967295,
+   "attached_body": 15,
    "local": {
     "pos": [
-     0.0,
-     0.0,
-     0.0
+     0.000500000024,
+     -0.0362249985,
+     0.0195499994
     ],
     "quat": [
-     1.0,
-     0.0,
+     0.707106769,
+     -0.707106769,
      0.0,
      0.0
     ]
@@ -4350,16 +4350,16 @@
   {
    "name": "left_foot_global_linvel",
    "type": "frame_pose",
-   "attached_body": 4294967295,
+   "attached_body": 6,
    "local": {
     "pos": [
-     0.0,
-     0.0,
-     0.0
+     0.000500000024,
+     -0.0362249985,
+     0.0195499994
     ],
     "quat": [
-     1.0,
-     0.0,
+     0.707106769,
+     -0.707106769,
      0.0,
      0.0
     ]
@@ -4369,16 +4369,16 @@
   {
    "name": "left_foot_upvector",
    "type": "frame_pose",
-   "attached_body": 4294967295,
+   "attached_body": 6,
    "local": {
     "pos": [
-     0.0,
-     0.0,
-     0.0
+     0.000500000024,
+     -0.0362249985,
+     0.0195499994
     ],
     "quat": [
-     1.0,
-     0.0,
+     0.707106769,
+     -0.707106769,
      0.0,
      0.0
     ]
@@ -4388,16 +4388,16 @@
   {
    "name": "right_foot_upvector",
    "type": "frame_pose",
-   "attached_body": 4294967295,
+   "attached_body": 15,
    "local": {
     "pos": [
-     0.0,
-     0.0,
-     0.0
+     0.000500000024,
+     -0.0362249985,
+     0.0195499994
     ],
     "quat": [
-     1.0,
-     0.0,
+     0.707106769,
+     -0.707106769,
      0.0,
      0.0
     ]
@@ -4407,16 +4407,16 @@
   {
    "name": "left_foot_pos",
    "type": "frame_pose",
-   "attached_body": 4294967295,
+   "attached_body": 6,
    "local": {
     "pos": [
-     0.0,
-     0.0,
-     0.0
+     0.000500000024,
+     -0.0362249985,
+     0.0195499994
     ],
     "quat": [
-     1.0,
-     0.0,
+     0.707106769,
+     -0.707106769,
      0.0,
      0.0
     ]
@@ -4426,16 +4426,16 @@
   {
    "name": "right_foot_pos",
    "type": "frame_pose",
-   "attached_body": 4294967295,
+   "attached_body": 15,
    "local": {
     "pos": [
-     0.0,
-     0.0,
-     0.0
+     0.000500000024,
+     -0.0362249985,
+     0.0195499994
     ],
     "quat": [
-     1.0,
-     0.0,
+     0.707106769,
+     -0.707106769,
      0.0,
      0.0
     ]

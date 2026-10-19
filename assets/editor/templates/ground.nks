@@ -1,7 +1,11 @@
 {
   "nks_version": 1,
   "render_materials": {
-    "ground": {"base_color": [0.012, 0.017, 0.019, 1], "roughness": 0.83, "metallic": 0}
+    "ground": {
+      "base_color": [1, 1, 1, 1], "roughness": 1, "metallic": 0,
+      "albedo_map": "../textures/grid_floor_albedo.png", "roughness_map": "../textures/grid_floor_roughness.png",
+      "uv_scale": 0.25, "triplanar": true
+    }
   },
   "environment": {
     "use_scene_materials": true,
@@ -9,12 +13,12 @@
     "specular_env": true,
     "shadow": {"map_size": 2048, "strength": 0.9, "bias": 0.0002, "filter_radius": 1.0},
     "sky": {
-      "top": [0.18, 0.24, 0.27],
-      "bottom": [0.39, 0.44, 0.43],
-      "ground": [0.115, 0.13, 0.13],
-      "ambient_sky": [0.12, 0.17, 0.18],
-      "ambient_ground": [0.075, 0.09, 0.09],
-      "background": [0.098, 0.133, 0.141],
+      "top": [0.33, 0.46, 0.66],
+      "bottom": [0.7, 0.75, 0.8],
+      "ground": [0.13, 0.13, 0.125],
+      "ambient_sky": [0.32, 0.37, 0.45],
+      "ambient_ground": [0.14, 0.13, 0.12],
+      "background": [0.62, 0.68, 0.76],
       "fill": 0.6
     }
   },

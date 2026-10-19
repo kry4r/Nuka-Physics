@@ -1219,8 +1219,8 @@ void ParseSensors(tinyxml2::XMLElement* mujoco,
             throw std::runtime_error("MJCF: unsupported <sensor> element '" + tag + "'");
         }
 
-        // A <site> carries (body, local frame); else objname/body name a body.
-        // An unresolved name stays kInvalidBody for the runtime to flag.
+        // A site (site=, or objtype="site" objname=) carries (body, local frame); else objname/body
+        // name a body. An unresolved name stays kInvalidBody for the runtime to flag.
         record.mount = scene::MountFrame::Body;
         if (record.type == scene::SensorType::JointState) {
             record.joint_id = ResolveJoint(sensor->Attribute("joint"), context);
@@ -1231,6 +1231,7 @@ void ParseSensors(tinyxml2::XMLElement* mujoco,
             continue;
         }
         const char* site_name = sensor->Attribute("site");
+        if (!site_name && sensor->Attribute("objtype", "site")) site_name = sensor->Attribute("objname");
         if (site_name) {
             const auto it = context.site_ids.find(site_name);
             if (it != context.site_ids.end()) {
@@ -1372,8 +1373,8 @@ scene::SceneIR LoadMjcf(const std::string& path) {
     tinyxml2::XMLDocument doc;
     const tinyxml2::XMLError err = doc.LoadFile(path.c_str());
     if (err != tinyxml2::XML_SUCCESS) {
-        throw std::runtime_error("MJCF: failed to load file: " + path +
-                                 " (error " + std::to_string(static_cast<int>(err)) + ")");
+        throw std::runtime_error("MJCF: failed to load file: " + path + " (" +
+                                 tinyxml2::XMLDocument::ErrorIDToName(err) + ")");
     }
 
     auto* mujoco = doc.FirstChildElement("mujoco");
