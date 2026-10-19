@@ -57,6 +57,7 @@ def Xform "World"
     def Camera "track"
     {
         double3 xformOp:translate = (1, -2, 1)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
         float focalLength = 24
         float clippingRange:min = 0.01
         float clippingRange:max = 100
@@ -72,9 +73,10 @@ def Xform "World"
     {
         rel physics:body0 = </World/base>
         rel physics:body1 = </World/link1>
+        point3f physics:localPos0 = (0, 0, 0.5)
         token physics:axis = "Z"
-        float physics:lowerLimit = -1.57
-        float physics:upperLimit = 1.57
+        float physics:lowerLimit = -89.95438
+        float physics:upperLimit = 89.95438
     }
 
     def NukaActuator "motor0"

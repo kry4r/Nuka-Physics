@@ -268,7 +268,16 @@ ImportAnalysis AnalyzeImport(const std::string& path, const ImportOptions& optio
                 break;
             }
             case AssetKind::Mjcf: a.scene = import::LoadMjcf(path); break;
-            case AssetKind::Usd: a.scene = import::LoadUsd(path); break;
+            case AssetKind::Usd: {
+                import::UsdImportResult r = import::ImportUsd(path);
+                for (const import::UsdDiagnostic& d : r.diagnostics) {
+                    const bool error = d.severity == import::UsdDiagnosticSeverity::Error;
+                    a.diagnostics.push_back(
+                        ImportDiagnostic{error ? "error" : "warning", d.code, "prim", d.prim, d.message, 0});
+                }
+                a.scene = std::move(r.scene);
+                break;
+            }
             case AssetKind::Scene: a.scene = scene::nks::Load(path); break;
             case AssetKind::Mesh: a.scene = MeshAssetScene(path); break;
             case AssetKind::Image:

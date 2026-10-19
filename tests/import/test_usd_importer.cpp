@@ -71,14 +71,15 @@ TEST(UsdImporter, CapsuleAxisComposesWithAuthoredRotation) {
     const char* axes[] = {"X", "Y", "Z", ""};
     {
         std::ofstream out(path);
-        out << "#usda 1.0\ndef Xform \"body\" (\n"
+        out << "#usda 1.0\n(\n    metersPerUnit = 1\n    upAxis = \"Z\"\n)\ndef Xform \"body\" (\n"
                "    prepend apiSchemas = [\"PhysicsRigidBodyAPI\"]\n)\n{\n"
                "    bool physics:rigidBodyEnabled = true\n";
         for (int i = 0; i < 4; ++i) {
             out << "    def Capsule \"cap" << i << "\" (\n"
                    "        prepend apiSchemas = [\"PhysicsCollisionAPI\"]\n    )\n    {\n"
                    "        double radius = 0.1\n        double height = 0.6\n"
-                   "        float3 xformOp:rotateXYZ = (0, 0, 90)\n";
+                   "        float3 xformOp:rotateXYZ = (0, 0, 90)\n"
+                   "        uniform token[] xformOpOrder = [\"xformOp:rotateXYZ\"]\n";
             if (axes[i][0]) out << "        uniform token axis = \"" << axes[i] << "\"\n";
             out << "    }\n";
         }
@@ -100,14 +101,14 @@ TEST(UsdImporter, CapsuleAxisComposesWithAuthoredRotation) {
     }
     {
         std::ofstream out(path);
-        out << "#usda 1.0\ndef Xform \"body\" (\n"
+        out << "#usda 1.0\n(\n    metersPerUnit = 1\n    upAxis = \"Z\"\n)\ndef Xform \"body\" (\n"
                "    prepend apiSchemas = [\"PhysicsRigidBodyAPI\"]\n)\n{\n"
                "    bool physics:rigidBodyEnabled = true\n"
                "    def Capsule \"cap\" (\n"
                "        prepend apiSchemas = [\"PhysicsCollisionAPI\"]\n    )\n    {\n"
                "        uniform token axis = \"invalid\"\n    }\n}\n";
     }
-    EXPECT_NE(ExceptionTextForLoadUsd(path.string()).find("invalid capsule axis"), std::string::npos);
+    EXPECT_NE(ExceptionTextForLoadUsd(path.string()).find("invalid Capsule axis"), std::string::npos);
     std::filesystem::remove(path);
 }
 
@@ -195,9 +196,8 @@ TEST(UsdImporter, LoadsTextUsdExtensionThroughAdapter) {
     std::filesystem::remove(usd_path);
 }
 
-TEST(UsdImporter, NonCrateBinaryUsdReportsOpenUsdSdkAdapterRequirement) {
-    // A binary .usd that is NOT a USDC crate (no PXR-USDC magic, not text) is not
-    // natively readable and must report the OpenUSD SDK adapter requirement.
+TEST(UsdImporter, UnreadableBinaryUsdReportsOpenError) {
+    // A binary .usd that is neither text nor a USDC crate fails to open, naming the file.
     const auto usd_path = TempUsdPath("nuka_binary_scene.usd");
     {
         std::ofstream out(usd_path, std::ios::binary);
@@ -207,15 +207,14 @@ TEST(UsdImporter, NonCrateBinaryUsdReportsOpenUsdSdkAdapterRequirement) {
 
     const std::string message = ExceptionTextForLoadUsd(usd_path.string());
 
-    EXPECT_NE(message.find("OpenUSD SDK adapter"), std::string::npos);
+    EXPECT_NE(message.find("USD: cannot open"), std::string::npos);
     EXPECT_NE(message.find(".usd"), std::string::npos);
 
     std::filesystem::remove(usd_path);
 }
 
-TEST(UsdImporter, UsdcReadsViaCrateReaderAndUsdzRequiresOpenUsdAdapter) {
-    // .usdc routes to the self-written crate reader (a malformed crate yields a
-    // "USDC:" diagnostic); .usdz is not crate-readable -> OpenUSD adapter required.
+TEST(UsdImporter, MalformedUsdcAndUsdzReportOpenErrors) {
+    // A truncated crate and a non-zip package both fail inside OpenUSD and name their file.
     const auto usdc_path = TempUsdPath("nuka_scene.usdc");
     const auto usdz_path = TempUsdPath("nuka_scene.usdz");
     {
@@ -229,16 +228,16 @@ TEST(UsdImporter, UsdcReadsViaCrateReaderAndUsdzRequiresOpenUsdAdapter) {
     const std::string usdc_message = ExceptionTextForLoadUsd(usdc_path.string());
     const std::string usdz_message = ExceptionTextForLoadUsd(usdz_path.string());
 
-    EXPECT_NE(usdc_message.find("USDC"), std::string::npos);
-    EXPECT_EQ(usdc_message.find("OpenUSD SDK adapter"), std::string::npos);
-    EXPECT_NE(usdz_message.find("OpenUSD SDK adapter"), std::string::npos);
-    EXPECT_NE(usdz_message.find("USDZ"), std::string::npos);
+    EXPECT_NE(usdc_message.find("USD: cannot open"), std::string::npos);
+    EXPECT_NE(usdc_message.find("nuka_scene.usdc"), std::string::npos);
+    EXPECT_NE(usdz_message.find("USD: cannot open"), std::string::npos);
+    EXPECT_NE(usdz_message.find("nuka_scene.usdz"), std::string::npos);
 
     std::filesystem::remove(usdc_path);
     std::filesystem::remove(usdz_path);
 }
 
-TEST(UsdImporter, RejectsUnsupportedUsdExtensionBeforeParsing) {
+TEST(UsdImporter, RejectsUnsupportedUsdExtension) {
     const auto txt_path = TempUsdPath("nuka_scene.txt");
     {
         std::ofstream out(txt_path);
@@ -247,7 +246,7 @@ TEST(UsdImporter, RejectsUnsupportedUsdExtensionBeforeParsing) {
 
     const std::string message = ExceptionTextForLoadUsd(txt_path.string());
 
-    EXPECT_NE(message.find("unsupported USD extension"), std::string::npos);
+    EXPECT_NE(message.find("USD: cannot open"), std::string::npos);
 
     std::filesystem::remove(txt_path);
 }

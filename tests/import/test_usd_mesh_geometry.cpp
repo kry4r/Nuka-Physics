@@ -58,7 +58,7 @@ const nuka::scene::CollisionShapeRecord* FirstMeshShape(const nuka::scene::Scene
 TEST(UsdMeshGeometry, InlineMeshQuadFanTriangulation) {
     // 4 verts: a unit quad in z=0; one quad face (count 4).
     const std::string usda =
-        "#usda 1.0\n"
+        "#usda 1.0\n(\n    metersPerUnit = 1\n    upAxis = \"Z\"\n)\n"
         "def Xform \"root\"\n"
         "{\n"
         "    def Mesh \"quad\"\n"
@@ -96,7 +96,7 @@ TEST(UsdMeshGeometry, InlineMeshQuadFanTriangulation) {
 // ---------------------------------------------------------------------------
 TEST(UsdMeshGeometry, MultiLineArraysMatchSingleLine) {
     const std::string single =
-        "#usda 1.0\n"
+        "#usda 1.0\n(\n    metersPerUnit = 1\n    upAxis = \"Z\"\n)\n"
         "def Xform \"root\"\n"
         "{\n"
         "    def Mesh \"quad\"\n"
@@ -107,7 +107,7 @@ TEST(UsdMeshGeometry, MultiLineArraysMatchSingleLine) {
         "    }\n"
         "}\n";
     const std::string multi =
-        "#usda 1.0\n"
+        "#usda 1.0\n(\n    metersPerUnit = 1\n    upAxis = \"Z\"\n)\n"
         "def Xform \"root\"\n"
         "{\n"
         "    def Mesh \"quad\"\n"
@@ -155,7 +155,7 @@ TEST(UsdMeshGeometry, MultiLineArraysMatchSingleLine) {
 TEST(UsdMeshGeometry, ReferencesGraftWithScaleBake) {
     // mesh.usda: a unit triangle under prim path /Model.
     const std::string mesh =
-        "#usda 1.0\n"
+        "#usda 1.0\n(\n    metersPerUnit = 1\n    upAxis = \"Z\"\n)\n"
         "def Xform \"Model\"\n"
         "{\n"
         "    def Mesh \"tri\"\n"
@@ -167,7 +167,7 @@ TEST(UsdMeshGeometry, ReferencesGraftWithScaleBake) {
         "}\n";
     // wrapper.usda: references the Model prim with a per-axis scale of (2,3,4).
     const std::string wrapper =
-        "#usda 1.0\n"
+        "#usda 1.0\n(\n    metersPerUnit = 1\n    upAxis = \"Z\"\n)\n"
         "def Xform \"root\"\n"
         "{\n"
         "    def Xform \"Model\" (\n"
@@ -206,7 +206,7 @@ TEST(UsdMeshGeometry, ReferencesGraftWithScaleBake) {
 // ---------------------------------------------------------------------------
 TEST(UsdMeshGeometry, PhysicsLessMeshDoesNotThrowAndHasGeometry) {
     const std::string usda =
-        "#usda 1.0\n"
+        "#usda 1.0\n(\n    metersPerUnit = 1\n    upAxis = \"Z\"\n)\n"
         "def Xform \"cup\"\n"
         "{\n"
         "    def Mesh \"cup_mesh\"\n"
@@ -238,7 +238,7 @@ TEST(UsdMeshGeometry, PhysicsLessMeshDoesNotThrowAndHasGeometry) {
 // ---------------------------------------------------------------------------
 TEST(UsdMeshGeometry, DeterministicAcrossLoads) {
     const std::string usda =
-        "#usda 1.0\n"
+        "#usda 1.0\n(\n    metersPerUnit = 1\n    upAxis = \"Z\"\n)\n"
         "def Xform \"root\"\n"
         "{\n"
         "    def Mesh \"quad\"\n"

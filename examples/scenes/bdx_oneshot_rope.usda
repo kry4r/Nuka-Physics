@@ -34,7 +34,7 @@ def Xform "World"
         bool physics:rigidBodyEnabled = true
         float physics:mass = 0.02
         float3 physics:diagonalInertia = (8e-6, 8e-6, 1e-6)
-        double3 xformOp:translate = (0, 0, -0.04300)
+        double3 xformOp:translate = (0, 0, -0.08600)
         uniform token[] xformOpOrder = ["xformOp:translate"]
         def Capsule "geom" ( prepend apiSchemas = ["PhysicsCollisionAPI"] )
         {
@@ -48,7 +48,7 @@ def Xform "World"
         bool physics:rigidBodyEnabled = true
         float physics:mass = 0.02
         float3 physics:diagonalInertia = (8e-6, 8e-6, 1e-6)
-        double3 xformOp:translate = (0, 0, -0.04300)
+        double3 xformOp:translate = (0, 0, -0.12900)
         uniform token[] xformOpOrder = ["xformOp:translate"]
         def Capsule "geom" ( prepend apiSchemas = ["PhysicsCollisionAPI"] )
         {
@@ -62,7 +62,7 @@ def Xform "World"
         bool physics:rigidBodyEnabled = true
         float physics:mass = 0.02
         float3 physics:diagonalInertia = (8e-6, 8e-6, 1e-6)
-        double3 xformOp:translate = (0, 0, -0.04300)
+        double3 xformOp:translate = (0, 0, -0.17200)
         uniform token[] xformOpOrder = ["xformOp:translate"]
         def Capsule "geom" ( prepend apiSchemas = ["PhysicsCollisionAPI"] )
         {
@@ -76,7 +76,7 @@ def Xform "World"
         bool physics:rigidBodyEnabled = true
         float physics:mass = 0.02
         float3 physics:diagonalInertia = (8e-6, 8e-6, 1e-6)
-        double3 xformOp:translate = (0, 0, -0.04300)
+        double3 xformOp:translate = (0, 0, -0.21500)
         uniform token[] xformOpOrder = ["xformOp:translate"]
         def Capsule "geom" ( prepend apiSchemas = ["PhysicsCollisionAPI"] )
         {
@@ -90,7 +90,7 @@ def Xform "World"
         bool physics:rigidBodyEnabled = true
         float physics:mass = 0.02
         float3 physics:diagonalInertia = (8e-6, 8e-6, 1e-6)
-        double3 xformOp:translate = (0, 0, -0.04300)
+        double3 xformOp:translate = (0, 0, -0.25800)
         uniform token[] xformOpOrder = ["xformOp:translate"]
         def Capsule "geom" ( prepend apiSchemas = ["PhysicsCollisionAPI"] )
         {
@@ -104,7 +104,7 @@ def Xform "World"
         bool physics:rigidBodyEnabled = true
         float physics:mass = 0.02
         float3 physics:diagonalInertia = (8e-6, 8e-6, 1e-6)
-        double3 xformOp:translate = (0, 0, -0.04300)
+        double3 xformOp:translate = (0, 0, -0.30100)
         uniform token[] xformOpOrder = ["xformOp:translate"]
         def Capsule "geom" ( prepend apiSchemas = ["PhysicsCollisionAPI"] )
         {
@@ -118,7 +118,8 @@ def Xform "World"
         bool physics:rigidBodyEnabled = true
         float physics:mass = 0.03
         float3 physics:diagonalInertia = (5e-5, 3e-5, 5e-5)
-        double3 xformOp:translate = (0, 0, -0.04300)
+        point3f physics:centerOfMass = (0, 0, 0)
+        double3 xformOp:translate = (0, 0, -0.34400)
         uniform token[] xformOpOrder = ["xformOp:translate"]
         def Capsule "leg_p" ( prepend apiSchemas = ["PhysicsCollisionAPI"] )
         {
@@ -144,7 +145,7 @@ def Xform "World"
         bool physics:rigidBodyEnabled = true
         float physics:mass = 0.6
         float3 physics:diagonalInertia = (0.003265, 0.000970, 0.002545)
-        double3 xformOp:translate = (0, 0, -0.11100)
+        double3 xformOp:translate = (0, 0, -0.45500)
         uniform token[] xformOpOrder = ["xformOp:translate"]
         def Cube "geom" ( prepend apiSchemas = ["PhysicsCollisionAPI"] )
         {
@@ -156,6 +157,7 @@ def Xform "World"
     def PhysicsRevoluteJoint "j_anchor" {
         rel physics:body0 = </World/anchor>
         rel physics:body1 = </World/link_0>
+        point3f physics:localPos0 = (0, 0, -0.04300)
         token physics:axis = "Y"
         float physics:lowerLimit = -175
         float physics:upperLimit = 175
@@ -163,6 +165,7 @@ def Xform "World"
     def PhysicsRevoluteJoint "j_1" {
         rel physics:body0 = </World/link_0>
         rel physics:body1 = </World/link_1>
+        point3f physics:localPos0 = (0, 0, -0.04300)
         token physics:axis = "Y"
         float physics:lowerLimit = -175
         float physics:upperLimit = 175
@@ -170,6 +173,7 @@ def Xform "World"
     def PhysicsRevoluteJoint "j_2" {
         rel physics:body0 = </World/link_1>
         rel physics:body1 = </World/link_2>
+        point3f physics:localPos0 = (0, 0, -0.04300)
         token physics:axis = "Y"
         float physics:lowerLimit = -175
         float physics:upperLimit = 175
@@ -177,6 +181,7 @@ def Xform "World"
     def PhysicsRevoluteJoint "j_3" {
         rel physics:body0 = </World/link_2>
         rel physics:body1 = </World/link_3>
+        point3f physics:localPos0 = (0, 0, -0.04300)
         token physics:axis = "Y"
         float physics:lowerLimit = -175
         float physics:upperLimit = 175
@@ -184,6 +189,7 @@ def Xform "World"
     def PhysicsRevoluteJoint "j_4" {
         rel physics:body0 = </World/link_3>
         rel physics:body1 = </World/link_4>
+        point3f physics:localPos0 = (0, 0, -0.04300)
         token physics:axis = "Y"
         float physics:lowerLimit = -175
         float physics:upperLimit = 175
@@ -191,6 +197,7 @@ def Xform "World"
     def PhysicsRevoluteJoint "j_5" {
         rel physics:body0 = </World/link_4>
         rel physics:body1 = </World/link_5>
+        point3f physics:localPos0 = (0, 0, -0.04300)
         token physics:axis = "Y"
         float physics:lowerLimit = -175
         float physics:upperLimit = 175
@@ -198,6 +205,7 @@ def Xform "World"
     def PhysicsRevoluteJoint "j_6" {
         rel physics:body0 = </World/link_5>
         rel physics:body1 = </World/link_6>
+        point3f physics:localPos0 = (0, 0, -0.04300)
         token physics:axis = "Y"
         float physics:lowerLimit = -175
         float physics:upperLimit = 175
@@ -205,6 +213,7 @@ def Xform "World"
     def PhysicsRevoluteJoint "j_yoke" {
         rel physics:body0 = </World/link_6>
         rel physics:body1 = </World/yoke>
+        point3f physics:localPos0 = (0, 0, -0.04300)
         token physics:axis = "Y"
         float physics:lowerLimit = -175
         float physics:upperLimit = 175
@@ -212,5 +221,6 @@ def Xform "World"
     def PhysicsFixedJoint "j_slab" {
         rel physics:body0 = </World/yoke>
         rel physics:body1 = </World/slab>
+        point3f physics:localPos0 = (0, 0, -0.11100)
     }
 }

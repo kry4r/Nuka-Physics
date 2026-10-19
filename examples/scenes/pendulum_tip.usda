@@ -29,7 +29,9 @@ def Xform "World"
     {
         bool physics:rigidBodyEnabled = true
         float physics:mass = 0.5
-        double3 xformOp:translate = (0, 0, 0.5)
+        float3 physics:diagonalInertia = (1, 1, 1)
+        point3f physics:centerOfMass = (0, 0, 0)
+        double3 xformOp:translate = (0, 0, 1)
         uniform token[] xformOpOrder = ["xformOp:translate"]
 
         def Sphere "tip_geom" (
@@ -46,9 +48,10 @@ def Xform "World"
     {
         rel physics:body0 = </World/base>
         rel physics:body1 = </World/arm>
+        point3f physics:localPos0 = (0, 0, 0.5)
         token physics:axis = "Y"
-        float physics:lowerLimit = -3.0
-        float physics:upperLimit = 3.0
+        float physics:lowerLimit = -171.88734
+        float physics:upperLimit = 171.88734
     }
 
     def NukaActuator "motor0"

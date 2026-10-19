@@ -243,7 +243,27 @@ def _parse_usda_prims(source: Path) -> list[_UsdPrim]:
             pending = None
         if "}" in line and stack:
             stack.pop()
+    _to_joint_parent_frames(prims)
     return prims
+
+
+def _to_joint_parent_frames(prims: list[_UsdPrim]) -> None:
+    # UsdPhysics authors bodies in world space and revolute limits in degrees; the emitters
+    # below want each body's offset from its joint parent (translate-only scenes) and radians.
+    world = {prim.path: prim.translate for prim in prims if _is_rigid_body(prim)}
+    by_path = {prim.path: prim for prim in prims}
+    for joint in prims:
+        if not _is_joint(joint):
+            continue
+        if joint.type == "PhysicsRevoluteJoint":
+            if joint.has_lower_limit:
+                joint.lower_limit *= np.pi / 180.0
+            if joint.has_upper_limit:
+                joint.upper_limit *= np.pi / 180.0
+        if joint.body0_path in world and joint.body1_path in world:
+            parent, child = world[joint.body0_path], world[joint.body1_path]
+            by_path[joint.body1_path].translate = (
+                child[0] - parent[0], child[1] - parent[1], child[2] - parent[2])
 
 
 def _axis_tuple(axis: str) -> tuple[float, float, float]:

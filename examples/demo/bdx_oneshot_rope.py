@@ -7,10 +7,10 @@ scene through the general importer + SceneBuilder.compose.
 The assembly is a fixed-base tree: a kinematic anchor (mass 0 => Fixed root),
 `n_links` capsule links joined by coaxial Revolute-Y joints (a planar pendulum
 swinging in X-Z), the yoke joined revolute-Y to the chain tail, and the slab
-fixed to the yoke. Every xformOp:translate is the PARENT-RELATIVE offset down
-the chain, so the assembly hangs straight below the anchor and swings freely
-under gravity. Visually the yoke's two legs read as a two-rope suspension while
-the topology stays a tree (no closed loop).
+fixed to the yoke. Bodies sit at their world positions straight below the anchor
+and each joint's physics:localPos0 places the pivot at the child's origin, so the
+assembly swings freely under gravity. Visually the yoke's two legs read as a
+two-rope suspension while the topology stays a tree (no closed loop).
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ def rope_usda(n_links: int = 7, seg: float = 0.043, radius: float = 0.008,
         bool physics:rigidBodyEnabled = true
         float physics:mass = {link_mass}
         float3 physics:diagonalInertia = (8e-6, 8e-6, 1e-6)
-        double3 xformOp:translate = (0, 0, {-seg:.5f})
+        double3 xformOp:translate = (0, 0, {-(i + 1) * seg:.5f})
         uniform token[] xformOpOrder = ["xformOp:translate"]
         def Capsule "geom" ( prepend apiSchemas = ["PhysicsCollisionAPI"] )
         {{
@@ -71,12 +71,14 @@ def rope_usda(n_links: int = 7, seg: float = 0.043, radius: float = 0.008,
             float3 xformOp:rotateXYZ = ({rx:.3f}, 0, 0)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
         }}''')
+    yoke_z = -(n_links + 1) * seg
     P.append(f'''    def Xform "yoke" ( prepend apiSchemas = ["PhysicsRigidBodyAPI","PhysicsMassAPI"] )
     {{
         bool physics:rigidBodyEnabled = true
         float physics:mass = {yoke_mass}
         float3 physics:diagonalInertia = (5e-5, 3e-5, 5e-5)
-        double3 xformOp:translate = (0, 0, {-seg:.5f})
+        point3f physics:centerOfMass = (0, 0, 0)
+        double3 xformOp:translate = (0, 0, {yoke_z:.5f})
         uniform token[] xformOpOrder = ["xformOp:translate"]
 {chr(10).join(legs)}
     }}''')
@@ -87,7 +89,7 @@ def rope_usda(n_links: int = 7, seg: float = 0.043, radius: float = 0.008,
         bool physics:rigidBodyEnabled = true
         float physics:mass = {sm}
         float3 physics:diagonalInertia = ({sm / 12.0 * (4 * hy * hy + 4 * hz * hz):.6f}, {sm / 12.0 * (4 * hx * hx + 4 * hz * hz):.6f}, {sm / 12.0 * (4 * hx * hx + 4 * hy * hy):.6f})
-        double3 xformOp:translate = (0, 0, {-(leg_dz + hz):.5f})
+        double3 xformOp:translate = (0, 0, {yoke_z - (leg_dz + hz):.5f})
         uniform token[] xformOpOrder = ["xformOp:translate"]
         def Cube "geom" ( prepend apiSchemas = ["PhysicsCollisionAPI"] )
         {{
@@ -101,6 +103,7 @@ def rope_usda(n_links: int = 7, seg: float = 0.043, radius: float = 0.008,
         return f'''    def PhysicsRevoluteJoint "{name}" {{
         rel physics:body0 = </World/{b0}>
         rel physics:body1 = </World/{b1}>
+        point3f physics:localPos0 = (0, 0, {-seg:.5f})
         token physics:axis = "Y"
         float physics:lowerLimit = -175
         float physics:upperLimit = 175
@@ -113,6 +116,7 @@ def rope_usda(n_links: int = 7, seg: float = 0.043, radius: float = 0.008,
     P.append(f'''    def PhysicsFixedJoint "j_slab" {{
         rel physics:body0 = </World/yoke>
         rel physics:body1 = </World/slab>
+        point3f physics:localPos0 = (0, 0, {-(leg_dz + hz):.5f})
     }}''')
     P.append('}\n')
     return "\n".join(P)

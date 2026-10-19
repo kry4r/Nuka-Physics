@@ -479,6 +479,7 @@ endif()
 add_library(nuka_import STATIC
     import/mjcf_importer.cpp
     import/urdf_importer.cpp
+    import/geom_inertia.cpp
     import/usd_stage_adapter.cpp
     import/usd_importer.cpp
     import/mesh_file_loader.cpp
@@ -504,6 +505,7 @@ target_link_libraries(nuka_import
         nuka_cgltf
         usd
         usdGeom
+        usdPhysics
         sdf
         tf
         vt

@@ -81,6 +81,10 @@ private:
 // A Mesh collision shape carrying the custom nuka:decompose token + max_pieces.
 TEST(DecomposeAttribute, UsdParsesForceAndMaxPieces) {
     const std::string usd = R"USD(#usda 1.0
+(
+    metersPerUnit = 1
+    upAxis = "Z"
+)
 def Xform "robot"
 {
     def Xform "link1" (
@@ -93,6 +97,9 @@ def Xform "robot"
             prepend apiSchemas = ["PhysicsCollisionAPI"]
         )
         {
+            point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0)]
+            int[] faceVertexIndices = [0, 1, 2]
+            int[] faceVertexCounts = [3]
             custom token nuka:decompose = "force"
             custom int nuka:decompose:max_pieces = 12
         }
@@ -113,6 +120,10 @@ def Xform "robot"
 
 TEST(DecomposeAttribute, UsdDefaultsToAutoWhenAbsent) {
     const std::string usd = R"USD(#usda 1.0
+(
+    metersPerUnit = 1
+    upAxis = "Z"
+)
 def Xform "robot"
 {
     def Xform "link1" (
@@ -125,6 +136,9 @@ def Xform "robot"
             prepend apiSchemas = ["PhysicsCollisionAPI"]
         )
         {
+            point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0)]
+            int[] faceVertexIndices = [0, 1, 2]
+            int[] faceVertexCounts = [3]
         }
     }
 }
