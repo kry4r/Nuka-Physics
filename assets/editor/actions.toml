@@ -1825,7 +1825,7 @@ summary = "The scene's nodes in tree order: all, those under `under`, or those o
 kind = "read"
 args.under = "string, a node whose subtree to list, default the whole scene"
 args.kind = "string, artic, soft, cloth, fluid, body, static, joint, geom, visual, camera, light, script or group, optional"
-returns = "a list of {path, name, kind}"
+returns = "a list of {path, name, kind, pose}; pose is the world {pos, quat} the node stands at now, live for what moves"
 example = '{"under": "/go2", "kind": "body"}'
 
 ["scene.fields"]

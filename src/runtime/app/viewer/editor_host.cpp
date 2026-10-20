@@ -4189,11 +4189,14 @@ void EditorHost::State::OnLoaded(const std::string& path) {
     }
 }
 
-// A rebuild replaced the simulation binding: re-attach the controller and drive editor.
+// A rebuild replaced the simulation binding: re-attach the controller and drive editor. The new world has
+// the authored gains and no command, so teleop sends its hold gains and command again.
 void EditorHost::State::OnRebound(uint64_t tick, double sim_time) {
     AttachController();
     SeedDriveTargets();
     BindWorker(tick, sim_time);
+    teleop_hold_prev_ = false;
+    teleop_command_sent_.reset();
     grab_.reset();
     video_.reset();
     hidden_meshes_.clear();
@@ -7844,7 +7847,8 @@ void EditorHost::State::RegisterScriptActions() {
                       if (sc == nullptr) return ActionResult::Fail("'" + path + "' is not a /script node");
                       return Ok(tab_json(ui_state_.scripts.AddNode(path, sc->source)));
                   }});
-    // The scene's nodes as {path, name, kind}: all, those under `under`, or of one `kind`.
+    // The scene's nodes as {path, name, kind, pose}: all, those under `under`, or of one `kind`. A pose is
+    // where the node stands now, as the gizmo shows it.
     actions_.Add({"scene.nodes", "List Nodes", "scene", "", ShortcutScope::Global, has_scene, {},
                   [this](const json::Value& args) {
                       const std::string under = StrArg(args, "under");
@@ -7857,9 +7861,14 @@ void EditorHost::State::RegisterScriptActions() {
                           if (n == tree.Root()) return;
                           const std::string k = NodeKind(loaded_->scene.Ecs(), n->entity);
                           if (!kind.empty() && k != kind) return;
+                          const scene::EntityId e = n->entity;
+                          const render::RenderInstance* inst = PoseInstance(*loaded_, doc_.Records(), e);
+                          const math::Transform world = inst != nullptr ? LiveWorldTransform(loaded_->scene, e, *inst)
+                                                                        : AuthoredWorldTransform(loaded_->scene, e);
                           out.PushBack(Object({{"path", json::Value::Str(tree.PathOf(n))},
                                                {"name", json::Value::Str(n->name)},
-                                               {"kind", json::Value::Str(k)}}));
+                                               {"kind", json::Value::Str(k)},
+                                               {"pose", TransformToJson(world)}}));
                       });
                       return Ok(std::move(out));
                   }});

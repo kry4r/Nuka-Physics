@@ -21,8 +21,9 @@ def helpers(app) -> Dict[str, Callable]:
         return app.actions.run(action_id, **args)
 
     def nodes(under: str = "", kind: str = "") -> List[dict]:
-        """The scene's nodes as {path, name, kind}: all, those under ``under``, or of one ``kind``
-        ("artic", "body", "static", "joint", "geom", "visual", "camera", "light", "script", "group")."""
+        """The scene's nodes as {path, name, kind, pose}: all, those under ``under``, or of one ``kind``
+        ("artic", "body", "static", "joint", "geom", "visual", "camera", "light", "script", "group"); a pose
+        is the world {pos, quat} the node stands at now."""
         return action("scene.nodes", under=under, kind=kind)
 
     def find(name: str) -> Optional[str]:

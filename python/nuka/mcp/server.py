@@ -89,9 +89,9 @@ class Server:
                            ["id", "until"]), self._wait, read=True)
         self._tool("document_get", "The open document's state: path, revision, dirty, hash, undo depth, tick, "
                    "selection, playing, last error.", _schema({}), self._document, read=True)
-        self._tool("scene_tree", "The scene's nodes as {path, name, kind}: all, those under a path, those of one "
-                   "kind (artic, body, static, joint, geom, visual, camera, light, script, group, ...), down to "
-                   "`depth` levels.",
+        self._tool("scene_tree", "The scene's nodes as {path, name, kind, pose}: all, those under a path, those of "
+                   "one kind (artic, body, static, joint, geom, visual, camera, light, script, group, ...), down to "
+                   "`depth` levels. A pose is the world {pos, quat} the node stands at now.",
                    _schema({"under": {"type": "string"}, "kind": {"type": "string"},
                             "depth": {"type": "integer", "description": "Levels below `under`, 1 for its children."}}),
                    self._tree, read=True)
