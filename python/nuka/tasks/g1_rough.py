@@ -8,9 +8,10 @@ followed by the same terms without noise, five frames of history. Rewards and te
 velocity_env_cfg (Apache-2.0). Foot contact is the sole spheres' distance to the heightfield, and other links
 touching down are found the same way from their origins.
 
-Training runs on a copy of the scene with its mesh collision shapes dropped: the sole spheres carry the contacts,
-and dense meshes on thousands of robots overflow the contact budget. The copy also drops the scene's terrain, since
-the task bakes the field its `terrain` option describes.
+Training runs on a copy of the scene with its mesh and hull collision shapes dropped: the sole spheres carry the
+contacts, and dense shapes on thousands of robots overflow the contact budget. The copy also drops the scene's
+terrain and its static bodies' shapes, such as a floor, since the task bakes the field its `terrain` option
+describes and every environment would get a floor of its own over all the others.
 """
 
 from __future__ import annotations
@@ -83,7 +84,8 @@ def _match(table, name, default):
 
 
 def training_scene(scene: str) -> tuple[Path, dict]:
-    """The scene flattened into a temporary .nks without mesh collision shapes, and its parsed tree."""
+    """The scene flattened into a temporary .nks without mesh, hull or static collision shapes, and its parsed
+    tree."""
     folder = Path(tempfile.mkdtemp(prefix="nuka_g1_"))
     out = folder / "scene.nks"
     loaded = nuka.Scene.load(scene)
@@ -91,11 +93,13 @@ def training_scene(scene: str) -> tuple[Path, dict]:
     loaded.destroy()
     doc = json.loads(out.read_text(encoding="utf-8"))
 
-    def strip(nodes):
+    def strip(nodes, static=False):
         for n in nodes:
-            if n.get("collision_shape", {}).get("type") == "trimesh":
+            # A body's shapes are its children; the body stays, as joints count bodies by index.
+            here = static or n.get("rigid_body", {}).get("is_static", False)
+            if "collision_shape" in n and (here or n["collision_shape"]["type"] in ("trimesh", "convex_hull")):
                 del n["collision_shape"]
-            strip(n.get("children", []))
+            strip(n.get("children", []), here)
 
     strip(doc["tree"])
     # The task bakes its own field; the scene's terrain would lie under it as a second one.
