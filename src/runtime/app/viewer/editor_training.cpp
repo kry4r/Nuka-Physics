@@ -4,11 +4,13 @@
 #include "runtime/app/viewer/editor_profile.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <ctime>
 #include <fstream>
 #include <iterator>
 #include <optional>
+#include <thread>
 #include <utility>
 
 namespace nuka::runtime::app::viewer {
@@ -47,8 +49,14 @@ constexpr std::pair<const char*, std::vector<double> TrainSeries::*> kSeriesColu
 }  // namespace
 
 json::Value ReadJsonFile(const fs::path& path) {
-    if (!fs::is_regular_file(path)) return json::Value::Null();
-    return json::Value::Parse(ReadText(path));
+    // The runner swaps its reports in whole, and Windows refuses an open that lands mid-swap, so that one waits.
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        if (!fs::is_regular_file(path)) return json::Value::Null();
+        std::ifstream in(path, std::ios::binary);
+        if (in) return json::Value::Parse(std::string(std::istreambuf_iterator<char>(in), {}));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return json::Value::Null();
 }
 
 json::Value ReadJsonLines(const fs::path& path, size_t skip) {
