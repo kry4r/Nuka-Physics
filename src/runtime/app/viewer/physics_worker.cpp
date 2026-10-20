@@ -26,6 +26,8 @@ constexpr std::chrono::milliseconds kBatchPublishPeriod{33};
 constexpr size_t kSolverLog = 4096u;
 // The joint samples kept: 20 s at 200 Hz.
 constexpr size_t kJointLog = 4096u;
+// The stream samples kept while nothing takes them.
+constexpr size_t kStreamSamples = 4096u;
 
 bool Capped(const nuka_telemetry_record_t& r) { return (r.flags & NUKA_TELEMETRY_CAP) != 0u; }
 
@@ -752,6 +754,7 @@ bool PhysicsWorker::StepOnce() {
     HistoryBranch& b = Current();
     if (recording) {
         if (!demo_envs_.empty()) SampleDemo();
+        if (stream_every_ != 0u && tick_ % stream_every_ == 0u) SampleStream();
         b.head = tick_;
         return healthy;
     }
@@ -906,6 +909,30 @@ void PhysicsWorker::SampleDemo() {
         s.axes = axes_;
     }
     demo_count_.store(demo_.size(), std::memory_order_relaxed);
+}
+
+uint64_t PhysicsWorker::StreamPoses(uint32_t every) {
+    const uint64_t taken = stream_taken_;
+    stream_every_ = every;
+    stream_taken_ = 0u;
+    if (every != 0u) {
+        {
+            std::lock_guard<std::mutex> lock(stream_mu_);
+            stream_.clear();
+        }
+        SampleStream();
+    }
+    return taken;
+}
+
+// The oldest samples go once more wait than kStreamSamples.
+void PhysicsWorker::SampleStream() {
+    PoseSample s{tick_, bind_.env, {}, {}};
+    DownloadEnvPoses(bind_.world, bind_.layout, bind_.env, &s.links, &s.bodies);
+    ++stream_taken_;
+    std::lock_guard<std::mutex> lock(stream_mu_);
+    stream_.push_back(std::move(s));
+    while (stream_.size() > kStreamSamples) stream_.pop_front();
 }
 
 // Steps the drive alone, without loads, ramp or policy, writing one link's target each step,

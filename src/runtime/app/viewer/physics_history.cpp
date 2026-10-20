@@ -47,6 +47,15 @@ void PutRange(std::string& out, const std::vector<T>& values) {
     out.append(reinterpret_cast<const char*>(values.data()), values.size() * sizeof(T));
 }
 
+void PutSample(std::string& out, const PoseSample& s) {
+    Put(out, s.tick);
+    Put(out, s.env);
+    Put(out, static_cast<uint32_t>(s.links.size()));
+    Put(out, static_cast<uint32_t>(s.bodies.size()));
+    PutRange(out, s.links);
+    PutRange(out, s.bodies);
+}
+
 // Reads back what Put wrote, in order.
 class Cursor {
 public:
@@ -463,6 +472,17 @@ void PhysicsWorker::SampleTrack() {
     while (track.size() > kTrackSamples) track.pop_front();
 }
 
+void PhysicsWorker::TakeStream(std::string* out) {
+    std::deque<PoseSample> taken;
+    {
+        std::lock_guard<std::mutex> lock(stream_mu_);
+        taken.swap(stream_);
+    }
+    out->clear();
+    Put(*out, static_cast<uint64_t>(taken.size()));
+    for (const PoseSample& s : taken) PutSample(*out, s);
+}
+
 // The ghost branch's newest sample at or before the playhead, once the two branches diverged.
 const PoseSample* PhysicsWorker::GhostSample() {
     const auto g = branches_.find(ghost_);
@@ -556,12 +576,7 @@ json::Value PhysicsWorker::SaveHistory(const std::string& path, json::Value mani
         const uint64_t until = i + 1u < line.size() ? line[i + 1u]->fork_tick : ~uint64_t(0);
         for (const PoseSample& s : line[i]->track) {
             if ((samples != 0u && s.tick <= last) || s.tick > until) continue;
-            Put(track, s.tick);
-            Put(track, s.env);
-            Put(track, static_cast<uint32_t>(s.links.size()));
-            Put(track, static_cast<uint32_t>(s.bodies.size()));
-            PutRange(track, s.links);
-            PutRange(track, s.bodies);
+            PutSample(track, s);
             last = s.tick;
             ++samples;
         }

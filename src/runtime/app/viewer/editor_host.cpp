@@ -1285,6 +1285,9 @@ struct EditorHost::State : DocumentHost {
     std::string RunDemoExchange(const char* fn, const std::string& path);
     // Runs `code` in the editor's Python; returns the exception it raised, empty when it ran.
     std::string RunPython(const std::string& code, const char* source);
+    // Exclusive sections only. Ends the rerun stream once nuka.editor.stream logged what it
+    // gathered; returns how many samples that was.
+    uint64_t EndStream();
     void TakeWorkerResults();
     void PushTransport();
     void PushPoseWrites();
@@ -1405,6 +1408,7 @@ struct EditorHost::State : DocumentHost {
     };
     std::optional<VideoExport> video_;
     json::Value exported_;  // the last export's path and frames, with an error when it failed
+    bool streaming_ = false;  // nuka.editor.stream sends the worker's pose samples to Rerun
     // The RT preview; one request is in flight at a time and `chain` is the view its samples refine.
     struct RtPreview {
         bool on = false;
@@ -2194,6 +2198,11 @@ void EditorHost::State::BindWorker(uint64_t tick, double sim_time) {
     ui_state_.clips.left = 0u;
     teleop_command_sent_.reset();
     bound_epoch_ = worker_.Bind(std::move(binding));
+    // A rebuild may rename and renumber the links and bodies the stream logs.
+    if (streaming_) {
+        const std::string names = json::Value::Str(RecordingIdentity().Dump(0)).Dump(0);
+        RunPython("import nuka.editor.stream\nnuka.editor.stream.rename(" + names + ")\n", "<rerun>");
+    }
     // The new binding starts from nominal values and draws again from the same seed.
     physics_drawn_ = false;
     if (randomize.config.Active())
@@ -8975,22 +8984,21 @@ json::Value EditorHost::State::RecordingIdentity() {
     const std::string counts = Format("%u %u %u %u %u %u %.9g", l.env_count, l.links_per_env, l.bodies_per_env,
                                       l.articulations_per_env, l.dofs_per_env, l.particles_per_env,
                                       static_cast<double>(opt_.dt));
-    std::vector<std::string> links(l.links_per_env), bodies(l.bodies_per_env);
-    for (const render::RenderInstance& inst : loaded_->sim->GetRenderWorld().instances) {
-        const bool link = inst.pose_source.kind == render::PoseSource::Kind::Link;
-        std::vector<std::string>& rows = link ? links : bodies;
-        if ((link || inst.pose_source.kind == render::PoseSource::Kind::Body) && inst.pose_source.row < rows.size())
-            rows[inst.pose_source.row] = PathOfEntity(CarrierOf(loaded_->scene, inst.entity));
-    }
-    const auto names = [](const std::vector<std::string>& rows) {
-        json::Value list = json::Value::Array();
-        for (const std::string& name : rows) list.PushBack(json::Value::Str(name));
-        return list;
+    // Body rows follow the scene's body records; a link's body row is null, since its link shows it.
+    const auto path = [this](uint32_t body) {
+        return json::Value::Str(PathOfEntity(loaded_->scene.EntityOfBody(body)));
     };
+    std::vector<bool> linked(l.bodies_per_env, false);
+    json::Value links = json::Value::Array(), bodies = json::Value::Array();
+    for (uint32_t i = 0; i < l.links_per_env; ++i) {
+        links.PushBack(path(l.links[i].body_index));
+        if (l.links[i].body_index < l.bodies_per_env) linked[l.links[i].body_index] = true;
+    }
+    for (uint32_t b = 0; b < l.bodies_per_env; ++b) bodies.PushBack(linked[b] ? json::Value::Null() : path(b));
     return Object({{"scene", json::Value::Str(Hex(DocumentHash()))},
                    {"layout", json::Value::Str(Hex(Fnv1a(counts)))},
-                   {"links", names(links)},
-                   {"bodies", names(bodies)}});
+                   {"links", std::move(links)},
+                   {"bodies", std::move(bodies)}});
 }
 
 // One step of an mp4 export a frame: seek the next frame's tick, capture the viewport once the
@@ -9199,6 +9207,42 @@ void EditorHost::State::RegisterTimelineActions() {
                       video_ = std::move(v);
                       exported_ = json::Value::Null();
                       return Ok(Object({{"path", json::Value::Str(path)}, {"frames", json::Value::Int(static_cast<int64_t>(frames))}}));
+                  }});
+    // {on, every, file, addr}: logs the shown environment's link and body poses to Rerun every `every`
+    // ticks at the head: into the .rrd `file`, else to the viewer at `addr`, else to a new local one.
+    actions_.Add({"rerun.stream", "Stream to Rerun", "timeline", "", ShortcutScope::Global, has_scene,
+                  [this] { return streaming_; },
+                  [this](const json::Value& args) {
+                      if (!BoolArg(args, "on", !streaming_)) {
+                          uint64_t samples = 0u;
+                          if (streaming_) worker_.Exclusive([&] { samples = EndStream(); });
+                          return Ok(Object({{"on", json::Value::Bool(false)},
+                                            {"samples", json::Value::Int(static_cast<int64_t>(samples))}}));
+                      }
+                      const double rate = std::round(1.0 / (60.0 * static_cast<double>(opt_.dt)));
+                      const double every = NumArg(args, "every", std::max(1.0, rate));
+                      if (every < 1.0 || every != std::floor(every))
+                          return ActionResult::Fail("every: whole ticks >= 1");
+                      if (!script_host_.Valid())
+                          return ActionResult::Fail("streaming to Rerun needs the editor's Python");
+                      if (streaming_) worker_.Exclusive([&] { EndStream(); });
+                      json::Value config = RecordingIdentity();
+                      config.Set("dt", json::Value::Float(opt_.dt));
+                      config.Set("file", json::Value::Str(StrArg(args, "file")));
+                      config.Set("addr", json::Value::Str(StrArg(args, "addr")));
+                      const std::string code = "import nuka.editor.stream\nnuka.editor.stream.start(app, " +
+                                               json::Value::Str(config.Dump(0)).Dump(0) + ")\n";
+                      if (const std::string why = RunPython(code, "<rerun>"); !why.empty())
+                          return ActionResult::Fail(why);
+                      worker_.Exclusive([&] { worker_.StreamPoses(static_cast<uint32_t>(every)); });
+                      streaming_ = true;
+                      const auto count = [&](const char* key) {
+                          return json::Value::Int(static_cast<int64_t>(config.At(key).Size()));
+                      };
+                      return Ok(Object({{"on", json::Value::Bool(true)},
+                                        {"every", json::Value::Int(static_cast<int64_t>(every))},
+                                        {"links", count("links")},
+                                        {"bodies", count("bodies")}}));
                   }});
 }
 
@@ -9450,8 +9494,16 @@ std::string EditorHost::State::RunPython(const std::string& code, const char* so
     return text.substr(begin, end + 1u - begin);
 }
 
+uint64_t EditorHost::State::EndStream() {
+    streaming_ = false;
+    const uint64_t samples = worker_.StreamPoses(0u);
+    RunPython("import nuka.editor.stream\nnuka.editor.stream.stop()\n", "<rerun>");
+    return samples;
+}
+
 // Drops the scene binding; the world stays until the editor is destroyed.
 void EditorHost::State::ApplyUnload() {
+    if (streaming_) EndStream();
     present_->WaitIdle();
     worker_.Unbind();
     DropPublisher();
@@ -10198,6 +10250,7 @@ void EditorHost::RpcClients(const std::string& clients_json) {
     std::lock_guard<std::mutex> lock(state_->inbox_mu_);
     state_->clients_inbox_ = clients_json;
 }
+void EditorHost::StreamTake(std::string* out) { state_->worker_.TakeStream(out); }
 void EditorHost::Update(bool step_physics) { state_->Frame(step_physics); }
 void EditorHost::StopPhysics() { state_->StopWorker(); }
 bool EditorHost::Running() const { return state_->running_; }

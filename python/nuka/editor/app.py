@@ -19,7 +19,7 @@ import numpy
 
 import nuka
 
-from . import scripting
+from . import scripting, stream
 from .extension import ExtensionLoader
 from .rpc import RpcServer
 from .ui import UI, ScriptInterrupted, _capture
@@ -555,6 +555,7 @@ class EditorApp:
             return
         atexit.unregister(self.close)
         self.rpc.close()
+        stream.stop()
         if self._borrowed is not None:
             self._borrowed.destroy()  # detaches only: the editor owns that world
             self._borrowed = None

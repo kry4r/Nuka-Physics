@@ -389,6 +389,12 @@ public:
         Check(nuka_editor_set_rpc_hooks(Editor(), &hooks), "nuka_editor_set_rpc_hooks");
     }
     void rpc_clients(const std::string& clients_json) { nuka_editor_rpc_clients(Editor(), clients_json.c_str()); }
+    nb::bytes stream_take() {
+        const void* data = nullptr;
+        size_t size = 0u;
+        Check(nuka_editor_stream_take(Editor(), &data, &size), "nuka_editor_stream_take");
+        return nb::bytes(static_cast<const char*>(data), size);
+    }
 
     void destroy() {
         if (editor_ == nullptr) return;
@@ -614,5 +620,7 @@ NB_MODULE(_editor_ext, m) {
              "Route the agent endpoint's listen(on) and disconnect() calls to endpoint.")
         .def("rpc_clients", &App::rpc_clients, nb::arg("clients_json"),
              "Report the endpoint's clients as a JSON array of {client, pid, since}.")
+        .def("stream_take", &App::stream_take,
+             "The poses rerun.stream gathered since the last call, as nuka.editor.nkrec.track reads them.")
         .def("destroy", &App::destroy, "Close the window and destroy any world the editor created.");
 }

@@ -148,7 +148,7 @@ This page is generated from assets/editor/actions.toml by tools/skill_actions.py
 - `clip.undo` [edit]: Steps back through the clip edits; scene edits keep their own history.
 - `clip.redo` [edit]: Steps forward again through undone clip edits.
 
-## Simulation, timeline and solver
+## Simulation, timeline, solver and Rerun
 
 - `sim.play` [sim]: Starts the simulation.
 - `sim.pause` [sim]: Pauses the simulation.
@@ -179,6 +179,7 @@ This page is generated from assets/editor/actions.toml by tools/skill_actions.py
 - `timeline.save` {path?} [file]: The current branch's line of history with what it plays in, as a .nkrec; the dialog asks without `path`.
 - `timeline.load` {path?} [file]: A recording of this document and world layout becomes the history, back where it was saved; the dialog asks without `path`.
 - `timeline.export` {path?, fps?, from?, to?} [file]: An mp4 of ticks `from` to `to` (the start and head) at `fps` frames a simulated second, drawn by the viewport and encoded by ffmpeg from the PATH; timeline.status reports its progress.
+- `rerun.stream` {on?, every?, file?, addr?} [process]: Logs the shown environment's link and body poses to Rerun every `every` ticks at the head, named as nuka.editor.nkrec names them (world/links/<node>, world/bodies/<node>) over the `tick` and `sim_time` timelines: into the .rrd `file`, else to the viewer at `addr`, else to a new local viewer.
 
 ## Sensors, labels, datasets and randomization
 

@@ -757,6 +757,16 @@ args.from = "int, the first tick, default the start"
 args.to = "int, the last tick, default the head"
 returns = "{path, frames}"
 
+["rerun.stream"]
+summary = "Logs the shown environment's link and body poses to Rerun every `every` ticks at the head, named as nuka.editor.nkrec names them (world/links/<node>, world/bodies/<node>) over the `tick` and `sim_time` timelines: into the .rrd `file`, else to the viewer at `addr`, else to a new local viewer. Needs rerun-sdk in the editor's Python and fails saying so without it; loading another scene ends the stream."
+kind = "process"
+args.on = "bool, start or stop, default: toggles"
+args.every = "int, ticks between samples, default about 60 a simulated second"
+args.file = "string, an .rrd file to write instead of sending to a viewer, default none"
+args.addr = "string, a running viewer's gRPC address such as rerun+http://127.0.0.1:9876/proxy, default: spawn a local viewer"
+returns = "{on, every, links, bodies} when it starts; {on: false, samples} when it stops"
+example = '{"on": true, "file": "C:/runs/walk.rrd", "every": 2}'
+
 ["robot.joints"]
 summary = "The moving joints of the scene's robots with their limits and drives, and the shown environment's live values; the roots and whether the base floats."
 kind = "read"

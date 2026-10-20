@@ -78,6 +78,10 @@ Imported environments (rooms, warehouses, terrain) often bring visual meshes onl
 - Pushing a body: `sim.perturb {path, force: [0, 0, 50]}`, then `sim.release {path}`.
 - Timeline: `timeline.status`, `timeline.seek {tick}`, `timeline.fork {label}` to try a variation,
   `timeline.export {path: "C:/out/run.mp4", fps: 30}`; its progress shows in `timeline.status`.
+- Rerun: `rerun.stream {on: true, every: 4}` opens a local Rerun viewer and logs every link and body
+  pose over the `tick` timeline; `file: "C:/out/run.rrd"` writes a file instead, `addr` sends to a
+  running viewer, and `rerun.stream {on: false}` ends it and reports the sample count. It needs
+  rerun-sdk in the editor's Python.
 - Demonstrations: `teleop.use {on: true}`, `demo.record {on: true}`, ..., `demo.record {on: false}`,
   `demo.save {path: "C:/out/demos.hdf5"}`.
 

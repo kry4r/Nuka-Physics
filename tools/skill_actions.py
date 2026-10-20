@@ -22,7 +22,7 @@ GROUPS = [
     (("material",), "Materials"),
     (("robot",), "Robots: joints, poses, gains, IK"),
     (("clip", "demo", "teleop", "policy"), "Motion: clips, demonstrations, teleoperation, policies"),
-    (("sim", "timeline", "solver"), "Simulation, timeline and solver"),
+    (("sim", "timeline", "solver", "rerun"), "Simulation, timeline, solver and Rerun"),
     (("sensor", "label", "dataset", "dr"), "Sensors, labels, datasets and randomization"),
     (("train",), "Training"),
     (("view",), "View and camera"),

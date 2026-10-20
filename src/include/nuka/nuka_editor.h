@@ -118,6 +118,11 @@ NUKA_EDITOR_API nuka_result_t nuka_editor_actions(nuka_editor_handle editor, con
 NUKA_EDITOR_API nuka_result_t nuka_editor_action_log(nuka_editor_handle editor, uint64_t since,
                                                      const char** out_json);
 NUKA_EDITOR_API nuka_result_t nuka_editor_document_state(nuka_editor_handle editor, const char** out_json);
+// The poses the rerun.stream action gathered since the last call, laid out like a recording's track
+// chunk: a u64 count, then per sample u64 tick, u32 env, u32 links, u32 bodies and (links + bodies)
+// poses of 7 floats. Any thread; the bytes live until that thread's next such call.
+NUKA_EDITOR_API nuka_result_t nuka_editor_stream_take(nuka_editor_handle editor, const void** out_data,
+                                                      size_t* out_size);
 
 // The UI component table for panels built by Python or extensions; lives as long as the editor.
 NUKA_EDITOR_API const nuka_nui_api_t* nuka_editor_nui(nuka_editor_handle editor);

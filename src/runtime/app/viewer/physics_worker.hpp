@@ -354,6 +354,11 @@ public:
     std::vector<DemoSample> TakeDemo();
     // The samples waiting for TakeDemo; readable from any thread.
     uint64_t DemoCount() const { return demo_count_.load(std::memory_order_relaxed); }
+    // Exclusive sections only. Every `every` ticks at the head from now on, starting now, the shown
+    // environment's poses wait for TakeStream; 0 stops. Returns the samples the previous stream took.
+    uint64_t StreamPoses(uint32_t every);
+    // Moves the waiting stream samples into `out` as a recording's track chunk; any thread.
+    void TakeStream(std::string* out);
     // Exclusive sections only. Writes the current branch's line of history to `path` after
     // `manifest`, which comes back with the history's own fields; keyframes pass through `scratch`.
     scene::json::Value SaveHistory(const std::string& path, scene::json::Value manifest, const std::string& scratch);
@@ -402,6 +407,7 @@ private:
     void WriteRamp();
     void WriteTrack();
     void SampleDemo();
+    void SampleStream();
     void RunGainTest(const TickCommand& cmd);
     void SolveIk(const TickCommand& cmd);
     void Randomize(const TickCommand& cmd);
@@ -502,6 +508,10 @@ private:
     std::vector<uint32_t> demo_roots_;
     std::vector<DemoSample> demo_;
     std::atomic<uint64_t> demo_count_{0u};
+    uint32_t stream_every_ = 0u;
+    uint64_t stream_taken_ = 0u;
+    std::mutex stream_mu_;
+    std::deque<PoseSample> stream_;
     uint64_t timeline_value_ = 0u;
     uint64_t sequence_ = 0u;
     WorkerClock::time_point last_publish_{};

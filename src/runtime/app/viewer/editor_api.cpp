@@ -17,6 +17,7 @@ namespace {
 
 thread_local std::string create_error;  // why this thread's last nuka_editor_create failed
 thread_local std::string reply;         // the text this thread's last text-returning call handed out
+thread_local std::string stream;        // the samples this thread's last nuka_editor_stream_take handed out
 
 template <class Fn>
 nuka_result_t Guard(Fn&& fn) {
@@ -122,6 +123,16 @@ nuka_result_t nuka_editor_document_state(nuka_editor_handle editor, const char**
     return Guard([&] {
         reply = editor->DocumentState();
         *out_json = reply.c_str();
+    });
+}
+
+nuka_result_t nuka_editor_stream_take(nuka_editor_handle editor, const void** out_data, size_t* out_size) {
+    if (editor == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    if (out_data == nullptr || out_size == nullptr) return NUKA_RESULT_INVALID_ARG;
+    return Guard([&] {
+        editor->StreamTake(&stream);
+        *out_data = stream.data();
+        *out_size = stream.size();
     });
 }
 

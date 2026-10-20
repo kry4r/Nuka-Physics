@@ -41,6 +41,8 @@ public:
     std::string Actions() const;
     std::string ActionLog(uint64_t since) const;
     std::string DocumentState();
+    // Moves the rerun stream's waiting samples into `out`; thread-safe.
+    void StreamTake(std::string* out);
     // The shell's nui C API; valid for the editor's lifetime.
     const nuka_nui_api_t* Nui();
     // The host table of an enabled extension, or null; valid until it is disabled.
