@@ -79,6 +79,10 @@ class Run:
         policies.mkdir(exist_ok=True)
         nkml = policies / (pth.stem + ".nkml")
         obs_dim, act_dim = export(pth, nkml)
+        # A task whose actor the editor runs through a contract describes it beside the policy.
+        contract = getattr(algo.vec_env.env, "contract", None)
+        if contract is not None:
+            _write_json(nkml.with_suffix(".contract.json"), contract())
         epoch = int(algo.epoch_num)
         kind = "best" if pth.stem == self.status["name"] else "epoch"
         # The last epoch's periodic save comes before the final one.

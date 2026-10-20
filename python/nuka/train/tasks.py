@@ -212,7 +212,7 @@ def _go2_build(config: dict, scene: str, name: str) -> dict:
     return params
 
 
-def _go2_check(config: dict, layout: dict) -> list:
+def _batch_check(config: dict, layout: dict) -> list:
     errors = []
     run, algo = config["run"], config["algorithm"]
     if (run["num_envs"] * algo["horizon_length"]) % algo["minibatches"] != 0:
@@ -220,6 +220,122 @@ def _go2_check(config: dict, layout: dict) -> list:
                        "message": f"{algo['minibatches']} minibatches do not divide "
                                   f"{run['num_envs']} envs x {algo['horizon_length']} steps"})
     return errors
+
+
+# unitree_rl_lab G1 velocity reward weights (nuka.tasks.g1_rough.REWARD_SCALES).
+_G1_REWARDS = [
+    ("track_lin_vel_xy", 1.0, "Track the commanded xy velocity"),
+    ("track_ang_vel_z", 0.5, "Track the commanded yaw rate"),
+    ("alive", 0.15, "Reward every step not fallen"),
+    ("lin_vel_z", -2.0, "Penalize vertical base velocity"),
+    ("ang_vel_xy", -0.05, "Penalize roll and pitch rates"),
+    ("joint_vel", -0.001, "Penalize joint velocities"),
+    ("joint_acc", -2.5e-7, "Penalize joint accelerations"),
+    ("action_rate", -0.05, "Penalize action changes"),
+    ("dof_pos_limits", -5.0, "Penalize joints past 90% of their range"),
+    ("energy", -2e-5, "Penalize mechanical power"),
+    ("joint_deviation_arms", -0.1, "Keep the arms near the default stance"),
+    ("joint_deviation_waist", -1.0, "Keep the waist near the default stance"),
+    ("joint_deviation_legs", -1.0, "Keep hip roll and yaw near the default stance"),
+    ("flat_orientation", -5.0, "Keep the base level"),
+    ("base_height", -10.0, "Hold the base 0.78 m above the ground"),
+    ("gait", 0.5, "Alternate the feet on a 0.8 s cycle"),
+    ("feet_slide", -0.2, "Penalize feet sliding on the ground"),
+    ("feet_clearance", 1.0, "Lift swing feet 0.10 m"),
+    ("undesired_contacts", -1.0, "Penalize knees, elbows and wrists near the ground"),
+]
+
+
+def _g1_groups() -> List[Group]:
+    term = lambda key, dims, scale, help: Param(key, "term", scale, dims=dims, help=help, readonly=True)
+    return [
+        Group("run", "Run", [
+            Param("num_envs", "int", 4096, 1, 16384, help="Robots trained in parallel"),
+            Param("max_epochs", "int", 3000, 1, 100000, help="PPO iterations"),
+            Param("save_every", "int", 100, 1, 100000, help="Epochs between checkpoints"),
+            Param("seed", "int", 0, 0, 2 ** 31 - 1, help="Seed of the training run"),
+        ]),
+        Group("observation", "Observation", [
+            term("base_ang_vel", 3, 0.2, "Base angular velocity, body frame"),
+            term("projected_gravity", 3, 1.0, "Gravity direction, body frame"),
+            term("velocity_commands", 3, 1.0, "Commanded vx, vy and yaw rate"),
+            term("joint_pos_rel", 23, 1.0, "Joint positions minus the default stance"),
+            term("joint_vel_rel", 23, 0.05, "Joint velocities"),
+            term("last_action", 23, 1.0, "The previous action"),
+            Param("history", "int", 5, readonly=True, help="Frames of each term, oldest first; " + _CONTRACT),
+            Param("noise", "bool", True, help="Add uniform sensor noise to the observations"),
+        ]),
+        Group("action", "Action", [
+            Param("joint_position_scale", "float", 0.25, readonly=True, unit="rad",
+                  help="Target = default stance + scale x action; " + _CONTRACT),
+            Param("decimation", "int", 4, readonly=True, help="Physics steps per policy step; " + _CONTRACT),
+        ]),
+        Group("command", "Command", [
+            Param("fixed", "bool", False, help="Hold one command instead of resampling every 10 s"),
+            Param("fixed_value", "vec3", [0.5, 0.0, 0.0], -2.0, 2.0, unit="m/s, m/s, rad/s",
+                  help="The command held when fixed"),
+            Param("lin_vel_x", "range", [-0.5, 1.0], -2.0, 2.0, unit="m/s",
+                  help="Forward velocity limits; ranges start at 10% and widen as tracking improves"),
+            Param("lin_vel_y", "range", [-0.3, 0.3], -2.0, 2.0, unit="m/s", help="Lateral velocity limits"),
+            Param("ang_vel_yaw", "range", [-0.5, 0.5], -3.0, 3.0, unit="rad/s", help="Yaw rate limits"),
+        ]),
+        Group("terrain", "Terrain", [
+            Param("kind", "enum", "bumps", choices=("flat", "bumps", "mixed"),
+                  help="Flat ground, random bumps, or tiles of stairs, pits and bumps"),
+            Param("bump_height", "float", 0.05, 0.0, 0.3, unit="m", help="Highest bump"),
+            Param("bump_cell", "float", 0.4, 0.05, 2.0, unit="m", help="Bump footprint edge"),
+            Param("step_height", "float", 0.08, 0.0, 0.3, unit="m", help="Stair rise of the mixed tiles"),
+        ]),
+        Group("reward", "Reward", [Param(k, "float", w, -100.0, 100.0, help=h) for k, w, h in _G1_REWARDS]),
+        Group("termination", "Termination", [
+            Param("base_height", "float", 0.3, 0.0, 1.0, unit="m", help="End an episode below this base height"),
+            Param("tilt", "float", 45.0, 0.0, 180.0, unit="deg", help="End an episode past this tilt"),
+            Param("episode_length", "float", 20.0, 1.0, 120.0, unit="s", help="Time out an episode"),
+        ]),
+        Group("event", "Event", [
+            Param("push", "bool", True, help="Kick each robot up to 0.5 m/s sideways every 5 s"),
+        ]),
+        Group("algorithm", "Algorithm", [
+            Param("learning_rate", "float", 1e-3, 1e-6, 1.0, help="Adam step size, adapted to the KL"),
+            Param("kl_threshold", "float", 0.01, 1e-4, 1.0, help="KL the adaptive step size aims for"),
+            Param("gamma", "float", 0.99, 0.0, 1.0, help="Discount"),
+            Param("tau", "float", 0.95, 0.0, 1.0, help="GAE lambda"),
+            Param("entropy_coef", "float", 0.01, 0.0, 1.0, help="Exploration bonus"),
+            Param("e_clip", "float", 0.2, 0.01, 1.0, help="PPO clip"),
+            Param("horizon_length", "int", 24, 1, 1024, help="Steps per robot per epoch"),
+            Param("minibatches", "int", 4, 1, 1024, help="Minibatches per epoch; divides envs x horizon"),
+            Param("mini_epochs", "int", 5, 1, 100, help="Passes over each epoch's batch"),
+            Param("units", "ints", [512, 256, 128], 8, 4096, help="Hidden layer widths of actor and critic"),
+        ]),
+    ]
+
+
+def _g1_build(config: dict, scene: str, name: str) -> dict:
+    run, obs, cmd, rew = config["run"], config["observation"], config["command"], config["reward"]
+    terr, term, event, algo = config["terrain"], config["termination"], config["event"], config["algorithm"]
+    params = copy.deepcopy(_PPO)
+    params["seed"] = run["seed"]
+    params["network"]["mlp"]["units"] = list(algo["units"])
+    env_config = {
+        "scene": scene, "seed": run["seed"], "noise": obs["noise"], "push": event["push"],
+        "fixed_command": cmd["fixed"], "command": list(cmd["fixed_value"]),
+        "command_ranges": {k: list(cmd[k]) for k in ("lin_vel_x", "lin_vel_y", "ang_vel_yaw")},
+        "terrain": dict(terr), "reward_scales": dict(rew),
+        "termination_height": term["base_height"], "termination_tilt_deg": term["tilt"],
+        "episode_length_s": term["episode_length"],
+    }
+    batch = run["num_envs"] * algo["horizon_length"]
+    params["config"].update({
+        "name": name, "env_name": "nuka_g1", "num_actors": run["num_envs"], "max_epochs": run["max_epochs"],
+        "save_frequency": run["save_every"], "learning_rate": algo["learning_rate"],
+        "kl_threshold": algo["kl_threshold"], "gamma": algo["gamma"], "tau": algo["tau"],
+        "entropy_coef": algo["entropy_coef"], "e_clip": algo["e_clip"],
+        "horizon_length": algo["horizon_length"], "minibatch_size": batch // algo["minibatches"],
+        "mini_epochs": algo["mini_epochs"], "env_config": env_config,
+        # Actions go to the robot unscaled and unclipped, as in rsl_rl.
+        "clip_actions": False, "bounds_loss_coef": 0.0,
+    })
+    return params
 
 
 TASKS: Dict[str, TaskSpec] = {}
@@ -231,4 +347,6 @@ def register(spec: TaskSpec) -> None:
 
 
 register(TaskSpec(name="go2_velocity", title="Go2 velocity tracking", env="nuka_go2", groups=_go2_groups(),
-                  robot={"links": 13, "joints": 12}, dt=0.005, spacing=1.0, build=_go2_build, check=_go2_check))
+                  robot={"links": 13, "joints": 12}, dt=0.005, spacing=1.0, build=_go2_build, check=_batch_check))
+register(TaskSpec(name="g1_rough", title="G1 rough-terrain walking", env="nuka_g1", groups=_g1_groups(),
+                  robot={"links": 31, "joints": 23}, dt=0.005, spacing=0.0, build=_g1_build, check=_batch_check))
