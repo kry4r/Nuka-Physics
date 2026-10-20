@@ -2818,7 +2818,7 @@ void ImGuiLayer::DrawViewTools(const ImVec2& vmin, const ImVec2& vmax) {
             ImGui::SameLine(0.0f, 4.0f * s);
             ImGui::SetNextItemWidth(130.0f * s);
             const ViewModeInfo& shown = kViewModes[static_cast<size_t>(ui.view_mode)];
-            if (ImGui::BeginCombo("##mode", Tr(shown.label))) {
+            if (draw::BeginCombo("##mode", Tr(shown.label))) {
                 for (const ViewModeInfo& m : kViewModes)
                     if (ImGui::Selectable(Tr(m.label), m.mode == ui.view_mode))
                         Queue("view.mode", Args({{"mode", json::Value::Str(m.name)}}));
@@ -2940,7 +2940,7 @@ void ImGuiLayer::DrawPaneHeaders(const ImVec2& cmin, const ImVec2& cmax, const I
             }
             ImGui::SameLine(0.0f, 4.0f * s);
             ImGui::SetNextItemWidth(104.0f * s);
-            if (ImGui::BeginCombo("##mode", Tr(kViewModes[static_cast<size_t>(p.mode)].label))) {
+            if (draw::BeginCombo("##mode", Tr(kViewModes[static_cast<size_t>(p.mode)].label))) {
                 for (const ViewModeInfo& m : kViewModes)
                     if (ImGui::Selectable(Tr(m.label), m.mode == p.mode))
                         Queue("view.view", Args({{"index", index}, {"mode", json::Value::Str(m.name)}}));

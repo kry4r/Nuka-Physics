@@ -315,7 +315,7 @@ void ImGuiLayer::TrainRunPicker() {
     ImGui::SameLine();
     ImGui::SetNextItemWidth(-FLT_MIN);
     const std::string shown = run != nullptr ? run->name + "   " + Tr(run->state) : std::string(Tr("No runs yet"));
-    if (ImGui::BeginCombo("##run_pick", shown.c_str())) {
+    if (draw::BeginCombo("##run_pick", shown.c_str())) {
         for (const TrainRunRow& r : p.runs)
             if (ImGui::Selectable(label(r).c_str(), r.name == p.selected)) p.selected = r.name;
         ImGui::EndCombo();
@@ -359,7 +359,7 @@ void ImGuiLayer::DrawTrainTask() {
     ImGui::TextColored(theme::kFgMuted, "%s", Tr("Task"));
     ImGui::SameLine();
     ImGui::SetNextItemWidth(-FLT_MIN);
-    if (ImGui::BeginCombo("##task", schema != nullptr ? Tr(schema->At("title").AsString()).c_str() : task.c_str())) {
+    if (draw::BeginCombo("##task", schema != nullptr ? Tr(schema->At("title").AsString()).c_str() : task.c_str())) {
         for (const json::Value& t : p.tasks.Elements()) {
             const std::string& name = t.At("name").AsString();
             if (ImGui::Selectable(Tr(t.At("title").AsString()).c_str(), name == task) && name != task)
@@ -432,6 +432,8 @@ void ImGuiLayer::DrawTrainTask() {
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip)) ParamTip(param, path);
                 ImGui::TableSetColumnIndex(1);
                 ImGui::SetNextItemWidth(-FLT_MIN);
+                // The value widget is named by its parameter path, so ui.pointer finds it.
+                const std::string vid = "##" + path;
                 const float lo = param.At("min").IsNull() ? 0.0f : param.At("min").AsFloat();
                 const float hi = param.At("max").IsNull() ? 0.0f : param.At("max").AsFloat();
                 const std::string& unit = param.At("unit").AsString();
@@ -450,16 +452,17 @@ void ImGuiLayer::DrawTrainTask() {
                     ImGui::TextColored(theme::kFgDim, "%s  %s", icon::kLock, (ValueText(v) + suffix).c_str());
                 } else if (kind == "bool") {
                     bool b = v.AsBool();
-                    if (ImGui::Checkbox("##v", &b)) commit(path, json::Value::Bool(b));
+                    if (ImGui::Checkbox(vid.c_str(), &b)) commit(path, json::Value::Bool(b));
                 } else if (kind == "int") {
                     int x = static_cast<int>(v.AsInt());
-                    if (ImGui::DragInt("##v", &x, std::max(0.1f, speed(static_cast<float>(x))), static_cast<int>(lo),
-                                       static_cast<int>(hi), ("%d" + suffix).c_str(), ImGuiSliderFlags_AlwaysClamp))
+                    if (ImGui::DragInt(vid.c_str(), &x, std::max(0.1f, speed(static_cast<float>(x))),
+                                       static_cast<int>(lo), static_cast<int>(hi), ("%d" + suffix).c_str(),
+                                       ImGuiSliderFlags_AlwaysClamp))
                         v = json::Value::Int(x);
                     if (finished()) commit(path, v);
                 } else if (kind == "float") {
                     float x = v.AsFloat();
-                    if (ImGui::DragFloat("##v", &x, speed(x), lo, hi, ("%.4g" + suffix).c_str(),
+                    if (ImGui::DragFloat(vid.c_str(), &x, speed(x), lo, hi, ("%.4g" + suffix).c_str(),
                                          ImGuiSliderFlags_AlwaysClamp))
                         v = json::Value::Float(x);
                     if (finished()) commit(path, v);
@@ -472,8 +475,8 @@ void ImGuiLayer::DrawTrainTask() {
                         step = std::max(step, speed(x[k]));
                     }
                     // Too narrow for units; the tooltip has them.
-                    const bool moved = n == 2u ? ImGui::DragFloat2("##v", x, step, lo, hi, "%.3g")
-                                               : ImGui::DragFloat3("##v", x, step, lo, hi, "%.3g");
+                    const bool moved = n == 2u ? ImGui::DragFloat2(vid.c_str(), x, step, lo, hi, "%.3g")
+                                               : ImGui::DragFloat3(vid.c_str(), x, step, lo, hi, "%.3g");
                     if (moved) {
                         json::Value list = json::Value::Array();
                         for (size_t k = 0; k < n; ++k) list.PushBack(json::Value::Float(x[k]));
@@ -481,7 +484,7 @@ void ImGuiLayer::DrawTrainTask() {
                     }
                     if (finished()) commit(path, v);
                 } else if (kind == "enum") {
-                    if (ImGui::BeginCombo("##v", ValueText(v).c_str())) {
+                    if (draw::BeginCombo(vid.c_str(), ValueText(v).c_str())) {
                         for (const json::Value& choice : param.At("choices").Elements())
                             if (ImGui::Selectable(ValueText(choice).c_str(), ValueText(choice) == ValueText(v)))
                                 commit(path, choice);
@@ -492,7 +495,7 @@ void ImGuiLayer::DrawTrainTask() {
                     char text[128];
                     std::snprintf(text, sizeof(text), "%s",
                                   v.type() == json::Value::Type::String ? v.AsString().c_str() : ValueText(v).c_str());
-                    if (ImGui::InputText("##v", text, sizeof(text))) v = json::Value::Str(text);
+                    if (ImGui::InputText(vid.c_str(), text, sizeof(text))) v = json::Value::Str(text);
                     if (finished()) {
                         json::Value list = json::Value::Array();
                         for (const char* c = text; *c != '\0';) {
@@ -749,7 +752,7 @@ void ImGuiLayer::DrawTrainDashboard() {
     const float combo = 150.0f * s;
     if (ImGui::GetCursorScreenPos().x + combo > right) ImGui::NewLine();
     ImGui::SetNextItemWidth(combo);
-    if (ImGui::BeginCombo("##compare", Tr("Compare with..."))) {
+    if (draw::BeginCombo("##compare", Tr("Compare with..."))) {
         for (const TrainRunRow& r : p.runs) {
             if (r.name == p.selected || std::find(p.compare.begin(), p.compare.end(), r.name) != p.compare.end())
                 continue;

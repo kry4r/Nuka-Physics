@@ -91,7 +91,7 @@ std::string UsersText(uint32_t users) {
 void ImGuiLayer::MaterialCombo(const char* id, const std::string& current, const std::string& path) {
     const MaterialView& v = frame_.ui->materials;
     const std::string shown = current.empty() ? std::string(Tr("Default")) : current;
-    if (!ImGui::BeginCombo(id, shown.c_str(), ImGuiComboFlags_HeightLarge)) return;
+    if (!draw::BeginCombo(id, shown.c_str(), ImGuiComboFlags_HeightLarge)) return;
     if (ImGui::IsWindowAppearing()) material_filter_[0] = '\0';
     if (v.materials.size() > 8u) {
         if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
@@ -287,7 +287,7 @@ void ImGuiLayer::DrawMaterialMaps() {
             ImGui::SetCursorScreenPos(ImVec2(x, y));
             ImGui::SetNextItemWidth(channel_w);
             const uint32_t now = k == 1u ? v.roughness_channel : v.metallic_channel;
-            if (ImGui::BeginCombo("##channel", kChannels[now])) {
+            if (draw::BeginCombo("##channel", kChannels[now])) {
                 for (uint32_t c = 0; c < 3u; ++c)
                     if (ImGui::Selectable(kChannels[c], c == now) && c != now)
                         set(k == 1u ? "roughness_channel" : "metallic_channel", json::Value::Int(c));
@@ -309,7 +309,7 @@ void ImGuiLayer::DrawMaterialMaps() {
     if (!BeginRows("##mapping")) return;
     Row("Mapping");
     ImGui::SetNextItemWidth(-FLT_MIN);
-    if (ImGui::BeginCombo("##mapping", Tr(v.triplanar ? "Triplanar" : "UV"))) {
+    if (draw::BeginCombo("##mapping", Tr(v.triplanar ? "Triplanar" : "UV"))) {
         if (ImGui::Selectable(Tr("UV"), !v.triplanar) && v.triplanar) set("triplanar", json::Value::Bool(false));
         if (ImGui::Selectable(Tr("Triplanar"), v.triplanar) && !v.triplanar) set("triplanar", json::Value::Bool(true));
         ImGui::EndCombo();
@@ -486,7 +486,7 @@ void ImGuiLayer::DrawMaterialLibrary() {
     ImGui::TextUnformatted(Fmt(Tr("'%s' is in use. What do its users take instead?"), library_delete_.c_str()).c_str());
     ImGui::SetNextItemWidth(280.0f * s);
     const std::string replace = library_replace_.empty() ? std::string(Tr("Default")) : library_replace_;
-    if (ImGui::BeginCombo("##replace", replace.c_str())) {
+    if (draw::BeginCombo("##replace", replace.c_str())) {
         if (ImGui::Selectable(Tr("Default"), library_replace_.empty())) library_replace_.clear();
         for (const MaterialItem& m : v.materials)
             if (m.name != library_delete_ && ImGui::Selectable(m.name.c_str(), m.name == library_replace_))

@@ -423,7 +423,7 @@ void ComboBox::DrawSelf() {
     const int value = model->Get();
     const char* preview = value >= 0 && value < static_cast<int>(options.size()) ? Tr(options[static_cast<size_t>(value)]).c_str() : "";
     ImGui::SetNextItemWidth(ItemWidth(160.0f * Scale()));
-    if (!ImGui::BeginCombo("##combo", preview)) return;
+    if (!draw::BeginCombo("##combo", preview)) return;
     for (size_t i = 0; i < options.size(); ++i) {
         const bool selected = static_cast<int>(i) == value;
         ImGui::PushID(static_cast<int>(i));

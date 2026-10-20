@@ -2,6 +2,7 @@
 
 #include "runtime/app/viewer/nui/nui_internal.hpp"
 
+#include "render/imgui/imgui_item_hooks.hpp"
 #include "render/imgui/nuka_imgui.hpp"
 
 #include "imgui_internal.h"
@@ -333,6 +334,7 @@ bool Chip(const char* id, const std::string& text, bool on) {
     ImGui::PushID(id);
     const bool clicked = ImGui::InvisibleButton("##chip", box);
     ImGui::PopID();
+    render::imgui::NoteItemLabel(ImGui::GetItemID(), text.c_str());
     const bool hot = ImGui::IsItemHovered();
     ImDrawList* list = ImGui::GetWindowDrawList();
     Chamfer(list, p, ImVec2(p.x + box.x, p.y + box.y), 4.0f * s,
@@ -341,6 +343,14 @@ bool Chip(const char* id, const std::string& text, bool on) {
     list->AddText(ImVec2(p.x + 8.0f * s, p.y + (box.y - size.y) * 0.5f), U32(on ? theme::kAccent : hot ? theme::kFg : theme::kFgMuted),
                   text.c_str());
     return clicked;
+}
+
+bool BeginCombo(const char* label, const char* preview, ImGuiComboFlags flags) {
+    const ImGuiID id = ImGui::GetID(label);
+    const bool open = ImGui::BeginCombo(label, preview, flags);
+    // ImGui's combo gives the hooks no label.
+    render::imgui::NoteItemLabel(id, label);
+    return open;
 }
 
 }  // namespace draw

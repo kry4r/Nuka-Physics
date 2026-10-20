@@ -69,7 +69,7 @@ void ImGuiLayer::DrawSemanticField() {
     if (ImGui::IsItemDeactivatedAfterEdit()) set(label_buf_);
     ImGui::SetItemTooltip("%s", Tr("The class this node and its children show in semantic images; empty inherits."));
     ImGui::SameLine();
-    if (ImGui::BeginCombo("##classes", nullptr, ImGuiComboFlags_NoPreview | ImGuiComboFlags_PopupAlignLeft)) {
+    if (draw::BeginCombo("##classes", nullptr, ImGuiComboFlags_NoPreview | ImGuiComboFlags_PopupAlignLeft)) {
         if (l.classes.empty()) ImGui::TextDisabled("%s", Tr("No labels yet"));
         for (const std::string& c : l.classes)
             if (ImGui::Selectable(c.c_str(), own && c == label)) set(c);

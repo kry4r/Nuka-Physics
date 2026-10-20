@@ -154,8 +154,10 @@ bool IconButton(const char* id, const char* glyph, bool checked = false, const c
 void ThinProgress(float fraction, float width, Tone tone = Tone::Accent);
 // Corner brackets and HUD chips over the scene viewport, the chips `hud_top` lower.
 void ViewportFrame(const ImVec2& min, const ImVec2& max, const std::vector<std::string>& hud, float hud_top = 0.0f);
-// A small toggle chip; true when clicked.
+// A small toggle chip, named by its text for the item hooks; true when clicked.
 bool Chip(const char* id, const std::string& text, bool on);
+// ImGui::BeginCombo, with the combo named for the item hooks the demo pointer finds widgets by.
+bool BeginCombo(const char* label, const char* preview, ImGuiComboFlags flags = 0);
 }  // namespace draw
 
 class Host;

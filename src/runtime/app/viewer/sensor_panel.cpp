@@ -303,7 +303,7 @@ void ImGuiLayer::DrawSensorInspector() {
     if (finished()) commit(Args({{"name", json::Value::Str(sensor_name_)}}));
     row("Type");
     const SensorKind& kind = FindSensorKind(e.type);
-    if (ImGui::BeginCombo("##type", Iconed(kind.glyph, Tr(kind.label)).c_str())) {
+    if (draw::BeginCombo("##type", Iconed(kind.glyph, Tr(kind.label)).c_str())) {
         for (const SensorKind& k : SensorKinds())
             if (ImGui::Selectable(Iconed(k.glyph, Tr(k.label)).c_str(), e.type == k.type))
                 commit(Args({{"type", json::Value::Str(k.type)}}));
@@ -311,7 +311,7 @@ void ImGuiLayer::DrawSensorInspector() {
     }
     row("Mount");
     const std::string mount = !e.mount.empty() ? e.mount : e.frame == "world" ? std::string(Tr("World")) : e.frame;
-    if (ImGui::BeginCombo("##mount", mount.c_str())) {
+    if (draw::BeginCombo("##mount", mount.c_str())) {
         if (ImGui::Selectable(Tr("World"), e.frame == "world")) commit(Args({{"mount", json::Value::Str("")}}));
         for (const std::string& path : v.bodies)
             if (ImGui::Selectable(path.c_str(), path == e.mount)) commit(Args({{"mount", json::Value::Str(path)}}));
@@ -360,7 +360,7 @@ void ImGuiLayer::DrawSensorInspector() {
         std::string planes;
         for (const auto& [label, bit] : kAovs)
             if ((shown & bit) != 0u) planes += (planes.empty() ? "" : ", ") + std::string(Tr(label));
-        if (ImGui::BeginCombo("##aov", planes.c_str())) {
+        if (draw::BeginCombo("##aov", planes.c_str())) {
             for (const auto& [label, bit] : kAovs) {
                 bool on = (shown & bit) != 0u;
                 ImGui::BeginDisabled(shown == bit);
@@ -501,7 +501,7 @@ void ImGuiLayer::DrawSensorsPanel() {
     if (shown != nullptr && shown->camera) {
         ImGui::SameLine();
         ImGui::SetNextItemWidth(130.0f * s);
-        if (ImGui::BeginCombo("##plane", Tr(p.semantic ? "Semantic" : kAovs[p.channel].first))) {
+        if (draw::BeginCombo("##plane", Tr(p.semantic ? "Semantic" : kAovs[p.channel].first))) {
             for (uint32_t c = 0; c < std::size(kAovs); ++c)
                 if (ImGui::Selectable(Tr(kAovs[c].first), c == p.channel && !p.semantic))
                     Queue("sensor.preview", Args({{"channel", json::Value::Str(kSensorChannels[c])}}));

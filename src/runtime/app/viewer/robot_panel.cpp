@@ -317,7 +317,7 @@ void ImGuiLayer::BuildJoints(nui::VStack& root) {
         ImGui::TextDisabled("%s", Tr("Chain root"));
         ImGui::SetNextItemWidth(-FLT_MIN);
         const std::string root_name = k.root.empty() ? std::string(Tr("Articulation root")) : leaf(k.root);
-        if (ImGui::BeginCombo("##ik_root", root_name.c_str())) {
+        if (nui::draw::BeginCombo("##ik_root", root_name.c_str())) {
             if (ImGui::Selectable(Tr("Articulation root"), k.root.empty()))
                 Queue("robot.ik_settings", Args({{"root", json::Value::Str(std::string())}}));
             for (size_t i = 0; i < v.links.size(); ++i) {
@@ -373,7 +373,7 @@ void ImGuiLayer::BuildJoints(nui::VStack& root) {
         ImGui::TextDisabled("%s", Tr("Device"));
         ImGui::SetNextItemWidth(-FLT_MIN);
         const std::string current = device != nullptr ? std::string(Tr(device->label.c_str())) : Fmt(Tr("%s (gone)"), t.device.c_str());
-        if (ImGui::BeginCombo("##teleop_device", current.c_str())) {
+        if (nui::draw::BeginCombo("##teleop_device", current.c_str())) {
             for (const TeleopDeviceInfo& d : t.devices) {
                 ImGui::PushID(d.id.c_str());
                 if (ImGui::Selectable(Tr(d.label.c_str()), d.id == t.device)) use("device", json::Value::Str(d.id));
@@ -392,7 +392,7 @@ void ImGuiLayer::BuildJoints(nui::VStack& root) {
         };
         ImGui::TextDisabled("%s", Tr("Mode"));
         ImGui::SetNextItemWidth(-FLT_MIN);
-        if (ImGui::BeginCombo("##teleop_mode", mode_label(t.mode).c_str())) {
+        if (nui::draw::BeginCombo("##teleop_mode", mode_label(t.mode).c_str())) {
             std::vector<std::string> modes = kTeleopModes;
             for (const TeleopRetarget& r : t.retargets) modes.push_back(r.id);
             for (const std::string& m : modes) {
@@ -406,7 +406,7 @@ void ImGuiLayer::BuildJoints(nui::VStack& root) {
             const int j = std::clamp(t.joint, 0, static_cast<int>(v.joints.size()) - 1);
             ImGui::TextDisabled("%s", Tr("Joint"));
             ImGui::SetNextItemWidth(-FLT_MIN);
-            if (ImGui::BeginCombo("##teleop_joint", v.joints[static_cast<size_t>(j)].name.c_str())) {
+            if (nui::draw::BeginCombo("##teleop_joint", v.joints[static_cast<size_t>(j)].name.c_str())) {
                 for (size_t i = 0; i < v.joints.size(); ++i) {
                     ImGui::PushID(static_cast<int>(i));
                     if (ImGui::Selectable(v.joints[i].name.c_str(), static_cast<int>(i) == j))
@@ -420,7 +420,7 @@ void ImGuiLayer::BuildJoints(nui::VStack& root) {
             ImGui::TextDisabled("%s", Tr("Link"));
             ImGui::SetNextItemWidth(-FLT_MIN);
             const std::string link = t.link.empty() ? std::string(Tr("Selected link")) : Leaf(t.link);
-            if (ImGui::BeginCombo("##teleop_link", link.c_str())) {
+            if (nui::draw::BeginCombo("##teleop_link", link.c_str())) {
                 if (ImGui::Selectable(Tr("Selected link"), t.link.empty())) use("link", json::Value::Str(std::string()));
                 for (size_t i = 0; i < v.links.size(); ++i) {
                     if (v.links[i].parent < 0) continue;
@@ -521,7 +521,7 @@ void ImGuiLayer::BuildJoints(nui::VStack& root) {
                 ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0);
                 ImGui::SetNextItemWidth(-FLT_MIN);
-                if (ImGui::BeginCombo("##input", b.input.c_str(), ImGuiComboFlags_NoArrowButton)) {
+                if (nui::draw::BeginCombo("##input", b.input.c_str(), ImGuiComboFlags_NoArrowButton)) {
                     for (const std::string& in : inputs)
                         if (ImGui::Selectable(in.c_str(), in == b.input)) b.input = in;
                     ImGui::EndCombo();
@@ -532,7 +532,8 @@ void ImGuiLayer::BuildJoints(nui::VStack& root) {
                     char text[64];
                     std::snprintf(text, sizeof(text), "%s", b.quantity.c_str());
                     if (ImGui::InputText("##quantity", text, sizeof(text))) b.quantity = text;
-                } else if (ImGui::BeginCombo("##quantity", ("\xE2\x86\x92 " + b.quantity).c_str(), ImGuiComboFlags_NoArrowButton)) {
+                } else if (nui::draw::BeginCombo("##quantity", ("\xE2\x86\x92 " + b.quantity).c_str(),
+                                                 ImGuiComboFlags_NoArrowButton)) {
                     for (const std::string& q : names)
                         if (ImGui::Selectable(q.c_str(), q == b.quantity)) b.quantity = q;
                     ImGui::EndCombo();
@@ -862,7 +863,7 @@ void ImGuiLayer::DrawGainTuner() {
             ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed, 120.0f * s);
             ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
             TunerLabel("Joint");
-            if (ImGui::BeginCombo("##joint", joint.name.c_str())) {
+            if (nui::draw::BeginCombo("##joint", joint.name.c_str())) {
                 for (size_t i = 0; i < v.joints.size(); ++i) {
                     const std::string name = Iconed(v.joints[i].prismatic ? icon::kMove : icon::kRotate, v.joints[i].name.c_str());
                     if (ImGui::Selectable(name.c_str(), static_cast<int>(i) == j)) g.joint = v.joints[i].name;
@@ -1048,7 +1049,7 @@ void ImGuiLayer::DrawSysId() {
                 ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed, 120.0f * s);
                 ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
                 TunerLabel("Episode");
-                if (ImGui::BeginCombo("##episode", episode_name(shown).c_str())) {
+                if (nui::draw::BeginCombo("##episode", episode_name(shown).c_str())) {
                     for (int k = 0; k < episodes; ++k)
                         if (ImGui::Selectable(episode_name(k).c_str(), k == shown)) id.episode = k;
                     ImGui::EndCombo();
@@ -1085,7 +1086,7 @@ void ImGuiLayer::DrawSysId() {
                     ImGui::TableNextRow();
                     ImGui::TableSetColumnIndex(0);
                     ImGui::SetNextItemWidth(-FLT_MIN);
-                    if (ImGui::BeginCombo("##param", name_of(p.param))) {
+                    if (nui::draw::BeginCombo("##param", name_of(p.param))) {
                         for (size_t k = 0; k < 4u; ++k) {
                             if (!ImGui::Selectable(Tr(kNames[k]), p.param == kKeys[k]) || p.param == kKeys[k]) continue;
                             p.param = kKeys[k];
@@ -1097,7 +1098,7 @@ void ImGuiLayer::DrawSysId() {
                     }
                     ImGui::TableSetColumnIndex(1);
                     ImGui::SetNextItemWidth(-FLT_MIN);
-                    if (ImGui::BeginCombo("##joint", p.joint.empty() ? Tr("All joints") : p.joint.c_str())) {
+                    if (nui::draw::BeginCombo("##joint", p.joint.empty() ? Tr("All joints") : p.joint.c_str())) {
                         if (ImGui::Selectable(Tr("All joints"), p.joint.empty())) p.joint.clear();
                         for (const RobotJoint& joint : v.joints)
                             if (ImGui::Selectable(joint.name.c_str(), p.joint == joint.name)) p.joint = joint.name;
@@ -1264,7 +1265,7 @@ void ImGuiLayer::DrawAssembler() {
                 }
                 TunerLabel("Mount");
                 const std::string shown = a.mount.empty() ? std::string(Tr("its root")) : a.mount;
-                if (ImGui::BeginCombo("##mount", shown.c_str())) {
+                if (nui::draw::BeginCombo("##mount", shown.c_str())) {
                     if (ImGui::Selectable(Tr("its root"), a.mount.empty())) a.mount.clear();
                     for (const std::string& link : a.asset_links)
                         if (ImGui::Selectable(link.c_str(), a.mount == link)) a.mount = link;
@@ -1277,7 +1278,7 @@ void ImGuiLayer::DrawAssembler() {
             }
             TunerLabel("Parent link");
             ImGui::SetNextItemWidth(-pick_w);
-            if (ImGui::BeginCombo("##parent", node(a.parent).c_str())) {
+            if (nui::draw::BeginCombo("##parent", node(a.parent).c_str())) {
                 for (const RobotLink& link : v.links)
                     if (ImGui::Selectable(link.path.c_str(), a.parent == link.path)) a.parent = link.path;
                 ImGui::EndCombo();

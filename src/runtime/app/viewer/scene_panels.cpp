@@ -150,7 +150,7 @@ void ImGuiLayer::BuildAssets(nui::VStack& root) {
         ImGui::SameLine();
         ImGui::SetNextItemWidth(kind_w);
         const std::string shown_kind = b.kind.empty() ? std::string(Tr("All kinds")) : Iconed(KindOf(b.kind).glyph, Tr(KindOf(b.kind).label));
-        if (ImGui::BeginCombo("##asset_kind", shown_kind.c_str())) {
+        if (draw::BeginCombo("##asset_kind", shown_kind.c_str())) {
             if (ImGui::Selectable(Tr("All kinds"), b.kind.empty())) b.kind.clear();
             for (auto k = std::begin(kKinds); k + 1 != std::end(kKinds); ++k)
                 if (ImGui::Selectable(Iconed(k->glyph, Tr(k->label)).c_str(), b.kind == k->kind)) b.kind = k->kind;

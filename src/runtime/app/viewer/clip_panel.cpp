@@ -149,7 +149,7 @@ void ImGuiLayer::DrawClipEditor() {
         const json::Value name = json::Value::Str(clip != nullptr ? clip->name : std::string());
 
         ImGui::SetNextItemWidth(170.0f * s);
-        if (ImGui::BeginCombo("##clip", clip != nullptr ? clip->name.c_str() : Tr("No clip"))) {
+        if (nui::draw::BeginCombo("##clip", clip != nullptr ? clip->name.c_str() : Tr("No clip"))) {
             for (size_t k = 0; k < c.clips.size(); ++k)
                 if (ImGui::Selectable(c.clips[k].name.c_str(), static_cast<int>(k) == c.edited))
                     Queue("clip.editor", Args({{"clip", json::Value::Str(c.clips[k].name)}}));
@@ -214,7 +214,7 @@ void ImGuiLayer::DrawClipEditor() {
             ImGui::SetItemTooltip("%s", Tr("Keys every joint at the playhead where the robot stands now."));
             ImGui::SameLine();
             ImGui::SetNextItemWidth(150.0f * s);
-            if (ImGui::BeginCombo("##key_library", Tr("Key a saved pose"))) {
+            if (nui::draw::BeginCombo("##key_library", Tr("Key a saved pose"))) {
                 if (v.poses.empty()) ImGui::TextDisabled("%s", Tr("No saved poses"));
                 for (const JointPose& p : v.poses)
                     if (ImGui::Selectable(p.name.c_str()))
