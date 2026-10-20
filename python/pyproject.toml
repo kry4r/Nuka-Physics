@@ -13,6 +13,7 @@ dependencies = ["numpy", "jedi"]
 [project.scripts]
 # The editor, or with --headless the bare world; see nuka.editor.
 nuka-editor = "nuka.editor:main"
+nuka-mcp = "nuka.mcp:main"
 
 [tool.scikit-build]
 # scikit-build-core drives the CMakeLists.txt next to this pyproject.

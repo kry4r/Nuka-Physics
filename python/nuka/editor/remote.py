@@ -122,6 +122,7 @@ class RemoteEditor:
             raise RemoteError(f"cannot reach the editor with pid {self.pid}: {error}") from None
         self._lock = threading.Lock()
         self._next = 0
+        self.closed = False  # the editor went away or close() ran
         self.actions = RemoteActions(self)
         self.hello = self.call("hello", client=client)
 
@@ -129,10 +130,11 @@ class RemoteEditor:
         """One request; returns its value or raises RemoteError with the editor's reason."""
         with self._lock:
             self._next += 1
-            self._conn.send_bytes(json.dumps({"id": self._next, "op": op, "args": args}).encode("utf-8"))
             try:
+                self._conn.send_bytes(json.dumps({"id": self._next, "op": op, "args": args}).encode("utf-8"))
                 reply = json.loads(self._conn.recv_bytes())
             except (EOFError, OSError):
+                self.closed = True
                 raise RemoteError("the editor closed the connection") from None
         if not reply["ok"]:
             raise RemoteError(f"{op}: {reply['error']}")
@@ -154,6 +156,7 @@ class RemoteEditor:
         return self.call("wait", id=action_id, args=args, until=until, timeout_s=timeout_s)
 
     def close(self) -> None:
+        self.closed = True
         self._conn.close()
 
     def __enter__(self) -> "RemoteEditor":

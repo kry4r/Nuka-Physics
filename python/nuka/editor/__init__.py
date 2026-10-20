@@ -6,6 +6,7 @@ Command line (also the ``nuka-editor`` app)::
     python -m nuka.editor scene.nks                     # editor window
     python -m nuka.editor scene.nks --offscreen --frames 60
     python -m nuka.editor scene.nks --headless --steps 600
+    python -m nuka.editor --mcp                         # MCP server on stdio (see nuka.mcp)
 
 A scene given while an editor already runs on the same ``--profile`` opens in that window;
 ``--new-window`` starts another editor instead.
@@ -112,8 +113,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     add_launcher_args(parser)
     parser.add_argument("--new-window", action="store_true")
     parser.add_argument("--console", action="store_true")
+    parser.add_argument("--mcp", action="store_true")
     parser.add_argument("--render", default=None, help=argparse.SUPPRESS)
     opts, rest = parser.parse_known_args(sys.argv[1:] if argv is None else argv)
+    if opts.mcp:
+        from ..mcp import main as mcp_main
+        return mcp_main(rest)
     if opts.render:
         from .render_job import run
         return run(opts.render)
@@ -125,7 +130,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         app = launch(scene=scene_opts.scene, dt=scene_opts.dt, headless=True)
     else:
         if "--help" in rest:
-            print("app: [--headless] [--steps N] [--new-window] [--console]")
+            print("app: [--headless] [--steps N] [--new-window] [--console] [--mcp [--profile DIR] [--pid PID]]")
         elif not opts.new_window and forward(rest):
             return 0
         python, python_ok = _use_python_env(rest)
