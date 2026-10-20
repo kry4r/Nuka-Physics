@@ -735,6 +735,13 @@ void ImGuiLayer::DrawCollisionDialog() {
             ImGui::SliderInt("##pieces", &d.max_pieces, 1, 64);
             changed = ImGui::IsItemDeactivatedAfterEdit() || changed;
         }
+        if (d.method == "mesh") {
+            OptionLabel("Max triangles");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::SliderInt("##max_triangles", &d.max_triangles, 0, 1000000, d.max_triangles == 0 ? Tr("All") : "%d",
+                             ImGuiSliderFlags_Logarithmic);
+            changed = ImGui::IsItemDeactivatedAfterEdit() || changed;
+        }
         OptionLabel("Bodies");
         changed = ImGui::Checkbox(Tr("Include descendants"), &d.subtree) || changed;
         OptionLabel("");

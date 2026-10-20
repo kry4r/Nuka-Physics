@@ -41,8 +41,8 @@ This page is generated from assets/editor/actions.toml by tools/skill_actions.py
 - `scene.select` {path?, mode?, paths} [view]: Selects Stage nodes: replace makes `path` the selection (none clears it), add and toggle grow or shrink the selection, range takes `paths` with `path` leading.
 - `scene.set_visible` {value?, paths?, path?} [view]: Shows or hides Stage nodes in the viewport; a hidden node keeps simulating.
 - `scene.set_locked` {value?, paths?, path?} [view]: Locks or unlocks Stage nodes against picking and gizmo drags in the viewport.
-- `scene.collision_preview` {paths?, path?, method?, max_pieces?, replace?, only_missing?, subtree?} [read]: What scene.generate_collision would do with the same arguments, body by body, without changing anything; the Generate Collision dialog shows it.
-- `scene.generate_collision` {paths?, path?, method?, max_pieces?, replace?, only_missing?, subtree?} [edit]: Builds colliders for bodies from their visual meshes, as one undoable edit: a convex hull, a convex decomposition, an SDF or the triangle mesh itself.
+- `scene.collision_preview` {paths?, path?, method?, max_pieces?, max_triangles?, replace?, only_missing?, subtree?} [read]: What scene.generate_collision would do with the same arguments, body by body, without changing anything; the Generate Collision dialog shows it.
+- `scene.generate_collision` {paths?, path?, method?, max_pieces?, max_triangles?, replace?, only_missing?, subtree?} [edit]: Builds colliders for bodies from their visual meshes, as one undoable edit: a convex hull, a convex decomposition, an SDF or the triangle mesh itself.
 - `scene.collision_dialog` [view]: Opens the Generate Collision dialog on the selection with its preview.
 - `scene.terrain` {kind, size?, center?, cell?, base?, height?, bump?, grade?, rise?, width?, platform?, count?, tile?, margin?, seed?} [edit]: Sets the scene's terrain field, which the cook bakes into a static heightfield, or removes it with kind none.
 - `scene.terrain_info` [read]: The scene's terrain field as scene.terrain arguments, every size filled in; null when the scene has none.

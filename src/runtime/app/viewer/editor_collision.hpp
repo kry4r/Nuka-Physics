@@ -18,10 +18,11 @@ const char* CollisionMethodName(CollisionMethod method);
 
 struct CollisionOptions {
     CollisionMethod method = CollisionMethod::Hull;
-    uint32_t max_pieces = 16u;  // decomposition only
-    bool replace = true;        // drop the body's colliders first
-    bool only_missing = false;  // leave bodies that have a collider
-    bool subtree = false;       // a body's descendants too; a group always takes all under it
+    uint32_t max_pieces = 16u;    // decomposition only
+    uint32_t max_triangles = 0u;  // triangle mesh only: merges vertices on a grid to keep at most this many, 0 all
+    bool replace = true;          // drop the body's colliders first
+    bool only_missing = false;    // leave bodies that have a collider
+    bool subtree = false;         // a body's descendants too; a group always takes all under it
 };
 
 // Reads the options an action or edit op names; missing keys keep the defaults.

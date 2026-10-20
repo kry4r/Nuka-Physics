@@ -6,6 +6,10 @@
 #include "scene/graph/scene_graph.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
+#include <limits>
+#include <map>
 #include <unordered_map>
 #include <utility>
 
@@ -48,6 +52,254 @@ BodyMesh VisualMeshOf(const scene::SceneIR& s, scene::BodyId b) {
         for (const uint32_t index : sh.mesh_indices) mesh.indices.push_back(base + index);
     }
     return mesh;
+}
+
+using Vec3d = std::array<double, 3>;
+
+Vec3d PointOf(const BodyMesh& mesh, uint32_t v) {
+    return {mesh.vertices[v * 3u], mesh.vertices[v * 3u + 1u], mesh.vertices[v * 3u + 2u]};
+}
+
+Vec3d Sub(const Vec3d& a, const Vec3d& b) { return {a[0] - b[0], a[1] - b[1], a[2] - b[2]}; }
+
+Vec3d Cross(const Vec3d& a, const Vec3d& b) {
+    return {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
+}
+
+double Dot(const Vec3d& a, const Vec3d& b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+
+// The grid cell of every vertex, numbered in the order the vertices first reach them.
+std::vector<uint32_t> CellsOf(const BodyMesh& mesh, const Vec3d& origin, double cell, uint32_t* count) {
+    std::vector<uint32_t> out(mesh.vertices.size() / 3u);
+    std::unordered_map<uint64_t, uint32_t> ids;
+    ids.reserve(out.size());
+    for (uint32_t v = 0; v < out.size(); ++v) {
+        const Vec3d p = Sub(PointOf(mesh, v), origin);
+        const uint64_t key = static_cast<uint64_t>(p[0] / cell) << 42u | static_cast<uint64_t>(p[1] / cell) << 21u |
+                             static_cast<uint64_t>(p[2] / cell);
+        out[v] = ids.emplace(key, static_cast<uint32_t>(ids.size())).first->second;
+    }
+    *count = static_cast<uint32_t>(ids.size());
+    return out;
+}
+
+// The triangles left when each vertex merges into its cell: those on three cells, the first of any that
+// share their cells.
+std::vector<uint32_t> MergedTriangles(const BodyMesh& mesh, const std::vector<uint32_t>& cell_of) {
+    std::vector<std::array<uint32_t, 4>> keys;  // the sorted cells, then the triangle
+    keys.reserve(mesh.indices.size() / 3u);
+    for (size_t t = 0; t + 2u < mesh.indices.size(); t += 3u) {
+        std::array<uint32_t, 3> c = {cell_of[mesh.indices[t]], cell_of[mesh.indices[t + 1u]],
+                                     cell_of[mesh.indices[t + 2u]]};
+        if (c[0] == c[1] || c[1] == c[2] || c[0] == c[2]) continue;
+        std::sort(c.begin(), c.end());
+        keys.push_back({c[0], c[1], c[2], static_cast<uint32_t>(t / 3u)});
+    }
+    std::sort(keys.begin(), keys.end());
+    std::vector<uint32_t> kept;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const bool repeat = i != 0u && std::equal(keys[i].begin(), keys[i].begin() + 3, keys[i - 1u].begin());
+        if (!repeat) kept.push_back(keys[i][3]);
+    }
+    std::sort(kept.begin(), kept.end());
+    return kept;
+}
+
+// The eigenvalues `w` and eigenvectors (the columns of `v`) of the symmetric matrix `a`, by Jacobi sweeps.
+void SymmetricEigen(std::array<double, 9> a, Vec3d& w, std::array<double, 9>& v) {
+    v = {1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0};
+    for (int sweep = 0; sweep < 16; ++sweep) {
+        const double off = std::abs(a[1]) + std::abs(a[2]) + std::abs(a[5]);
+        if (off <= 1e-12 * (std::abs(a[0]) + std::abs(a[4]) + std::abs(a[8]))) break;
+        for (int p = 0; p < 2; ++p) {
+            for (int q = p + 1; q < 3; ++q) {
+                if (a[p * 3 + q] == 0.0) continue;
+                const double theta = (a[q * 3 + q] - a[p * 3 + p]) / (2.0 * a[p * 3 + q]);
+                const double t = (theta >= 0.0 ? 1.0 : -1.0) / (std::abs(theta) + std::sqrt(theta * theta + 1.0));
+                const double c = 1.0 / std::sqrt(t * t + 1.0), s = t * c;
+                for (int k = 0; k < 3; ++k) {
+                    const double kp = a[k * 3 + p], kq = a[k * 3 + q];
+                    a[k * 3 + p] = c * kp - s * kq;
+                    a[k * 3 + q] = s * kp + c * kq;
+                }
+                for (int k = 0; k < 3; ++k) {
+                    const double pk = a[p * 3 + k], qk = a[q * 3 + k];
+                    a[p * 3 + k] = c * pk - s * qk;
+                    a[q * 3 + k] = s * pk + c * qk;
+                }
+                for (int k = 0; k < 3; ++k) {
+                    const double kp = v[k * 3 + p], kq = v[k * 3 + q];
+                    v[k * 3 + p] = c * kp - s * kq;
+                    v[k * 3 + q] = s * kp + c * kq;
+                }
+            }
+        }
+    }
+    w = {a[0], a[4], a[8]};
+}
+
+// A cell's vertices and the area-weighted plane quadrics of their triangles.
+struct CellFit {
+    std::array<double, 9> a{};
+    Vec3d b{};
+    Vec3d sum{};
+    uint32_t count = 0u;
+};
+
+// The point that fits the cell's planes best, moved from its vertices' mean only along the directions the
+// planes pin down, so floors stay flat and corners stay sharp; it stays inside the cell.
+Vec3d Representative(const CellFit& f, const Vec3d& origin, double cell) {
+    const double n = static_cast<double>(f.count);
+    const Vec3d mean = {f.sum[0] / n, f.sum[1] / n, f.sum[2] / n};
+    Vec3d x = mean;
+    Vec3d r = {-f.b[0], -f.b[1], -f.b[2]};
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) r[i] -= f.a[i * 3 + j] * x[j];
+    Vec3d w;
+    std::array<double, 9> v;
+    SymmetricEigen(f.a, w, v);
+    const double top = std::max({w[0], w[1], w[2]});
+    for (int e = 0; e < 3; ++e) {
+        if (w[e] <= 1e-3 * top) continue;
+        const Vec3d axis = {v[e], v[3 + e], v[6 + e]};
+        const double step = Dot(axis, r) / w[e];
+        for (int k = 0; k < 3; ++k) x[k] += step * axis[k];
+    }
+    for (int k = 0; k < 3; ++k) {
+        const double lo = origin[k] + std::floor((mean[k] - origin[k]) / cell) * cell;
+        x[k] = std::clamp(x[k], lo, lo + cell);
+    }
+    return x;
+}
+
+// Drops triangles until each patch joined across edges that two triangles share can take one winding, as the
+// cook requires; merging can fold a surface into a Moebius-like loop.
+void DropFolds(BodyMesh& mesh) {
+    for (bool dropped = true; dropped;) {
+        const auto count = static_cast<uint32_t>(mesh.indices.size() / 3u);
+        // Each edge, then the triangle and whether it runs from the lower index.
+        std::vector<std::pair<uint64_t, uint32_t>> sides;
+        sides.reserve(mesh.indices.size());
+        for (uint32_t t = 0; t < count; ++t) {
+            for (uint32_t k = 0; k < 3u; ++k) {
+                const uint32_t a = mesh.indices[t * 3u + k], b = mesh.indices[t * 3u + (k + 1u) % 3u];
+                sides.push_back({uint64_t{std::min(a, b)} << 32u | std::max(a, b), t << 1u | uint32_t{a < b}});
+            }
+        }
+        std::sort(sides.begin(), sides.end());
+        std::vector<std::vector<std::pair<uint32_t, int8_t>>> next(count);
+        for (size_t i = 0, j = 0; i < sides.size(); i = j) {
+            while (j < sides.size() && sides[j].first == sides[i].first) ++j;
+            if (j - i != 2u) continue;
+            const uint32_t p = sides[i].second, q = sides[i + 1u].second;
+            const auto same = static_cast<int8_t>((p & 1u) == (q & 1u));
+            next[p >> 1u].push_back({q >> 1u, same});
+            next[q >> 1u].push_back({p >> 1u, same});
+        }
+        std::vector<int8_t> flip(count, -1);
+        std::vector<uint8_t> fold(count, 0u);
+        dropped = false;
+        for (uint32_t seed = 0; seed < count; ++seed) {
+            if (flip[seed] >= 0) continue;
+            flip[seed] = 0;
+            std::vector<uint32_t> patch = {seed};
+            for (size_t head = 0; head < patch.size(); ++head) {
+                for (const auto& [other, parity] : next[patch[head]]) {
+                    const auto want = static_cast<int8_t>(flip[patch[head]] ^ parity);
+                    if (flip[other] < 0) {
+                        flip[other] = want;
+                        patch.push_back(other);
+                    } else if (flip[other] != want) {
+                        fold[other] = 1u;
+                        dropped = true;
+                    }
+                }
+            }
+        }
+        std::vector<uint32_t> kept;
+        for (uint32_t t = 0; t < count; ++t) {
+            const auto first = mesh.indices.begin() + t * 3u;
+            if (fold[t] == 0u) kept.insert(kept.end(), first, first + 3);
+        }
+        mesh.indices = std::move(kept);
+    }
+}
+
+// Merges the mesh's vertices on about the finest grid that leaves at most `limit` triangles, so a large
+// environment's collider fits the contact budget.
+void ClusterMesh(BodyMesh& mesh, uint32_t limit) {
+    if (limit == 0u || mesh.indices.size() / 3u <= limit) return;
+    Vec3d origin;
+    origin.fill(std::numeric_limits<double>::max());
+    for (uint32_t v = 0; v < mesh.vertices.size() / 3u; ++v)
+        for (int k = 0; k < 3; ++k) origin[k] = std::min(origin[k], static_cast<double>(mesh.vertices[v * 3u + k]));
+    double area = 0.0;
+    for (size_t t = 0; t + 2u < mesh.indices.size(); t += 3u) {
+        const Vec3d p = PointOf(mesh, mesh.indices[t]);
+        const Vec3d n = Cross(Sub(PointOf(mesh, mesh.indices[t + 1u]), p), Sub(PointOf(mesh, mesh.indices[t + 2u]), p));
+        area += 0.5 * std::sqrt(Dot(n, n));
+    }
+    // About two triangles per cell a surface crosses; the search brackets the cell between one that keeps
+    // too many and one that fits.
+    double cell = std::sqrt(2.0 * area / limit), over = 0.0, fits = 0.0;
+    uint32_t cells = 0u;
+    for (int pass = 0; pass < 6 || fits == 0.0; ++pass) {
+        const size_t kept = MergedTriangles(mesh, CellsOf(mesh, origin, cell, &cells)).size();
+        if (kept > limit) over = std::max(over, cell);
+        else if (fits == 0.0 || cell < fits) fits = cell;
+        if (kept <= limit && kept * 5u >= size_t{limit} * 4u) break;
+        const double ratio = std::sqrt(static_cast<double>(std::max<size_t>(kept, 1u)) / limit);
+        cell *= kept > limit ? std::max(ratio, 1.1) : ratio;
+        if (cell <= over || (fits != 0.0 && cell >= fits))
+            cell = over == 0.0 ? fits * 0.5 : fits == 0.0 ? over * 2.0 : std::sqrt(over * fits);
+    }
+
+    const std::vector<uint32_t> cell_of = CellsOf(mesh, origin, fits, &cells);
+    std::vector<CellFit> fit(cells);
+    for (uint32_t v = 0; v < cell_of.size(); ++v) {
+        CellFit& f = fit[cell_of[v]];
+        const Vec3d p = PointOf(mesh, v);
+        for (int k = 0; k < 3; ++k) f.sum[k] += p[k];
+        ++f.count;
+    }
+    for (size_t t = 0; t + 2u < mesh.indices.size(); t += 3u) {
+        const Vec3d p = PointOf(mesh, mesh.indices[t]);
+        Vec3d n = Cross(Sub(PointOf(mesh, mesh.indices[t + 1u]), p), Sub(PointOf(mesh, mesh.indices[t + 2u]), p));
+        const double len = std::sqrt(Dot(n, n));
+        if (len == 0.0) continue;
+        for (double& c : n) c /= len;
+        const double d = -Dot(n, p), weight = 0.5 * len;
+        for (size_t k = 0; k < 3u; ++k) {
+            CellFit& f = fit[cell_of[mesh.indices[t + k]]];
+            for (int i = 0; i < 3; ++i) {
+                for (int j = 0; j < 3; ++j) f.a[i * 3 + j] += weight * n[i] * n[j];
+                f.b[i] += weight * d * n[i];
+            }
+        }
+    }
+    std::vector<uint32_t> out_of(cells, std::numeric_limits<uint32_t>::max());
+    std::map<std::array<float, 3>, uint32_t> welded;  // the cook welds equal points, so they share an index here
+    std::vector<float> vertices;
+    std::vector<uint32_t> indices;
+    for (const uint32_t t : MergedTriangles(mesh, cell_of)) {
+        std::array<uint32_t, 3> tri;
+        for (uint32_t k = 0; k < 3u; ++k) {
+            const uint32_t c = cell_of[mesh.indices[t * 3u + k]];
+            if (out_of[c] == std::numeric_limits<uint32_t>::max()) {
+                const Vec3d p = Representative(fit[c], origin, fits);
+                const std::array<float, 3> point = {static_cast<float>(p[0]), static_cast<float>(p[1]),
+                                                    static_cast<float>(p[2])};
+                out_of[c] = welded.emplace(point, static_cast<uint32_t>(welded.size())).first->second;
+                if (out_of[c] == vertices.size() / 3u) vertices.insert(vertices.end(), point.begin(), point.end());
+            }
+            tri[k] = out_of[c];
+        }
+        if (tri[0] != tri[1] && tri[1] != tri[2] && tri[0] != tri[2])
+            indices.insert(indices.end(), tri.begin(), tri.end());
+    }
+    mesh.vertices = std::move(vertices);
+    mesh.indices = std::move(indices);
+    DropFolds(mesh);
 }
 
 std::string PathOfBody(const scene::SceneIR& s, scene::BodyId b) {
@@ -159,6 +411,8 @@ CollisionOptions CollisionOptionsFromJson(const json::Value& v) {
     CollisionOptions o;
     if (const json::Value* m = v.Find("method")) ParseCollisionMethod(m->AsString(), &o.method);
     if (const json::Value* n = v.Find("max_pieces")) o.max_pieces = static_cast<uint32_t>(std::max<int64_t>(n->AsInt(), 1));
+    if (const json::Value* n = v.Find("max_triangles"))
+        o.max_triangles = static_cast<uint32_t>(std::max<int64_t>(n->AsInt(), 0));
     if (const json::Value* r = v.Find("replace")) o.replace = r->AsBool();
     if (const json::Value* m = v.Find("only_missing")) o.only_missing = m->AsBool();
     if (const json::Value* t = v.Find("subtree")) o.subtree = t->AsBool();
@@ -169,6 +423,7 @@ json::Value CollisionOptionsToJson(const CollisionOptions& o) {
     json::Value v = json::Value::Object();
     v.Set("method", json::Value::Str(CollisionMethodName(o.method)));
     v.Set("max_pieces", json::Value::Int(o.max_pieces));
+    v.Set("max_triangles", json::Value::Int(o.max_triangles));
     v.Set("replace", json::Value::Bool(o.replace));
     v.Set("only_missing", json::Value::Bool(o.only_missing));
     v.Set("subtree", json::Value::Bool(o.subtree));
@@ -208,7 +463,7 @@ std::vector<CollisionPreview> PreviewCollision(const scene::SceneIR& s, const st
                                                const CollisionOptions& o) {
     std::vector<CollisionPreview> out;
     for (const scene::BodyId b : CollisionBodies(s, paths, o.subtree)) {
-        const BodyMesh mesh = VisualMeshOf(s, b);
+        BodyMesh mesh = VisualMeshOf(s, b);
         CollisionPreview p;
         p.path = PathOfBody(s, b);
         p.triangles = static_cast<uint32_t>(mesh.indices.size() / 3u);
@@ -234,9 +489,13 @@ std::vector<CollisionPreview> PreviewCollision(const scene::SceneIR& s, const st
                     break;
                 }
                 case CollisionMethod::Sdf:
-                case CollisionMethod::Mesh:
                     p.pieces = 1u;
                     p.vertices = vertex_count;
+                    break;
+                case CollisionMethod::Mesh:
+                    ClusterMesh(mesh, o.max_triangles);
+                    p.pieces = 1u;
+                    p.vertices = static_cast<uint32_t>(mesh.vertices.size() / 3u);
                     break;
             }
         }
@@ -279,6 +538,7 @@ size_t GenerateCollision(scene::SceneIR& s, const std::vector<std::string>& path
             col.mesh_vertices = std::move(hull.vertices);
             col.mesh_indices = std::move(hull.indices);
         } else {
+            if (o.method == CollisionMethod::Mesh) ClusterMesh(mesh, o.max_triangles);
             col.type = scene::ShapeType::TriMesh;
             col.mesh_vertices = std::move(mesh.vertices);
             col.mesh_indices = std::move(mesh.indices);

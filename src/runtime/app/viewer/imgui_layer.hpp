@@ -147,6 +147,7 @@ struct CollisionDialog {
     bool dismiss = false;  // a generate or a load closes the open dialog
     std::string method = "hull";  // hull, vhacd, sdf or mesh
     int max_pieces = 16;
+    int max_triangles = 0;  // mesh only, 0 keeps them all
     bool replace = true;
     bool only_missing = false;
     bool subtree = true;
@@ -158,6 +159,7 @@ inline nui::json::Value CollisionArgs(const CollisionDialog& d) {
     nui::json::Value args = nui::json::Value::Object();
     args.Set("method", nui::json::Value::Str(d.method));
     args.Set("max_pieces", nui::json::Value::Int(d.max_pieces));
+    args.Set("max_triangles", nui::json::Value::Int(d.max_triangles));
     args.Set("replace", nui::json::Value::Bool(d.replace));
     args.Set("only_missing", nui::json::Value::Bool(d.only_missing));
     args.Set("subtree", nui::json::Value::Bool(d.subtree));
