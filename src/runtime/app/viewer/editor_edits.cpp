@@ -378,6 +378,11 @@ std::string DeleteSubtree(EditorScene& es, const std::string& path) {
             return es.scene.RemoveScript(sid) ? parent_path : "";
         }
     }
+    // A shape node, a collider or a visual, deletes as its one record.
+    for (size_t i = 0; i < es.scene.ShapeCount(); ++i) {
+        const auto sid = static_cast<scene::ShapeId>(i);
+        if (es.scene.EntityOfShape(sid) == node->entity) return es.scene.RemoveShape(sid) ? parent_path : "";
+    }
 
     // A body subtree deletes through the ONE general SceneIR remover: joints /
     // actuators / sensors / pairs / touched ICs go with it, everything else persists.

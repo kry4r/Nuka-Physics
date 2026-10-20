@@ -882,15 +882,17 @@ bool EditorDocument::ApplyOp(const EditOp& op, EditOp* done, EditOp* inverse, Op
         out->rebuild = true;
     } else if (op.field == "delete") {
         const size_t bodies = es_->scene.RigidBodyCount();
+        const size_t shapes = es_->scene.ShapeCount();
         const size_t scripts = es_->scene.ScriptCount();
         out->focus = DeleteSubtree(*es_, op.target);
         const bool body_deleted = es_->scene.RigidBodyCount() < bodies;
-        if (!body_deleted && es_->scene.ScriptCount() >= scripts) {
+        const bool shape_deleted = es_->scene.ShapeCount() < shapes;
+        if (!body_deleted && !shape_deleted && es_->scene.ScriptCount() >= scripts) {
             *error = "nothing to delete at '" + op.target + "'";
             return false;
         }
         MoveSources(es_->scene, op.target, "");
-        out->rebuild = out->rebuild || body_deleted;
+        out->rebuild = out->rebuild || body_deleted || shape_deleted;
     } else if (op.field == "reparent") {
         out->focus = ReparentNode(*es_, op.target, op.after.AsString());
         if (out->focus.empty()) {

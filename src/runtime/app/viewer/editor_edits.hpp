@@ -124,8 +124,8 @@ std::string SpawnPrimitive(EditorScene& es, PrimitiveKind kind,
 // SpawnPrimitive (the single general spawn entry). Returns the new node's path.
 std::string AddBoxChild(EditorScene& es, const std::string& parent_path);
 
-// Remove the subtree at `path` via the general SceneIR removers (body subtree or
-// /script node). Returns the parent path to reselect, "" when `path` backs neither.
+// Remove the subtree at `path` via the general SceneIR removers (body subtree, /script
+// node or shape). Returns the parent path to reselect, "" when `path` backs none.
 std::string DeleteSubtree(EditorScene& es, const std::string& path);
 
 // Move the body subtree at `path` under the body / pure group at `new_parent_path`
