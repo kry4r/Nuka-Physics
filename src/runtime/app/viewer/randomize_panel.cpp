@@ -112,6 +112,7 @@ void ImGuiLayer::DrawRandomizePanel() {
     int seed = static_cast<int>(e.seed);
     if (ImGui::DragInt("##seed", &seed, 0.2f, 0, INT_MAX)) e.seed = static_cast<uint32_t>(seed);
     if (finished()) commit(Args({{"seed", json::Value::Int(e.seed)}}));
+    ImGui::SetItemTooltip("%s", Tr("Every environment draws its own values; the draw is part of the timeline."));
     ImGui::SameLine();
     ImGui::BeginDisabled(!v.config.Active());
     if (draw::IconButton("##resample", icon::kShuffle, false, Tr("Resample"))) Queue("dr.sample");
@@ -128,6 +129,8 @@ void ImGuiLayer::DrawRandomizePanel() {
     ImGui::BeginDisabled(!v.camera);
     if (ImGui::Checkbox(Tr("Randomize what cameras see"), &e.render))
         commit(Args({{"render", Args({{"on", json::Value::Bool(e.render)}})}}));
+    if (!v.camera && ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip | ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s", Tr("Add a camera sensor to randomize what it sees."));
     if (begin("##render")) {
         for (size_t k = 0; k < kJitterCount; ++k) {
             ImGui::PushID(static_cast<int>(k));
@@ -140,12 +143,13 @@ void ImGuiLayer::DrawRandomizePanel() {
         ImGui::EndTable();
     }
     ImGui::EndDisabled();
-    if (!v.camera) ImGui::TextDisabled("%s", Tr("Add a camera sensor to randomize what it sees."));
 
     draw::SectionHeader(Tr("Physics"));
     ImGui::BeginDisabled(!v.articulated);
     if (ImGui::Checkbox(Tr("Randomize articulations"), &e.physics))
         commit(Args({{"physics", Args({{"on", json::Value::Bool(e.physics)}})}}));
+    if (!v.articulated && ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip | ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s", Tr("Physics ranges act on articulated bodies; this scene has none."));
     if (begin("##physics")) {
         for (size_t k = 0; k < kRangeCount; ++k) {
             ImGui::PushID(static_cast<int>(k));
@@ -159,7 +163,6 @@ void ImGuiLayer::DrawRandomizePanel() {
         ImGui::EndTable();
     }
     ImGui::EndDisabled();
-    if (!v.articulated) ImGui::TextDisabled("%s", Tr("Physics ranges act on articulated bodies; this scene has none."));
 
     draw::SectionHeader(Tr("Parameters"), Fmt("%zu", v.param_keys.size()).c_str());
     if (v.param_keys.empty()) {
@@ -191,9 +194,6 @@ void ImGuiLayer::DrawRandomizePanel() {
         ImGui::EndTable();
     }
     ImGui::Spacing();
-    ImGui::PushTextWrapPos(0.0f);
-    ImGui::TextDisabled("%s", Tr("Every environment draws its own values; the draw is part of the timeline."));
-    ImGui::PopTextWrapPos();
     if (ImGui::Button(Iconed(icon::kDatabase, Tr("Export Dataset...")).c_str()))
         Queue("dataset.exporter", Args({{"on", json::Value::Bool(true)}}));
 }

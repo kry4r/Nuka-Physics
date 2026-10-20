@@ -368,12 +368,12 @@ void ImGuiLayer::DrawTrainTask() {
         }
         ImGui::EndCombo();
     }
-    if (schema != nullptr) {
+    if (schema != nullptr && ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip)) {
         std::string robot;
         for (const auto& [key, count] : schema->At("robot").Items())
             robot += (robot.empty() ? "" : ", ") + Fmt("%lld ", static_cast<long long>(count.AsInt())) + Tr(key);
-        Wrapped(theme::kFgDim, Fmt(Tr("One robot (%s) per environment, stepped at %.0f Hz"), robot.c_str(),
-                                   1.0 / schema->At("dt").AsDouble()));
+        ImGui::SetTooltip("%s", Fmt(Tr("One robot (%s) per environment, stepped at %.0f Hz"), robot.c_str(),
+                                    1.0 / schema->At("dt").AsDouble()).c_str());
     }
     const size_t problems = errors.Size();
     if (problems == 0u)
@@ -825,14 +825,19 @@ void ImGuiLayer::DrawTrainSaves() {
     const auto play = [this, &p](const char* kind) {
         Queue("train.play", Args({{"name", json::Value::Str(p.selected)}, {"kind", json::Value::Str(kind)}}));
     };
+    const auto tip = [] {
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip | ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("%s", Tr("Playing loads a save's policy onto the scene's robot and runs the simulation."));
+    };
     ImGui::BeginDisabled(!scene || !best);
     if (ImGui::Button(Iconed(icon::kTrophy, Tr("Play Best")).c_str())) play("best");
+    tip();
     ImGui::EndDisabled();
     ImGui::SameLine();
     ImGui::BeginDisabled(!scene || p.saves.empty());
     if (ImGui::Button(Iconed(icon::kPlay, Tr("Play Latest")).c_str())) play("last");
+    tip();
     ImGui::EndDisabled();
-    Wrapped(theme::kFgDim, Tr("Playing loads a save's policy onto the scene's robot and runs the simulation."));
     draw::SectionHeader(Tr("Saves"), Fmt("%zu", p.saves.size()).c_str());
     if (p.saves.empty()) {
         ImGui::TextDisabled("%s", Tr("No saves yet; a run saves every few epochs and when it ends."));

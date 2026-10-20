@@ -694,7 +694,7 @@ void ImGuiLayer::BuildPolicy(nui::VStack& root) {
         ImGui::TextColored(theme::kAccent, "\xE2\x86\x92 vx %+.2f  vy %+.2f  wyaw %+.2f", static_cast<double>(p.command[0]),
                            static_cast<double>(p.command[1]), static_cast<double>(p.command[2]));
         nui::PopTextStyle();
-        ImGui::TextDisabled("%s", Tr("Teleop's velocity command mode steers it."));
+        ImGui::SetItemTooltip("%s", Tr("Teleop's velocity command mode steers it."));
         ImGui::PopTextWrapPos();
         nui::draw::SectionHeader(Tr("Action norm"));
         if (p.norm_time.empty()) {
@@ -720,7 +720,8 @@ void ImGuiLayer::BuildDemos(nui::VStack& root) {
 
     auto& head = root.Add<nui::HStack>();
     head.wrap = true;
-    head.Add<nui::ToggleButton>("Record").Action("demo.record");
+    head.Add<nui::ToggleButton>("Record").Action("demo.record").tooltip =
+        "Each step at the head records the joints, drive targets, base, command and device axes.";
     auto& state = head.Add<nui::Badge>();
     state.text_fn = [demo] {
         const DemoView& d = demo();
@@ -741,9 +742,6 @@ void ImGuiLayer::BuildDemos(nui::VStack& root) {
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort | ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("%s", Tr("Record every displayed environment, each as its own episode."));
-        ImGui::PushTextWrapPos(0.0f);
-        ImGui::TextDisabled("%s", Tr("Each step at the head records the joints, drive targets, base, command and device axes."));
-        ImGui::PopTextWrapPos();
 
         nui::draw::SectionHeader(Tr("Episodes"));
         const int n = static_cast<int>(d.episodes.size());
@@ -799,6 +797,9 @@ void ImGuiLayer::BuildDemos(nui::VStack& root) {
                           stop = Iconed(icon::kStop, Tr("Stop"));
         ImGui::BeginDisabled(!picked);
         if (ImGui::Button(replay.c_str())) Queue("demo.play", Args({{"episode", json::Value::Int(d.selected)}}));
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip | ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("%s", Tr("A replay drives the targets from the state now; reset first to replay "
+                                       "from its start."));
         beside(discard);
         if (ImGui::Button(discard.c_str())) Queue("demo.discard", Args({{"episode", json::Value::Int(d.selected)}}));
         ImGui::EndDisabled();
@@ -812,9 +813,6 @@ void ImGuiLayer::BuildDemos(nui::VStack& root) {
             const std::string over = Fmt(Tr("episode %d: %u steps left"), d.playing, d.left);
             ImGui::ProgressBar(done, ImVec2(-FLT_MIN, 0.0f), over.c_str());
         }
-        ImGui::PushTextWrapPos(0.0f);
-        ImGui::TextDisabled("%s", Tr("A replay drives the targets from the state now; reset first to replay from its start."));
-        ImGui::PopTextWrapPos();
 
         // The HDF5 file, in robomimic's layout.
         nui::draw::SectionHeader(Tr("File"));

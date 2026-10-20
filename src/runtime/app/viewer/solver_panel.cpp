@@ -103,14 +103,13 @@ void ImGuiLayer::BuildSolver(nui::VStack& root) {
     auto& rec = hero.Add<nui::Badge>();
     rec.text_fn = [view] { return std::string(Tr(view().mask != 0u ? "recording" : "idle")); };
     rec.tone_fn = [view] { return view().mask != 0u ? Tone::Accent : Tone::Dim; };
-    auto& hint = root.Add<nui::Label>("Records each solve's residual, sweeps and energy; the heatmap colours "
-                                      "cloth by its Newton correction.",
-                                      Tone::Dim);
-    hint.wrap = true;
-
     auto& toggles = root.Add<nui::HStack>();
-    toggles.Add<nui::ToggleButton>("Record").Action("solver.telemetry").enabled_if = has_scene;
-    toggles.Add<nui::ToggleButton>("Heatmap").Action("solver.heatmap").enabled_if = has_scene;
+    auto& record = toggles.Add<nui::ToggleButton>("Record").Action("solver.telemetry");
+    record.enabled_if = has_scene;
+    record.tooltip = "Records each solve's residual, sweeps and energy.";
+    auto& heatmap = toggles.Add<nui::ToggleButton>("Heatmap").Action("solver.heatmap");
+    heatmap.enabled_if = has_scene;
+    heatmap.tooltip = "Colours cloth by its Newton correction.";
     auto& locate = root.Add<nui::Button>("Locate worst", icon::kTarget).Action("solver.locate");
     locate.enabled_if = [view, has_scene] { return has_scene() && !view().history.empty(); };
 
@@ -187,7 +186,9 @@ void ImGuiLayer::BuildSolver(nui::VStack& root) {
     });
     stat("worst", [last] { return last() ? WorstText(*last()) : std::string(Tr("N/A")); });
 
-    root.Add<nui::Separator>("Residual");
+    // The plots wait for the first record; empty log axes only show noise.
+    const auto recorded = [view] { return !view().history.empty(); };
+    root.Add<nui::Separator>("Residual").visible_if = recorded;
     root.Add<nui::Custom>([view] {
         const SolverView& v = view();
         std::vector<float> x, vertex, contact, cap_x, cap_y;
@@ -213,7 +214,7 @@ void ImGuiLayer::BuildSolver(nui::VStack& root) {
         ImPlot::PlotScatter(Tr("cap"), cap_x.data(), cap_y.data(), static_cast<int>(cap_x.size()), caps);
         AlertLine(v.alert);
         EndSolverPlot();
-    });
+    }).visible_if = recorded;
     root.Add<nui::Custom>([view] {
         const SolverView& v = view();
         std::vector<float> x, sweeps;
@@ -231,7 +232,7 @@ void ImGuiLayer::BuildSolver(nui::VStack& root) {
         cap.Flags = ImPlotInfLinesFlags_Horizontal;
         ImPlot::PlotInfLines(Tr("budget"), &budget, 1, cap);
         EndSolverPlot();
-    });
+    }).visible_if = recorded;
 
     root.Add<nui::Separator>("Convergence").visible_if = [view] { return (view().mask & NUKA_TELEMETRY_SWEEPS) != 0u; };
     auto& convergence = root.Add<nui::Custom>([view] {

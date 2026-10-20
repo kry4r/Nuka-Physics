@@ -680,7 +680,9 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
                            "robot.attach", "robot.attach_asset", "robot.ik", "robot.ik_settings", "view.robot_overlays",
                            "demo.episodes", "clip.list", "clip.get", "clip.set", "clip.rename", "clip.key",
                            "clip.remove_keys", "clip.move_keys", "clip.sample", "view.record_status", "view.project",
-                           "ui.pointer", "ui.pointer_status"})
+                           "ui.pointer", "ui.pointer_status", "view.mode", "view.pick", "view.envs", "view.camera",
+                           "view.select_rect", "view.bookmark_goto", "view.bookmark_rename", "view.bookmark_remove",
+                           "view.sensor_overlays", "view.ui_scale", "view.language"})
         registry.Decorate(id, "", true);
     registry.Rebind("file.open", "Ctrl+O");
     registry.Rebind("file.save", "Ctrl+S");
@@ -1503,8 +1505,9 @@ void ImGuiLayer::DrawRepl() {
         }
         return 0;
     };
-    if (ImGui::InputTextWithHint("##repl", Tr("Python  (Enter runs, Tab completes, Up/Down history)"), repl_, sizeof(repl_), flags,
-                                 callback, this)) {
+    const bool entered = ImGui::InputTextWithHint("##repl", "Python", repl_, sizeof(repl_), flags, callback, this);
+    ImGui::SetItemTooltip("%s", Tr("Python  (Enter runs, Tab completes, Up/Down history)"));
+    if (entered) {
         const std::string line = repl_;
         if (!line.empty()) {
             if (repl_history_.empty() || repl_history_.back() != line) repl_history_.push_back(line);

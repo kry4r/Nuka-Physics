@@ -207,12 +207,13 @@ void ImGuiLayer::DrawDatasetExporter() {
         draw::SectionHeader(Tr("Randomize each frame"));
         ImGui::BeginDisabled(!r.camera);
         ImGui::Checkbox(Tr("Render"), &f.render);
+        ImGui::SetItemTooltip("%s", Tr("The ranges are the Randomize panel's."));
         ImGui::EndDisabled();
         ImGui::SameLine(240.0f * s);
         ImGui::BeginDisabled(!r.articulated && r.param_keys.empty());
         ImGui::Checkbox(Tr("Physics"), &f.physics);
+        ImGui::SetItemTooltip("%s", Tr("The ranges are the Randomize panel's."));
         ImGui::EndDisabled();
-        ImGui::TextDisabled("%s", Tr("The ranges are the Randomize panel's."));
 
         draw::SectionHeader(Tr("Labels"), Fmt("%zu", l.labels.size()).c_str());
         ImGui::PushTextWrapPos(0.0f);
