@@ -445,6 +445,7 @@ endif()
 # The viewer panels and camera use render snapshots without a physics backend.
 if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)
     add_library(nuka_viewer STATIC
+        runtime/app/viewer/agents_panel.cpp
         runtime/app/viewer/camera_controller.cpp
         runtime/app/viewer/clip_panel.cpp
         runtime/app/viewer/clips.cpp
@@ -1324,6 +1325,7 @@ if(CMAKE_CUDA_COMPILER)
         # nuka.editor and the nuka-editor launcher load it; it exports only nuka_editor_*.
         add_library(nuka_editor SHARED
             runtime/app/viewer/editor_host.cpp
+            runtime/app/viewer/editor_agents.cpp
             runtime/app/viewer/editor_api.cpp
             runtime/app/viewer/editor_extensions.cpp
             runtime/app/viewer/editor_profile.cpp

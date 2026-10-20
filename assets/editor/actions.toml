@@ -1694,6 +1694,55 @@ args.kind = "string, artic, soft, cloth, fluid, body, static, joint, geom, visua
 returns = "a list of {path, name, kind}"
 example = '{"under": "/go2", "kind": "body"}'
 
+["agent.mode"]
+summary = "Sets what programs driving the editor from outside (agents, through nuka.editor.connect or MCP) may do. full runs every action; propose turns their edits into proposals and asks the user before file, process and app actions; read lets only read and view actions through; off closes the endpoint and drops every client. `allow` runs actions without asking, `deny` refuses them; both take ids or wildcards such as file.*. Only the user runs it, never an agent."
+kind = "app"
+args.mode = "string, off, read, propose or full, default unchanged"
+args.allow = "list of strings, actions agents run without asking, default unchanged"
+args.deny = "list of strings, actions agents may never run, default unchanged"
+returns = "{mode, allow, deny, clients}: clients is how many are connected"
+example = '{"mode": "propose", "deny": ["file.*"]}'
+
+["agent.proposals"]
+summary = "The requests agents made that wait for the user, or were answered: proposals of edits and actions to approve, the pending ones first, then the newest."
+kind = "read"
+returns = "a list of {id, kind, state, client, action, args, label, note, changes: [{target, field, before, after}], value, error}; kind is proposal or approval, state pending, accepted, approved, rejected or failed"
+
+["agent.propose"]
+summary = "Offers an edit for the user to review in the Agents panel, with each field's value before and after; accepting applies it as one undoable step named after `label`. Agents may propose in every access mode but read and off."
+kind = "edit"
+args.label = 'string, what the edit does, default "Edit"'
+args.ops = "list of {target, field, before, after}, as edit.apply takes them"
+args.note = "string, why, shown to the user, default empty"
+returns = "{request, kind, state, note}: the request's id, and pending"
+example = '{"label": "Lower ground friction", "ops": [{"target": "ground/ground_collision", "field": "shape.friction_mu", "after": 0.8}]}'
+
+["agent.accept"]
+summary = "Accepts an agent's proposal: applies its edit. Only the user runs it, never an agent."
+kind = "edit"
+args.id = "int, the proposal"
+returns = "the request as agent.proposals lists it, now accepted, or failed with the edit's error"
+
+["agent.approve"]
+summary = "Runs the action an agent asked to run. With `always` its id joins the access settings' allow list, so it runs without asking from then on. Only the user runs it, never an agent."
+kind = "app"
+args.request = "int, the request"
+args.always = "bool, allow this action from now on, default false"
+returns = "the request as agent.proposals lists it, now approved with the action's value, or failed with its error"
+
+["agent.reject"]
+summary = "Turns down an agent's proposal or request; the agent sees it rejected with `reason`. Only the user runs it, never an agent."
+kind = "app"
+args.id = "int, the request"
+args.reason = 'string, why, default "rejected by the user"'
+returns = "the request as agent.proposals lists it, now rejected"
+
+["agent.disconnect"]
+summary = "Drops every connected agent; each finds its connection closed at its next call. With `off` agent access turns off too, so none can connect again until it is turned back on. Only the user runs it, never an agent."
+kind = "app"
+args.off = "bool, also turn agent access off, default false"
+returns = "{dropped, mode}: how many were connected, and the access mode now"
+
 ["scene.add_box"]
 summary = "Adds a box above the selection, else above the origin, as one undoable edit; scene.spawn with kind box."
 kind = "edit"
@@ -1957,5 +2006,10 @@ returns = "nothing"
 
 ["tools.nui_inspector"]
 summary = "Opens or closes the UI Inspector; the same as window.toggle_nui."
+kind = "view"
+returns = "nothing"
+
+["window.toggle_agents"]
+summary = "Opens or closes the Agents panel: the programs driving the editor from outside, their access, requests and calls."
 kind = "view"
 returns = "nothing"

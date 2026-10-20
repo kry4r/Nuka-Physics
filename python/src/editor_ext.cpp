@@ -382,12 +382,20 @@ public:
         if (host == nullptr) throw std::runtime_error("no enabled extension '" + id + "'");
         return ExtHost(host);
     }
+    // The endpoint answers listen(on) and disconnect() on the UI thread; listen comes at once.
+    void set_rpc_hooks(nb::object endpoint) {
+        rpc_ = std::move(endpoint);
+        const nuka_editor_rpc_hooks_t hooks{this, &Listen, &Disconnect};
+        Check(nuka_editor_set_rpc_hooks(Editor(), &hooks), "nuka_editor_set_rpc_hooks");
+    }
+    void rpc_clients(const std::string& clients_json) { nuka_editor_rpc_clients(Editor(), clients_json.c_str()); }
 
     void destroy() {
         if (editor_ == nullptr) return;
         nuka_editor_handle editor = std::exchange(editor_, nullptr);
         api_ = nullptr;
         ui_handler_ = nb::object();
+        rpc_ = nb::object();
         nb::gil_scoped_release release;
         nuka_editor_destroy(editor);
     }
@@ -494,9 +502,27 @@ private:
         }
     }
 
+    template <class Fn>
+    static void Endpoint(void* self, Fn&& fn) {
+        App& app = *static_cast<App*>(self);
+        nb::gil_scoped_acquire acquire;
+        try {
+            fn(app.rpc_);
+        } catch (nb::python_error& error) {
+            error.discard_as_unraisable("nuka.editor endpoint");
+        }
+    }
+    static void Listen(void* self, uint32_t on) {
+        Endpoint(self, [on](nb::object& rpc) { rpc.attr("listen")(on != 0u); });
+    }
+    static void Disconnect(void* self) {
+        Endpoint(self, [](nb::object& rpc) { rpc.attr("disconnect")(); });
+    }
+
     nb::object runner_;
     nb::object extensions_;
     nb::object ui_handler_;
+    nb::object rpc_;
     nuka_editor_handle editor_ = nullptr;
     const nuka_nui_api_t* api_ = nullptr;
 };
@@ -584,5 +610,9 @@ NB_MODULE(_editor_ext, m) {
         .def("toast", &App::toast, nb::arg("level"), nb::arg("text"))
         .def("progress", &App::progress, nb::arg("id"), nb::arg("label"), nb::arg("fraction"))
         .def("extension_host", &App::extension_host, nb::arg("id"))
+        .def("set_rpc_hooks", &App::set_rpc_hooks, nb::arg("endpoint"),
+             "Route the agent endpoint's listen(on) and disconnect() calls to endpoint.")
+        .def("rpc_clients", &App::rpc_clients, nb::arg("clients_json"),
+             "Report the endpoint's clients as a JSON array of {client, pid, since}.")
         .def("destroy", &App::destroy, "Close the window and destroy any world the editor created.");
 }

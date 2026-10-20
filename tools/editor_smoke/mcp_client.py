@@ -66,6 +66,11 @@ def main(profile: str, pid: int, asset: str, out: str) -> None:
     seen["shot"] = png_info(mcp.images(shot)[0])
     seen["shot_reported"] = [shot["structuredContent"]["width"], shot["structuredContent"]["height"]]
     seen["eval"] = mcp.call("python_eval", code="print(6 * 7)")["output"]
+    proposed = mcp.call("edit_propose", label="Rename the robot", note="A clearer name.",
+                        ops=[{"target": imported["focus"], "field": "name", "after": "go2_agent"}])
+    held = mcp.call("proposal_get", id=proposed["request"], wait_s=0.3)
+    seen["proposal"] = [proposed["state"], held["state"], held["changes"][0]["after"],
+                        len(mcp.call("proposal_get")["requests"])]
     batch = mcp.call("actions_batch", steps=[{"id": "sim.step"}, {"id": "no.such_action"}, {"id": "sim.step"}])
     seen["batch"] = [r["ok"] for r in batch["results"]]
     good = mcp.call("scenario_run", steps=[{"action": "timeline.status"}, {"expect": {"dirty": True}}])

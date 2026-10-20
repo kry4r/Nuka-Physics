@@ -51,7 +51,8 @@ def default_profile() -> str:
 
 
 def editors(profile: Optional[str] = None) -> List[dict]:
-    """The editors running on ``profile``, the last started first: pid, address and start time."""
+    """The editors running on ``profile``, the last started first: pid, address and start time.
+    An editor whose agent access is off does not list itself."""
     folder = os.path.join(profile or default_profile(), "rpc")
     found = []
     for name in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
@@ -69,7 +70,8 @@ def connect(pid: Optional[int] = None, client: str = "python", profile: Optional
     found = [e for e in editors(profile) if pid is None or e["pid"] == pid]
     if not found:
         which = f"with pid {pid} " if pid is not None else ""
-        raise RemoteError(f"no editor {which}is running on profile {profile or default_profile()}")
+        raise RemoteError(f"no editor {which}is running on profile {profile or default_profile()}, "
+                          "or its agent access is off")
     return RemoteEditor(found[0], client)
 
 
@@ -124,7 +126,7 @@ class RemoteEditor:
         self._next = 0
         self.closed = False  # the editor went away or close() ran
         self.actions = RemoteActions(self)
-        self.hello = self.call("hello", client=client)
+        self.hello = self.call("hello", client=client, pid=os.getpid())
 
     def call(self, op: str, **args):
         """One request; returns its value or raises RemoteError with the editor's reason."""
@@ -135,7 +137,8 @@ class RemoteEditor:
                 reply = json.loads(self._conn.recv_bytes())
             except (EOFError, OSError):
                 self.closed = True
-                raise RemoteError("the editor closed the connection") from None
+                raise RemoteError("the editor closed the connection: it exited, or its user "
+                                  "disconnected agents") from None
         if not reply["ok"]:
             raise RemoteError(f"{op}: {reply['error']}")
         return reply["value"]

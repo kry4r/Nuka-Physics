@@ -132,6 +132,15 @@ nuka_result_t nuka_editor_set_python_hooks(nuka_editor_handle editor, const nuka
     return Guard([&] { editor->SetPythonHooks(hooks != nullptr ? *hooks : nuka_editor_python_hooks_t{}); });
 }
 
+nuka_result_t nuka_editor_set_rpc_hooks(nuka_editor_handle editor, const nuka_editor_rpc_hooks_t* hooks) {
+    if (editor == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    return Guard([&] { editor->SetRpcHooks(hooks != nullptr ? *hooks : nuka_editor_rpc_hooks_t{}); });
+}
+
+void nuka_editor_rpc_clients(nuka_editor_handle editor, const char* clients_json) {
+    if (clients_json != nullptr) editor->RpcClients(clients_json);
+}
+
 const nuka_editor_host_api_t* nuka_editor_extension_host(nuka_editor_handle editor, const char* extension_id) {
     return editor->ExtensionHost(extension_id);
 }

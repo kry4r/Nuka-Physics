@@ -96,7 +96,8 @@ const PanelSpec kPanels[] = {{"stage", "Stage", icon::kStage},       {"property"
                              {"randomize", "Randomize", icon::kShuffle},
                              {"training", "Training", icon::kTraining},
                              {"script", "Script", icon::kScript},    {"console", "Console", icon::kConsole},
-                             {"nui", "UI Inspector", icon::kInspector}};
+                             {"nui", "UI Inspector", icon::kInspector},
+                             {"agents", "Agents", icon::kSparkle}};
 
 // Panels per dock column; the first of each column is its selected tab. `right_share` is the right
 // column's share of the width the left column leaves.
@@ -181,7 +182,7 @@ const std::vector<MenuSpec>& Menus() {
             {"Tools",
              {"script", "tools"},
              {"script.new", "script.open", "script.save", "-", "script.run", "script.stop", "script.toggle_rerun", "-",
-              "script.attach", "script.load", "script.clear_console", "-", "tools.nui_inspector"}},
+              "script.attach", "script.load", "script.clear_console", "-", "tools.nui_inspector", "agent.disconnect"}},
             {"Window", {"window"}, window},
             {"Help", {"help"}, {"help.about"}},
             {"Extensions", {"extensions"}, {"extensions.manager", "extensions.rescan", "-"}},
@@ -470,6 +471,8 @@ const std::vector<ImGuiLayer::BuiltinExtension>& ImGuiLayer::Builtins() {
          {"training"}},
         {"nuka.script", "Script", "The Python script editor and the console.", {"script", "console"}},
         {"nuka.ui_inspector", "UI Inspector", "The nui component tree, for extension authors.", {"nui"}},
+        {"nuka.agents", "Agents", "Programs driving the editor from outside: their access, requests and calls.",
+         {"agents"}},
     };
     return builtins;
 }
@@ -484,7 +487,8 @@ void ImGuiLayer::AddBuiltinPanel(const std::string& panel_id) {
                                 &ImGuiLayer::BuildSensors,
                                 &ImGuiLayer::BuildRandomize,
                                 &ImGuiLayer::BuildTraining,
-                                &ImGuiLayer::BuildScript, &ImGuiLayer::BuildConsole,    &ImGuiLayer::BuildInspector};
+                                &ImGuiLayer::BuildScript, &ImGuiLayer::BuildConsole,    &ImGuiLayer::BuildInspector,
+                                &ImGuiLayer::BuildAgents};
     const size_t i = static_cast<size_t>(
         std::find_if(std::begin(kPanels), std::end(kPanels), [&](const PanelSpec& p) { return panel_id == p.id; }) -
         std::begin(kPanels));
@@ -645,6 +649,10 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
         {"script.new", icon::kNew},   {"script.open", icon::kOpen},     {"script.save", icon::kSave},
         {"script.stop", icon::kStop}, {"script.toggle_rerun", icon::kRepeat}, {"script.eval", icon::kTerminal}};
     for (const auto& [id, glyph] : script_icons) registry.Decorate(id, glyph, false);
+    registry.Decorate("agent.disconnect", icon::kPlug, false);
+    for (const char* id : {"agent.mode", "agent.proposals", "agent.propose", "agent.accept", "agent.approve",
+                           "agent.reject"})
+        registry.Decorate(id, icon::kSparkle, true);
     for (const char* id : {"script.close", "script.complete", "script.tabs", "script.goto", "script.console",
                            "script.result", "script.reload", "script.set_budget", "scene.nodes"})
         registry.Decorate(id, "", true);
@@ -1682,6 +1690,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
     DrawClipEditor();
     DrawAssembler();
     DrawPrompt();
+    DrawAgentApproval();
 }
 
 void ImGuiLayer::DockLayout(ImGuiID dockspace) {
@@ -2146,6 +2155,14 @@ void ImGuiLayer::DrawStatusBar() {
         const ImVec2 rsize = font->CalcTextSizeA(px, FLT_MAX, 0.0f, right.c_str());
         list->AddText(font, px, ImVec2(wpos.x + wsize.x - rsize.x - 10.0f * s, cy - rsize.y * 0.5f), U32(theme::kFgDim),
                       right.c_str());
+        // AGENT while programs drive the editor from outside, with what waits on the user.
+        if (const AgentView& agents = frame_.ui->agents; !agents.clients.empty() || agents.pending > 0u) {
+            std::string mark = Iconed(icon::kSparkle, Fmt(Tr("AGENT %zu"), agents.clients.size()).c_str());
+            if (agents.pending > 0u) mark += "   " + Fmt(Tr("%zu WAITING"), agents.pending);
+            const ImVec2 msize = font->CalcTextSizeA(px, FLT_MAX, 0.0f, mark.c_str());
+            list->AddText(font, px, ImVec2(wpos.x + wsize.x - rsize.x - msize.x - 34.0f * s, cy - msize.y * 0.5f),
+                          U32(agents.pending > 0u ? theme::kWarn : theme::kAccent), mark.c_str());
+        }
     }
     ImGui::End();
     ImGui::PopStyleColor();

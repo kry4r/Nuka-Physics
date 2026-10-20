@@ -11,6 +11,7 @@ import base64
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
@@ -29,7 +30,11 @@ INSTRUCTIONS = (
     "none runs. Every editor feature is an action: find one with actions_find, read its arguments with "
     "action_help, run it with action_run. An action's kind says what it touches: read, view, edit, sim, "
     "file, process or app. Check outcomes with document_get, scene_tree and screenshot; scenario_run runs a "
-    "list of checks. Edits are undoable (action edit.undo). The nuka://guide/* resources hold workflows."
+    "list of checks. Edits are undoable (action edit.undo). The nuka://guide/* resources hold workflows. "
+    "The user sets what agents may do (document_get's agent.mode): full runs everything; propose turns edits "
+    "into proposals and asks before file, process and app actions; read allows read and view actions only. "
+    "A call that waits for the user returns {request, state: pending}; follow it with proposal_get. "
+    "edit_propose offers an edit for the user to review in any mode but read."
 )
 KINDS = ["read", "view", "edit", "sim", "file", "process", "app"]
 
@@ -51,7 +56,8 @@ class Server:
         self.tools: List[dict] = []
         self._calls: Dict[str, Callable[[dict], object]] = {}
         self._tool("editor_status", "List the editors running on this machine and show the connected one's "
-                   "document: path, revision, dirty, selection, playing.", _schema({}), self._status, read=True)
+                   "document: path, revision, dirty, selection, playing, and agent access (mode, pending "
+                   "requests).", _schema({}), self._status, read=True)
         self._tool("editor_launch", "Start an editor window (optionally on a scene file) and connect to it.",
                    _schema({"scene": {"type": "string", "description": "A scene to open: .nks, .usd*, .urdf, "
                                                                         ".xml (MJCF)."},
@@ -67,7 +73,8 @@ class Server:
                    "and its kind.",
                    _schema({"id": {"type": "string"}}, ["id"]), self._help, read=True)
         self._tool("action_run", "Run one editor action with arguments and return its value; a refusal comes "
-                   "back as an error with the editor's reason.",
+                   "back as an error with the editor's reason, and one the user must allow first as "
+                   "{request, state: pending}.",
                    _schema({"id": {"type": "string"}, "args": _ARGS}, ["id"]), self._run)
         self._tool("actions_batch", "Run several actions in order; stops at the first failure unless told not to.",
                    _schema({"steps": {"type": "array", "items": _schema({"id": {"type": "string"}, "args": _ARGS},
@@ -94,9 +101,24 @@ class Server:
         self._tool("action_log", "The actions run so far, by anyone, after sequence number `since`.",
                    _schema({"since": {"type": "integer", "default": 0}}), self._log, read=True)
         self._tool("python_eval", "Run Python in the editor's console (`app`, `world`, `nuka` and `np` bound) and "
-                   "return its output.",
+                   "return its output. When the user must allow it first it returns {pending: request}; once "
+                   "approved, action_run script.result {seq} gives the output.",
                    _schema({"code": {"type": "string"}, "timeout_s": {"type": "number", "default": 60}},
                            ["code"]), self._eval)
+        self._tool("edit_propose", "Offer the user an edit to review: they see each field's value before and "
+                   "after, then accept (it applies as one undoable step) or reject it. Ops are edit.apply's.",
+                   _schema({"label": {"type": "string", "description": "What the edit does, in a few words."},
+                            "ops": {"type": "array", "items": _schema(
+                                {"target": {"type": "string", "description": "A node path."},
+                                 "field": {"type": "string"}, "before": {}, "after": {}},
+                                ["target", "field", "after"])},
+                            "note": {"type": "string", "description": "Why; shown to the user."}},
+                           ["label", "ops"]), self._propose)
+        self._tool("proposal_get", "The state of a request waiting for the user (pending, accepted, approved, "
+                   "rejected or failed) with its value or error; waits up to wait_s while it is pending. "
+                   "Without id, every request the editor holds.",
+                   _schema({"id": {"type": "integer"}, "wait_s": {"type": "number", "default": 0}}),
+                   self._proposal, read=True)
         self._tool("scenario_run", "Run a list of checks in the editor and report each: "
                    "{action, args, expect_error, expect_value}, {wait, args, until, timeout_s}, "
                    "{expect: {document key: value}}, {screenshot: name}.",
@@ -191,7 +213,10 @@ class Server:
 
     def _eval(self, args: dict) -> dict:
         editor = self.connected()
-        seq = editor.actions.run("script.eval", code=args["code"])["seq"]
+        ran = editor.actions.run("script.eval", code=args["code"])
+        if ran.get("state") == "pending":
+            return {"pending": ran}
+        seq = ran["seq"]
         done = editor.wait("script.result", {"done": True}, float(args.get("timeout_s", 60)), seq=seq)
         if not done["met"]:
             raise RemoteError(f"the code still runs after {args.get('timeout_s', 60)} s (script run {seq})")
@@ -199,6 +224,24 @@ class Server:
         if result["failed"]:
             raise RemoteError(result["output"])
         return {"output": result["output"]}
+
+    def _propose(self, args: dict) -> dict:
+        return self.connected().actions.run("agent.propose", label=args["label"], ops=args["ops"],
+                                            note=args.get("note", ""))
+
+    def _proposal(self, args: dict) -> dict:
+        editor = self.connected()
+        deadline = time.monotonic() + float(args.get("wait_s", 0))
+        while True:
+            requests = editor.actions.run("agent.proposals")
+            if args.get("id") is None:
+                return {"requests": requests}
+            found = [r for r in requests if r["id"] == int(args["id"])]
+            if not found:
+                raise RemoteError(f"the editor holds no request {args['id']}")
+            if found[0]["state"] != "pending" or time.monotonic() >= deadline:
+                return found[0]
+            time.sleep(0.25)
 
     def _scenario(self, args: dict) -> dict:
         editor, report = self.connected(), []

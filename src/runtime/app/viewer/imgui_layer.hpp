@@ -5,6 +5,7 @@
 #include "math/transform.hpp"
 #include "nuka/nuka.h"
 #include "render/render_world.hpp"
+#include "runtime/app/viewer/agent_view.hpp"
 #include "runtime/app/viewer/clip_view.hpp"
 #include "runtime/app/viewer/dataset_view.hpp"
 #include "runtime/app/viewer/demo_view.hpp"
@@ -328,6 +329,7 @@ struct ViewerUiState {
     DatasetView dataset;
     TrainView train;
     TrainPanel training;
+    AgentView agents;
 
     // Queued for the next frame top, so recording the UI never changes the world.
     std::vector<ActionCall> actions;
@@ -536,6 +538,11 @@ private:
     // The console's Python line: Enter runs it, Tab completes, Up/Down walk the history.
     void DrawRepl();
     void BuildInspector(nui::VStack& root);
+    // Agent access, the connected programs, their pending requests with accept and reject, and
+    // their recent calls.
+    void BuildAgents(nui::VStack& root);
+    // Asks the user about the oldest pending agent approval: allow once, always, or deny.
+    void DrawAgentApproval();
     void BuildAssets(nui::VStack& root);
     // The schema groups of the selection's fields, after the transform and material.
     void BuildFieldGroups(nui::VStack& root);

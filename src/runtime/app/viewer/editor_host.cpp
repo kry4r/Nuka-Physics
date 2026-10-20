@@ -21,6 +21,7 @@
 #include "runtime/app/viewer/camera_controller.hpp"
 #include "runtime/app/viewer/debug_overlay.hpp"
 #include "runtime/app/viewer/editor_actions.hpp"
+#include "runtime/app/viewer/editor_agents.hpp"
 #include "runtime/app/viewer/editor_assets.hpp"
 #include "runtime/app/viewer/editor_collision.hpp"
 #include "runtime/app/viewer/editor_dataset.hpp"
@@ -1001,6 +1002,16 @@ struct EditorHost::State : DocumentHost {
     void RegisterDatasetActions();
     void RegisterTrainActions();
     void RegisterMaterialActions();
+    // agent.*: the access mode and the requests agents filed, answered by the user.
+    void RegisterAgentActions();
+    // Files an agent's action as a request for the user and says so in the editor.
+    ActionResult AskUser(const std::string& kind, const std::string& client, const std::string& action,
+                         json::Value args, std::string label, std::string note);
+    // Runs what an accepted proposal or an approval holds, as its agent, and settles it.
+    ActionResult Settle(AgentRequest& request, const std::string& state);
+    // Opens or closes the endpoint when the access mode left or entered "off".
+    void AgentModeChanged(const std::string& before);
+    std::string FieldNow(const std::string& target, const std::string& field) const;
     // Runs nuka.train.exchange on `request`; returns why it failed, empty when `*response` is set.
     std::string TrainExchange(const json::Value& request, json::Value* response);
     // The probe of the interpreter runs start in, from the profile's train.python; cached until it changes.
@@ -1040,7 +1051,10 @@ struct EditorHost::State : DocumentHost {
     void ConfigureExtensions();
     void Queue(const std::string& id, json::Value args, const std::string& source);
     void RunQueuedActions();
+    // An action from "agent:<client>" passes the agent access check; the rest run as registered.
     ActionResult RunAction(const std::string& id, const json::Value& args, const std::string& source);
+    ActionResult RunRegistered(const std::string& id, const json::Value& args, const std::string& source);
+    ActionResult RunAgentAction(const std::string& id, const json::Value& args, const std::string& client);
     ActionResult SaveScene(const std::string& path);
     ActionResult OpenDocument(const std::string& file, const std::string& doc_path);
     bool Confirmed(const std::string& id, const json::Value& args, ActionResult* asked);
@@ -1180,6 +1194,8 @@ struct EditorHost::State : DocumentHost {
     void WriteLog(const std::string& text);
     void ConsoleAppend(const std::string& s);
     void DrainConsoleInbox();
+    // Takes the endpoint's latest client report.
+    void DrainAgentInbox();
     void SetHooks(const nuka_editor_script_hooks_t& hooks);
     // Runs `fn` on the UI thread. Other threads wait for it to run there between frames; the
     // physics thread counts as parked meanwhile, so `fn` may edit the world.
@@ -1349,6 +1365,10 @@ struct EditorHost::State : DocumentHost {
         json::Value args;
     };
     std::optional<Prompt> prompt_;
+    // What agents may do and what they asked for; the endpoint's hooks open, close and drop it.
+    AgentAccess agents_;
+    nuka_editor_rpc_hooks_t rpc_hooks_{};
+    std::string running_source_;  // the source of the action running now
     // A Save answer resumes its action once the frame showing the saved scene is captured.
     std::optional<Prompt> resume_;
     std::string autosave_file_;
@@ -1554,6 +1574,7 @@ struct EditorHost::State : DocumentHost {
     std::atomic<bool> playing_mirror_{false};  // read by script callbacks off the UI thread
     std::mutex inbox_mu_;
     std::string console_inbox_;                // host console text, appended from any thread
+    std::optional<std::string> clients_inbox_;  // the endpoint's latest client report, from any thread
     struct RemoteCall {
         std::function<void()> fn;
         bool done = false;
@@ -1588,6 +1609,7 @@ EditorHost::State::State(const std::vector<std::string>& args, nuka_world_handle
         return;
     }
     profile_.emplace(opt_.profile);
+    agents_.Load(*profile_);
     OpenLog();
     thumbnails_ = std::make_unique<ThumbnailCache>(profile_->Dir() / "thumbnails" / "assets");
     map_thumbnails_ = std::make_unique<ThumbnailCache>(profile_->Dir() / "thumbnails" / "maps", kMapThumb, kMapThumb);
@@ -1790,6 +1812,15 @@ void EditorHost::State::DrainConsoleInbox() {
         text.swap(console_inbox_);
     }
     ConsoleAppend(text);
+}
+
+void EditorHost::State::DrainAgentInbox() {
+    std::optional<std::string> clients;
+    {
+        std::lock_guard<std::mutex> lock(inbox_mu_);
+        clients.swap(clients_inbox_);
+    }
+    if (clients) agents_.SetClients(json::Value::Parse(*clients));
 }
 
 // Search order: --ext-folder, so a working copy wins over an installed one, then next to the
@@ -4094,9 +4125,101 @@ void EditorHost::State::RunQueuedActions() {
 }
 
 ActionResult EditorHost::State::RunAction(const std::string& id, const json::Value& args, const std::string& source) {
+    if (source.rfind("agent:", 0) == 0) return RunAgentAction(id, args, source.substr(6));
+    return RunRegistered(id, args, source);
+}
+
+ActionResult EditorHost::State::RunAgentAction(const std::string& id, const json::Value& args,
+                                               const std::string& client) {
+    const auto start = Clock::now();
+    const Action* action = actions_.Find(id);
+    std::string reason;
+    const AgentAccess::Verdict verdict =
+        agents_.Check(id, action != nullptr ? actions_.Kind(*action) : std::string(), &reason);
+    ActionResult result;
+    std::string outcome = "ran";
+    if (verdict == AgentAccess::Verdict::Run) {
+        result = RunRegistered(id, args, "agent:" + client);
+    } else if (verdict == AgentAccess::Verdict::Refuse) {
+        result = ActionResult::Fail(reason);
+        outcome = "refused";
+        ConsoleAppend("[nuka_editor] agent " + client + ": " + id + " refused: " + reason + "\n");
+    } else {
+        const std::string kind = verdict == AgentAccess::Verdict::Propose ? "proposal" : "approval";
+        result = AskUser(kind, client, id, args, std::string(), std::string());
+        outcome = kind + " " + std::to_string(result.value.At("request").AsInt());
+    }
+    agents_.Record(client, id, args, result, outcome,
+                   std::chrono::duration<double, std::milli>(Clock::now() - start).count());
+    return result;
+}
+
+// The current value of a field the Properties panel shows for `target`, as text; empty otherwise.
+std::string EditorHost::State::FieldNow(const std::string& target, const std::string& field) const {
+    if (!loaded_) return std::string();
+    const std::vector<std::string> paths = target.empty() ? std::vector<std::string>{} : std::vector{target};
+    for (const PropertyGroup& group : PropertySchema(loaded_->scene, doc_, paths))
+        for (const PropertyField& f : group.fields)
+            if (f.field == field) return Format("%g", static_cast<double>(f.value));
+    return std::string();
+}
+
+ActionResult EditorHost::State::AskUser(const std::string& kind, const std::string& client, const std::string& action,
+                                        json::Value args, std::string label, std::string note) {
+    AgentRequest request;
+    request.view.kind = kind;
+    request.view.client = client;
+    request.view.action = action;
+    if (label.empty()) label = StrArg(args, "label", action);
+    if (kind == "proposal" && action == "edit.apply") {
+        for (const json::Value& op : args.At("ops").Elements()) {
+            const std::string target = op.At("target").AsString(), field = op.At("field").AsString();
+            const json::Value* before = op.Find("before");
+            request.view.changes.push_back(AgentChange{
+                target, field, before != nullptr && !before->IsNull() ? before->Dump(0) : FieldNow(target, field),
+                op.At("after").Dump(0)});
+        }
+        args.Set("label", json::Value::Str("Agent: " + label));
+    } else if (kind == "proposal") {
+        request.view.changes.push_back(AgentChange{StrArg(args, "path", ""), action, "", args.Dump(0)});
+    }
+    request.view.label = std::move(label);
+    request.view.note = std::move(note);
+    request.args = std::move(args);
+    const std::string toast =
+        kind == "proposal" ? Format(nui::Tr("%s proposes %s"), client.c_str(), request.view.label.c_str())
+                           : Format(nui::Tr("%s asks to run %s"), client.c_str(), action.c_str());
+    const uint64_t id = agents_.Ask(std::move(request));
+    ui_.Nui().Toast(nui::Level::Info, toast);
+    const char* waits = kind == "proposal" ? "waiting for the user to accept or reject it in the editor"
+                                           : "waiting for the user to approve or deny it in the editor";
+    return Ok(Object({{"request", json::Value::Int(static_cast<int64_t>(id))},
+                      {"kind", json::Value::Str(kind)},
+                      {"state", json::Value::Str("pending")},
+                      {"note", json::Value::Str(waits)}}));
+}
+
+ActionResult EditorHost::State::Settle(AgentRequest& request, const std::string& state) {
+    const auto start = Clock::now();
+    const ActionResult result = RunRegistered(request.view.action, request.args, "agent:" + request.view.client);
+    agents_.Record(request.view.client, request.view.action, request.args, result, state,
+                   std::chrono::duration<double, std::milli>(Clock::now() - start).count());
+    agents_.Decide(request, state, &result);
+    return result.ok ? Ok(agents_.Describe(request)) : result;
+}
+
+void EditorHost::State::AgentModeChanged(const std::string& before) {
+    const bool was = before != "off", now = agents_.Mode() != "off";
+    if (was != now && rpc_hooks_.listen != nullptr) rpc_hooks_.listen(rpc_hooks_.user_data, now ? 1u : 0u);
+}
+
+ActionResult EditorHost::State::RunRegistered(const std::string& id, const json::Value& args,
+                                              const std::string& source) {
     const Action* action = actions_.Find(id);
     const std::string owner = action != nullptr ? action->owner : std::string();
+    const std::string outer = std::exchange(running_source_, source);
     ActionResult result = actions_.Run(id, args, source, frame_index_);
+    running_source_ = outer;
     if (!result.ok) {
         last_error_ = result.error;
         const std::string msg = "[nuka_editor] " + id + " failed: " + result.error + "\n";
@@ -4281,8 +4404,67 @@ void EditorHost::State::RegisterActions() {
     RegisterTrainActions();
     RegisterMaterialActions();
     RegisterScriptActions();
+    RegisterAgentActions();
     ui_.RegisterActions(actions_);
     actions_.SetDocs(ReadToml(Utf8Path(Resource("assets/editor/actions.toml"))));
+}
+
+void EditorHost::State::RegisterAgentActions() {
+    const auto id_arg = [](const json::Value& args, const char* key) {
+        return static_cast<uint64_t>(args.At(key).AsInt());
+    };
+    actions_.Add({"agent.mode", "Agent Access", "tools", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value& args) {
+                      const std::string before = agents_.Mode();
+                      agents_.Configure(args, &*profile_);
+                      AgentModeChanged(before);
+                      json::Value v = agents_.Settings();
+                      v.Set("clients", json::Value::Int(static_cast<int64_t>(agents_.ClientCount())));
+                      return Ok(std::move(v));
+                  }});
+    actions_.Add({"agent.proposals", "Agent Requests", "tools", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value&) { return Ok(agents_.Requests()); }});
+    // An edit for the user to accept or reject; an agent's carries its client's name.
+    actions_.Add({"agent.propose", "Propose Edit", "tools", "", ShortcutScope::Global,
+                  [this] { return loaded_ != nullptr; }, {},
+                  [this](const json::Value& args) {
+                      TxnFromJson(args);
+                      const std::string& source = running_source_;
+                      const std::string client = source.rfind("agent:", 0) == 0 ? source.substr(6) : source;
+                      json::Value edit = Object({{"label", json::Value::Str(StrArg(args, "label", "Edit"))},
+                                                 {"ops", args.At("ops")}});
+                      return AskUser("proposal", client, "edit.apply", std::move(edit), StrArg(args, "label", "Edit"),
+                                     StrArg(args, "note", ""));
+                  }});
+    actions_.Add({"agent.accept", "Accept Proposal", "tools", "", ShortcutScope::Global, {}, {},
+                  [this, id_arg](const json::Value& args) {
+                      return Settle(agents_.Pending(id_arg(args, "id"), "proposal"), "accepted");
+                  }});
+    actions_.Add({"agent.approve", "Approve Agent Action", "tools", "", ShortcutScope::Global, {}, {},
+                  [this, id_arg](const json::Value& args) {
+                      AgentRequest& request = agents_.Pending(id_arg(args, "request"), "approval");
+                      if (BoolArg(args, "always", false)) agents_.AllowAlways(request.view.action, &*profile_);
+                      return Settle(request, "approved");
+                  }});
+    actions_.Add({"agent.reject", "Reject Agent Request", "tools", "", ShortcutScope::Global, {}, {},
+                  [this, id_arg](const json::Value& args) {
+                      AgentRequest& request = agents_.Pending(id_arg(args, "id"), "");
+                      request.view.error = StrArg(args, "reason", "rejected by the user");
+                      agents_.Decide(request, "rejected", nullptr);
+                      return Ok(agents_.Describe(request));
+                  }});
+    actions_.Add({"agent.disconnect", "Disconnect Agents", "tools", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value& args) {
+                      const int64_t dropped = static_cast<int64_t>(agents_.ClientCount());
+                      if (rpc_hooks_.disconnect != nullptr) rpc_hooks_.disconnect(rpc_hooks_.user_data);
+                      if (BoolArg(args, "off", false)) {
+                          const std::string before = agents_.Mode();
+                          agents_.Configure(Object({{"mode", json::Value::Str("off")}}), &*profile_);
+                          AgentModeChanged(before);
+                      }
+                      return Ok(Object({{"dropped", json::Value::Int(dropped)},
+                                        {"mode", json::Value::Str(agents_.Mode())}}));
+                  }});
 }
 
 void EditorHost::State::RegisterRobotActions() {
@@ -9032,6 +9214,11 @@ json::Value EditorHost::State::DocumentState() {
     v.Set("autosave", json::Value::Str(autosave_file_));
     v.Set("log", json::Value::Str(log_path_));
     v.Set("profile", json::Value::Str(PathText(profile_->Dir())));
+    json::Value agent = json::Value::Object();
+    agent.Set("mode", json::Value::Str(agents_.Mode()));
+    agent.Set("clients", json::Value::Int(static_cast<int64_t>(agents_.ClientCount())));
+    agent.Set("pending", json::Value::Int(static_cast<int64_t>(agents_.PendingCount())));
+    v.Set("agent", std::move(agent));
     return v;
 }
 
@@ -9372,6 +9559,7 @@ void EditorHost::State::Frame(bool step_physics) {
     if (step_physics) worker_.StartThread();
     else StopWorker();
     DrainConsoleInbox();
+    DrainAgentInbox();
     ServeRemote(now);
     ui_state_.script_driven = borrowed_ && !step_physics;
     // Open script files follow the disk: clean tabs reload, and run again when asked to.
@@ -9613,6 +9801,7 @@ void EditorHost::State::Frame(bool step_physics) {
                                            : 1.0f);
     imgui_.NewFrame();
     SyncViews(render_world);
+    agents_.Fill(&ui_state_.agents);
     ui_.RecordUi(render_world, stats, camera_, ui_state_, loaded_ ? &loaded_->scene : nullptr,
                  surface_suspended_ ? 0u : vp_w, surface_suspended_ ? 0u : vp_h);
     // A press in another pane makes it the active one before anything takes the press.
@@ -9963,6 +10152,14 @@ bool EditorHost::Forward(const std::vector<std::string>& args) {
 
 void EditorHost::SetScriptHooks(const nuka_editor_script_hooks_t& hooks) { state_->SetHooks(hooks); }
 void EditorHost::SetPythonHooks(const nuka_editor_python_hooks_t& hooks) { state_->extensions_.SetPythonHooks(hooks); }
+void EditorHost::SetRpcHooks(const nuka_editor_rpc_hooks_t& hooks) {
+    state_->rpc_hooks_ = hooks;
+    if (hooks.listen != nullptr) hooks.listen(hooks.user_data, state_->agents_.Mode() != "off" ? 1u : 0u);
+}
+void EditorHost::RpcClients(const std::string& clients_json) {
+    std::lock_guard<std::mutex> lock(state_->inbox_mu_);
+    state_->clients_inbox_ = clients_json;
+}
 void EditorHost::Update(bool step_physics) { state_->Frame(step_physics); }
 void EditorHost::StopPhysics() { state_->StopWorker(); }
 bool EditorHost::Running() const { return state_->running_; }

@@ -25,6 +25,9 @@ public:
     static bool Forward(const std::vector<std::string>& args);
     void SetScriptHooks(const nuka_editor_script_hooks_t& hooks);
     void SetPythonHooks(const nuka_editor_python_hooks_t& hooks);
+    void SetRpcHooks(const nuka_editor_rpc_hooks_t& hooks);
+    // Thread-safe; the next frame shows the clients.
+    void RpcClients(const std::string& clients_json);
     void Update(bool step_physics);
     void StopPhysics();
     bool Running() const;

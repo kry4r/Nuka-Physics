@@ -1,0 +1,14 @@
+{
+  "name": "agents",
+  "launch": [],
+  "steps": [
+    {"frames": 10},
+    {"action": "file.new", "args": {"template": "ground", "discard": true}},
+    {"frames": 20},
+    {"action": "window.toggle_agents"},
+    {"frames": 10},
+    {"python": "import runpy\nrunpy.run_path(r'${scenario_dir}/agents_user.py', {'app': app, 'scenario_dir': r'${scenario_dir}', 'out': r'${out}'})"},
+    {"frames": 20},
+    {"screenshot": "00_agents_panel"}
+  ]
+}

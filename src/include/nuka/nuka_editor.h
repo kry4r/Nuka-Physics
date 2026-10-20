@@ -64,6 +64,16 @@ typedef struct nuka_editor_python_hooks_t {
     const char* (*unload)(void* user_data, const char* extension_id);
 } nuka_editor_python_hooks_t;
 
+// Hooks the host's endpoint for other programs (agents) runs through, called on the UI thread.
+// The editor opens or closes it as the agent access mode leaves or enters "off".
+typedef struct nuka_editor_rpc_hooks_t {
+    void* user_data;
+    // Opens the endpoint when `on` is nonzero; zero closes it and drops its clients.
+    void (*listen)(void* user_data, uint32_t on);
+    // Drops every connected client; the endpoint stays open.
+    void (*disconnect)(void* user_data);
+} nuka_editor_rpc_hooks_t;
+
 // argv holds the launcher flags and an optional scene path. A non-NULL world is borrowed and
 // must outlive the editor; otherwise the first load creates a world the editor owns.
 NUKA_EDITOR_API nuka_result_t nuka_editor_create(int argc, const char* const* argv,
@@ -79,6 +89,11 @@ NUKA_EDITOR_API nuka_result_t nuka_editor_set_script_hooks(nuka_editor_handle ed
                                                            const nuka_editor_script_hooks_t* hooks);
 NUKA_EDITOR_API nuka_result_t nuka_editor_set_python_hooks(nuka_editor_handle editor,
                                                            const nuka_editor_python_hooks_t* hooks);
+// Calls listen at once with the current access mode.
+NUKA_EDITOR_API nuka_result_t nuka_editor_set_rpc_hooks(nuka_editor_handle editor,
+                                                        const nuka_editor_rpc_hooks_t* hooks);
+// The endpoint's clients, a JSON array of {"client", "pid", "since"}; any thread may report them.
+NUKA_EDITOR_API void nuka_editor_rpc_clients(nuka_editor_handle editor, const char* clients_json);
 // One frame of input, edits and presentation. With step_physics nonzero a physics thread
 // advances the transport; with zero none runs and the host steps the world between updates.
 NUKA_EDITOR_API nuka_result_t nuka_editor_update(nuka_editor_handle editor, uint32_t step_physics);

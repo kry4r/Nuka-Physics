@@ -457,7 +457,9 @@ class EditorApp:
         self.clips = Clips(self)
         self.ui = UI(weakref.proxy(self))
         # Other programs on this machine (nuka.editor.connect, the MCP server) reach the editor here.
+        # It opens and closes as agent access leaves and enters "off".
         self.rpc = RpcServer(weakref.proxy(self), os.path.join(profile_dir(argv), "rpc"))
+        self._native.set_rpc_hooks(self.rpc)
         atexit.register(self.close)
 
     @property
