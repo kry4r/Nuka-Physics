@@ -44,9 +44,15 @@ def pending() -> dict:
 
 profile = os.path.dirname(os.path.dirname(app.rpc.file))
 seen = {}
-nodes = app.actions.run("scene.nodes")
-collision = next(n["path"] for n in nodes if n["kind"] == "geom" and "ground" in n["path"])
-plan = {"collision": collision, "root": collision.split("/")[0]}
+# An agent finds the friction field and its target the way the Properties panel lists them.
+root = next(n["path"] for n in app.actions.run("scene.nodes") if n["name"] == "ground")
+friction = [(g["targets"][0], f) for g in app.actions.run("scene.fields", path=root) for f in g["fields"]
+            if f["field"] == "shape.friction_mu"]
+assert friction and abs(friction[0][1]["value"] - 1.0) < 1e-6, friction
+collision = friction[0][0]
+world = app.actions.run("scene.fields", path="")
+assert [g["kind"] for g in world] == ["world"] and world[0]["targets"] == [""], world
+plan = {"collision": collision, "root": root}
 with open(os.path.join(out, "agents_plan.json"), "w", encoding="utf-8") as f:
     json.dump(plan, f)
 app.actions.run("agent.mode", mode="full", allow=[], deny=["scene.*"])

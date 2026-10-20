@@ -7517,6 +7517,44 @@ void EditorHost::State::RegisterScriptActions() {
                       });
                       return Ok(std::move(out));
                   }});
+    // The Properties panel's fields of the nodes: each group names the targets an edit.apply op takes,
+    // each field its op name, unit, range, value and whether an edit reaches the running world.
+    actions_.Add({"scene.fields", "Node Fields", "scene", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      const bool named = args.Find("paths") != nullptr || args.Find("path") != nullptr;
+                      std::vector<std::string> paths = named ? StrListArg(args, "paths") : SelectionPaths();
+                      if (const std::string path = StrArg(args, "path"); !path.empty()) paths.push_back(path);
+                      json::Value groups = json::Value::Array();
+                      for (const PropertyGroup& g : PropertySchema(loaded_->scene, doc_, paths)) {
+                          json::Value targets = json::Value::Array();
+                          for (const std::string& t : g.targets) targets.PushBack(json::Value::Str(t));
+                          json::Value fields = json::Value::Array();
+                          for (const PropertyField& f : g.fields) {
+                              json::Value v = Object({{"field", json::Value::Str(f.field)},
+                                                      {"label", json::Value::Str(f.label)},
+                                                      {"unit", json::Value::Str(f.unit)},
+                                                      {"value", json::Value::Float(f.value)},
+                                                      {"live", json::Value::Bool(f.live)},
+                                                      {"integer", json::Value::Bool(f.integer)}});
+                              if (f.min != f.max) {
+                                  json::Value range = json::Value::Array();
+                                  range.PushBack(json::Value::Float(f.min));
+                                  range.PushBack(json::Value::Float(f.max));
+                                  v.Set("range", std::move(range));
+                              }
+                              if (f.mixed) v.Set("mixed", json::Value::Bool(true));
+                              if (f.inherited) v.Set("inherited", json::Value::Bool(true));
+                              if (f.has_saved) v.Set("saved", json::Value::Float(f.saved));
+                              fields.PushBack(std::move(v));
+                          }
+                          groups.PushBack(Object({{"title", json::Value::Str(g.title)},
+                                                  {"kind", json::Value::Str(g.kind)},
+                                                  {"detail", json::Value::Str(g.detail)},
+                                                  {"targets", std::move(targets)},
+                                                  {"fields", std::move(fields)}}));
+                      }
+                      return Ok(std::move(groups));
+                  }});
 }
 
 void EditorHost::State::RegisterSceneActions() {

@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -23,8 +24,9 @@ MODERN = "2026-07-28"
 LEGACY = ["2025-11-25", "2025-06-18", "2025-03-26"]
 SERVER_INFO = {"name": "nuka-editor", "title": "Nuka Editor", "version": "1.0.0"}
 UNSUPPORTED_VERSION = -32022
-# The skill's reference pages, served as nuka://guide/<name>.
-GUIDES = Path(__file__).resolve().parent / "skill" / "nuka-editor" / "references"
+# The nuka-editor skill; its reference pages are served as nuka://guide/<name>.
+SKILL = Path(__file__).resolve().parent / "skill" / "nuka-editor"
+GUIDES = SKILL / "references"
 INSTRUCTIONS = (
     "Drives the Nuka physics editor open on this machine. Begin with editor_status, or editor_launch when "
     "none runs. Every editor feature is an action: find one with actions_find, read its arguments with "
@@ -386,8 +388,23 @@ class Server:
                 stdout.flush()
 
 
+def install_skill(dest: str) -> Path:
+    """Copies the nuka-editor skill into the skills folder ``dest``; returns the skill's folder there."""
+    target = Path(dest).expanduser() / SKILL.name
+    shutil.copytree(SKILL, target, dirs_exist_ok=True, ignore=shutil.ignore_patterns("__pycache__"))
+    return target
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     import argparse
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["install-skill"]:
+        install = argparse.ArgumentParser(prog="python -m nuka.mcp install-skill",
+                                          description="Copy the nuka-editor skill into an agent's skills folder.")
+        install.add_argument("--dest", default=os.path.join("~", ".claude", "skills"),
+                             help="the skills folder (default ~/.claude/skills)")
+        print(install_skill(install.parse_args(argv[1:]).dest))
+        return 0
     parser = argparse.ArgumentParser(prog="python -m nuka.mcp", description="MCP server for the Nuka editor.")
     parser.add_argument("--profile", default=os.environ.get("NUKA_EDITOR_PROFILE"))
     parser.add_argument("--pid", type=int, default=int(os.environ.get("NUKA_EDITOR_PID", 0)) or None)

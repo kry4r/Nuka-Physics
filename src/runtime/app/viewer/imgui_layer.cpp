@@ -654,7 +654,7 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
                            "agent.reject"})
         registry.Decorate(id, icon::kSparkle, true);
     for (const char* id : {"script.close", "script.complete", "script.tabs", "script.goto", "script.console",
-                           "script.result", "script.reload", "script.set_budget", "scene.nodes"})
+                           "script.result", "script.reload", "script.set_budget", "scene.nodes", "scene.fields"})
         registry.Decorate(id, "", true);
     for (const char* id : {"edit.apply", "edit.rename", "edit.reparent", "scene.spawn", "scene.select", "sim.play",
                            "sim.pause", "sim.speed", "view.stats", "file.unload", "file.open_recent", "file.forget_recent",

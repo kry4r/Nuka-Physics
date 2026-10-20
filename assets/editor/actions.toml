@@ -1694,6 +1694,14 @@ args.kind = "string, artic, soft, cloth, fluid, body, static, joint, geom, visua
 returns = "a list of {path, name, kind}"
 example = '{"under": "/go2", "kind": "body"}'
 
+["scene.fields"]
+summary = "The fields the Properties panel edits for `paths` (else `path`, else the selection; \"\" or no selection gives the world options), in groups: each group's `targets` are what an edit.apply op names as its target, each field's `field` the op's field. A field applies to the running world when `live`, else at the next rebuild."
+kind = "read"
+args.paths = "list of strings, node paths, optional"
+args.path = "string, one node path, default the selection"
+returns = "a list of {title, kind (body, joint, drive, collision or world), detail, targets, fields: [{field, label, unit, value, live, integer, range, mixed, inherited, saved}]}"
+example = '{"path": "ground/ground_collision"}'
+
 ["agent.mode"]
 summary = "Sets what programs driving the editor from outside (agents, through nuka.editor.connect or MCP) may do. full runs every action; propose turns their edits into proposals and asks the user before file, process and app actions; read lets only read and view actions through; off closes the endpoint and drops every client. `allow` runs actions without asking, `deny` refuses them; both take ids or wildcards such as file.*. Only the user runs it, never an agent."
 kind = "app"

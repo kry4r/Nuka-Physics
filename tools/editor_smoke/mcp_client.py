@@ -8,6 +8,7 @@ saw as JSON.
 import json
 import os
 import struct
+import subprocess
 import sys
 import zlib
 
@@ -78,7 +79,11 @@ def main(profile: str, pid: int, asset: str, out: str) -> None:
     seen["scenario"] = [good["passed"], failing["passed"], [s["ok"] for s in failing["steps"]]]
     seen["resources"] = [r["uri"] for r in mcp.list_resources()]
     seen["catalog"] = len(json.loads(mcp.read_resource("nuka://catalog")))
+    seen["guide"] = mcp.read_resource("nuka://guide/safety").splitlines()[0]
     seen["exit"] = [mcp.close()]
+    skills = os.path.join(os.path.dirname(out), "skills")
+    installed = subprocess.run(command + ["install-skill", "--dest", skills], env=env, capture_output=True, text=True)
+    seen["skill"] = sorted(os.listdir(os.path.join(skills, "nuka-editor"))) + [installed.returncode]
 
     with McpClient(command, env=env, legacy="2025-11-25") as legacy:
         seen["legacy_version"] = legacy.server["protocolVersion"]
