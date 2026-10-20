@@ -104,6 +104,8 @@ constexpr size_t kConsoleLogCap = 256u * 1024u;
 constexpr size_t kScriptRunsKept = 64u;
 // A spawned primitive starts this far above its reference so a free body drops in.
 constexpr float kSpawnDropHeight = 0.75f;
+// The largest primitive's half size plus a margin: a drop starts this far clear of moving geometry.
+constexpr float kSpawnClearance = 0.5f;
 constexpr uint64_t kFpsWarmup = 30u;
 // Frame timings keep this many recent samples for the exit percentiles.
 constexpr size_t kSampleCap = 65536u;
@@ -495,6 +497,22 @@ void InstanceAabb(const render::RenderInstance& inst, const render::RenderWorld&
         lo->x = std::min(lo->x, p.x); lo->y = std::min(lo->y, p.y); lo->z = std::min(lo->z, p.z);
         hi->x = std::max(hi->x, p.x); hi->y = std::max(hi->y, p.y); hi->z = std::max(hi->z, p.z);
     }
+}
+
+// The height a primitive dropped over `at` starts from, raised above every moving body or link
+// under that spot: a primitive spawned inside one would fail the first contact pass.
+float SpawnDropZ(const render::RenderWorld& w, const math::Vec3& at) {
+    float z = at.z + kSpawnDropHeight;
+    for (const render::RenderInstance& inst : w.instances) {
+        if (inst.pose_source.kind == render::PoseSource::Kind::Static) continue;
+        math::Vec3 lo, hi;
+        InstanceAabb(inst, w, &lo, &hi);
+        if (lo.x > at.x + kSpawnClearance || hi.x < at.x - kSpawnClearance || lo.y > at.y + kSpawnClearance ||
+            hi.y < at.y - kSpawnClearance)
+            continue;
+        z = std::max(z, hi.z + kSpawnClearance);
+    }
+    return z;
 }
 
 // Slab test; the near hit distance t >= 0 lands in *t_out.
@@ -7602,7 +7620,7 @@ void EditorHost::State::RegisterEditActions() {
                   [node_edit](const json::Value& args) {
                       return node_edit("Reparent", "reparent", args, json::Value::Str(StrArg(args, "parent")));
                   }});
-    // Without a pose, a spawn drops in above the selection.
+    // Without a pose, a spawn drops in above where the selection stands now, clear of moving bodies.
     actions_.Add({"scene.spawn", "Add Primitive", "scene", "", ShortcutScope::Global, has_scene, {},
                   [this](const json::Value& args) {
                       const std::string kind = StrArg(args, "kind", "box");
@@ -7611,11 +7629,13 @@ void EditorHost::State::RegisterEditActions() {
                           pose = *p;
                       } else {
                           math::Transform placement;
-                          placement.position = math::Vec3{0.0f, 0.0f, kSpawnDropHeight};
-                          if (ui_state_.selected_entity != scene::kInvalidEntity) {
-                              placement.position = AuthoredWorldTransform(loaded_->scene, ui_state_.selected_entity).position;
-                              placement.position.z += kSpawnDropHeight;
+                          if (const scene::EntityId e = ui_state_.selected_entity; e != scene::kInvalidEntity) {
+                              const render::RenderInstance* inst = PoseInstance(*loaded_, doc_.Records(), e);
+                              const math::Transform at = inst != nullptr ? LiveWorldTransform(loaded_->scene, e, *inst)
+                                                                         : AuthoredWorldTransform(loaded_->scene, e);
+                              placement.position = at.position;
                           }
+                          placement.position.z = SpawnDropZ(loaded_->sim->GetRenderWorld(), placement.position);
                           pose = TransformToJson(placement);
                       }
                       const json::Value spawn = Object({{"kind", json::Value::Str(kind)}, {"pose", pose}});
