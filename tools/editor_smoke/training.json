@@ -3,7 +3,7 @@
   "launch": [],
   "steps": [
     {"action": "train.tasks", "bind": "tasks"},
-    {"python": "t = ${tasks}\nassert [x['name'] for x in t] == ['go2_velocity'], t\ng = {x['key']: x for x in t[0]['groups']}\nassert list(g) == ['run', 'observation', 'action', 'command', 'reward', 'termination', 'event', 'algorithm'], list(g)\nassert all(p['readonly'] for p in g['observation']['params'] + g['action']['params']), g\nassert sum(p['dims'] for p in g['observation']['params']) == 48 and t[0]['robot'] == {'links': 13, 'joints': 12}, t[0]\nassert t[0]['module'] == 'nuka.train.tasks', t[0]"},
+    {"python": "t = ${tasks}\nassert [x['name'] for x in t] == ['go2_velocity', 'g1_rough'], t\ng = {x['key']: x for x in t[0]['groups']}\nassert list(g) == ['run', 'observation', 'action', 'command', 'reward', 'termination', 'event', 'algorithm'], list(g)\nassert all(p['readonly'] for p in g['observation']['params'] + g['action']['params']), g\nassert sum(p['dims'] for p in g['observation']['params']) == 48 and t[0]['robot'] == {'links': 13, 'joints': 12}, t[0]\nassert t[0]['module'] == 'nuka.train.tasks', t[0]"},
     {"action": "train.python", "bind": "py"},
     {"python": "p = ${py}\nprint('TRAINER', p['python'], p['ready'], p['error'])\nassert p['ready'] and p['argv'][1] == '-c' and p['error'] == '', p"},
     {"action": "train.python", "args": {"path": "${out}/nope/python.exe"}, "expect_value": {"ready": false}, "bind": "nopy"},

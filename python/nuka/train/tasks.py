@@ -268,14 +268,14 @@ def _g1_groups() -> List[Group]:
         Group("action", "Action", [
             Param("joint_position_scale", "float", 0.25, readonly=True, unit="rad",
                   help="Target = default stance + scale x action; " + _CONTRACT),
-            Param("decimation", "int", 4, readonly=True, help="Physics steps per policy step; " + _CONTRACT),
+            Param("decimation", "int", 10, readonly=True, help="Physics steps per policy step; " + _CONTRACT),
         ]),
         Group("command", "Command", [
             Param("fixed", "bool", False, help="Hold one command instead of resampling every 10 s"),
             Param("fixed_value", "vec3", [0.5, 0.0, 0.0], -2.0, 2.0, unit="m/s, m/s, rad/s",
                   help="The command held when fixed"),
-            Param("lin_vel_x", "range", [-0.5, 1.0], -2.0, 2.0, unit="m/s",
-                  help="Forward velocity limits; ranges start at 10% and widen as tracking improves"),
+            Param("curriculum", "bool", True, help="Start the ranges at 0.1 and widen them as tracking improves"),
+            Param("lin_vel_x", "range", [-0.5, 1.0], -2.0, 2.0, unit="m/s", help="Forward velocity limits"),
             Param("lin_vel_y", "range", [-0.3, 0.3], -2.0, 2.0, unit="m/s", help="Lateral velocity limits"),
             Param("ang_vel_yaw", "range", [-0.5, 0.5], -3.0, 3.0, unit="rad/s", help="Yaw rate limits"),
         ]),
@@ -318,7 +318,7 @@ def _g1_build(config: dict, scene: str, name: str) -> dict:
     params["network"]["mlp"]["units"] = list(algo["units"])
     env_config = {
         "scene": scene, "seed": run["seed"], "noise": obs["noise"], "push": event["push"],
-        "fixed_command": cmd["fixed"], "command": list(cmd["fixed_value"]),
+        "fixed_command": cmd["fixed"], "command": list(cmd["fixed_value"]), "curriculum": cmd["curriculum"],
         "command_ranges": {k: list(cmd[k]) for k in ("lin_vel_x", "lin_vel_y", "ang_vel_yaw")},
         "terrain": dict(terr), "reward_scales": dict(rew),
         "termination_height": term["base_height"], "termination_tilt_deg": term["tilt"],
@@ -334,6 +334,14 @@ def _g1_build(config: dict, scene: str, name: str) -> dict:
         "mini_epochs": algo["mini_epochs"], "env_config": env_config,
         # Actions go to the robot unscaled and unclipped, as in rsl_rl.
         "clip_actions": False, "bounds_loss_coef": 0.0,
+        # The critic is a network of its own on the env's privileged states, as in unitree_rl_lab.
+        "use_experimental_cv": False,
+        "central_value_config": {
+            "minibatch_size": batch // algo["minibatches"], "mini_epochs": algo["mini_epochs"],
+            "learning_rate": algo["learning_rate"], "e_clip": algo["e_clip"], "clip_value": True,
+            "normalize_input": True, "truncate_grads": True, "grad_norm": 1.0,
+            "network": {"name": "actor_critic", "central_value": True, "mlp": dict(params["network"]["mlp"])},
+        },
     })
     return params
 
@@ -349,4 +357,4 @@ def register(spec: TaskSpec) -> None:
 register(TaskSpec(name="go2_velocity", title="Go2 velocity tracking", env="nuka_go2", groups=_go2_groups(),
                   robot={"links": 13, "joints": 12}, dt=0.005, spacing=1.0, build=_go2_build, check=_batch_check))
 register(TaskSpec(name="g1_rough", title="G1 rough-terrain walking", env="nuka_g1", groups=_g1_groups(),
-                  robot={"links": 31, "joints": 23}, dt=0.005, spacing=0.0, build=_g1_build, check=_batch_check))
+                  robot={"links": 31, "joints": 30}, dt=0.002, spacing=0.0, build=_g1_build, check=_batch_check))

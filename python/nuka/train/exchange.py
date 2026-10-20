@@ -3,7 +3,7 @@
 `call(request, response)` reads `{"op": ...}` from `request` and writes the answer to `response`:
 - `tasks`: {} -> {"tasks": [schema, ...]}
 - `resolve`: {task, config, set, layout} -> {task, config, changed, errors}; see config.resolve.
-  Without `task` it is the first registered one.
+  Without `task` it is the first registered one whose robot the scene holds, else the first registered one.
 - `trainer`: {python} -> {python, argv, ready, error}: the interpreter a run starts in, `argv` +
   [job.json] being its command.
 A request the package cannot answer, such as one for an unknown task, is answered `{"failed": why}`.
@@ -16,7 +16,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .config import changed, resolve
+from .config import changed, resolve, scene_errors
 from .tasks import TASKS
 
 # The run imports this editor's nuka, whatever the interpreter has installed.
@@ -31,7 +31,9 @@ def _tasks(req: dict) -> dict:
 
 
 def _resolve(req: dict) -> dict:
-    name = req.get("task") or next(iter(TASKS))
+    layout = req.get("layout")
+    fits = [n for n, t in TASKS.items() if layout and not scene_errors(t, layout)]
+    name = req.get("task") or (fits + list(TASKS))[0]
     if name not in TASKS:
         raise ValueError(f"no training task {name!r}; there are {', '.join(TASKS)}")
     task = TASKS[name]

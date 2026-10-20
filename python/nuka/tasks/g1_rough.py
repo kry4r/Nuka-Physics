@@ -3,9 +3,10 @@
 The robot's revolute joints are found by name, so any G1 scene works; the 23-joint G1 (31 links) stays on the fast
 articulation path, while the 29-joint one (39 links) does not. Observations follow unitree_rl_lab's velocity task:
 base angular velocity, projected gravity, the command, joint positions and velocities and the last action, five
-frames of history, term by term and oldest first. Rewards and terminations follow its velocity_env_cfg
-(Apache-2.0). Foot contact is the sole spheres' distance to the heightfield, and other links touching down are
-found the same way from their origins.
+frames of history, term by term and oldest first. As there, the critic sees `states`: the base's linear velocity
+followed by the same terms without noise, five frames of history. Rewards and terminations follow its
+velocity_env_cfg (Apache-2.0). Foot contact is the sole spheres' distance to the heightfield, and other links
+touching down are found the same way from their origins.
 
 Training runs on a copy of the scene with its mesh collision shapes dropped: the sole spheres carry the contacts,
 and dense meshes on thousands of robots overflow the contact budget. The copy also drops the scene's terrain, since
@@ -136,11 +137,13 @@ class G1RoughEnv:
 
     metadata = {"render_modes": []}
 
-    def __init__(self, scene: str, num_envs: int, *, device=None, dt: float = 0.005, decimation: int = 4,
+    # 2 ms physics steps: at 5 ms Unitree's pretrained G1 gait covers a third of its distance in Nuka.
+    def __init__(self, scene: str, num_envs: int, *, device=None, dt: float = 0.002, decimation: int = 10,
                  terrain: dict | None = None, command_ranges: dict | None = None, reward_scales: dict | None = None,
                  push: bool = True, noise: bool = True, termination_height: float = 0.3,
                  termination_tilt_deg: float = 45.0, episode_length_s: float = 20.0, env_spacing: float = 2.5,
-                 fixed_command: bool = False, command=(0.5, 0.0, 0.0), seed: int | None = None, **_ignored):
+                 fixed_command: bool = False, command=(0.5, 0.0, 0.0), curriculum: bool = True,
+                 seed: int | None = None, **_ignored):
         self.num_envs = int(num_envs)
         self.dt, self.decimation = float(dt), int(decimation)
         self.step_dt = self.dt * self.decimation
@@ -229,11 +232,11 @@ class G1RoughEnv:
         for s in self.slots.tolist():
             w.set_param(armature, s, ARMATURE)
 
-        # Command ranges and the per-env command. As in unitree_rl_lab, yaw starts at its limit and the
-        # curriculum widens the linear ranges.
+        # Command ranges and the per-env command; the curriculum widens the ranges toward their limits, and
+        # without it they start there.
         self._limit = {k: tuple(v) for k, v in {**COMMAND_LIMIT, **(command_ranges or {})}.items()}
-        self._ranges = {k: (lo, hi) if k == "ang_vel_yaw" else (max(lo, -COMMAND_START), min(hi, COMMAND_START))
-                        for k, (lo, hi) in self._limit.items()}
+        start = COMMAND_START if curriculum else math.inf
+        self._ranges = {k: (max(lo, -start), min(hi, start)) for k, (lo, hi) in self._limit.items()}
         self._fixed_command = bool(fixed_command)
         self.command = torch.tensor(command, dtype=torch.float32, device=self._dev).repeat(self.num_envs, 1)
         self._track_sum = torch.zeros(self.num_envs, 2, device=self._dev)
@@ -245,8 +248,11 @@ class G1RoughEnv:
                        ("joint_pos_rel", J), ("joint_vel_rel", J), ("last_action", J)]
         self._frame = sum(d for _, d in self._terms)
         self.obs_dim = self._frame * HISTORY
+        self.state_dim = (self._frame + 3) * HISTORY
         self.action_dim = J
         self._history = torch.zeros(self.num_envs, HISTORY, self._frame, device=self._dev)
+        self._state_history = torch.zeros(self.num_envs, HISTORY, self._frame + 3, device=self._dev)
+        self.states = torch.zeros(self.num_envs, self.state_dim, device=self._dev)
         self.action = torch.zeros(self.num_envs, J, device=self._dev)
         self._last_action = torch.zeros_like(self.action)
         self._last_qd = torch.zeros(self.num_envs, J, device=self._dev)
@@ -259,6 +265,7 @@ class G1RoughEnv:
         high = np.full(self.obs_dim, np.inf, np.float32)
         self.single_observation_space = spaces.Box(-high, high, dtype=np.float32)
         self.single_action_space = spaces.Box(-np.inf, np.inf, (J,), dtype=np.float32)
+        self.single_state_space = spaces.Box(-np.inf, np.inf, (self.state_dim,), dtype=np.float32)
         self.observation_space = self.single_observation_space
         self.action_space = self.single_action_space
         print(f"[g1_rough] envs={self.num_envs} joints={J} obs={self.obs_dim} terrain={t} "
@@ -295,25 +302,31 @@ class G1RoughEnv:
 
     # -- observation ---------------------------------------------------------
     def _frame_now(self):
+        """The actor's frame and the critic's: the base's linear velocity, then the terms without noise."""
         q = self._q[:, self.slots]
         qd = self._qd[:, self.slots]
         values = {"base_ang_vel": self._vel[:, 0, 0:3], "projected_gravity": self._gravity(),
                   "velocity_commands": self.command, "joint_pos_rel": q - self.default, "joint_vel_rel": qd,
                   "last_action": self.action}
-        parts = []
+        parts, clean = [], [self._vel[:, 0, 3:6]]
         for k, _ in self._terms:
             v = values[k]
+            clean.append(v * OBS_SCALES[k])
             if self.noise and k in OBS_NOISE:
                 v = v + (torch.rand(v.shape, generator=self._gen, device=self._dev) * 2 - 1) * OBS_NOISE[k]
             parts.append(v * OBS_SCALES[k])
-        return torch.cat(parts, 1)
+        return torch.cat(parts, 1), torch.cat(clean, 1)
 
     def _observe(self, fresh=None):
-        frame = self._frame_now()
+        frame, state = self._frame_now()
         self._history = torch.roll(self._history, -1, 1)
         self._history[:, -1] = frame
+        self._state_history = torch.roll(self._state_history, -1, 1)
+        self._state_history[:, -1] = state
         if fresh is not None:
             self._history[fresh] = frame[fresh, None].expand(-1, HISTORY, -1)
+            self._state_history[fresh] = state[fresh, None].expand(-1, HISTORY, -1)
+        self.states = self._state_history.reshape(self.num_envs, -1).nan_to_num(0.0, 100.0, -100.0)
         out, start = [], 0
         for _, d in self._terms:
             out.append(self._history[:, :, start:start + d].reshape(self.num_envs, -1))
@@ -376,15 +389,17 @@ class G1RoughEnv:
 
     # -- curriculum ------------------------------------------------------------
     def _grow_commands(self):
-        """Once per episode length, widen the linear ranges by 0.1 toward their limits when the episodes that timed
-        out since the last check tracked them well. Falls are left to the termination terms."""
+        """Once per episode length, widen the linear and the yaw ranges by 0.1 toward their limits when the episodes
+        that timed out since the last check tracked them well. Falls are left to the termination terms."""
         if self._fixed_command or self._common_step % self.max_episode_length != 0:
             return
         count = float(self._tracked[2])
         tracked = self._tracked[0:2] / (max(count, 1.0) * self.max_episode_length)
         self._tracked.zero_()
-        if count > 0 and float(tracked[0]) > 0.8:
-            for key in ("lin_vel_x", "lin_vel_y"):
+        for keys, score in (("lin_vel_x", "lin_vel_y"), tracked[0]), (("ang_vel_yaw",), tracked[1]):
+            if count == 0 or float(score) <= 0.8:
+                continue
+            for key in keys:
                 (lo, hi), (llo, lhi) = self._ranges[key], self._limit[key]
                 self._ranges[key] = (round(max(llo, lo - 0.1), 3), round(min(lhi, hi + 0.1), 3))
         print(f"[g1_rough] step {self._common_step}: {int(count)} timed out, tracking {tracked[0]:.3f} linear "

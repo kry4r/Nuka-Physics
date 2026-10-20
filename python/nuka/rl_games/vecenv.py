@@ -101,22 +101,30 @@ class NukaVecEnv(IVecEnv):
         # Single-env spaces (rl_games prepends num_actors).
         self.observation_space = self.env.single_observation_space
         self.action_space = self.env.single_action_space
+        # Envs with privileged critic inputs hand them over as ``states`` for rl_games' central value net.
+        self.state_space = getattr(self.env, "single_state_space", None)
 
     # -- IVecEnv API --------------------------------------------------------
     def get_number_of_agents(self) -> int:
         return 1
 
     def get_env_info(self) -> dict:
-        return {
+        info = {
             "observation_space": self.observation_space,
             "action_space": self.action_space,
             "agents": 1,
             "value_size": 1,
         }
+        if self.state_space is not None:
+            info["state_space"] = self.state_space
+        return info
+
+    def _with_states(self, obs):
+        return obs if self.state_space is None else {"obs": obs, "states": self.env.states}
 
     def reset(self):
         obs, _info = self.env.reset()
-        return obs
+        return self._with_states(obs)
 
     def step(self, actions):
         # actions: cuda tensor (N,12) handed over by rl_games.
@@ -127,7 +135,7 @@ class NukaVecEnv(IVecEnv):
         reward = reward.to(dtype=torch.float32)
         # legged_gym-style time-limit bootstrap signal (read iff value_bootstrap).
         infos = {"time_outs": truncated}
-        return obs, reward, dones, infos
+        return self._with_states(obs), reward, dones, infos
 
     def seed(self, seed):
         # NukaGymEnv reseeds its RNG on reset(seed=...); rl_games seeds globals
