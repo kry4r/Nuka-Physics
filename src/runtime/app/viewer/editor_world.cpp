@@ -20,11 +20,11 @@ static_assert(sizeof(math::Vec3) == 3u * sizeof(float), "velocity wire layout");
 
 // The command arrow's shaft and head widths, head length and thickness in metres; the measured arrow
 // is narrower so the command shows around it where the two agree.
-constexpr float kArrowShaft = 0.05f, kArrowHead = 0.15f, kArrowHeadLength = 0.13f, kArrowThick = 0.03f;
+constexpr float kArrowShaft = 0.08f, kArrowHead = 0.24f, kArrowHeadLength = 0.2f, kArrowThick = 0.05f;
 constexpr float kMeasuredWidth = 0.7f;
-// Metres of arrow per m/s, the longest arrow and the slowest speed drawn. Lengths snap to a step so
-// the mesh library keeps few arrows; one shorter than kArrowShortest shrinks whole.
-constexpr float kArrowPerSpeed = 0.6f, kArrowMax = 1.2f, kArrowMinSpeed = 0.02f, kArrowStep = 0.02f;
+// Metres of arrow per m/s (a walking robot's arrows read in a crowd), the longest arrow and the slowest speed
+// drawn. Lengths snap to a step so the mesh library keeps few; one shorter than kArrowShortest shrinks whole.
+constexpr float kArrowPerSpeed = 1.5f, kArrowMax = 2.0f, kArrowMinSpeed = 0.02f, kArrowStep = 0.02f;
 constexpr float kArrowShortest = 1.5f * kArrowHeadLength;
 // The measured arrow's rise over the command's, a thickness and a hair.
 constexpr float kArrowRise = kArrowThick + 0.01f;

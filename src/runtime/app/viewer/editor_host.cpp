@@ -1073,7 +1073,8 @@ struct EditorHost::State : DocumentHost {
     fs::path TrainRunDir(const json::Value& args) const;
     // Watches the run in `dir` through its first `envs` environments; the world holds still at its frames.
     ActionResult StartObserve(const fs::path& dir, uint32_t envs, bool follow);
-    // Stops watching, saying `why` when it is not empty; history starts again from the last frame shown.
+    // Stops watching, saying `why` when it is not empty; history starts again from the last frame shown, or
+    // from a reset when the run placed its environments on its own terrain.
     void EndObserve(const std::string& why);
     // Shows the watched run's newest frame, its arrows and its progress; ends when the run or the world goes.
     void StepObserve();
@@ -1413,6 +1414,7 @@ struct EditorHost::State : DocumentHost {
         uint32_t envs = 0u, links = 0u, bodies = 0u, articulations = 0u;
         float spacing = 0.0f;  // the run's: 0 when its environments stand apart already
         float lift = 0.0f;     // the arrows' height over each base; the first frame sets it
+        uint32_t scene_envs = 1u;  // the world's environments before the watch
         ObserveFrame frame;
         uint64_t frames = 0u;
         Clock::time_point status_due{};
@@ -6078,6 +6080,7 @@ ActionResult EditorHost::State::StartObserve(const fs::path& dir, uint32_t envs,
     const auto spacing = static_cast<float>(answer.At("spacing").AsDouble());
     ui_state_.playing = false;
     PushTransport();
+    const uint32_t scene_envs = ui_state_.envs.count;
     if (shown != ui_state_.envs.count) {
         const json::Value count = Object({{"count", json::Value::Int(shown)}});
         ActionResult resized = actions_.Run("sim.envs", count, "train.observe", frame_index_);
@@ -6087,6 +6090,7 @@ ActionResult EditorHost::State::StartObserve(const fs::path& dir, uint32_t envs,
     ActionResult grid = actions_.Run("view.envs", show, "train.observe", frame_index_);
     if (!grid.ok) return grid;
     observe_ = Observing{std::move(link), dir, shown, links, bodies, articulations, spacing};
+    observe_->scene_envs = scene_envs;
     TrainView& t = ui_state_.train;
     t = TrainView{};
     t.observing = true;
@@ -6098,6 +6102,10 @@ ActionResult EditorHost::State::StartObserve(const fs::path& dir, uint32_t envs,
 }
 
 void EditorHost::State::EndObserve(const std::string& why) {
+    // A run that placed its environments on its own terrain leaves them there when the watch ends, so the world
+    // goes back to the scene's environment count, unless something else resized it, and starts over.
+    const bool placed = observe_ && observe_->spacing == 0.0f;
+    const uint32_t scene_envs = placed && ui_state_.envs.count == observe_->envs ? observe_->scene_envs : 0u;
     observe_.reset();
     ui_state_.train = TrainView{};
     if (loaded_) {
@@ -6106,6 +6114,9 @@ void EditorHost::State::EndObserve(const std::string& why) {
         worker_.Push(std::move(cmd));
         loaded_->sim->SetArrows({});
         loaded_->sim->SetTerrain(loaded_->terrain);
+        if (scene_envs != 0u && scene_envs != ui_state_.envs.count)
+            actions_.Run("sim.envs", Object({{"count", json::Value::Int(scene_envs)}}), "train.observe", frame_index_);
+        if (placed) actions_.Run("sim.reset", json::Value::Object(), "train.observe", frame_index_);
     }
     if (!why.empty()) ui_.Nui().Toast(nui::Level::Info, Format(nui::Tr("Stopped observing: %s"), why.c_str()));
 }
