@@ -1,6 +1,8 @@
 #include "runtime/app/viewer/editor_collision.hpp"
 
+#include "collision/convex_narrowphase.hpp"
 #include "import/cooker/convex_decomposition.hpp"
+#include "runtime/app/viewer/editor_import.hpp"
 #include "scene/graph/scene_graph.hpp"
 
 #include <algorithm>
@@ -12,6 +14,7 @@ namespace {
 
 namespace json = scene::json;
 namespace cooker = import::cooker;
+namespace cvx = collision::cvx;
 
 constexpr uint32_t kHullVertices = 64u;
 // The cook's decomposition cache, so a preview's decomposition is the one the cook reuses.
@@ -71,6 +74,63 @@ std::string SkipReason(const scene::SceneIR& s, scene::BodyId b, const BodyMesh&
     if (mesh.indices.empty()) return "no visual mesh";
     if (o.only_missing && HasCollider(s, b)) return "has a collider";
     return std::string();
+}
+
+// The body's convex-hull colliders in world space, at the pose its joints start from.
+std::vector<float> HullPoints(const scene::SceneIR& s, scene::BodyId b) {
+    std::vector<float> out;
+    const math::Transform world = BodyWorld(s, b);
+    for (const scene::CollisionShapeRecord& sh : s.Shapes()) {
+        if (sh.body_id != b || sh.type != scene::ShapeType::ConvexHull) continue;
+        for (size_t i = 0; i + 2u < sh.mesh_vertices.size(); i += 3u) {
+            const math::Vec3 p = world.TransformPoint(sh.local_transform.TransformPoint(
+                math::Vec3{sh.mesh_vertices[i], sh.mesh_vertices[i + 1u], sh.mesh_vertices[i + 2u]}));
+            out.insert(out.end(), {p.x, p.y, p.z});
+        }
+    }
+    return out;
+}
+
+bool HullsOverlap(const std::vector<float>& a, const std::vector<float>& b) {
+    cvx::ConvexHullView ha, hb;
+    ha.verts = a.data();
+    ha.vcount = static_cast<uint32_t>(a.size() / 3u);
+    hb.verts = b.data();
+    hb.vcount = static_cast<uint32_t>(b.size() / 3u);
+    cvx::SupportProxy pa, pb;
+    pa.hull = &ha;
+    pb.hull = &hb;
+    return cvx::GjkIntersect(pa, pb).intersect;
+}
+
+// Hulls of one articulation's links that overlap where the joints start would fail the contact pass on
+// the first step, so each such pair stops colliding; jointed neighbours never collide anyway.
+void ExcludeOverlappingLinks(scene::SceneIR& s, const std::vector<scene::BodyId>& made) {
+    std::unordered_map<scene::BodyId, scene::BodyId> parent;
+    for (const scene::JointRecord& j : s.Joints()) parent[j.child_body] = j.parent_body;
+    const auto root = [&](scene::BodyId b) {
+        for (auto it = parent.find(b); it != parent.end() && it->second != scene::kInvalidBody; it = parent.find(b))
+            b = it->second;
+        return b;
+    };
+    std::unordered_map<scene::BodyId, std::vector<float>> points;
+    const auto hull = [&](scene::BodyId b) -> const std::vector<float>& {
+        auto it = points.find(b);
+        if (it == points.end()) it = points.emplace(b, HullPoints(s, b)).first;
+        return it->second;
+    };
+    const auto joined = [&](scene::BodyId a, scene::BodyId b) {
+        const auto pa = parent.find(a), pb = parent.find(b);
+        return (pa != parent.end() && pa->second == b) || (pb != parent.end() && pb->second == a);
+    };
+    for (const scene::BodyId a : made) {
+        if (hull(a).empty()) continue;
+        for (scene::BodyId b = 0; b < s.RigidBodyCount(); ++b) {
+            const bool seen = b < a && std::binary_search(made.begin(), made.end(), b);
+            if (b == a || seen || joined(a, b) || root(b) != root(a) || hull(b).empty()) continue;
+            if (HullsOverlap(hull(a), hull(b))) s.AddExcludePair(a, b);
+        }
+    }
 }
 
 }  // namespace
@@ -201,7 +261,7 @@ json::Value PreviewToJson(const std::vector<CollisionPreview>& preview) {
 }
 
 size_t GenerateCollision(scene::SceneIR& s, const std::vector<std::string>& paths, const CollisionOptions& o) {
-    size_t done = 0u;
+    std::vector<scene::BodyId> made;
     for (const scene::BodyId b : CollisionBodies(s, paths, o.subtree)) {
         BodyMesh mesh = VisualMeshOf(s, b);
         if (!SkipReason(s, b, mesh, o).empty()) continue;
@@ -229,9 +289,10 @@ size_t GenerateCollision(scene::SceneIR& s, const std::vector<std::string>& path
             if (o.method == CollisionMethod::Sdf) col.mesh_contact = scene::CollisionShapeRecord::MeshContact::Sdf;
         }
         s.InsertCollisionShape(std::move(col));
-        ++done;
+        made.push_back(b);
     }
-    return done;
+    ExcludeOverlappingLinks(s, made);
+    return made.size();
 }
 
 }  // namespace nuka::runtime::app::viewer
