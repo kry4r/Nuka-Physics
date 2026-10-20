@@ -146,7 +146,7 @@ void ImGuiLayer::DrawDatasetExporter() {
         ImGui::BeginDisabled(d.running);
         if (ImGui::BeginTable("##dataset_options", 2, ImGuiTableFlags_SizingStretchProp)) {
             ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed, 130.0f * s);
-            ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
             row("Folder");
             ImGui::InputTextWithHint("##out", Tr("empty asks for a folder"), f.out, sizeof(f.out));
             row("Frames");

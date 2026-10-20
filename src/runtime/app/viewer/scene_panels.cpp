@@ -486,7 +486,7 @@ void ImGuiLayer::DrawImportWizard() {
     int dest = w.open_as_new || !w.add_allowed ? 1 : 0;
     if (ImGui::BeginTable("##import_options", 2, ImGuiTableFlags_SizingStretchProp)) {
         ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed, 130.0f * s);
-        ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
         if (kind == "urdf") {
             OptionLabel("Profile");
             int choice = profile == "legacy" ? 1 : 0;
@@ -603,7 +603,7 @@ void ImGuiLayer::DrawSourceSection() {
 
     if (ImGui::BeginTable("##source", 2, ImGuiTableFlags_SizingStretchProp)) {
         ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed, 70.0f * s);
-        ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
         OptionLabel("File");
         nui::PushTextStyle(TextStyle::Mono);
         const std::string shown = Elide(GetNukaFont(FontRole::Mono), theme::kFontMono * s, source->file,
@@ -716,7 +716,7 @@ void ImGuiLayer::DrawCollisionDialog() {
     bool changed = false;
     if (ImGui::BeginTable("##collision_options", 2, ImGuiTableFlags_SizingStretchProp)) {
         ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed, 130.0f * s);
-        ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
         OptionLabel("Method");
         int method = static_cast<int>(std::find(std::begin(kMethods), std::end(kMethods), d.method) - std::begin(kMethods));
         nui::Segmented methods({"Convex Hull", "V-HACD", "SDF", "Triangle Mesh"}, nui::Ref(&method));
@@ -833,7 +833,7 @@ void ImGuiLayer::DrawTerrainDialog() {
     static const char* const kTerrainKinds[] = {"flat", "bumps", "slope", "stairs", "mixed"};
     if (ImGui::BeginTable("##terrain_options", 2, ImGuiTableFlags_SizingStretchProp)) {
         ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed, 110.0f * s);
-        ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
         OptionLabel("Kind");
         const auto* const at = std::find(std::begin(kTerrainKinds), std::end(kTerrainKinds), d.kind);
         int kind = static_cast<int>(at - std::begin(kTerrainKinds));

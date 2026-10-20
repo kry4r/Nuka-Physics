@@ -675,7 +675,7 @@ void ImGuiLayer::BuildPolicy(nui::VStack& root) {
         const float s = nui::Scale();
         if (ImGui::BeginTable("##policy_info", 2, ImGuiTableFlags_SizingStretchProp)) {
             ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed);
-            ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
             const auto row = [](const char* label, const std::string& value) {
                 ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0);
@@ -861,7 +861,7 @@ void ImGuiLayer::DrawGainTuner() {
         const bool position = joint.drive == "position";
         if (ImGui::BeginTable("##gain_options", 2, ImGuiTableFlags_SizingStretchProp)) {
             ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed, 120.0f * s);
-            ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
             TunerLabel("Joint");
             if (nui::draw::BeginCombo("##joint", joint.name.c_str())) {
                 for (size_t i = 0; i < v.joints.size(); ++i) {
@@ -1047,7 +1047,7 @@ void ImGuiLayer::DrawSysId() {
             };
             if (ImGui::BeginTable("##sysid_options", 2, ImGuiTableFlags_SizingStretchProp)) {
                 ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed, 120.0f * s);
-                ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
                 TunerLabel("Episode");
                 if (nui::draw::BeginCombo("##episode", episode_name(shown).c_str())) {
                     for (int k = 0; k < episodes; ++k)
@@ -1240,7 +1240,7 @@ void ImGuiLayer::DrawAssembler() {
         const auto node = [](const std::string& path) { return path.empty() ? std::string(Tr("none")) : path; };
         if (ImGui::BeginTable("##assembler", 2, ImGuiTableFlags_SizingStretchProp, ImVec2(440.0f * s, 0.0f))) {
             ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed, 110.0f * s);
-            ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
             TunerLabel("Attach");
             if (ImGui::RadioButton(Tr("Asset file"), a.from_asset)) a.from_asset = true;
             ImGui::SameLine();

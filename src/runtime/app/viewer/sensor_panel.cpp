@@ -287,7 +287,7 @@ void ImGuiLayer::DrawSensorInspector() {
     const float s = nui::Scale();
     if (!ImGui::BeginTable("##sensor", 2, ImGuiTableFlags_SizingStretchProp)) return;
     ImGui::TableSetupColumn("##key", ImGuiTableColumnFlags_WidthFixed, 96.0f * s);
-    ImGui::TableSetupColumn("##value", ImGuiTableColumnFlags_WidthStretch);
+    ImGui::TableSetupColumn("##value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
     const auto row = [](const char* label) {
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);

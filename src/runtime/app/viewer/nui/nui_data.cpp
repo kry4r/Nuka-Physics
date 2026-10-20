@@ -481,7 +481,7 @@ void PropertyGrid::DrawSelf() {
     if (!ImGui::BeginTable("##properties", 2, ImGuiTableFlags_SizingStretchProp)) return;
     ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthFixed,
                             std::min(std::max(widest, avail * 0.25f), avail * 0.55f));
-    ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
+    ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
     for (const auto& child : children_) {
         if (!child->Shown()) continue;
         if (!child->IsField()) {

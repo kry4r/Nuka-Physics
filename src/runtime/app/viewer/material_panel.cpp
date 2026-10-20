@@ -69,7 +69,7 @@ void Row(const char* label) {
 bool BeginRows(const char* id) {
     if (!ImGui::BeginTable(id, 2, ImGuiTableFlags_SizingStretchProp)) return false;
     ImGui::TableSetupColumn("##key", ImGuiTableColumnFlags_WidthFixed, 96.0f * nui::Scale());
-    ImGui::TableSetupColumn("##value", ImGuiTableColumnFlags_WidthStretch);
+    ImGui::TableSetupColumn("##value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
     return true;
 }
 
