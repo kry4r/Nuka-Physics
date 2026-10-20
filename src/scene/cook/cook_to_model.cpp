@@ -1594,6 +1594,32 @@ uint32_t CookHeightfieldGrid(nk::Model& model,
     return body_row;
 }
 
+// Pairs every immovable non-link row off from the static field, so a ground box left under a terrain
+// adds no candidate pair.
+static void ExcludeStaticRowsFromField(nk::Model& model, uint32_t field_row) {
+    nk::ModelCapacities& cap = model.capacities;
+    const auto staged = [&](const std::vector<uint32_t>& table) {
+        std::vector<uint32_t> values(cap.bodies_per_env, ~0u);
+        std::copy_n(table.begin(), std::min(table.size(), values.size()), values.begin());
+        return values;
+    };
+    const auto link = staged(model.body_to_link);
+    const auto articulation = staged(model.body_to_articulation);
+    const auto proxy = staged(model.body_collidable_body);
+    for (uint32_t row = 0u; row < field_row; ++row) {
+        const nk::CollidableOwner owner = nk::ResolveCollidableOwner(model.shape_table_rows[row].body_id, 0u, row,
+            cap.bodies_per_env, cap.links_per_env, cap.articulations_per_env, link.data(), articulation.data(),
+            proxy.data());
+        if (owner.kind == nk::kNkSideStatic ||
+            (owner.kind == nk::kNkSideRigid && model.body_init[owner.body].inv_mass == 0.0f))
+            model.excluded_pairs.push_back((uint64_t{row} << 32u) | field_row);
+    }
+    std::sort(model.excluded_pairs.begin(), model.excluded_pairs.end());
+    model.excluded_pairs.erase(std::unique(model.excluded_pairs.begin(), model.excluded_pairs.end()),
+                               model.excluded_pairs.end());
+    cap.max_excluded_pairs = static_cast<uint32_t>(model.excluded_pairs.size());
+}
+
 // The ONE terrain bake (see cook_to_model.hpp). Stages the heightfield collidable
 // over the static ground-plane row at `orig_bodies` and recomputes the contact budget.
 uint32_t CookTerrainIntoModel(nk::Model& model,
@@ -1608,6 +1634,7 @@ uint32_t CookTerrainIntoModel(nk::Model& model,
     nk::ModelCapacities& cap = model.capacities;
     cap.bodies_per_env = static_cast<uint32_t>(model.body_init.size());
     cap.max_bodies_total = static_cast<uint32_t>(model.shape_table_rows.size());
+    if (body_row != ~0u) ExcludeStaticRowsFromField(model, body_row);
     const auto rigid_capacity = nk::ComputeRigidContactCapacity(model);
     const uint64_t rigid_pairs = rigid_capacity.CandidateCount();
     const uint64_t rigid_rows = rigid_capacity.RowsForSlots(rigid_pairs);

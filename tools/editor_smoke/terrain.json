@@ -54,6 +54,13 @@
     {"action": "scene.terrain", "args": {"kind": "none"}},
     {"frames": 6},
     {"python": "assert app.actions.run('scene.terrain_info') is None and app.world.terrain() is None"},
+
+    {"action": "file.new", "args": {"template": "ground", "discard": true}},
+    {"frames": 10},
+    {"action": "scene.terrain", "args": {"kind": "bumps"}},
+    {"action": "scene.spawn", "args": {"kind": "sphere", "pose": {"pos": [0.0, 0.0, 0.5], "quat": [1.0, 0.0, 0.0, 0.0]}}},
+    {"frames": 6},
+    {"python": "import builtins, time\nt = time.monotonic()\nbuiltins.tr_step(240)\nt = time.monotonic() - t\nprint('TERRAIN_OVER_GROUND', t)\nassert t < 20.0, t"},
     {"action": "file.close", "args": {"discard": true}},
     {"frames": 4},
     {"expect": {"loaded": false}}
