@@ -1650,7 +1650,13 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
         viewport_ = pane_rects_[ui_state.active_view];
     }
     const ImVec2 mouse = ImGui::GetMousePos();
-    pointer_free_ = ui_state.window_focused && !ui_state.layout_modifier_down && !io.WantCaptureMouse;
+    // A hot gizmo makes ImGuizmo claim the mouse for this frame, which would switch the gizmo off; a window
+    // or popup under the pointer is what keeps it from the viewport then.
+    const bool ui_mouse = gizmo_hot_ ? ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) ||
+                                           ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopup)
+                                     : io.WantCaptureMouse;
+    gizmo_hot_ = false;
+    pointer_free_ = ui_state.window_focused && !ui_state.layout_modifier_down && !ui_mouse;
     viewport_hovered_ = pointer_free_ && viewport_.Contains(mouse.x, mouse.y);
     hovered_pane_ = -1;
     for (uint32_t i = 0; i < kViewPanes; ++i)
@@ -2992,6 +2998,7 @@ void ImGuiLayer::DrawGizmo(CameraController& camera, uint32_t vp_w, uint32_t vp_
 
     gz.active = ImGuizmo::IsOver() || ImGuizmo::IsUsing();
     gz.using_now = ImGuizmo::IsUsing();
+    gizmo_hot_ = gz.active;
     if (gz.using_now) {
         world = TransformFromModel(model);
         changed = true;

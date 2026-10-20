@@ -693,6 +693,7 @@ private:
     std::array<SceneViewportRect, kViewPanes> pane_rects_{};
     int hovered_pane_ = -1;
     bool pointer_free_ = false;  // focused, no layout modifier and no ImGui window under the pointer
+    bool gizmo_hot_ = false;     // the gizmo was hovered or held last frame
 
     std::string layout_ = "authoring";
     bool layout_pending_ = true;
