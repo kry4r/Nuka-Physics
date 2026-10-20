@@ -2,6 +2,8 @@
 
 #include "runtime/app/viewer/nui/nui_internal.hpp"
 
+#include "render/imgui/imgui_item_hooks.hpp"
+
 #include "TextEditor.h"
 #include "imgui_internal.h"
 #include "implot.h"
@@ -332,6 +334,7 @@ void ToggleButton::DrawSelf() {
     const float text_w = caption.empty() ? 0.0f : ImGui::CalcTextSize(caption.c_str()).x + 8.0f * s;
     const ImVec2 pos = ImGui::GetCursorScreenPos();
     const bool clicked = ImGui::InvisibleButton("##toggle", ImVec2(track.x + text_w, h));
+    render::imgui::NoteItemLabel(ImGui::GetItemID(), caption.c_str());
     const bool hovered = ImGui::IsItemHovered();
     if (clicked) {
         on = !on;
@@ -382,6 +385,7 @@ void Segmented::DrawSelf() {
         ImGui::PushID(static_cast<int>(i));
         const bool clicked = ImGui::InvisibleButton("##segment", size);
         ImGui::PopID();
+        render::imgui::NoteItemLabel(ImGui::GetItemID(), Tr(options[i]).c_str());
         const bool hovered = ImGui::IsItemHovered();
         const bool selected = static_cast<int>(i) == value;
         const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();

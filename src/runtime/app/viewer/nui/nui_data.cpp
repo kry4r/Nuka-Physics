@@ -2,6 +2,7 @@
 
 #include "runtime/app/viewer/nui/nui_internal.hpp"
 
+#include "render/imgui/imgui_item_hooks.hpp"
 #include "render/imgui/nuka_imgui.hpp"
 
 #include "imgui_internal.h"
@@ -240,6 +241,9 @@ void TreeView::DrawSelf() {
                 if (!row_tools.empty()) ImGui::SetNextItemAllowOverlap();
                 const bool clicked = ImGui::InvisibleButton("##row", ImVec2(w, row_h));
                 ImGui::PopStyleVar();
+                // The hooks see a bare id; the row's name lets them find it.
+                if (render::imgui::CapturingItems())
+                    render::imgui::NoteItemLabel(ImGui::GetItemID(), std::string(model->Label(row.item)).c_str());
                 const bool hovered = ImGui::IsItemHovered();
                 const bool selected = is_selected ? is_selected(row.item) : row.item == selected_;
                 const bool open = !needle.empty() || open_.count(row.item) != 0u;
