@@ -1964,9 +1964,12 @@ struct PresentRenderer::Impl {
         VkMemoryAllocateInfo alloc{};
         alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         alloc.allocationSize = req.size;
+        // A readback the CPU reads whole is cached: uncached reads of a 2560x1440 frame took ~45 ms.
+        const VkMemoryPropertyFlags read =
+            usage == VK_BUFFER_USAGE_TRANSFER_DST_BIT ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0u;
         alloc.memoryTypeIndex = FindMemoryType(physical, req.memoryTypeBits,
                                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | read);
         CheckVk(vkAllocateMemory(device, &alloc, nullptr, &res.memory), "vkAllocateMemory(present buf)");
         CheckVk(vkBindBufferMemory(device, res.buffer, res.memory, 0), "vkBindBufferMemory(present)");
         return res;
