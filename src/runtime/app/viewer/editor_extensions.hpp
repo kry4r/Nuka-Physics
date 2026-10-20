@@ -18,6 +18,9 @@ namespace nuka::runtime::app::viewer {
 class CameraController;
 class ImGuiLayer;
 
+// A TOML file as JSON: tables become objects. Throws on a syntax error.
+scene::json::Value ReadToml(const std::filesystem::path& file);
+
 // What the manager needs from the editor around it.
 struct ExtensionServices {
     ActionRegistry* actions = nullptr;

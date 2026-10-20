@@ -244,7 +244,8 @@ class Actions:
         return reply["value"]
 
     def list(self) -> list:
-        """Each action's id, label, category, shortcut, enabled and (for toggles) checked."""
+        """Each action's id, label, category, shortcut, enabled, (for toggles) checked, owner, summary
+        and kind; the action ``action.help`` gives one action's arguments, return value and example."""
         return json.loads(self._app._native.actions())
 
     def log(self, since: int = 0) -> list:

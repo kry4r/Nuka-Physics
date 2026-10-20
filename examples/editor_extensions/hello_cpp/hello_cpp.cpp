@@ -47,7 +47,10 @@ public:
         host.OnEvent(ring, [this](uint32_t, const std::string& event) {
             ring_ = event.find("\"value\":true") != std::string::npos;
         });
-        host.AddAction({"hello_cpp.greet", "Greet from C++", "tools", nullptr, "file_cpp"},
+        host.AddAction({"hello_cpp.greet", "Greet from C++", "tools", nullptr, "file_cpp", false,
+                        R"({"summary": "Shows the greeting as a toast and counts the greetings.", "kind": "view",
+                            "args": {"fail": "bool, fail on purpose, default false"},
+                            "returns": "{count, text, build}"})"},
                        [this](const std::string& args) {
                            if (args.find("\"fail\":true") != std::string::npos) return Reply::Fail("asked to fail");
                            return Reply::Value(Greet());

@@ -2215,6 +2215,14 @@ void ImGuiLayer::DrawPalette() {
             const float w = ImGui::GetContentRegionAvail().x;
             if (ImGui::InvisibleButton("##row", ImVec2(w, row_h)) && enabled) chosen = &a;
             if (ImGui::IsItemHovered() && (mouse_delta.x != 0.0f || mouse_delta.y != 0.0f)) palette_index_ = i;
+            const json::Value* doc = ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip) ? registry_->Doc(a) : nullptr;
+            if (const json::Value* summary = doc != nullptr ? doc->Find("summary") : nullptr) {
+                ImGui::BeginTooltip();
+                ImGui::PushTextWrapPos(360.0f * s);
+                ImGui::TextUnformatted(summary->AsString().c_str());
+                ImGui::PopTextWrapPos();
+                ImGui::EndTooltip();
+            }
             const bool current = i == palette_index_;
             if (current) {
                 list->AddRectFilled(p, ImVec2(p.x + w, p.y + row_h), U32(theme::Alpha(theme::kAccent, 0.12f)), theme::kRadius * s);

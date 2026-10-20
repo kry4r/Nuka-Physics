@@ -12,8 +12,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <sstream>
@@ -434,6 +436,25 @@ const nuka_nui_api_t& Real(void* host) { return *S(host).impl->services.ui->Nui(
 
 // ---- the host table ----------------------------------------------------------------------
 
+// An action doc from an extension: a JSON object whose summary and kind, when given, are text
+// and the kind one of kActionKinds. Returns why it is not.
+std::string ReadActionDoc(const char* text, json::Value* doc) {
+    try {
+        *doc = json::Value::Parse(text);
+    } catch (const json::ParseError& e) {
+        return std::string("the doc is not JSON: ") + e.what();
+    }
+    if (!doc->IsObject()) return "the doc is not a JSON object";
+    for (const char* key : {"summary", "kind"})
+        if (const json::Value* v = doc->Find(key); v != nullptr && v->type() != json::Value::Type::String)
+            return std::string("the doc's ") + key + " is not text";
+    const json::Value* kind = doc->Find("kind");
+    if (kind != nullptr && std::find(std::begin(kActionKinds), std::end(kActionKinds), kind->AsString()) ==
+                               std::end(kActionKinds))
+        return "the doc's kind '" + kind->AsString() + "' is not read, view, edit, sim, file, process or app";
+    return std::string();
+}
+
 nuka_result_t ApiRegisterAction(void* host, const nuka_editor_action_desc_t* desc) {
     Scope& s = S(host);
     std::shared_ptr<void> user = Owned(desc->user, desc->release);
@@ -442,6 +463,14 @@ nuka_result_t ApiRegisterAction(void* host, const nuka_editor_action_desc_t* des
         return NUKA_RESULT_INVALID_ARG;
     }
     Action action;
+    // Plugins built before doc_json pass a shorter struct.
+    if (desc->struct_size >= offsetof(nuka_editor_action_desc_t, doc_json) + sizeof(desc->doc_json) &&
+        desc->doc_json != nullptr) {
+        if (const std::string error = ReadActionDoc(desc->doc_json, &action.doc); !error.empty()) {
+            s.impl->Log(*s.record, NUKA_NUI_ERROR, std::string("action '") + desc->id + "': " + error);
+            return NUKA_RESULT_INVALID_ARG;
+        }
+    }
     action.id = desc->id;
     action.label = desc->label;
     action.category = desc->category != nullptr ? desc->category : "extensions";
@@ -1077,6 +1106,8 @@ void Impl::DrawCards() {
 }
 
 // ---- the manager --------------------------------------------------------------------------
+
+json::Value ReadToml(const fs::path& file) { return FromToml(ParseToml(file)); }
 
 ExtensionManager::ExtensionManager() : impl_(std::make_unique<Impl>()) {}
 

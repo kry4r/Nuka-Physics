@@ -116,9 +116,10 @@ public:
         Nui().progress(Nui().host, entry_id.c_str(), label.c_str(), fraction);
     }
 
-    // fn(args_json) returns (ok, value_json or reason).
+    // fn(args_json) returns (ok, value_json or reason); doc_json is the action's doc, "" for none.
     void register_action(const std::string& action_id, const std::string& label, const std::string& category,
-                         const std::string& shortcut, const std::string& icon, bool hidden, nb::object fn) {
+                         const std::string& shortcut, const std::string& icon, bool hidden, nb::object fn,
+                         const std::string& doc_json) {
         nuka_editor_action_desc_t desc{};
         desc.struct_size = static_cast<uint32_t>(sizeof(desc));
         desc.id = action_id.c_str();
@@ -127,6 +128,7 @@ public:
         desc.shortcut = shortcut.empty() ? nullptr : shortcut.c_str();
         desc.icon = icon.empty() ? nullptr : icon.c_str();
         desc.hidden = hidden ? 1u : 0u;
+        desc.doc_json = doc_json.empty() ? nullptr : doc_json.c_str();
         desc.run = &RunAction;
         desc.user = new Callback{std::move(fn), std::string()};
         desc.release = &Callback::Release;
@@ -538,7 +540,7 @@ NB_MODULE(_editor_ext, m) {
         .def("toast", &ExtHost::toast, nb::arg("level"), nb::arg("text"))
         .def("progress", &ExtHost::progress, nb::arg("id"), nb::arg("label"), nb::arg("fraction"))
         .def("register_action", &ExtHost::register_action, nb::arg("id"), nb::arg("label"), nb::arg("category"),
-             nb::arg("shortcut"), nb::arg("icon"), nb::arg("hidden"), nb::arg("fn"))
+             nb::arg("shortcut"), nb::arg("icon"), nb::arg("hidden"), nb::arg("fn"), nb::arg("doc_json") = "")
         .def("register_overlay", &ExtHost::register_overlay, nb::arg("id"), nb::arg("fn"))
         .def("register_teleop_device", &ExtHost::register_teleop_device, nb::arg("id"), nb::arg("label"),
              nb::arg("kind"), nb::arg("axes"), nb::arg("buttons"), nb::arg("fn"))

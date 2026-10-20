@@ -59,8 +59,14 @@ class _Actions:
         self._ctx = ctx
 
     def register(self, action_id: str, label: str, fn: Callable, *, category: Optional[str] = None,
-                 shortcut: Optional[str] = None, icon: Optional[str] = None, hidden: bool = False) -> None:
-        """An editor action running fn(args) or fn(); its return value is the action's value."""
+                 shortcut: Optional[str] = None, icon: Optional[str] = None, hidden: bool = False,
+                 doc: Optional[dict] = None) -> None:
+        """An editor action running fn(args) or fn(); its return value is the action's value.
+
+        ``doc`` tells agents what it does, as assets/editor/actions.toml does for the editor's own:
+        {"summary", "kind", "args": {name: "type, meaning, default"}, "returns", "example"}. kind is
+        read, view, edit, sim, file, process or app; an action without one counts as process.
+        """
         fn = _adapt(fn)
         ctx = self._ctx
 
@@ -71,7 +77,8 @@ class _Actions:
                 ctx.log(traceback.format_exc(), "error")
                 return False, f"{type(error).__name__}: {error}"
 
-        ctx._host.register_action(action_id, label, category or "", shortcut or "", icon or "", hidden, run)
+        ctx._host.register_action(action_id, label, category or "", shortcut or "", icon or "", hidden, run,
+                                  json.dumps(doc) if doc else "")
 
     def run(self, action_id: str, /, **args):
         """Run any editor action now; see ``EditorApp.actions``."""

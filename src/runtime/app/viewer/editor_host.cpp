@@ -4282,6 +4282,7 @@ void EditorHost::State::RegisterActions() {
     RegisterMaterialActions();
     RegisterScriptActions();
     ui_.RegisterActions(actions_);
+    actions_.SetDocs(ReadToml(Utf8Path(Resource("assets/editor/actions.toml"))));
 }
 
 void EditorHost::State::RegisterRobotActions() {
@@ -7045,6 +7046,14 @@ void EditorHost::State::RegisterAppActions() {
                       checks_.push_back(std::move(check));
                       start_stale_ = true;
                       return Ok();
+                  },
+                  "", true});
+    actions_.Add({"action.help", "Action Help", "help", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value& args) {
+                      const std::string id = StrArg(args, "id");
+                      const Action* action = actions_.Find(id);
+                      if (action == nullptr) return ActionResult::Fail("unknown action '" + id + "'");
+                      return Ok(actions_.Help(*action));
                   },
                   "", true});
 }

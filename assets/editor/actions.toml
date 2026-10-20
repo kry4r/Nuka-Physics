@@ -1,0 +1,1961 @@
+# The editor's actions: what each does, the arguments it reads and what it returns. The action
+# list (app.actions.list(), the RPC `actions` call) carries each summary and kind, the action
+# `action.help {id}` all of an entry; tools/action_docs.py drafts the entries of new actions.
+#
+# args maps a name to "type, meaning, default"; an argument without a default is required.
+# kind says what an action touches, and so what an agent's access mode lets through:
+#   read     reads state and changes nothing
+#   view     the camera, panels, overlays and other display state; never the document
+#   edit     the document and what is saved beside it (poses, clips, randomization, labels)
+#   sim      runs, steps, resets or drives the simulation, or records it
+#   file     reads or writes files
+#   process  runs code, scripts or other programs
+#   app      the editor itself: settings, extensions, windows, exit
+
+["file.new"]
+summary = "Replaces the document with a new untitled scene from a template (assets/editor/templates). With unsaved changes and no `discard` it asks first and returns {prompt}; app.answer_prompt answers."
+kind = "file"
+args.template = "string, the template's name: empty or ground, default \"empty\""
+args.discard = "bool, drop unsaved changes without asking, default false"
+returns = "{path, title} of the new document, or {prompt} while it asks"
+example = '{"template": "ground", "discard": true}'
+
+["file.open"]
+summary = "Opens a scene file as the document: .nks opens in place, other formats (URDF, MJCF, USD, meshes) import into an untitled document. Without `path` a file dialog asks. With unsaved changes and no `discard` it asks first."
+kind = "file"
+args.path = "string, the file to open, default: a file dialog"
+args.discard = "bool, drop unsaved changes without asking, default false"
+returns = "{path, title}, or {prompt} while it asks"
+
+["file.open_recent"]
+summary = "Opens a file from the recent list; the same as file.open."
+kind = "file"
+args.path = "string, the file to open"
+args.discard = "bool, drop unsaved changes without asking, default false"
+returns = "{path, title}, or {prompt} while it asks"
+
+["file.forget_recent"]
+summary = "Removes a file from the recent list on the start page."
+kind = "app"
+args.path = "string, the file to forget"
+returns = "nothing"
+
+["file.open_window"]
+summary = "Starts another editor in a window of its own, on `path` or on an empty document; it shares this editor's profile."
+kind = "process"
+args.path = "string, the scene to open there, default: a file dialog"
+args.empty = "bool, open no scene and skip the dialog, default false"
+returns = "{spawned}: the new editor's process id"
+
+["file.revert"]
+summary = "Reloads the document from its file, dropping unsaved changes; enabled only for a saved document with changes."
+kind = "file"
+returns = "{path, title}"
+
+["file.close"]
+summary = "Closes the document and leaves the editor on the start page. With unsaved changes and no `discard` it asks first."
+kind = "file"
+args.discard = "bool, drop unsaved changes without asking, default false"
+returns = "nothing, or {prompt} while it asks"
+
+["file.recover"]
+summary = "Opens an autosave left by an editor that did not close cleanly, as the document it belonged to with its changes unsaved."
+kind = "file"
+args.path = "string, the autosave .nks (from the start page's recovery list)"
+args.discard = "bool, drop unsaved changes without asking, default false"
+returns = "{path, title}, or {prompt} while it asks"
+
+["file.autosave"]
+summary = "Writes the autosave of the document now."
+kind = "file"
+returns = "{path} of the autosave"
+
+["file.unload"]
+summary = "Unloads the scene from the world, keeping the editor open with no scene."
+kind = "file"
+returns = "nothing"
+
+["file.save"]
+summary = "Saves the document to its file, or to `path`; an untitled document asks where with a file dialog."
+kind = "file"
+args.path = "string, where to save, default the document's own file"
+returns = "{path}"
+
+["file.save_as"]
+summary = "Saves the document to a new file, which becomes its file; without `path` a file dialog asks."
+kind = "file"
+args.path = "string, where to save, default: a file dialog"
+returns = "{path}"
+
+["file.package"]
+summary = "Saves a copy at `path` that carries every image the scene uses in its own .nka, so it opens with no other files; the document keeps its path. `missing` lists the images that could not be read."
+kind = "file"
+args.path = "string, where to write the packaged .nks, default: a file dialog"
+returns = "{path, packed, missing}"
+
+["file.export_usd"]
+summary = "Writes the scene, or the Stage node `node` with what hangs from it, as UsdPhysics in the format the path's extension names (.usd, .usda, .usdc, .usdz). `warnings` lists what USD could not carry; they go to the Console too."
+kind = "file"
+args.path = "string, the USD file to write, default: a file dialog"
+args.node = "string, the Stage path of the subtree to export, default the whole scene"
+args.light_units = 'string, isaac (intensity x1000, as Isaac Sim reads it), nits or raw, default "isaac"'
+returns = "{path, warnings: [{code, prim, message}]}"
+example = '{"path": "C:/tmp/stage.usda"}'
+
+["app.exit"]
+summary = "Closes the editor. With unsaved changes and no `discard` it asks first. A script's world outlives the window: closing only hides it and ends app.run()."
+kind = "app"
+args.discard = "bool, drop unsaved changes without asking, default false"
+returns = "nothing, or {prompt} while it asks"
+
+["window.minimize"]
+summary = "Minimizes the editor's window."
+kind = "app"
+returns = "nothing"
+
+["window.maximize"]
+summary = "Maximizes the editor's window, or restores it when it is maximized."
+kind = "app"
+returns = "nothing"
+
+["window.restore"]
+summary = "Restores the editor's window from minimized or maximized."
+kind = "app"
+returns = "nothing"
+
+["window.state"]
+summary = "The editor window's state: maximized, minimized, focused, position and size in pixels, and the title bar's height and drag spans."
+kind = "read"
+returns = "{maximized, minimized, focused, x, y, width, height, title_bar: {height, drag}}"
+
+["app.answer_prompt"]
+summary = "Answers the open save question that file.new, file.open, file.close or app.exit raised: save saves first (to `path` for an untitled document) and then reruns the action, discard reruns it dropping the changes, cancel drops it."
+kind = "file"
+args.choice = "string, save, discard or cancel"
+args.path = "string, where to save an untitled document when the choice is save, optional"
+returns = "{choice}, or the rerun action's value"
+example = '{"choice": "discard"}'
+
+["app.check"]
+summary = "Reports a named check from a script or smoke: it goes to the log and the start page's checks."
+kind = "app"
+args.name = "string, the check's name"
+args.value = "string, what was measured"
+args.ok = "bool, whether it passed, default true"
+returns = "nothing"
+
+["action.help"]
+summary = "Everything about one action: what it does, the arguments it reads, what it returns, an example, its kind and whether it can run now. The action list carries the summary and kind of all of them."
+kind = "read"
+args.id = "string, the action"
+returns = "{id, label, category, shortcut, icon, hidden, enabled, checked, owner, summary, kind, args, returns, example}"
+example = '{"id": "file.import"}'
+
+["edit.undo"]
+summary = "Undoes the last edit of the document."
+kind = "edit"
+returns = "{focus}: the node the restored step selects"
+
+["edit.redo"]
+summary = "Redoes the last undone edit of the document."
+kind = "edit"
+returns = "{focus}: the node the restored step selects"
+
+["edit.apply"]
+summary = "Applies one edit transaction: its ops change fields of Stage nodes, all as one undoable step. Fields: transform ({pos, quat}), name, reparent, delete, spawn, static, drive, initial_position, pin, attach, sensor, collision, script, import, reimport, material and material_* (new, rename, delete, assign, unique, friction), plus any live physics parameter by name. A null `before` is read from the document."
+kind = "edit"
+args.label = "string, the step's name in the history, default empty"
+args.ops = 'list of {target, field, before, after}: target is a Stage path ("" is the world), after the new value'
+returns = "{focus}: the node the edit selects"
+example = '{"label": "Lift", "ops": [{"target": "/World/box", "field": "transform", "after": {"pos": [0, 0, 1], "quat": [1, 0, 0, 0]}}]}'
+
+["edit.rename"]
+summary = "Renames the node at `path`, or the selection."
+kind = "edit"
+args.name = "string, the new name"
+args.path = "string, the node's Stage path, default the selection"
+returns = "{focus}: the renamed node's path"
+
+["edit.delete"]
+summary = "Deletes `paths`, `path` or the selection in one step; a node under another goes with it. With no node selected it removes the selected sensor."
+kind = "edit"
+args.paths = "list of strings, the Stage paths to delete, optional"
+args.path = "string, one Stage path to delete, default the selection"
+returns = "{focus}"
+
+["edit.reparent"]
+summary = "Moves the node at `path`, or the selection, under another node."
+kind = "edit"
+args.parent = "string, the new parent's Stage path"
+args.path = "string, the node to move, default the selection"
+returns = "{focus}: the moved node's new path"
+
+["scene.spawn"]
+summary = "Adds a primitive to the scene. Without a pose, a spawn drops in above the selection, else above the origin."
+kind = "edit"
+args.kind = 'string, box, sphere, capsule, cylinder or plane, default "box"'
+args.pose = "{pos: [x, y, z], quat: [w, x, y, z]}, the world pose, optional"
+returns = "{focus}: the new node's path"
+example = '{"kind": "sphere", "pose": {"pos": [0, 0, 1], "quat": [1, 0, 0, 0]}}'
+
+["scene.select"]
+summary = "Selects Stage nodes: replace makes `path` the selection (none clears it), add and toggle grow or shrink the selection, range takes `paths` with `path` leading."
+kind = "view"
+args.path = "string, the node's Stage path, default none"
+args.mode = 'string, replace, add, toggle or range, default "replace"'
+args.paths = "list of strings, the nodes of a range"
+returns = "{path, selection}: the leading node and every selected path"
+
+["scene.set_visible"]
+summary = "Shows or hides Stage nodes in the viewport; a hidden node keeps simulating. Without `value` the first node's state flips for all."
+kind = "view"
+args.value = "bool, true shows and false hides, default: flips"
+args.paths = "list of strings, the nodes, optional"
+args.path = "string, one node, default the selection"
+returns = "{paths, visible}"
+
+["scene.set_locked"]
+summary = "Locks or unlocks Stage nodes against picking and gizmo drags in the viewport. Without `value` the first node's state flips for all."
+kind = "view"
+args.value = "bool, true locks, default: flips"
+args.paths = "list of strings, the nodes, optional"
+args.path = "string, one node, default the selection"
+returns = "{paths, locked}"
+
+["scene.collision_preview"]
+summary = "What scene.generate_collision would do with the same arguments, body by body, without changing anything; the Generate Collision dialog shows it."
+kind = "read"
+args.paths = "list of strings, the nodes: a body, a shape or joint in one, or a group for every body under it, optional"
+args.path = "string, one node, default the selection"
+args.method = 'string, hull, vhacd (convex decomposition), sdf or mesh, default "hull"'
+args.max_pieces = "int, the most convex pieces vhacd makes per body, default 16"
+args.replace = "bool, drop each body's colliders first, default true"
+args.only_missing = "bool, leave bodies that already have a collider, default false"
+args.subtree = "bool, a body's descendants too, default false"
+returns = "a list of {path, triangles, pieces, vertices, had_collider, skipped}"
+
+["scene.generate_collision"]
+summary = "Builds colliders for bodies from their visual meshes, as one undoable edit: a convex hull, a convex decomposition, an SDF or the triangle mesh itself. Use it to make an imported environment collide."
+kind = "edit"
+args.paths = "list of strings, the nodes: a body, a shape or joint in one, or a group for every body under it, optional"
+args.path = "string, one node, default the selection"
+args.method = 'string, hull, vhacd (convex decomposition), sdf or mesh, default "hull"'
+args.max_pieces = "int, the most convex pieces vhacd makes per body, default 16"
+args.replace = "bool, drop each body's colliders first, default true"
+args.only_missing = "bool, leave bodies that already have a collider, default false"
+args.subtree = "bool, a body's descendants too, default false"
+returns = "{focus}"
+example = '{"path": "/World/warehouse", "method": "mesh"}'
+
+["scene.collision_dialog"]
+summary = "Opens the Generate Collision dialog on the selection with its preview."
+kind = "view"
+returns = "the preview, as scene.collision_preview returns it"
+
+["file.import_analyze"]
+summary = "Reads an asset file (URDF, MJCF, USD, mesh, NKS) without importing it: whether it imports, its diagnostics and its size."
+kind = "read"
+args.path = "string, the asset file"
+args.profile = 'string, how a URDF reads: strict or legacy, default "strict"'
+args.fix_base = "bool, fix the robot's base to the world, default false"
+args.package_paths = "list of strings, folders to search for package:// files, optional"
+args.light_units = "string, how a USD stage's light intensities read: isaac, nits or raw, default \"isaac\""
+returns = "{path, kind, ok, loaded, name, profile, diagnostics: [{severity, code, element, owner, message, line}], stats: {links, joints, colliders, mesh_colliders, visual_meshes, mass, lo, hi}, package_paths}"
+
+["file.import"]
+summary = 'Imports an asset file (URDF, MJCF, USD, OBJ/STL/GLB meshes, NKS). Without `mode` the import wizard opens on it; "auto" adds a clean asset to the open document at once and opens the wizard otherwise, "add" adds it as one undoable edit, "open" opens it as a new document.'
+kind = "edit"
+args.path = "string, the asset file, default: a file dialog"
+args.mode = "string, auto, add or open, default: the wizard"
+args.name = "string, the new node's name, default the file's stem"
+args.pose = "{pos: [x, y, z], quat: [w, x, y, z]}, where it lands, optional"
+args.ground = "bool, rest the lowest shape on z = 0 unless the asset brings its own floor, default true"
+args.profile = 'string, how a URDF reads: strict or legacy, default "strict"'
+args.fix_base = "bool, fix the robot's base to the world, default false"
+args.package_paths = "list of strings, folders to search for package:// files, optional"
+args.light_units = "string, how a USD stage's light intensities read: isaac, nits or raw, default \"isaac\""
+args.discard = "bool, with mode open: drop unsaved changes without asking, default false"
+returns = "{focus} after add, {path, title} after open, the analysis while the wizard shows"
+example = '{"path": "C:/assets/go2/go2.urdf", "mode": "add"}'
+
+["asset.sources"]
+summary = "The files the document's nodes were imported from, with the options each import used."
+kind = "read"
+returns = "a list of {node, file, kind, profile, fix_base, package_paths, light_units, ground, exists}"
+
+["asset.reimport"]
+summary = 'Imports the source of the node at `path` (the selection by default) again in its place, as one edit to undo; the node "" is an asset opened whole, which opens again as a new document.'
+kind = "edit"
+args.path = "string, the imported node's Stage path, default the selection"
+args.discard = 'bool, for the node "": drop unsaved changes without asking, default false'
+returns = "{focus}"
+
+["asset.show_source"]
+summary = "Shows the source file of the node at `path` (the selection by default) in the system's file browser."
+kind = "process"
+args.path = "string, the imported node's Stage path, default the selection"
+returns = "{file}"
+
+["assets.add_folder"]
+summary = "Adds a folder to the Assets panel's roots, saved in the profile; without `path` a folder dialog asks."
+kind = "app"
+args.path = "string, the folder, default: a folder dialog"
+returns = "{path}"
+
+["assets.remove_folder"]
+summary = "Removes a folder from the Assets panel's roots."
+kind = "app"
+args.path = "string, the folder"
+returns = "nothing"
+
+["assets.rescan"]
+summary = "Scans the Assets panel's folders again for new and removed files."
+kind = "view"
+returns = "nothing"
+
+["assets.page"]
+summary = "Shows the Assets panel's `page`: files or materials."
+kind = "view"
+args.page = "string, files or materials"
+returns = "nothing"
+
+["assets.list"]
+summary = "The asset cards as the Assets panel lists them: the bundled examples, the document's folder and the user's folders; `pictures` asks for their thumbnails as the panel does."
+kind = "read"
+args.pictures = "bool, render thumbnails for the cards, default false"
+returns = "{roots, cards: [{path, name, root, kind, thumbnail}]}"
+
+["sim.play"]
+summary = "Starts the simulation. Playing takes the world over from a watched training run, from the last frame it showed."
+kind = "sim"
+returns = "{playing}"
+
+["sim.pause"]
+summary = "Pauses the simulation."
+kind = "sim"
+returns = "{playing}"
+
+["sim.toggle_play"]
+summary = "Plays the simulation when it is paused, else pauses it."
+kind = "sim"
+returns = "{playing}"
+
+["sim.step"]
+summary = "Advances the paused simulation by `steps` physics steps."
+kind = "sim"
+args.steps = "int, how many steps, default 1"
+returns = "nothing"
+
+["sim.reset"]
+summary = "Resets every environment to the scene's initial state at tick 0 and pauses; an active randomization draws again (with the next seed unless the draw stays)."
+kind = "sim"
+returns = "nothing"
+
+["sim.speed"]
+summary = "Sets the playback speed: 1 is real time, below 1 slow motion, above 1 faster when the machine keeps up."
+kind = "sim"
+args.value = "number, the speed factor, default 1"
+returns = "{speed}"
+
+["sim.envs"]
+summary = "{count} rebuilds the world with that many environments, all from the scene's initial state at tick 0; loads and edits keep the count. Without it, the grid as view.envs reports it."
+kind = "sim"
+args.count = "int, how many environments, 1 up to the editor's limit, default the current count"
+returns = "{count, current, show, spacing, auto_spacing, cells: [{env, offset}], copies}"
+example = '{"count": 64}'
+
+["tool.perturb"]
+summary = "Makes Perturb the viewport tool (dragging a body pulls it with a spring), or goes back to Select; `on` sets it."
+kind = "view"
+args.on = "bool, true picks the tool, false goes back to Select, default: toggles"
+returns = "{tool}"
+
+["tool.pin"]
+summary = "Makes Pin the viewport tool (clicking a body holds it where it is), or goes back to Select; `on` sets it."
+kind = "view"
+args.on = "bool, true picks the tool, false goes back to Select, default: toggles"
+returns = "{tool}"
+
+["tool.measure"]
+summary = "`a` and `b` set the Measure tool's ends (a link's node path, a joint's name, or \"ground\" for b) and return the measurement; `at` takes link ends at their origin or com. Else it is the tool."
+kind = "view"
+args.a = "string, the first end: a link's Stage path or a joint's name, optional"
+args.b = 'string, the second end: a link, a joint or ground, default "ground"'
+args.at = "string, origin or com for link ends, default the current choice"
+args.on = "bool, without `a`: true picks the tool, false goes back to Select, default: toggles"
+returns = "{distance, delta, from, to} with ends, else {tool}"
+example = '{"a": "/World/go2/base", "b": "ground"}'
+
+["tool.measure_clear"]
+summary = "Clears the Measure tool's ends."
+kind = "view"
+returns = "nothing"
+
+["sim.perturb"]
+summary = "A world force and torque at a world point (the COM by default), plus a spring toward `target`; no load and no target releases the body. The load holds until released, on the shown environment."
+kind = "sim"
+args.path = "string, the Stage path of a moving link or body"
+args.force = "[x, y, z], N, default none"
+args.torque = "[x, y, z], N m, default none"
+args.point = "[x, y, z], the world point the force acts at, default the COM"
+args.target = "[x, y, z], a world point the body is pulled toward by a spring, optional"
+args.gain = "number, scales the spring's stiffness and damping, default 1"
+returns = "{held, stiffness, damping}"
+example = '{"path": "/World/go2/base", "force": [0, 80, 0]}'
+
+["sim.grab_particle"]
+summary = "Holds one environment particle (cloth or MPM) kinematic at `target`, where it is by default."
+kind = "sim"
+args.particle = "int, the particle's index in the shown environment"
+args.target = "[x, y, z], where to hold it, default where it is"
+returns = "{particle, target}"
+
+["sim.release"]
+summary = "Lets go of the load on `path`, the held `particle`, or with neither every load."
+kind = "sim"
+args.path = "string, the body whose load ends, optional"
+args.particle = "int, the particle to let go, optional"
+returns = "nothing"
+
+["sim.loads"]
+summary = "The loads held on the shown environment as its last frame has them."
+kind = "read"
+returns = "a list of {at, target, particle} or {at, target, path, force, torque, stiffness, damping}"
+
+["view.frame_all"]
+summary = "Points the camera so the whole shown world fits the viewport."
+kind = "view"
+returns = "nothing"
+
+["view.frame_selected"]
+summary = "Points the camera at the selection with everything under it."
+kind = "view"
+returns = "nothing"
+
+["view.reset_camera"]
+summary = "Puts the camera back at its default view of the world."
+kind = "view"
+returns = "nothing"
+
+["view.colliders"]
+summary = "Draws collider proxies over the scene; `on` sets it, else it toggles."
+kind = "view"
+args.on = "bool, show them, default: toggles"
+returns = "nothing"
+
+["view.contacts"]
+summary = "Draws contact points and normals; `on` sets it, else it toggles."
+kind = "view"
+args.on = "bool, show them, default: toggles"
+returns = "nothing"
+
+["view.hide_overlays"]
+summary = "Turns off the collider and contact overlays."
+kind = "view"
+returns = "nothing"
+
+["view.shadows"]
+summary = "Casts the sun's shadows in the Lit view; `on` sets it, else it toggles."
+kind = "view"
+args.on = "bool, cast them, default: toggles"
+returns = "nothing"
+
+["view.fog"]
+summary = "Fades distant geometry into the sky in the Lit view; `on` sets it, else it toggles."
+kind = "view"
+args.on = "bool, fog on, default: toggles"
+returns = "nothing"
+
+["view.ground_grid"]
+summary = "The Lit view's ground grid: mode auto (under scenes without a floor), on or off; a bare call flips what is shown."
+kind = "view"
+args.mode = "string, auto, on or off, default: flips what is shown"
+returns = "{mode, shown}"
+
+["view.screenshot"]
+summary = "Writes the next drawn frame, the whole window, as a PPM."
+kind = "file"
+args.path = 'string, the .ppm to write, default "nuka_screenshot.ppm"'
+returns = "{path}"
+
+["view.stats"]
+summary = "The editor's frame timings: frame count, frames per second, frame and UI time percentiles, the physics tick, how snapshots reach the renderer, whether it plays, the view mode and the viewport's pixel rectangle."
+kind = "read"
+returns = "{frame, measured, fps, frame_ms_p50, frame_ms_p95, ui_ms_p50, ui_ms_p95, age_ms_p95, tick, snapshot_drops, publish, playing, view_mode, viewport: {x, y, width, height}}"
+
+["view.mode"]
+summary = "The shading the viewport draws with; without a mode it reports the current one."
+kind = "view"
+args.mode = "string, lit, unlit, normals, material, residual, contact or wireframe, default the current one"
+returns = "{mode}"
+
+["view.layout"]
+summary = "The panes: one, two side by side or four; without a layout it reports the current one."
+kind = "view"
+args.layout = "string, single, split or quad, default the current one"
+returns = "{layout, active}"
+
+["view.layout_single"]
+summary = "Shows one viewport pane."
+kind = "view"
+returns = "{layout, active}"
+
+["view.layout_split"]
+summary = "Shows two viewport panes side by side."
+kind = "view"
+returns = "{layout, active}"
+
+["view.layout_quad"]
+summary = "Shows four viewport panes."
+kind = "view"
+returns = "{layout, active}"
+
+["view.maximize"]
+summary = "Shows one pane alone, the active one without an index, and goes back to the layout it left."
+kind = "view"
+args.index = "int, the pane to show alone, default the active one"
+returns = "{layout, active}"
+
+["view.view"]
+summary = "A pane's mode and scene camera (\"\" is free), each kept when left out; activate makes it the active pane."
+kind = "view"
+args.index = "int, the pane, 0 to 3, default the active one"
+args.mode = "string, lit, unlit, normals, material, residual, contact or wireframe, default the pane's"
+args.camera = "string, a scene camera's Stage path, \"\" for the free camera, default the pane's"
+args.activate = "bool, make it the active pane, default false"
+returns = "the pane: {index, mode, camera, active, shown, rect}"
+
+["view.views"]
+summary = "The viewport panes: the layout, the active pane, whether one is maximized, the scene cameras and each pane's mode and camera."
+kind = "read"
+returns = "{layout, active, maximized, cameras, panes}"
+
+["view.pick"]
+summary = "What the viewport shows at x, y: fractions of its width and height from the top left; `select` clicks there, making the environment it hits current and selecting the body."
+kind = "view"
+args.x = "number, 0 at the left edge to 1 at the right, default 0.5"
+args.y = "number, 0 at the top to 1 at the bottom, default 0.5"
+args.select = "bool, select what is hit, default false"
+returns = "{path, node, instance, env}; path is null over the background"
+
+["view.envs"]
+summary = "The environment grid: `show` cells of the current environment's page (up to 16), `current` makes one current, `spacing` sets the metres between cells (0 sizes them from the robot)."
+kind = "view"
+args.show = "int, how many environments to draw, 1 to 16, default the current number"
+args.current = "int, the environment the editor shows and edits, default the current one"
+args.spacing = "number, metres between cells, 0 sizes them from the robot, default the current spacing"
+returns = "{count, current, show, spacing, auto_spacing, cells: [{env, offset}], copies}"
+
+["view.camera"]
+summary = "The active pane's orbit camera: `target`, `distance` and `yaw`, `pitch` in degrees, each kept when left out."
+kind = "view"
+args.target = "[x, y, z], the point it orbits, default the current target"
+args.distance = "number, metres from the target, default the current distance"
+args.yaw = "number, degrees about z, default the current yaw"
+args.pitch = "number, degrees above the horizon, default the current pitch"
+returns = "{target, eye, distance, yaw, pitch}"
+example = '{"target": [0, 0, 0.4], "distance": 3, "yaw": 135, "pitch": 25}'
+
+["view.select_rect"]
+summary = "Selects what the viewport shows inside x0, y0 to x1, y1 in the same fractions as view.pick; add keeps the selection."
+kind = "view"
+args.x0 = "number, the left edge, default 0"
+args.y0 = "number, the top edge, default 0"
+args.x1 = "number, the right edge, default 1"
+args.y1 = "number, the bottom edge, default 1"
+args.mode = 'string, replace or add, default "replace"'
+returns = "{path, selection}"
+
+["view.rt_preview"]
+summary = "Path-traced frames of the view over the raster one, refined up to max_spp samples while nothing moves; `on` sets it, else it toggles."
+kind = "view"
+args.on = "bool, preview on, default: toggles"
+args.max_spp = "int, the samples per pixel it stops at, default the current limit"
+returns = "{on, max_spp}"
+
+["view.rt_status"]
+summary = "How far the RT preview has refined: samples so far, whether it converged and is shown, pending work, its size and any error."
+kind = "read"
+returns = "{on, spp, max_spp, converged, shown, pending, done, width, height, error}"
+
+["view.rt_save"]
+summary = "The RT image the viewport shows, as a PNG; the dialog asks without `path`."
+kind = "file"
+args.path = "string, the .png to write, default: a file dialog"
+returns = "{path, width, height, spp}"
+
+["view.render"]
+summary = "A path-traced PNG of the view at {width, height, spp}, rendered by another process from a copy of the scene and its state; view.render_status reports it."
+kind = "process"
+args.path = "string, the .png to write, default: a file dialog"
+args.width = "int, pixels, default 1920"
+args.height = "int, pixels, default 1080"
+args.spp = "int, samples per pixel, default 64"
+returns = "{path, process}"
+
+["view.render_status"]
+summary = "Whether a view.render job runs, how long it has, and the last finished one."
+kind = "read"
+returns = "{running, path, seconds, last}"
+
+["view.bookmarks"]
+summary = "The document's camera bookmarks."
+kind = "read"
+returns = "a list of {name, target, distance, yaw, pitch, fov}"
+
+["view.bookmark_add"]
+summary = 'Keeps the view as `name`, replacing a bookmark of that name; without one it is "View N". Bookmarks are saved beside the document.'
+kind = "view"
+args.name = "string, the bookmark's name, default \"View N\""
+returns = "{name, count}"
+
+["view.bookmark_goto"]
+summary = "Moves the camera to a bookmark."
+kind = "view"
+args.name = "string, the bookmark's name"
+returns = "{name}"
+
+["view.bookmark_rename"]
+summary = "Renames a camera bookmark."
+kind = "view"
+args.name = "string, the bookmark's name"
+args.to = "string, the new name"
+returns = "{name}"
+
+["view.bookmark_remove"]
+summary = "Removes a camera bookmark."
+kind = "view"
+args.name = "string, the bookmark's name"
+returns = "{count}"
+
+["view.bookmarks_save"]
+summary = "Writes the bookmarks in the format --cams reads; the dialog asks without `path`."
+kind = "file"
+args.path = "string, the .json to write, default: a file dialog"
+returns = "{path, count}"
+
+["view.bookmarks_load"]
+summary = "Replaces the bookmarks with a file's; the dialog asks without `path`."
+kind = "file"
+args.path = "string, the .json to read, default: a file dialog"
+returns = "{path, count}"
+
+["solver.telemetry"]
+summary = "Records solver telemetry each step: per-step residuals, sweep counts and capped steps. Without a mask the action toggles every channel; the alert defaults to the current one."
+kind = "sim"
+args.mask = "int, the channels as NUKA_TELEMETRY_* bits, 0 stops recording, default: toggles all"
+args.alert = "number, the residual above which a step counts as an alert, default the current alert"
+returns = "{mask, alert}"
+
+["solver.heatmap"]
+summary = "Colours the solver's per-vertex residuals over the scene; the heatmap needs the per-vertex channel and turns it on. `on` sets it, else it toggles."
+kind = "view"
+args.on = "bool, heatmap on, default: toggles"
+returns = "{on}"
+
+["solver.set_iterations"]
+summary = "Sets the solver's sweep budget per step, live."
+kind = "sim"
+args.n = "int, sweeps per step, at least 1"
+returns = "{n}"
+
+["solver.status"]
+summary = "The solver telemetry's state: channels, alert, sweep budget, heatmap, records kept and capped, the newest record and the located marker."
+kind = "read"
+returns = "{mask, alert, iterations, heatmap, records, caps, recent_caps, recent_records, dropped, first, next, applied, last, marker}"
+
+["solver.records"]
+summary = "Pages forward through the kept telemetry records: `since` on, at most `limit`, oldest first."
+kind = "read"
+args.since = "int, the first record number, default the oldest kept"
+args.limit = "int, the most records returned, default 64"
+args.capped = "bool, only steps that hit the sweep cap, default false"
+returns = "{records, first, next}: pass next as since to read on"
+
+["solver.locate"]
+summary = 'Frames and selects the worst element of a kept record: the given one, else the newest capped one, else the newest; {"clear": true} drops the marker.'
+kind = "view"
+args.record = "int, the record number, default the newest capped or newest"
+args.clear = "bool, drop the marker instead, default false"
+returns = "{record, label, env, position, entity, residual, capped}"
+
+["timeline.status"]
+summary = "The timeline: the playhead tick, the start and head of the current branch, whether it replays, every branch, the keyframes, the ghost, the keyframe settings and memory, and a running or finished video export."
+kind = "read"
+returns = "{tick, start, head, replaying, branch, branches: [{id, parent, fork_tick, head, label, exact}], keys, pinned, ghost, ghost_on, ghost_shown, interval, keyframes, bytes, budget_mb, applied, export, exported}"
+
+["timeline.seek"]
+summary = 'Moves the playhead and pauses: {tick}, {delta} ticks from the playhead, or {to: "start" | "head"}. Ticks before the head replay the recorded history exactly.'
+kind = "sim"
+args.tick = "int, the tick to show, optional"
+args.delta = "int, ticks from the playhead, negative goes back, optional"
+args.to = "string, start or head, optional"
+returns = "nothing"
+example = '{"delta": -60}'
+
+["timeline.fork"]
+summary = "Starts a new branch at the playhead: what runs from here on is kept beside the old history."
+kind = "sim"
+args.label = "string, the branch's name, default empty"
+returns = "nothing"
+
+["timeline.branch"]
+summary = "Switches to another branch and pauses at its playhead."
+kind = "sim"
+args.id = "int, the branch's id from timeline.status"
+returns = "nothing"
+
+["timeline.rename"]
+summary = "Renames a branch."
+kind = "sim"
+args.id = "int, the branch's id, default the current branch"
+args.label = "string, the new name"
+returns = "nothing"
+
+["timeline.ghost"]
+summary = "{on, branch}: draws another branch's bodies as a ghost over this one at the same tick; without `on` it toggles; `branch` picks what it shows, else the last parent."
+kind = "view"
+args.on = "bool, ghost on, default: toggles"
+args.branch = "int, the branch to show, default the parent"
+returns = "nothing"
+
+["timeline.configure"]
+summary = "Sets how often the timeline keeps a keyframe and how much memory its history may use."
+kind = "sim"
+args.interval = "int, ticks between keyframes, default the current interval"
+args.budget_mb = "number, the history's memory budget in MB, default the current budget"
+returns = "nothing"
+
+["timeline.clear"]
+summary = "Drops the recorded history and branches, keeping the world where it is."
+kind = "sim"
+returns = "nothing"
+
+["timeline.hash"]
+summary = "The world's state hash once every command queued before it applied; equal hashes mean bit-identical states."
+kind = "read"
+returns = "{hash, tick}"
+
+["timeline.save"]
+summary = "The current branch's line of history with what it plays in, as a .nkrec; the dialog asks without `path`."
+kind = "file"
+args.path = "string, the .nkrec to write, default: a file dialog"
+returns = "{path, start, head, keyframes, inputs}"
+
+["timeline.load"]
+summary = "A recording of this document and world layout becomes the history, back where it was saved; the dialog asks without `path`."
+kind = "file"
+args.path = "string, the .nkrec to read, default: a file dialog"
+returns = "{path, start, head, tick}"
+
+["timeline.export"]
+summary = "An mp4 of ticks `from` to `to` (the start and head) at `fps` frames a simulated second, drawn by the viewport and encoded by ffmpeg from the PATH; timeline.status reports its progress."
+kind = "file"
+args.path = "string, the .mp4 to write, default: a file dialog"
+args.fps = "number, frames per simulated second, default 30"
+args.from = "int, the first tick, default the start"
+args.to = "int, the last tick, default the head"
+returns = "{path, frames}"
+
+["robot.joints"]
+summary = "The moving joints of the scene's robots with their limits and drives, and the shown environment's live values; the roots and whether the base floats."
+kind = "read"
+returns = "{joints: [{name, link, path, type, lower, upper, drive, kp, force_limit, damping, q, qd, target, effort, saturated}], roots, floating, env, watch}"
+
+["robot.set_targets"]
+summary = "Sets drive targets for the shown environment by joint name, in rad or m; the next step reads them. Not an edit of the document: robot.pose_* and the initial_position field change what a reset starts from."
+kind = "sim"
+args.targets = "object, joint name to target in rad (revolute) or m (prismatic)"
+returns = "{set}: how many targets were written"
+example = '{"targets": {"FL_thigh_joint": 0.9, "FR_thigh_joint": 0.9}}'
+
+["robot.reset_targets"]
+summary = "Puts every joint's drive target back at its initial position."
+kind = "sim"
+returns = "{set}"
+
+["robot.radians"]
+summary = "Revolute joints read in radians while on, else degrees, in the Joints panel; without `on` it toggles."
+kind = "view"
+args.on = "bool, radians, default: toggles"
+returns = "{on}"
+
+["robot.watch"]
+summary = "While on, every step samples the shown environment's joints for robot.samples and the Joints panel's curves; without `on` it toggles."
+kind = "sim"
+args.on = "bool, sample, default: toggles"
+returns = "{on}"
+
+["robot.samples"]
+summary = "The newest `count` samples of one joint while robot.watch is on, oldest first; `total` counts the watch's samples."
+kind = "read"
+args.joint = "string, the joint's name"
+args.count = "int, how many of the newest samples, default all kept"
+returns = "{joint, count, total, watch, tick, t, q, target, effort}: parallel lists"
+
+["robot.drive"]
+summary = "One undoable edit gives `joints` (all by default) a drive of `type`; a position drive takes kp."
+kind = "edit"
+args.type = 'string, the drive type: position, motor, velocity or force, default "position"'
+args.kp = "number, a position drive's stiffness, default the Joints panel's kp"
+args.joints = "list of strings, joint names, default every joint"
+returns = "{focus}"
+
+["robot.fix_base"]
+summary = "Static roots are fixed bases: one undoable edit makes every robot root static (fixed to the world) or free; without `on` it toggles."
+kind = "edit"
+args.on = "bool, fix the base, default: toggles"
+returns = "{focus}"
+
+["robot.poses"]
+summary = "The joint poses kept with the document, each a name and its joints' positions (rad or m)."
+kind = "read"
+returns = "a list of {name, joints: {joint: position}}"
+
+["robot.pose_capture"]
+summary = "Keeps the shown environment's joint positions as pose `name`, replacing a pose of that name; without one it is \"Pose N\"."
+kind = "edit"
+args.name = "string, the pose's name, default \"Pose N\""
+returns = "{name, joints: {joint: position}}"
+
+["robot.pose_apply"]
+summary = "Blends the shown environment's drive targets to pose `name` over `duration` simulated seconds, 0 at once; joints the pose lacks keep their targets."
+kind = "sim"
+args.name = "string, the pose"
+args.duration = "float, seconds of simulated time the blend takes, default 0"
+returns = "{name, set, missing, unknown, steps}: joints set, the robot's joints the pose lacks, the pose's joints the robot lacks"
+example = '{"name": "stand", "duration": 1.0}'
+
+["robot.pose_initial"]
+summary = "Writes pose `name` into its joints' initial positions as one undoable edit; sim.reset starts there."
+kind = "edit"
+args.name = "string, the pose"
+returns = "{focus}"
+
+["robot.pose_rename"]
+summary = "Renames a pose."
+kind = "edit"
+args.name = "string, the pose"
+args.to = "string, its new name, not taken"
+returns = "{name}"
+
+["robot.pose_remove"]
+summary = "Removes a pose."
+kind = "edit"
+args.name = "string, the pose"
+returns = "{count}: the poses left"
+
+["robot.poses_save"]
+summary = 'Writes the poses to a JSON file as {"poses": [{name, joints}]}; without `path` a file dialog asks.'
+kind = "file"
+args.path = "string, the .json file, default: a file dialog"
+returns = "{path, count}"
+
+["robot.poses_load"]
+summary = "Adds the poses of a JSON file written by robot.poses_save, replacing those of the same name; without `path` a file dialog asks."
+kind = "file"
+args.path = "string, the .json file, default: a file dialog"
+returns = "{path, read, count}"
+
+["robot.gain_test"]
+summary = "Drives one joint's target through a step or a sine from where it stands, in a copy of the world the test throws away, and fits rise, overshoot, settling, damping ratio and more. Unset arguments keep the Gain Tuner's; the joint needs a position drive. One test runs at a time; robot.gain_status reports it."
+kind = "sim"
+args.joint = "string, the joint, default the tuner's, else the focused one"
+args.kind = "string, step or sine, default the tuner's"
+args.amplitude = "float, the step or sine amplitude in rad or m, nonzero, default the tuner's"
+args.frequency = "float, a sine's frequency in Hz, default the tuner's"
+args.duration = "float, seconds simulated, in (0, 10], default the tuner's"
+returns = "{joint, kind, steps}"
+example = '{"joint": "FL_calf_joint", "kind": "step", "amplitude": 0.2, "duration": 1.0}'
+
+["robot.gain_status"]
+summary = "Whether a gain test runs, how many runs the tuner keeps and the newest one's figures."
+kind = "read"
+returns = "{running, runs, last: {joint, kind, amplitude, frequency, duration, steps, kp, damping, force_limit, rise, overshoot, peak_time, settling, steady_error, zeta, omega, gain_db, lag, rmse, saturation} or null}"
+
+["robot.gain_runs"]
+summary = "The gain test runs the tuner keeps, oldest first; `trace` adds each one's samples."
+kind = "read"
+args.trace = "bool, add time, target, q, qd and effort per step, default false"
+returns = "a list of runs, as robot.gain_status's last"
+
+["robot.gain_clear"]
+summary = "Forgets the gain test runs the tuner keeps."
+kind = "view"
+returns = "{count}: 0"
+
+["robot.gain_tuner"]
+summary = "Opens or closes the Gain Tuner window; `on` sets it, else it toggles."
+kind = "view"
+args.on = "bool, open it, default: toggles"
+returns = "{on}"
+
+["robot.links"]
+summary = "The shown environment's robot links in link order, each with its parent link, incoming joint and mass, and where it and its centre of mass are; the robot's total mass, centre of mass and degrees of freedom."
+kind = "read"
+returns = "{links: [{path, parent, joint, type, mass, origin, com}], mass, com, dof}"
+
+["robot.asset_links"]
+summary = "Reads an asset file without importing it and lists its links, its roots first: the mounts robot.attach_asset takes. Without `path` a file dialog asks."
+kind = "read"
+args.path = "string, the asset file, default: a file dialog"
+args.profile = "string, how a URDF reads: strict or legacy, default the Assembler's"
+returns = "{path, links, roots}"
+
+["robot.attach"]
+summary = "Hangs the body `child`, and what its joints carry, off the link `parent` through a new joint, as one undoable edit. `frame` puts `mount` (default the child) at that pose in the parent's frame; without it the child stays where it is."
+kind = "edit"
+args.child = "string, the body to attach"
+args.parent = "string, the link it hangs off"
+args.joint = 'string, fixed, revolute or prismatic, default "fixed"'
+args.axis = "[x, y, z], the joint axis, default [0, 0, 1]"
+args.frame = "{pos: [x, y, z], rot: [x, y, z] degrees or quat: [w, x, y, z]}, the mount's pose in the parent's frame, optional"
+args.mount = "string, the link of what is attached that meets the parent, default its root"
+args.joint_name = "string, the new joint's name, optional"
+returns = "{focus, joint}: the attached root and its new joint"
+
+["robot.attach_asset"]
+summary = "Adds the asset at `path` and hangs its link `mount` (default its root) off the link `parent` in one undoable edit; without `frame` the mount takes the parent's frame. Takes file.import's options."
+kind = "edit"
+args.path = "string, the asset file"
+args.parent = "string, the link it hangs off"
+args.name = "string, the new node's name, default the file's stem"
+args.joint = 'string, fixed, revolute or prismatic, default "fixed"'
+args.axis = "[x, y, z], the joint axis, default [0, 0, 1]"
+args.frame = "{pos: [x, y, z], rot: [x, y, z] degrees or quat: [w, x, y, z]}, the mount's pose in the parent's frame, default the parent's frame"
+args.mount = "string, the asset's link that meets the parent (see robot.asset_links), default its root"
+args.joint_name = "string, the new joint's name, optional"
+args.profile = 'string, how a URDF reads: strict or legacy, default "strict"'
+returns = "{focus, joint}"
+example = '{"path": "C:/assets/gripper/gripper.urdf", "parent": "/go2/base", "frame": {"pos": [0.2, 0, 0.1]}}'
+
+["robot.assembler"]
+summary = "Opens or closes the Robot Assembler; opened on a selected link, that link becomes the parent. `on` sets it, else it toggles."
+kind = "view"
+args.on = "bool, open it, default: toggles"
+returns = "{on}"
+
+["robot.ik"]
+summary = "Moves `link` (node path or joint name) to world `pos`, and `quat` or XYZ-degree `rot`, keeping `pins` put. `apply` (default) writes the solution as a gizmo drag does, else it only reports it."
+kind = "sim"
+args.link = "string, the link's Stage path or its joint's name"
+args.pos = "[x, y, z], the world position to reach"
+args.quat = "[w, x, y, z], the world orientation, optional"
+args.rot = "[x, y, z], the world orientation as XYZ degrees, optional"
+args.position_only = "bool, ignore the orientation, default false"
+args.pins = "list of strings, links held where they are, default the IK settings' pins"
+args.root = "string, the chain's root link, default the IK settings' root"
+args.rotation_weight = "number, metres per radian of orientation error, default the IK settings' weight"
+args.apply = "bool, write the solution to the joints, default true"
+returns = "{q: joint to value, position_error, rotation_error, iterations, joints, at_limit, applied}"
+example = '{"link": "/World/arm/hand", "pos": [0.4, 0.0, 0.3], "rot": [180, 0, 0]}'
+
+["robot.ik_settings"]
+summary = "The gizmo's IK: the chain root (empty for the articulation's), the links a drag pins, whether a move locks the orientation and the rotation weight [m/rad]; an argument given replaces its setting."
+kind = "view"
+args.root = "string, the chain's root link, \"\" for the articulation's root, default kept"
+args.pins = "list of strings, links a drag holds, default kept"
+args.lock_orientation = "bool, a move keeps the link's orientation, default kept"
+args.rotation_weight = "number, metres per radian, default kept"
+returns = "{on, root, pins, lock_orientation, rotation_weight}"
+
+["tool.ik"]
+summary = "While on, the gizmo on a jointed link poses the robot through IK; without `on` it toggles."
+kind = "view"
+args.on = "bool, IK drag on, default: toggles"
+returns = "{on}"
+
+["view.robot_overlays"]
+summary = "The robot overlays: link frames, joint axes, centres of mass, inertia boxes and translucent links. Each switch given sets it; the result holds them all."
+kind = "view"
+args.on = "bool, overlays on, default kept"
+args.frames = "bool, link frames, default kept"
+args.axes = "bool, joint axes, default kept"
+args.com = "bool, centres of mass, default kept"
+args.inertia = "bool, inertia boxes, default kept"
+args.translucent = "bool, translucent links, default kept"
+returns = "{on, frames, axes, com, inertia, translucent}"
+
+["teleop.devices"]
+summary = "The devices teleop reads (keyboard, gamepads, the virtual device, extension devices) and the modes it maps them through, with the active ones."
+kind = "read"
+returns = "{devices: [{id, label, kind, owner, axes, buttons}], modes: [{id, label, owner, quantities}], device, mode}"
+
+["teleop.use"]
+summary = "Switches teleop on or off and picks the device, the mode, the joint mode's joint, the ik mode's link (\"\" follows the selection), PD hold and the command baseline; bare, it toggles."
+kind = "sim"
+args.on = "bool, teleop on, default kept (bare: toggles)"
+args.device = "string, a device id from teleop.devices, default kept"
+args.mode = "string, a mode id: command (vx, vy, wyaw for a policy), joint, ik or an extension's, default kept"
+args.joint = "string, the joint mode's joint, default kept"
+args.link = "string, the ik mode's link, \"\" follows the selection, default kept"
+args.hold = "bool, hold the pose with a PD law, default kept"
+args.kp = "number, the hold's stiffness, default kept"
+args.kd = "number, the hold's damping, default kept"
+args.command_base = "[vx, vy, wz], the command when the sticks rest, default kept"
+returns = "the teleop status, as teleop.status"
+example = '{"on": true, "device": "virtual", "mode": "command"}'
+
+["teleop.input"]
+summary = "Sets the virtual device's axes ([-1, 1]) and buttons by name; the others keep their values. This is how an agent steers teleop without hardware."
+kind = "sim"
+args.axes = "object, axis name (leftx, lefty, rightx, righty, lefttrigger, righttrigger) to a value in [-1, 1], optional"
+args.buttons = "object, button name (a, b, x, y, start, dpup, ...) to true, false or a number (nonzero is down), optional"
+returns = "{axes, buttons}: every axis and button now"
+example = '{"axes": {"lefty": 0.6}}'
+
+["teleop.map"]
+summary = "A mode's bindings [{input, quantity, gain, invert}]: given ones replace them and `reset` restores the defaults; `deadzone` in [0, 1) is shared by every axis."
+kind = "sim"
+args.mode = "string, the mode, default the active one"
+args.bindings = "list of {input, quantity, gain, invert}, the new bindings, optional"
+args.reset = "bool, restore the mode's default bindings first, default false"
+args.deadzone = "number, in [0, 1), default the current one"
+returns = "{mode, bindings, quantities, deadzone}"
+
+["teleop.pad"]
+summary = "A virtual gamepad on SDL's joystick path: `attach` names a new one; `id` with `axes` and `buttons` sets its inputs, and with `detach` removes it."
+kind = "sim"
+args.attach = "string, the new gamepad's name, optional"
+args.id = "string, the gamepad's id from attach"
+args.axes = "object, SDL axis name to value, optional"
+args.buttons = "object, SDL button name to pressed, optional"
+args.detach = "bool, remove the gamepad, default false"
+returns = "{id} (and detached)"
+
+["teleop.status"]
+summary = "The active device's reading, the mode's quantities and what they drove last frame."
+kind = "read"
+returns = "{on, device, connected, mode, axes, buttons, quantities, command, command_base, controller, joint, link, goal, hold, kp, kd, deadzone, error}"
+
+["policy.load"]
+summary = "Attaches an NKML locomotion policy to the loaded robots in place of the one before, and sends it teleop's command; the dialog asks without `path`, `host` runs the host MLP."
+kind = "process"
+args.path = "string, the policy file (.nkml or .bin), default: a file dialog"
+args.host = "bool, run the MLP on the CPU instead of the GPU, default false"
+returns = "the policy status, as policy.status"
+
+["policy.unload"]
+summary = "Detaches the loaded policy; the drive targets hold where it left them."
+kind = "sim"
+returns = "the policy status"
+
+["policy.enable"]
+summary = "Runs or stops the loaded policy; stopped, the drive targets hold where it left them. Bare, it toggles."
+kind = "sim"
+args.on = "bool, run it, default: toggles"
+returns = "the policy status"
+
+["policy.status"]
+summary = "The loaded policy, its contract, the joints it drives and the command it reads."
+kind = "read"
+returns = "{loaded, on, path, error, robot, ...}"
+
+["demo.record"]
+summary = "Records the shown environment, with `all` every displayed one, each step at the head: drive targets, joint states and the teleop device's axes. The stop cuts each environment's consecutive steps into an episode. Bare, it toggles."
+kind = "sim"
+args.on = "bool, recording on, default: toggles"
+args.all = "bool, record every environment the grid shows, default kept"
+returns = "the demonstrations' status, as demo.episodes"
+
+["demo.episodes"]
+summary = "The recorded episodes, the recording and the replay in progress."
+kind = "read"
+returns = "{recording, samples, playing, left, joints, axes, episodes: [{env, start, steps, seconds}]}"
+
+["demo.play"]
+summary = "Writes an episode's recorded drive targets into its environment a row a step from the state now, the controller waiting meanwhile; `play` (the default) starts the transport."
+kind = "sim"
+args.episode = "int, the episode's index, default the selected one"
+args.play = "bool, start the simulation, default true"
+returns = "{episode, env, steps}"
+
+["demo.stop"]
+summary = "Stops a demonstration replay."
+kind = "sim"
+returns = "the demonstrations' status"
+
+["demo.save"]
+summary = "The episodes as robomimic-style HDF5 through nuka.editor.demos; the dialog asks without `path`."
+kind = "file"
+args.path = "string, the .hdf5 to write, default: a file dialog"
+returns = "{path, episodes, steps}"
+
+["demo.load"]
+summary = "Replaces the episodes with an HDF5 file's, its joints matched by name to the scene's; the dialog asks without `path`."
+kind = "file"
+args.path = "string, the .hdf5 to read, default: a file dialog"
+returns = "the demonstrations' status with {path}"
+
+["demo.discard"]
+summary = "Drops episode `episode`, without it all of them."
+kind = "sim"
+args.episode = "int, the episode's index, default every episode"
+returns = "the demonstrations' status"
+
+["clip.list"]
+summary = "The joint clips saved beside the document, the edited one with its playhead and selection, and the clip playing."
+kind = "read"
+returns = "{clips, edited, open, playhead, auto_key, interp, curve, selected, playing, loop, left, can_undo, can_redo}"
+
+["clip.get"]
+summary = "A clip's tracks and keys, the edited clip's without `clip`."
+kind = "read"
+args.clip = "string, the clip's name, default the clip being edited"
+returns = "{name, duration, loop, tracks: [{joint, keys: [{time, value, interp, in, out}]}]}"
+
+["clip.new"]
+summary = 'A clip of `duration` seconds (1 by default) named `name`, else "Clip N"; the editor edits it.'
+kind = "edit"
+args.name = "string, the clip's name, default \"Clip N\""
+args.duration = "number, seconds, default 1"
+args.loop = "bool, play it over and over, default false"
+returns = "the new clip, as clip.get"
+
+["clip.set"]
+summary = "Sets a clip's `duration` or `loop`; keys past a shorter end stay but no longer play."
+kind = "edit"
+args.clip = "string, the clip's name, default the clip being edited"
+args.duration = "number, seconds, default kept"
+args.loop = "bool, default kept"
+returns = "the clip, as clip.get"
+
+["clip.rename"]
+summary = "Renames a clip."
+kind = "edit"
+args.clip = "string, the clip's name, default the clip being edited"
+args.to = "string, the new name"
+returns = "{name}"
+
+["clip.remove"]
+summary = "Removes a clip."
+kind = "edit"
+args.clip = "string, the clip's name, default the clip being edited"
+returns = "the clips' status, as clip.list"
+
+["clip.key"]
+summary = "Sets one key from the arguments or each of `keys`, replacing any at their times. A key is {joint, time, value, interp, in, out}: time defaults to the playhead, value to the joint's drive target, interp to the editor's."
+kind = "edit"
+args.clip = "string, the clip's name, default the clip being edited"
+args.joint = "string, the joint's name, without `keys`"
+args.time = "number, seconds into the clip, default the playhead"
+args.value = "number, rad or m, default the joint's drive target"
+args.interp = "string, step, linear or bezier, default the editor's"
+args.in = "number, a bezier key's incoming slope, default 0"
+args.out = "number, a bezier key's outgoing slope, default 0"
+args.keys = "list of keys as above, in place of one, optional"
+returns = "{clip, set, keys}"
+example = '{"keys": [{"joint": "FL_thigh_joint", "time": 0, "value": 0.8}, {"joint": "FL_thigh_joint", "time": 0.5, "value": 1.2}]}'
+
+["clip.key_pose"]
+summary = "Keys every joint at `time` (the playhead) from library pose `pose`, else from the shown environment's positions, or its drive targets with `from` \"target\"."
+kind = "edit"
+args.clip = "string, the clip's name, default the clip being edited"
+args.time = "number, seconds into the clip, default the playhead"
+args.pose = "string, a pose library entry, optional"
+args.from = 'string, q (joint positions) or target (drive targets), default "q"'
+returns = "{clip, time, set}"
+
+["clip.remove_keys"]
+summary = "Removes `keys` [{joint, time}], else every key of `joint` and/or at `time`, else the selection."
+kind = "edit"
+args.clip = "string, the clip's name, default the clip being edited"
+args.keys = "list of {joint, time}, optional"
+args.joint = "string, every key of this joint, optional"
+args.time = "number, every key at this time, optional"
+returns = "{removed, keys}"
+
+["clip.move_keys"]
+summary = "Shifts `keys` [{joint, time}], else the selection, by `dt` seconds and `dv` in value; keys stay within the clip and replace those where they land."
+kind = "edit"
+args.clip = "string, the clip's name, default the clip being edited"
+args.keys = "list of {joint, time}, default the selection"
+args.dt = "number, seconds, default 0"
+args.dv = "number, rad or m, default 0"
+returns = "{keys}: where the keys landed"
+
+["clip.sample"]
+summary = "Each keyed joint's value at `time` (the playhead); with `apply` they become the shown environment's drive targets at once."
+kind = "read"
+args.clip = "string, the clip's name, default the clip being edited"
+args.time = "number, seconds into the clip, default the playhead"
+args.apply = "bool, write them as drive targets, default false"
+returns = "{time, values: joint to value}"
+
+["clip.play"]
+summary = "Drives the shown environment through a clip a step a row from now, over and over with `loop` (the clip's own by default); `play` (the default) starts the transport."
+kind = "sim"
+args.clip = "string, the clip's name, default the clip being edited"
+args.loop = "bool, default the clip's own"
+args.play = "bool, start the simulation, default true"
+returns = "the clips' status"
+
+["clip.stop"]
+summary = "Stops the clip playing."
+kind = "sim"
+returns = "the clips' status"
+
+["clip.save"]
+summary = 'Writes a clip as {"format": "nkclip", "version": 1, "clip": ...}; the dialog asks without `path`.'
+kind = "file"
+args.clip = "string, the clip's name, default the clip being edited"
+args.path = "string, the .nkclip.json to write, default: a file dialog"
+returns = "{path, clip}"
+
+["clip.load"]
+summary = "Adds a clip file's clip, replacing one of its name; the editor edits it."
+kind = "file"
+args.path = "string, the .nkclip.json to read, default: a file dialog"
+returns = "{path, clip, keys}"
+
+["clip.editor"]
+summary = "Opens or closes the Clip Editor (bare, it toggles) and sets what it shows: the `clip`, the `playhead`, `auto_key`, the `interp` of new keys, the `curve` joint and the `selected` keys."
+kind = "view"
+args.on = "bool, open it, default kept (bare: toggles)"
+args.clip = "string, the clip to edit, default kept"
+args.playhead = "number, seconds, default kept"
+args.auto_key = "bool, dragging a joint keys it at the playhead, default kept"
+args.interp = "string, step, linear or bezier for new keys, default kept"
+args.curve = "string, the joint whose curve shows, default kept"
+args.selected = "list of {joint, time}, the selected keys, default kept"
+returns = "the clips' status"
+
+["clip.undo"]
+summary = "Steps back through the clip edits; scene edits keep their own history."
+kind = "edit"
+returns = "the clips' status"
+
+["clip.redo"]
+summary = "Steps forward again through undone clip edits."
+kind = "edit"
+returns = "the clips' status"
+
+["sensor.list"]
+summary = "The scene's sensors with their mounts and settings."
+kind = "read"
+returns = "a list of {index, name, type, mount, frame, offset, rate_hz, update_period, aov_mask, camera, lidar, tactile}; each kind has its own block"
+
+["sensor.add"]
+summary = "Adds a sensor of `type` riding the body at `mount` (default the selected sensor's body, else the selected node's body; \"\" mounts a camera or lidar in the world) as one undoable edit, and selects it. Other fields set it up as sensor.set."
+kind = "edit"
+args.type = "string, imu, contact, force_torque, frame_pose, joint_state, camera, depth, lidar, range_scan, linear_velocity or tactile"
+args.mount = 'string, the body it rides, "" for the world, default: from the selection'
+args.name = "string, its name, default the type"
+args.position = "[x, y, z], its offset from the mount, optional"
+args.rotation_deg = "[x, y, z], its rotation from the mount in degrees, optional"
+args.rate_hz = "float, samples per second, optional"
+args.camera = "{width, height, vfov, near, far}, a camera's image, optional"
+args.lidar = "{az_count, el_count, az_min, az_max, el_min, el_max, min_range, max_range}, a lidar's beams, optional"
+args.tactile = "{shape: box, sphere, ellipsoid, capsule or cylinder, size: [x, y, z]}, a contact region, optional"
+returns = "the new sensor, as sensor.list"
+example = '{"type": "camera", "mount": "/go2/base", "position": [0.3, 0, 0.05], "camera": {"width": 640, "height": 480}}'
+
+["sensor.set"]
+summary = "Edits a sensor (`index` or `sensor`, else the selected one) as one undoable edit: every other argument is a field, as sensor.add takes them, plus offset, update_period and aov_mask."
+kind = "edit"
+args.index = "int, the sensor's index, optional"
+args.sensor = "string, the sensor's name, optional"
+returns = "the sensor, as sensor.list"
+example = '{"sensor": "camera", "camera": {"vfov": 70}}'
+
+["sensor.remove"]
+summary = "Removes a sensor (`index` or `sensor`, else the selected one) as one undoable edit."
+kind = "edit"
+args.index = "int, the sensor's index, optional"
+args.sensor = "string, the sensor's name, optional"
+returns = "{focus}"
+
+["sensor.select"]
+summary = "Selects a sensor, which drops the node selection; `index` -1 selects none."
+kind = "view"
+args.index = "int, the sensor's index, -1 for none, optional"
+args.sensor = "string, the sensor's name, optional"
+returns = "the selected index"
+
+["sensor.preview"]
+summary = "The Sensors panel's live preview: `on`, the sensor it shows (`index` or `sensor`, else the selected one) and a camera's `channel`. Reports them with the newest reading's tick and error."
+kind = "view"
+args.on = "bool, show the preview, default kept"
+args.index = "int, the sensor's index, optional"
+args.sensor = "string, the sensor's name, optional"
+args.channel = "string, color, depth, normal, albedo, instance or semantic, default kept"
+returns = "{on, index, channel, read, tick, error}"
+
+["sensor.read"]
+summary = "Renders and reads a sensor of environment `env` now: a camera's `channel`, a lidar's ranges or a state sensor's values. Returns their shape and statistics, the values when there are at most 4096, and with `path` writes all of them to a .npy file. A semantic plane holds 1 + the index of each pixel's class in `classes`, 0 for none; an instance plane names its ids in `instances`."
+kind = "read"
+args.index = "int, the sensor's index, optional"
+args.sensor = "string, the sensor's name, default the selected one"
+args.channel = "string, a camera's plane: color, depth, normal, albedo, instance or semantic, default \"color\""
+args.env = "int, the environment, default the shown one"
+args.path = "string, a .npy file for all the values, optional"
+returns = "{index, name, channel, env, tick, sim_time, shape, dtype, min, max, mean, values, classes or instances, path}"
+example = '{"sensor": "camera", "channel": "depth", "path": "C:/data/depth.npy"}'
+
+["view.sensor_overlays"]
+summary = "The sensor overlays: camera frustums, lidar fans, sensor frames and labels. Each switch given sets it; the result holds them all."
+kind = "view"
+args.on = "bool, overlays on, default kept"
+args.frustums = "bool, camera frustums, default kept"
+args.fans = "bool, lidar fans, default kept"
+args.frames = "bool, sensor frames, default kept"
+args.labels = "bool, sensor names, default kept"
+returns = "{on, frustums, fans, frames, labels}"
+
+["dr.get"]
+summary = "The domain randomization of the document: the seed, whether a reset draws again, the render jitters, the physics ranges and the live parameters' factor ranges."
+kind = "read"
+returns = "{seed, reset_draws, render: {on, color, roughness, metallic, light_dir, light_intensity, light_color, ambient}, physics: {on, mass, armature, gravity}, params: {key: {on, range}}}"
+
+["dr.set"]
+summary = "Merges `args` in the shape dr.get reports and draws again when anything randomizes or did; saved beside the document. Render randomization needs a camera sensor, physics randomization an articulated body."
+kind = "edit"
+args.seed = "int, the draw's seed, optional"
+args.reset_draws = "bool, each reset draws with the next seed, optional"
+args.render = "object, {on, and jitters >= 0: color, roughness, metallic, light_dir, light_intensity, light_color, ambient}, optional"
+args.physics = "object, {on, mass: [lo, hi] factor, armature: [lo, hi] offset, gravity: [lo, hi] offset}, optional"
+args.params = "object, a live parameter's key to {on, range: [lo, hi] factor}, optional"
+returns = "the randomization config"
+example = '{"physics": {"on": true, "mass": [0.8, 1.2]}, "reset_draws": true}'
+
+["dr.sample"]
+summary = "Draws the randomization again with `seed`, else the next one."
+kind = "sim"
+args.seed = "int, the seed, default the next one"
+returns = "{seed}"
+
+["label.list"]
+summary = "The semantic labels by node path and their classes; with `path`, the label that node has and the node it comes `from`, itself or an ancestor."
+kind = "read"
+args.path = "string, a node to look up, optional"
+returns = "{labels: path to label, classes} (with label and from for `path`)"
+
+["label.set"]
+summary = "Gives the nodes at `paths` (or `path`, else the selected ones) the semantic `label` that datasets write; \"\" clears theirs, so they inherit their parent's again. Saved beside the document."
+kind = "edit"
+args.label = 'string, the class name, "" clears'
+args.paths = "list of strings, the nodes, optional"
+args.path = "string, one node, default the selection"
+returns = "{labels, classes}"
+example = '{"path": "/World/go2", "label": "robot"}'
+
+["dataset.export"]
+summary = "Steps `frames` frames of `every` ticks from a reset (unless `reset` is false), drawing the `randomize` kinds again for each from `seed` + frame, and writes the `cameras`' `channels`, the lidars and the state sensors under `out` (a folder dialog without it); dataset.status follows it."
+kind = "file"
+args.out = "string, the folder to write, default: a folder dialog"
+args.frames = "int, how many frames, default 100"
+args.every = "int, ticks between frames, default 1"
+args.seed = "int, the first frame's seed, default the randomization's"
+args.randomize = "object, {render, physics}: what draws again each frame, default the document's randomization"
+args.channels = "list of strings, rgb, depth, instance, semantic, normal, albedo, default rgb, depth, instance, semantic"
+args.cameras = "list of strings, camera sensor names, default every camera"
+args.lidar = "bool, write the lidars, default true"
+args.state = "bool, write the state sensors, default true"
+args.reset = "bool, start from a reset, default true"
+returns = "the export's status, as dataset.status"
+example = '{"out": "C:/data/run1", "frames": 50, "channels": ["rgb", "depth"]}'
+
+["dataset.status"]
+summary = "The dataset export running or last finished: frames written of how many, where, and any error."
+kind = "read"
+returns = "{running, frame, frames, out, cancelled, error}"
+
+["dataset.cancel"]
+summary = "Stops after the frame being read and writes the frames read so far."
+kind = "sim"
+returns = "the export's status"
+
+["dataset.exporter"]
+summary = "Opens or closes the Export Dataset dialog; `on` sets it, else it toggles."
+kind = "view"
+args.on = "bool, open it, default: toggles"
+returns = "{on}"
+
+["train.tasks"]
+summary = "The training tasks (go2_velocity, Go2 velocity tracking, and any registered from Python): each one's groups of parameters, the robot its scene holds and the step it trains at."
+kind = "read"
+returns = "a list of {name, title, module, root, robot, groups: [{name, params: [{key, type, default, ...}]}], ...}"
+
+["train.config"]
+summary = "The document's task and full configuration, the values that differ from the defaults (`changed`) and what keeps them from training the scene (`errors`); `task` switches to that task's defaults."
+kind = "read"
+args.task = "string, switch the document to this task's defaults first, optional"
+returns = "{task, config, changed, errors: [{path, message}], ...}"
+
+["train.set"]
+summary = 'Sets `values` ({"group.key": value}), or `path` to `value`, after switching to `task` if given; a value that does not fit fails the call and changes nothing. The configuration is kept per document in the profile.'
+kind = "edit"
+args.values = 'object, "group.key" to value, optional'
+args.path = 'string, one "group.key", optional'
+args.value = "value, for `path`"
+args.task = "string, switch to this task first, optional"
+returns = "the configuration, as train.config"
+example = '{"task": "go2_velocity", "values": {"run.num_envs": 2048, "run.max_epochs": 500, "event.randomize": true}}'
+
+["train.validate"]
+summary = "Whether the document's training configuration can train the scene as it stands."
+kind = "read"
+returns = "{ok, errors: [{path, message}]}"
+
+["train.python"]
+summary = "The Python runs start in and whether it can train (torch, rl_games, a GPU); `path` sets it, \"\" returns to the editor's own."
+kind = "app"
+args.path = "string, a python executable, \"\" for the editor's, optional"
+returns = "{python, ready, error, argv, ...}"
+
+["train.start"]
+summary = "Trains the scene as it stands, with the document's configuration, in another process as run `name` (the time by default), from the rl_games `checkpoint` if given. One run trains at a time."
+kind = "process"
+args.name = "string, the run's folder name, default run-<date>-<time>"
+args.checkpoint = "string, an rl_games checkpoint to resume from, optional"
+returns = "the run's status, as train.status"
+example = '{"name": "go2-walk-1"}'
+
+["train.stop"]
+summary = "Ends run `name` (else the one started last) after its current epoch, with a final checkpoint."
+kind = "process"
+args.name = "string, the run, default the one started last"
+returns = "the run's status"
+
+["train.status"]
+summary = "A run's state (starting, running, done, failed, lost), epoch, rewards and checkpoint count, and the last `log` lines (20) of its output."
+kind = "read"
+args.name = "string, the run, default the one started last, else the newest"
+args.log = "int, how many lines of its log, default 20"
+returns = "{name, dir, state, alive, pid, epoch, max_epochs, reward, observe, ..., log}"
+
+["train.runs"]
+summary = "The document's runs, newest first, each with its status."
+kind = "read"
+returns = "a list of run statuses"
+
+["train.metrics"]
+summary = "A run's epoch rows (reward, episode length, losses, timings) after the first `since`; `next` is the `since` of the following call."
+kind = "read"
+args.name = "string, the run, default the one started last, else the newest"
+args.since = "int, rows to skip, default 0"
+returns = "{name, rows, next}"
+
+["train.checkpoints"]
+summary = "A run's saves in order: each rl_games checkpoint, its NKML policy, kind (best, epoch, final), epoch and reward."
+kind = "read"
+args.name = "string, the run, default the one started last, else the newest"
+returns = "{name, checkpoints: [{checkpoint, policy, kind, epoch, reward}]}"
+
+["train.play"]
+summary = "Loads a run's policy onto the scene's robots and plays: `policy` (a file), else the newest checkpoint of `kind`: \"best\" (the default), \"final\", \"epoch\" or \"last\"."
+kind = "process"
+args.name = "string, the run, default the one started last, else the newest"
+args.policy = "string, a policy file instead of the run's, optional"
+args.kind = 'string, best, final, epoch or last, default "best"'
+returns = "{policy, status}"
+
+["train.observe"]
+summary = "`on: true` watches run `name` (else the one started last): the world holds its first `envs` (16) environments at the run's frames under arrows of their commanded and actual velocity, and `follow` keeps the camera on the current one. `on: false` stops; without `on` it reports, `follow` changing."
+kind = "view"
+args.on = "bool, true starts watching and false stops, default: reports"
+args.name = "string, the run, default the one started last"
+args.envs = "int, environments to show, 1 to 16, default 16"
+args.follow = "bool, the camera follows the current environment, default false"
+returns = "{on, name, envs, run_envs, frames, sequence, steps, spacing, follow, epoch, max_epochs, reward, terrain, arrows, ...}"
+example = '{"on": true, "envs": 16, "follow": true}'
+
+["train.reveal"]
+summary = "Opens run `name`'s folder (else the one started last, else the newest) in the file browser."
+kind = "process"
+args.name = "string, the run, optional"
+returns = "{dir}"
+
+["train.panel"]
+summary = "Opens the Training panel at `page` (task, runs, dashboard or checkpoints) on run `run`, with the runs `compare` drawn over it on the Dashboard; reports what the panel shows."
+kind = "view"
+args.page = "string, task, runs, dashboard or checkpoints, default kept"
+args.run = "string, the run the panel shows, default kept"
+args.compare = "list of strings, runs drawn over it on the Dashboard, default kept"
+returns = "{page, run, compare, runs, series, saves, log_lines, config_version, changed, problems, python_ready, ...}"
+
+["material.list"]
+summary = "The scene's materials: each one's fields as material.set takes them, its friction and how many shapes use it."
+kind = "read"
+returns = "a list of {name, base_color, metallic, roughness, emissive, opacity, sheen, transmission, ior, absorption, albedo_map, roughness_map, metallic_map, normal_map, emissive_map, roughness_channel, metallic_channel, uv_scale, triplanar, friction, users}"
+
+["material.get"]
+summary = "One material: `material` by name, else the one the drawn parts at `path` (else the Material section's part) share."
+kind = "read"
+args.material = "string, the material's name, optional"
+args.path = "string, a node whose drawn parts share one material, default the Material section's part"
+returns = "the material, as material.list"
+
+["material.slots"]
+summary = 'The parts the world draws at or under `path` (else the selection) and their materials, "" for the default one.'
+kind = "read"
+args.path = "string, the node, default the selection"
+returns = "a list of {path, material}"
+
+["material.create"]
+summary = "Makes a material as one undoable edit: a copy of `from`, else `preset`'s look, else the default, with `fields` over it. `assign` gives it to those nodes in the same edit."
+kind = "edit"
+args.name = 'string, its name, made unique, default from `from` or `preset`, else "Material"'
+args.from = "string, a material to copy, optional"
+args.preset = "string, plastic, metal, rubber, glass, emissive or textured, optional"
+args.fields = "object, material fields as material.set takes them, optional"
+args.assign = "string or list of strings, nodes that take it, optional"
+returns = "{material}: its name"
+example = '{"preset": "metal", "fields": {"base_color": [0.8, 0.6, 0.2, 1.0]}, "assign": "/robot/base"}'
+
+["material.set"]
+summary = 'Sets fields of a material (`material`, else the one at `path`) as one undoable edit. Fields are named as material.get reports them; a map is an image file path ("" for none) and `friction` is the contact friction.'
+kind = "edit"
+args.material = "string, the material's name, optional"
+args.path = "string, a node whose drawn parts share one material, default the Material section's part"
+args.base_color = "[r, g, b, a], linear, optional"
+args.metallic = "float, 0 to 1, optional"
+args.roughness = "float, 0 to 1, optional"
+args.emissive = "[r, g, b], optional"
+args.albedo_map = 'string, an image file, "" for none, optional'
+args.roughness_map = 'string, an image file, "" for none, optional'
+args.metallic_map = 'string, an image file, "" for none, optional'
+args.normal_map = 'string, an image file, "" for none, optional'
+args.emissive_map = 'string, an image file, "" for none, optional'
+args.uv_scale = "float, texture repeats, optional"
+args.triplanar = "bool, project textures from three axes, optional"
+args.friction = "float, the contact friction, optional"
+returns = "{focus}"
+example = '{"material": "Floor", "roughness": 0.7, "albedo_map": "C:/textures/concrete.png", "uv_scale": 4}'
+
+["material.choose_map"]
+summary = "Picks an image for a material's `map` slot in a file dialog."
+kind = "edit"
+args.map = "string, albedo_map, roughness_map, metallic_map, normal_map or emissive_map"
+args.material = "string, the material's name, optional"
+args.path = "string, a node whose drawn parts share one material, default the Material section's part"
+returns = "{focus}"
+
+["material.rename"]
+summary = "Renames a material (`material`, else the one at `path`) as one undoable edit."
+kind = "edit"
+args.name = "string, the new name"
+args.material = "string, the material's name, optional"
+args.path = "string, a node whose drawn parts share one material, optional"
+returns = "{focus}"
+
+["material.delete"]
+summary = "Deletes a material (`material`, else the one at `path`) as one undoable edit; the shapes that used it take `replace`, which a material in use needs."
+kind = "edit"
+args.material = "string, the material's name, optional"
+args.path = "string, a node whose drawn parts share one material, optional"
+args.replace = 'string, the material its users take, "" for the default one, required while it is in use'
+returns = "{focus}"
+
+["material.assign"]
+summary = 'Every shape at or under `paths`, else `path`, else the selection, takes `material` ("" for the default one), as one undoable edit.'
+kind = "edit"
+args.material = 'string, the material, "" for the default one'
+args.path = "string, a node, optional"
+args.paths = "list of strings, nodes, optional"
+returns = "{focus}"
+example = '{"material": "Rubber", "paths": ["/go2/FL_foot", "/go2/FR_foot"]}'
+
+["material.make_unique"]
+summary = "The part at `path` (else the Material section's) takes a copy of its material of its own, as one undoable edit."
+kind = "edit"
+args.path = "string, the part, default the Material section's"
+returns = "{material}: the copy's name"
+
+["material.select_users"]
+summary = "Selects the shapes that draw with `material`, and lists them."
+kind = "view"
+args.material = "string, the material"
+returns = "{paths}"
+
+["script.new"]
+summary = "Opens a new untitled script tab holding `text`."
+kind = "view"
+args.text = "string, the tab's text, default empty"
+returns = "{tab, title, path}"
+
+["script.open"]
+summary = "Opens a Python file in a script tab, at `line` if given; without `path` a file dialog asks."
+kind = "file"
+args.path = "string, the .py file, default: a file dialog"
+args.line = "int, the line to show, optional"
+returns = "{tab, title, path}"
+
+["script.save"]
+summary = "Saves a script tab (`tab`, else the active one) to `path`, else its own file, else where a file dialog says; with Rerun on Save it then runs."
+kind = "file"
+args.tab = "int, the tab, default the active one"
+args.path = "string, the file to save to, default the tab's"
+returns = "{tab, title, path}"
+
+["script.close"]
+summary = "Closes a script tab (`tab`, else the active one); one with unsaved edits needs `discard`."
+kind = "view"
+args.tab = "int, the tab, default the active one"
+args.discard = "bool, drop unsaved edits, default false"
+returns = "nothing"
+
+["script.run"]
+summary = "Runs Python in the editor, where `app`, `world`, `nuka` and `np` are bound: `code`, else the file at `path`, else a tab (`tab`, else the active one), or with `selection` that tab's selection or caret line, printing a final expression's value. Answers at once; script.result reports the run by its seq and script.console holds its output."
+kind = "process"
+args.code = "string, Python source, optional"
+args.name = 'string, the name tracebacks give `code`, default "<run>"'
+args.path = "string, a .py file to run, optional"
+args.tab = "int, the tab to run, default the active one"
+args.selection = "bool, run only the tab's selection or caret line, default false"
+returns = "{seq, name}"
+example = '{"code": "print(len(app.actions.run(\"scene.nodes\")))"}'
+
+["script.eval"]
+summary = "Runs one console line: echoes it, then runs it and prints the value of a final expression."
+kind = "process"
+args.code = "string, Python source"
+returns = "{seq}"
+
+["script.stop"]
+summary = "Interrupts the running script; enabled while one runs."
+kind = "process"
+returns = "{stopped}"
+
+["script.result"]
+summary = "A script run's state by the seq script.run or script.eval returned: whether it is done or failed, and its output."
+kind = "read"
+args.seq = "int, the run"
+returns = "{done, failed, output, name}"
+
+["script.complete"]
+summary = "Completions for Python `code` at a 1-based line and 0-based column."
+kind = "read"
+args.code = "string, Python source"
+args.line = "int, 1-based, default 1"
+args.column = "int, 0-based, default 0"
+returns = "a list of {name, type, signature}"
+
+["script.tabs"]
+summary = "The open script tabs: their files, the /script node each came from, whether they are dirty or changed on disk, the caret and the error markers."
+kind = "read"
+returns = "a list of {tab, title, name, path, node, active, dirty, disk_changed, line, column, lines, markers: [{line, message}]}"
+
+["script.goto"]
+summary = "Shows a file at a line in the Script panel: an open tab of that name, else the file opened in a new one."
+kind = "view"
+args.path = "string, the tab's name or the file"
+args.line = "int, 1-based, default 1"
+returns = "{tab, title, path}"
+
+["script.console"]
+summary = "Console text from byte `since` on (0: all that is kept); `next` is the `since` of the following call and `dropped` says text before `since` is gone."
+kind = "read"
+args.since = "int, the byte to read from, default 0"
+returns = "{text, next, dropped}"
+
+["script.clear_console"]
+summary = "Clears the console."
+kind = "view"
+returns = "nothing"
+
+["script.reload"]
+summary = "A script tab (`tab`, else the active one) whose file changed on disk reloads it, or with `keep` keeps its own text."
+kind = "file"
+args.tab = "int, the tab, default the active one"
+args.keep = "bool, keep the tab's text, default false"
+returns = "{tab, title, path}"
+
+["script.toggle_rerun"]
+summary = "Rerun on Save: whether saving a script tab runs it; `on` sets it, else it toggles. Kept in the profile."
+kind = "app"
+args.on = "bool, rerun on save, default: toggles"
+returns = "whether it is on"
+
+["script.set_budget"]
+summary = "Seconds a script may run before it is stopped, 0 for no limit; kept in the profile. Without `seconds` it reports."
+kind = "app"
+args.seconds = "float, the budget, 0 for none, default kept"
+returns = "the budget in seconds"
+
+["script.attach"]
+summary = "Keeps a script tab (`tab`, else the active one), or `source`, in the scene as a /script node, as one undoable edit: the node the tab came from, else a selected script node, else a new one."
+kind = "edit"
+args.tab = "int, the tab, default the active one"
+args.source = "string, Python source instead of the tab's text, optional"
+returns = "{focus}"
+
+["script.load"]
+summary = "Opens a /script node's source in a script tab: `path`, else the selection."
+kind = "view"
+args.path = "string, the /script node, default the selection"
+returns = "{tab, title, path}"
+
+["scene.nodes"]
+summary = "The scene's nodes in tree order: all, those under `under`, or those of one `kind`."
+kind = "read"
+args.under = "string, a node whose subtree to list, default the whole scene"
+args.kind = "string, artic, soft, cloth, fluid, body, static, joint, geom, visual, camera, light, script or group, optional"
+returns = "a list of {path, name, kind}"
+example = '{"under": "/go2", "kind": "body"}'
+
+["scene.add_box"]
+summary = "Adds a box above the selection, else above the origin, as one undoable edit; scene.spawn with kind box."
+kind = "edit"
+returns = "{focus}"
+
+["scene.add_sphere"]
+summary = "Adds a sphere above the selection, else above the origin, as one undoable edit; scene.spawn with kind sphere."
+kind = "edit"
+returns = "{focus}"
+
+["scene.add_capsule"]
+summary = "Adds a capsule above the selection, else above the origin, as one undoable edit; scene.spawn with kind capsule."
+kind = "edit"
+returns = "{focus}"
+
+["scene.add_cylinder"]
+summary = "Adds a cylinder above the selection, else above the origin, as one undoable edit; scene.spawn with kind cylinder."
+kind = "edit"
+returns = "{focus}"
+
+["scene.add_plane"]
+summary = "Adds a plane as one undoable edit; scene.spawn with kind plane."
+kind = "edit"
+returns = "{focus}"
+
+["window.layout_authoring"]
+summary = "Arranges the panels for building a scene: Stage and File left, Properties and Camera right, Assets, Console, Script, Stats, Timeline and Sensors below."
+kind = "view"
+returns = "nothing"
+
+["window.layout_debug"]
+summary = "Arranges the panels for debugging the solver: Stage left, Solver, Debug, Stats and Properties right, Console, Timeline, Script and Assets below."
+kind = "view"
+returns = "nothing"
+
+["window.layout_robot"]
+summary = "Arranges the panels for a robot: Stage left, Joints, Poses, Policy, Demos and Properties right, Console, Timeline, Stats, Assets and Sensors below."
+kind = "view"
+returns = "nothing"
+
+["window.layout_data"]
+summary = "Arranges the panels for making data: File and Stage left, Sensors, Randomize, Stats, Camera and Properties right, Assets, Console, Script and Timeline below."
+kind = "view"
+returns = "nothing"
+
+["window.layout_training"]
+summary = "Arranges the panels for training: Stats and Stage left, a wide Training, Policy and Camera column right, Console, Script, Assets and Timeline below."
+kind = "view"
+returns = "nothing"
+
+["window.reset_layout"]
+summary = "Puts the panels of the current layout back where it places them."
+kind = "view"
+returns = "nothing"
+
+["window.focus"]
+summary = "Opens a panel and brings it to the front."
+kind = "view"
+args.panel = "string, the panel id: stage, property, file, assets, stats, debug, solver, timeline, camera, joints, poses, policy, demos, sensors, randomize, training, script, console, nui, extensions or an extension's"
+returns = "nothing"
+example = '{"panel": "training"}'
+
+["app.command_palette"]
+summary = "Opens or closes the command palette, which finds and runs any action by name."
+kind = "view"
+returns = "nothing"
+
+["view.ui_scale"]
+summary = "Sets the UI scale, 0.5 to 3, on top of the display's."
+kind = "view"
+args.value = "float, the scale, 0.5 to 3"
+returns = "the scale"
+
+["view.ui_scale_up"]
+summary = "Makes the UI 10% larger, up to 3."
+kind = "view"
+returns = "the scale"
+
+["view.ui_scale_down"]
+summary = "Makes the UI 10% smaller, down to 0.5."
+kind = "view"
+returns = "the scale"
+
+["view.ui_scale_reset"]
+summary = "Returns the UI scale to 1."
+kind = "view"
+returns = "the scale"
+
+["scene.expand_all"]
+summary = "Expands every node in the Stage panel."
+kind = "view"
+returns = "nothing"
+
+["scene.collapse_all"]
+summary = "Collapses every node in the Stage panel."
+kind = "view"
+returns = "nothing"
+
+["help.about"]
+summary = "Shows the About window: the nui API and Dear ImGui versions and the open-source credits."
+kind = "view"
+returns = "nothing"
+
+["ui.toast"]
+summary = "Shows a short notice in the corner of the editor."
+kind = "view"
+args.text = "string, the notice"
+args.level = 'string, info, ok, warn or error, default "info"'
+returns = "nothing"
+example = '{"text": "Training started", "level": "ok"}'
+
+["view.toggle_language"]
+summary = "Switches the UI to the next language with a string table, English first."
+kind = "view"
+returns = "the locale now shown"
+
+["view.language"]
+summary = "Shows the UI in `locale`: en, or one with a string table (zh-CN ships with the editor)."
+kind = "view"
+args.locale = "string, the locale, such as en or zh-CN"
+returns = "the locale"
+
+["view.missing_strings"]
+summary = "UI strings the current language has no translation for, as shown so far."
+kind = "read"
+returns = "a list of strings"
+
+["extensions.manager"]
+summary = "Opens or closes the Extensions panel."
+kind = "view"
+returns = "nothing"
+
+["extensions.rescan"]
+summary = "Looks for extensions in the extension folders again; new ones stay disabled until enabled."
+kind = "app"
+returns = "how many were found"
+
+["extensions.list"]
+summary = "The extensions found: their state and error, and the actions, panels, overlays and teleop devices and modes each one adds."
+kind = "read"
+returns = "a list of {id, title, version, description, kind, state, error, auto_disabled, dir, actions, panels, overlays, teleop_devices, teleop_modes}"
+
+["extensions.enable"]
+summary = "Enables an extension, and what it depends on, which loads and runs its code; the choice is kept in the profile."
+kind = "process"
+args.id = "string, the extension"
+returns = "the extension, as extensions.list"
+
+["extensions.disable"]
+summary = "Disables an extension, and what depends on it; the choice is kept in the profile."
+kind = "app"
+args.id = "string, the extension"
+returns = "the extension, as extensions.list"
+
+["extensions.reload"]
+summary = "Re-reads an extension's manifest and restarts it with its code reloaded, and the dependents that went down with it."
+kind = "process"
+args.id = "string, the extension"
+returns = "the extension, as extensions.list"
+
+["extensions.log"]
+summary = "An extension's log text."
+kind = "read"
+args.id = "string, the extension"
+returns = "the log text"
+
+["window.toggle_stage"]
+summary = "Opens or closes the Stage panel: the scene tree, to select, rename, reparent and spawn."
+kind = "view"
+returns = "nothing"
+
+["window.toggle_property"]
+summary = "Opens or closes the Properties panel: transform, material and physics fields of the selection."
+kind = "view"
+returns = "nothing"
+
+["window.toggle_file"]
+summary = "Opens or closes the File panel: open, save and load scenes."
+kind = "view"
+returns = "nothing"
+
+["window.toggle_assets"]
+summary = "Opens or closes the Assets panel: importable files to drop into the scene or open."
+kind = "view"
+returns = "nothing"
+
+["window.toggle_stats"]
+summary = "Opens or closes the Stats panel: frame and physics timings."
+kind = "view"
+returns = "nothing"
+
+["window.toggle_debug"]
+summary = "Opens or closes the Debug Draw panel: collider and contact overlays."
+kind = "view"
+returns = "nothing"
+
+["window.toggle_solver"]
+summary = "Opens or closes the Solver panel: solver residuals, sweep budget alerts and the residual heatmap."
+kind = "view"
+returns = "nothing"
+
+["window.toggle_timeline"]
+summary = "Opens or closes the Timeline panel: seek, replay and fork the run, and compare branches with a ghost."
+kind = "view"
+returns = "nothing"
+
+["window.toggle_camera"]
+summary = "Opens or closes the Camera panel: camera pose, framing and controls."
+kind = "view"
+returns = "nothing"
+
+["window.toggle_joints"]
+summary = "Opens or closes the Joints panel: joint states, drive targets and gains, the fixed base and teleop."
+kind = "view"
+returns = "nothing"
+
+["window.toggle_poses"]
+summary = "Opens or closes the Poses panel: named joint poses to blend to, start from, import and export."
+kind = "view"
+returns = "nothing"
+
+["window.toggle_policy"]
+summary = "Opens or closes the Policy panel: load a locomotion policy, run or stop it and watch its actions."
+kind = "view"
+returns = "nothing"
+
+["window.toggle_demos"]
+summary = "Opens or closes the Demos panel: record teleoperated demonstrations, replay them and save them as HDF5."
+kind = "view"
+returns = "nothing"
+
+["window.toggle_sensors"]
+summary = "Opens or closes the Sensors panel: preview each sensor's images, ranges and readings as the simulation runs."
+kind = "view"
+returns = "nothing"
+
+["window.toggle_randomize"]
+summary = "Opens or closes the Randomize panel: randomize looks, masses, gravity and parameters from a seed, again on reset."
+kind = "view"
+returns = "nothing"
+
+["window.toggle_training"]
+summary = "Opens or closes the Training panel: configure a task, start and watch runs, plot them and play their saves."
+kind = "view"
+returns = "nothing"
+
+["window.toggle_script"]
+summary = "Opens or closes the Script panel: the Python editor."
+kind = "view"
+returns = "nothing"
+
+["window.toggle_console"]
+summary = "Opens or closes the Console panel: script output and a Python prompt."
+kind = "view"
+returns = "nothing"
+
+["window.toggle_nui"]
+summary = "Opens or closes the UI Inspector: the nui component tree, for extension authors."
+kind = "view"
+returns = "nothing"
+
+["tools.nui_inspector"]
+summary = "Opens or closes the UI Inspector; the same as window.toggle_nui."
+kind = "view"
+returns = "nothing"

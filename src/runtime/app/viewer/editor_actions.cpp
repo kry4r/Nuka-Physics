@@ -51,6 +51,12 @@ bool ParseShortcut(const std::string& text, std::vector<int>* chords) {
     return true;
 }
 
+// A text field of an action's doc, `fallback` when the doc lacks it.
+std::string DocText(const json::Value* doc, const char* key, const char* fallback) {
+    const json::Value* v = doc != nullptr ? doc->Find(key) : nullptr;
+    return v != nullptr ? v->AsString() : fallback;
+}
+
 }  // namespace
 
 ActionResult ActionResult::Fail(std::string error) {
@@ -139,22 +145,41 @@ std::vector<std::string> ActionRegistry::Pressed(bool global_ok, bool viewport_o
     return ids;
 }
 
+const json::Value* ActionRegistry::Doc(const Action& action) const {
+    return action.doc.IsNull() ? docs_.Find(action.id) : &action.doc;
+}
+
+std::string ActionRegistry::Kind(const Action& action) const { return DocText(Doc(action), "kind", "process"); }
+
+json::Value ActionRegistry::Describe(const Action& a, bool full) const {
+    const json::Value* doc = Doc(a);
+    json::Value v = json::Value::Object();
+    v.Set("id", json::Value::Str(a.id));
+    v.Set("label", json::Value::Str(a.label));
+    v.Set("category", json::Value::Str(a.category));
+    v.Set("shortcut", json::Value::Str(a.shortcut));
+    v.Set("icon", json::Value::Str(a.icon));
+    v.Set("hidden", json::Value::Bool(a.hidden));
+    v.Set("enabled", json::Value::Bool(!a.enabled || a.enabled()));
+    if (a.checked) v.Set("checked", json::Value::Bool(a.checked()));
+    v.Set("owner", json::Value::Str(a.owner));
+    v.Set("summary", json::Value::Str(DocText(doc, "summary", "")));
+    v.Set("kind", json::Value::Str(Kind(a)));
+    if (!full) return v;
+    for (const char* key : {"args", "returns", "example"}) {
+        const json::Value* field = doc != nullptr ? doc->Find(key) : nullptr;
+        v.Set(key, field != nullptr ? *field : json::Value());
+    }
+    return v;
+}
+
 json::Value ActionRegistry::List() const {
     json::Value list = json::Value::Array();
-    for (const Action& a : actions_) {
-        json::Value v = json::Value::Object();
-        v.Set("id", json::Value::Str(a.id));
-        v.Set("label", json::Value::Str(a.label));
-        v.Set("category", json::Value::Str(a.category));
-        v.Set("shortcut", json::Value::Str(a.shortcut));
-        v.Set("icon", json::Value::Str(a.icon));
-        v.Set("hidden", json::Value::Bool(a.hidden));
-        v.Set("enabled", json::Value::Bool(!a.enabled || a.enabled()));
-        if (a.checked) v.Set("checked", json::Value::Bool(a.checked()));
-        list.PushBack(std::move(v));
-    }
+    for (const Action& a : actions_) list.PushBack(Describe(a, false));
     return list;
 }
+
+json::Value ActionRegistry::Help(const Action& action) const { return Describe(action, true); }
 
 json::Value ActionRegistry::LogSince(uint64_t seq) const {
     json::Value list = json::Value::Array();

@@ -66,14 +66,16 @@ private:
 
 struct ActionInfo {
     ActionInfo(const char* action_id, const char* action_label, const char* menu = nullptr, const char* keys = nullptr,
-               const char* glyph = nullptr, bool skip_menus = false)
-        : id(action_id), label(action_label), category(menu), shortcut(keys), icon(glyph), hidden(skip_menus) {}
+               const char* glyph = nullptr, bool skip_menus = false, const char* doc_json = nullptr)
+        : id(action_id), label(action_label), category(menu), shortcut(keys), icon(glyph), hidden(skip_menus),
+          doc(doc_json) {}
     const char* id;
     const char* label;
     const char* category;  // "extensions" when null
     const char* shortcut;
     const char* icon;
     bool hidden;
+    const char* doc;  // the action's doc as JSON; see nuka_editor_action_desc_t::doc_json
 };
 
 using ActionFn = std::function<Reply(const std::string& args_json)>;
@@ -103,6 +105,7 @@ public:
         desc.shortcut = info.shortcut;
         desc.icon = info.icon;
         desc.hidden = info.hidden ? 1u : 0u;
+        desc.doc_json = info.doc;
         desc.run = &RunAction;
         desc.user = new ActionSlot{std::move(fn), std::string()};
         desc.release = [](void* user) { delete static_cast<ActionSlot*>(user); };

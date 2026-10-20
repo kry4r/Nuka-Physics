@@ -37,6 +37,9 @@ typedef struct nuka_editor_action_desc_t {
     nuka_editor_action_fn run;
     void* user;
     void (*release)(void* user);  // once the action is gone; may be NULL
+    // {"summary", "kind", "args", "returns", "example"} as JSON, the shape of assets/editor/actions.toml's
+    // entries; NULL leaves it undocumented, which agents' access modes treat as kind "process".
+    const char* doc_json;
 } nuka_editor_action_desc_t;
 
 // One frame over the scene viewport: column-major view and GL-style projection, the

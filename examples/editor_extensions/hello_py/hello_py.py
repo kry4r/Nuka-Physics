@@ -17,7 +17,10 @@ class HelloPy(Extension):
         row = panel.hstack()
         row.button("Greet", icon="file_py", primary=True, on_click=self.greet)
         row.toggle("Axes", value=True, on_change=self.show_axes)
-        ctx.actions.register("hello_py.greet", "Greet from Python", self.run_greet, category="tools", icon="file_py")
+        ctx.actions.register("hello_py.greet", "Greet from Python", self.run_greet, category="tools", icon="file_py",
+                             doc={"summary": "Shows the greeting as a toast and counts the greetings.", "kind": "view",
+                                  "args": {"fail": "bool, fail on purpose, default false"},
+                                  "returns": "{count, text}"})
         ctx.overlays.register("hello_py.axes", self.draw)
         ctx.log(f"started: {self.greeting}")
 
