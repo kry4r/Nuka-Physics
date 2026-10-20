@@ -47,6 +47,7 @@
 #include "runtime/app/viewer/sysid.hpp"
 #include "runtime/app/viewer/teleop.hpp"
 #include "runtime/app/viewer/train_observe.hpp"
+#include "runtime/inference/contract_policy_controller.hpp"
 #include "runtime/inference/go2_policy_controller.hpp"
 #include "scene/asset/asset_bytes.hpp"
 #include "scene/format/json.hpp"
@@ -1290,13 +1291,20 @@ struct EditorHost::State : DocumentHost {
     // The ik mode's link: the one teleop.use named, else the selected link below a root; -1 when none.
     int TeleopLink() const;
     json::Value TeleopStatus() const;
-    // A policy over the loaded robots, or null with `error` saying why it does not fit them.
-    std::unique_ptr<inference::Go2PolicyController> MakeController(const std::string& path, bool host,
-                                                                   std::string* error) const;
+    // A policy over the loaded robots, or null with `error` saying why it does not fit them. A policy with
+    // a contract beside it (<name>.contract.json) runs through it, any other through the Go2 contract.
+    std::unique_ptr<inference::PolicyController> MakeController(const std::string& path, bool host,
+                                                                std::string* error) const;
+    std::unique_ptr<inference::PolicyController> MakeContractController(const std::string& path,
+                                                                        const fs::path& contract,
+                                                                        std::string* error) const;
     // The Policy panel's copy of the loaded policy's contract; the command and the norms follow it.
     void SyncPolicyView();
     // The shown robots' action norm at a new tick, read back from the drive targets the policy wrote.
     void RecordPolicyNorm(const Snapshot& snap);
+    // The command and the measured velocity as arrows over each robot the policy drives.
+    void StepPolicyArrows(const Snapshot& snap);
+    void ClearPolicyArrows();
     json::Value PolicyStatus();
     // Ends the demonstration recording; each environment's consecutive steps become an episode.
     void StopDemo();
@@ -1344,9 +1352,16 @@ struct EditorHost::State : DocumentHost {
     std::unique_ptr<InstanceServer> instance_;
     SceneCache cache_;
     render::RenderWorld empty_world_;
-    std::unique_ptr<inference::Go2PolicyController> policy_ctrl_;
+    std::unique_ptr<inference::PolicyController> policy_ctrl_;
     bool policy_on_ = true;      // a loaded policy steps; off, its drive targets hold
     uint64_t policy_tick_ = 0u;  // the tick RecordPolicyNorm last read
+    // Each policy robot's root at the last snapshot, its smoothed planar velocity and its command in the world.
+    struct PolicyArrows {
+        float lift = 0.0f;  // over the root; 0 until the first snapshot measures the robot
+        double time = -1.0;
+        std::vector<math::Vec3> root, velocity, command;
+        bool drawn = false;
+    } policy_arrows_;
     DemoSet demos_;              // the demonstrations recorded or loaded
     bool demo_recording_ = false;
     std::vector<float> demo_axes_;  // the teleop axes last sent while recording, by the set's names
@@ -2271,6 +2286,7 @@ void EditorHost::State::ApplySnapshot(const Snapshot& snap) {
     if (!snap.particles.empty()) loaded_->sim->ApplyParticles(snap.particles, snap.heat, ui_state_.solver.alert);
     ui_state_.robot.live = snap.joints;
     RecordPolicyNorm(snap);
+    StepPolicyArrows(snap);
     DemoView& demo = ui_state_.demos;
     ClipView& clips = ui_state_.clips;
     demo.samples = worker_.DemoCount();
@@ -4994,7 +5010,7 @@ void EditorHost::State::RegisterPolicyActions() {
                       if (path.empty()) return ActionResult::Fail("no policy file chosen");
                       const bool host = BoolArg(args, "host", false);
                       std::string error;
-                      std::unique_ptr<inference::Go2PolicyController> pc = MakeController(path, host, &error);
+                      std::unique_ptr<inference::PolicyController> pc = MakeController(path, host, &error);
                       if (pc == nullptr) {
                           ui_state_.policy.error = error;
                           return ActionResult::Fail(error);
@@ -5021,6 +5037,7 @@ void EditorHost::State::RegisterPolicyActions() {
                           policy_ctrl_.reset();
                       });
                       opt_.policy_path.clear();
+                      ClearPolicyArrows();
                       SyncPolicyView();
                       return Ok(PolicyStatus());
                   }});
@@ -5033,6 +5050,15 @@ void EditorHost::State::RegisterPolicyActions() {
                       worker_.Exclusive([&] { worker_.SetController(policy_on_ ? policy_ctrl_.get() : nullptr); });
                       ui_state_.policy.on = policy_on_;
                       teleop_command_sent_.reset();
+                      return Ok(PolicyStatus());
+                  }});
+    // Shows or hides the arrows of the command and the measured velocity over the policy's robots. Bare, it toggles.
+    actions_.Add({"policy.arrows", "Policy Arrows", "robot", "", ShortcutScope::Global, has_policy,
+                  [this] { return ui_state_.policy.arrows; },
+                  [this](const json::Value& args) {
+                      PolicyView& p = ui_state_.policy;
+                      p.arrows = BoolArg(args, "on", args.Items().empty() ? !p.arrows : p.arrows);
+                      if (!p.arrows) ClearPolicyArrows();
                       return Ok(PolicyStatus());
                   }});
     // The loaded policy, its contract, the joints it drives and the command it reads.
@@ -9581,8 +9607,10 @@ json::Value EditorHost::State::DocumentState() {
     return v;
 }
 
-std::unique_ptr<inference::Go2PolicyController> EditorHost::State::MakeController(const std::string& path, bool host,
-                                                                                  std::string* error) const {
+std::unique_ptr<inference::PolicyController> EditorHost::State::MakeController(const std::string& path, bool host,
+                                                                               std::string* error) const {
+    const fs::path contract = Utf8Path(path).replace_extension(".contract.json");
+    if (fs::is_regular_file(contract)) return MakeContractController(path, contract, error);
     // Without a heightfield the height scan reads the z = 0 ground plane.
     static const terrain::HeightField kPlane = [] {
         terrain::HeightField plane;
@@ -9600,9 +9628,92 @@ std::unique_ptr<inference::Go2PolicyController> EditorHost::State::MakeControlle
     return pc;
 }
 
+std::unique_ptr<inference::PolicyController> EditorHost::State::MakeContractController(const std::string& path,
+                                                                                       const fs::path& file,
+                                                                                       std::string* error) const {
+    using Runner = inference::ContractPolicyController;
+    Runner::Contract c;
+    std::vector<std::string> names;
+    float dt = 0.0f;
+    try {
+        std::ifstream in(file, std::ios::binary);
+        const json::Value doc = json::Value::Parse(std::string(std::istreambuf_iterator<char>(in), {}));
+        if (doc.At("version").AsInt() != 1) {
+            *error = "the contract's version is not 1";
+            return nullptr;
+        }
+        const auto floats = [&](const char* key) {
+            std::vector<float> out;
+            for (const json::Value& e : doc.At(key).Elements()) out.push_back(e.AsFloat());
+            return out;
+        };
+        for (const json::Value& j : doc.At("joints").Elements()) names.push_back(j.AsString());
+        c.defaults = floats("default");
+        c.stiffness = floats("stiffness");
+        c.damping = floats("damping");
+        c.effort = floats("effort");
+        c.action_scale = doc.At("action_scale").AsFloat();
+        c.decimation = static_cast<uint32_t>(std::max<int64_t>(doc.At("decimation").AsInt(), 1));
+        c.history = static_cast<uint32_t>(std::max<int64_t>(doc.At("history").AsInt(), 1));
+        dt = doc.At("dt").AsFloat();
+        for (const json::Value& t : doc.At("terms").Elements()) {
+            Runner::TermSpec spec;
+            const std::string& name = t.At("name").AsString();
+            if (!Runner::ParseTerm(name, &spec.term)) {
+                *error = "the contract's term '" + name + "' is not one the editor builds";
+                return nullptr;
+            }
+            spec.dims = static_cast<uint32_t>(t.At("dims").AsInt());
+            spec.scale = t.At("scale").AsFloat();
+            c.terms.push_back(spec);
+        }
+    } catch (const std::exception& e) {
+        *error = "cannot read the contract '" + PathText(file) + "': " + e.what();
+        return nullptr;
+    }
+    const size_t n = names.size();
+    if (c.defaults.size() != n || c.stiffness.size() != n || c.damping.size() != n || c.effort.size() != n) {
+        *error = "the contract's joint lists differ in length";
+        return nullptr;
+    }
+    if (std::fabs(dt - opt_.dt) > 1e-6f) {
+        *error = Format("the policy was trained at a %g s step; the scene steps every %g s", static_cast<double>(dt),
+                        static_cast<double>(opt_.dt));
+        return nullptr;
+    }
+    // A robot is an articulation with every joint the contract names.
+    const WorldLayout& layout = loaded_->Layout();
+    const std::vector<RobotJoint> joints =
+        RobotJoints(loaded_->scene, layout, [this](scene::EntityId e) { return PathOfEntity(e); });
+    std::vector<Runner::Robot> robots;
+    for (uint32_t a = 0; a < layout.articulations_per_env; ++a) {
+        Runner::Robot robot;
+        for (uint32_t l = 0; l < layout.links_per_env; ++l)
+            if (layout.links[l].articulation_index == a && layout.links[l].is_root != 0u) robot.root = l;
+        for (const std::string& name : names) {
+            const auto j = std::find_if(joints.begin(), joints.end(), [&](const RobotJoint& r) {
+                return r.name == name && layout.links[r.link].articulation_index == a;
+            });
+            if (j == joints.end()) break;
+            robot.joints.push_back(j->link);
+        }
+        if (robot.joints.size() == n) robots.push_back(std::move(robot));
+    }
+    if (layout.articulations_per_env == 0u || n == 0u || robots.empty()) {
+        *error = layout.articulations_per_env == 0u ? "the scene has no robot"
+                 : n == 0u                         ? "the contract names no joints"
+                                                   : Format("no robot has all %zu joints of the contract", n);
+        return nullptr;
+    }
+    auto pc = std::make_unique<Runner>();
+    if (!pc->Init(path, layout.links_per_env, robots, c, error)) return nullptr;
+    return pc;
+}
+
 // The --policy or policy.load policy, attached again at every load and rebuild.
 void EditorHost::State::AttachController() {
     policy_ctrl_.reset();
+    ClearPolicyArrows();
     ui_state_.policy.error.clear();
     if (!opt_.policy_path.empty()) {
         policy_ctrl_ = MakeController(opt_.policy_path, opt_.force_host_policy, &ui_state_.policy.error);
@@ -9625,21 +9736,21 @@ void EditorHost::State::SyncPolicyView() {
     p.norm = 0.0f;
     p.norm_time.clear();
     p.norm_value.clear();
+    p.contract.clear();
     if (policy_ctrl_ == nullptr) return;
-    const inference::Go2PolicyController::Config& c = policy_ctrl_->Contract();
     p.gpu = policy_ctrl_->UsingGpu();
     p.robots = policy_ctrl_->Robots();
     p.obs_dim = policy_ctrl_->ObsDim();
     p.act_dim = policy_ctrl_->ActDim();
-    p.decimation = c.decimation;
-    p.rate_hz = 1.0f / (opt_.dt * static_cast<float>(c.decimation));
-    p.action_scale = c.action_scale;
-    for (uint32_t k = 0; k < p.robots; ++k)
-        for (size_t u = 0; u < c.default_angles.size(); ++u) {
-            p.links.push_back(k * policy_ctrl_->LinksPerRobot() + 1u + c.slot_of_urdf[u]);
-            p.defaults.push_back(c.default_angles[u]);
-        }
-    std::copy(c.command.begin(), c.command.end(), p.command);
+    p.decimation = policy_ctrl_->Decimation();
+    p.rate_hz = 1.0f / (opt_.dt * static_cast<float>(p.decimation));
+    p.action_scale = policy_ctrl_->ActionScale();
+    p.links = policy_ctrl_->ActionLinks();
+    p.defaults = policy_ctrl_->ActionDefaults();
+    const std::array<float, 3> command = policy_ctrl_->Command();
+    std::copy(command.begin(), command.end(), p.command);
+    const fs::path contract = Utf8Path(opt_.policy_path).replace_extension(".contract.json");
+    if (fs::is_regular_file(contract)) p.contract = PathText(contract);
     std::snprintf(p.path_edit, sizeof(p.path_edit), "%s", opt_.policy_path.c_str());
 }
 
@@ -9669,6 +9780,58 @@ void EditorHost::State::RecordPolicyNorm(const Snapshot& snap) {
     }
 }
 
+void EditorHost::State::StepPolicyArrows(const Snapshot& snap) {
+    // The newest measurement's share of the shown velocity, and the arrows' clearance over a robot's top.
+    constexpr float kVelocityShare = 0.2f, kArrowClearance = 0.3f;
+    // Train Observe draws its own arrows while it runs.
+    if (observe_) return;
+    PolicyArrows& a = policy_arrows_;
+    if (policy_ctrl_ == nullptr || !ui_state_.policy.arrows || snap.link_poses.empty()) {
+        ClearPolicyArrows();
+        return;
+    }
+    const std::vector<uint32_t>& roots = policy_ctrl_->RootLinks();
+    const size_t n = roots.size();
+    if (a.lift == 0.0f)
+        a.lift = std::max(loaded_->sim->LinkTop(snap.link_poses) - snap.link_poses[roots[0]].position.z, 0.0f) +
+                 kArrowClearance;
+    // A rewound timeline starts the measurement over.
+    if (a.root.size() != n || snap.sim_time < a.time) {
+        a.root.clear();
+        a.velocity.assign(n, math::Vec3{});
+    }
+    const float dt = a.root.empty() ? 0.0f : static_cast<float>(snap.sim_time - a.time);
+    const float* cmd = ui_state_.policy.command;
+    a.command.resize(n);
+    std::vector<EditorSim::Arrow> arrows;
+    for (size_t r = 0; r < n; ++r) {
+        const math::Transform& pose = snap.link_poses[roots[r]];
+        if (dt > 0.0f) {
+            const math::Vec3 v = (pose.position - a.root[r]) * (1.0f / dt);
+            a.velocity[r] = a.velocity[r] + (math::Vec3{v.x, v.y, 0.0f} - a.velocity[r]) * kVelocityShare;
+        }
+        const auto& q = pose.rotation;
+        const float yaw = std::atan2(2.0f * (q.w * q.z + q.x * q.y), 1.0f - 2.0f * (q.y * q.y + q.z * q.z));
+        const float c = std::cos(yaw), s = std::sin(yaw);
+        a.command[r] = math::Vec3{c * cmd[0] - s * cmd[1], s * cmd[0] + c * cmd[1], 0.0f};
+        const math::Vec3 at = pose.position + math::Vec3{0.0f, 0.0f, a.lift};
+        arrows.push_back({at, a.command[r], true});
+        arrows.push_back({at, a.velocity[r], false});
+    }
+    if (a.root.empty() || dt > 0.0f) {
+        a.root.resize(n);
+        for (size_t r = 0; r < n; ++r) a.root[r] = snap.link_poses[roots[r]].position;
+        a.time = snap.sim_time;
+    }
+    loaded_->sim->SetArrows(arrows);
+    a.drawn = true;
+}
+
+void EditorHost::State::ClearPolicyArrows() {
+    if (policy_arrows_.drawn && loaded_ && !observe_) loaded_->sim->SetArrows({});
+    policy_arrows_ = PolicyArrows{};
+}
+
 json::Value EditorHost::State::PolicyStatus() {
     const PolicyView& p = ui_state_.policy;
     json::Value v = Object({{"loaded", json::Value::Bool(p.loaded)},
@@ -9678,7 +9841,7 @@ json::Value EditorHost::State::PolicyStatus() {
     if (policy_ctrl_ == nullptr) return v;
     // The command the policy reads now, which the stepping thread writes.
     std::array<float, 3> command{};
-    worker_.Exclusive([&] { command = policy_ctrl_->Contract().command; });
+    worker_.Exclusive([&] { command = policy_ctrl_->Command(); });
     const std::vector<RobotJoint>& rj = ui_state_.robot.joints;
     const size_t per = p.links.size() / p.robots;
     json::Value joints = json::Value::Array();
@@ -9699,6 +9862,19 @@ json::Value EditorHost::State::PolicyStatus() {
     v.Set("joints", std::move(joints));
     v.Set("command", Vec3Json(math::Vec3{command[0], command[1], command[2]}));
     v.Set("action_norm", json::Value::Float(p.norm));
+    v.Set("contract", json::Value::Str(p.contract));
+    json::Value roots = json::Value::Array();
+    for (const uint32_t root : policy_ctrl_->RootLinks()) roots.PushBack(json::Value::Int(root));
+    v.Set("roots", std::move(roots));
+    // The arrows drawn over each robot: where they start, the command and the measured velocity in the world.
+    json::Value arrows = json::Value::Array();
+    const PolicyArrows& a = policy_arrows_;
+    for (size_t r = 0; r < a.root.size() && a.drawn; ++r)
+        arrows.PushBack(Object({{"at", Vec3Json(a.root[r] + math::Vec3{0.0f, 0.0f, a.lift})},
+                                {"command", Vec3Json(a.command[r])},
+                                {"velocity", Vec3Json(a.velocity[r])}}));
+    v.Set("arrows_on", json::Value::Bool(p.arrows));
+    v.Set("arrows", std::move(arrows));
     return v;
 }
 

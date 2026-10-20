@@ -874,6 +874,7 @@ if(CMAKE_CUDA_COMPILER)
     # -------------------------------------------------------------------------
     add_library(nuka_inference STATIC
         runtime/inference/go2_policy_controller.cpp
+        runtime/inference/contract_policy_controller.cpp
     )
     set_target_properties(nuka_inference PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_include_directories(nuka_inference PUBLIC ${CMAKE_SOURCE_DIR}/src)

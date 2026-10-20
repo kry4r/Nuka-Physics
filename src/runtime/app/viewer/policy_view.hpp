@@ -12,7 +12,9 @@ struct PolicyView {
     bool on = true;  // it steps; off, the drive targets hold where it left them
     bool gpu = false;
     std::string path;
-    std::string error;  // why the last attach failed
+    std::string contract;  // the contract it runs under, empty for the Go2 one
+    std::string error;     // why the last attach failed
+    bool arrows = true;    // the command and measured velocity draw over its robots
     uint32_t robots = 0u;
     uint32_t obs_dim = 0u;
     uint32_t act_dim = 0u;

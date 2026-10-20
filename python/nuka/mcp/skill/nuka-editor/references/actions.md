@@ -127,6 +127,7 @@ This page is generated from assets/editor/actions.toml by tools/skill_actions.py
 - `policy.unload` [sim]: Detaches the loaded policy; the drive targets hold where it left them.
 - `policy.enable` {on?} [sim]: Runs or stops the loaded policy; stopped, the drive targets hold where it left them.
 - `policy.status` [read]: The loaded policy, its contract, the joints it drives and the command it reads.
+- `policy.arrows` {on?} [view]: Shows or hides the arrows of the command and the measured velocity over the policy's robots.
 - `demo.record` {on?, all?} [sim]: Records the shown environment, with `all` every displayed one, each step at the head: drive targets, joint states and the teleop device's axes.
 - `demo.episodes` [read]: The recorded episodes, the recording and the replay in progress.
 - `demo.play` {episode?, play?} [sim]: Writes an episode's recorded drive targets into its environment a row a step from the state now, the controller waiting meanwhile; `play` (the default) starts the transport.

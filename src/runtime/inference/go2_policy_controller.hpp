@@ -15,7 +15,7 @@
 
 #include "runtime/inference/gpu_policy.hpp"
 #include "runtime/inference/mlp_policy.hpp"
-#include "runtime/inference/world_controller.hpp"
+#include "runtime/inference/policy_controller.hpp"
 #include "scene/terrain/heightfield.hpp"
 
 #include <array>
@@ -25,7 +25,7 @@
 
 namespace nuka::runtime::inference {
 
-class Go2PolicyController : public WorldController {
+class Go2PolicyController : public PolicyController {
 public:
     // The Go2 locomotion contract DATA (legged_gym FL/FR/RL/RR x hip/thigh/calf).
     // slot_of_urdf[u] = buffer leg-slot of URDF joint u (identity for go2.nks).
@@ -65,10 +65,15 @@ public:
     bool Ready() const { return ready_; }
     // Only `command` changes after Init, on the thread that steps the world.
     const Config& Contract() const { return cfg_; }
-    uint32_t Robots() const { return num_dogs_; }
+    const std::vector<uint32_t>& RootLinks() const override { return roots_; }
+    const std::vector<uint32_t>& ActionLinks() const override { return links_; }
+    const std::vector<float>& ActionDefaults() const override { return defaults_; }
+    uint32_t Decimation() const override { return cfg_.decimation; }
+    float ActionScale() const override { return cfg_.action_scale; }
+    std::array<float, 3> Command() const override { return cfg_.command; }
     uint32_t LinksPerRobot() const { return links_per_dog_; }
-    uint32_t ObsDim() const { return policy_.ObsDim(); }
-    uint32_t ActDim() const { return policy_.ActDim(); }
+    uint32_t ObsDim() const override { return policy_.ObsDim(); }
+    uint32_t ActDim() const override { return policy_.ActDim(); }
     void SetCommand(float vx, float vy, float wyaw) {
         cfg_.command = {vx, vy, wyaw};
         gpu_.SetCommand(vx, vy, wyaw);
@@ -76,7 +81,6 @@ public:
 
     // General command seam: a locomotion command consumer. Teleop / scripts write a
     // [vx, vy, wyaw] vector through the base WorldController without knowing the type.
-    bool AcceptsCommand() const override { return true; }
     void SetCommandVector(const float* cmd, uint32_t count) override {
         SetCommand(count > 0u ? cmd[0] : 0.0f, count > 1u ? cmd[1] : 0.0f,
                    count > 2u ? cmd[2] : 0.0f);
@@ -86,7 +90,7 @@ public:
     // stays the numeric ORACLE. SetUseGpu(false) forces the host path (validation
     // A/B + the no-CUDA fallback). UsingGpu() reports the resolved choice.
     void SetUseGpu(bool on) { use_gpu_ = on && gpu_.Ready(); }
-    bool UsingGpu() const { return use_gpu_; }
+    bool UsingGpu() const override { return use_gpu_; }
 
     void OnStep(nuka_world_handle world, uint32_t env_index) override;
 
@@ -107,6 +111,8 @@ private:
     mutable std::vector<float> pose_, vel_, q_, qd_, bp_, tgt_;
     mutable std::vector<float> obs_, mu_;
     std::vector<float> last_action_;  // num_dogs*12, persists across control steps
+    std::vector<uint32_t> roots_, links_;
+    std::vector<float> defaults_;
 };
 
 }  // namespace nuka::runtime::inference

@@ -134,6 +134,16 @@ bool Go2PolicyController::Init(const std::string& policy_path, uint32_t links_pe
     if (!use_gpu_) {
         std::fprintf(stderr, "[go2_policy] GPU policy init failed; host fallback\n");
     }
+    roots_.clear();
+    links_.clear();
+    defaults_.clear();
+    for (uint32_t k = 0; k < num_dogs_; ++k) {
+        roots_.push_back(k * links_per_dog_);
+        for (uint32_t u = 0; u < kJoints; ++u) {
+            links_.push_back(k * links_per_dog_ + 1u + cfg_.slot_of_urdf[u]);
+            defaults_.push_back(cfg_.default_angles[u]);
+        }
+    }
     ready_ = true;
     return true;
 }

@@ -633,6 +633,7 @@ void ImGuiLayer::BuildPolicy(nui::VStack& root) {
     auto& head = root.Add<nui::HStack>();
     head.wrap = true;
     head.Add<nui::ToggleButton>("Run").Action("policy.enable");
+    head.Add<nui::ToggleButton>("Arrows").Action("policy.arrows");
     auto& state = head.Add<nui::Badge>();
     state.text_fn = [pol] { return std::string(Tr(!pol().loaded ? "no policy" : pol().on ? "running" : "stopped")); };
     state.tone_fn = [pol] { return !pol().loaded ? Tone::Dim : pol().on ? Tone::Accent : Tone::Warn; };

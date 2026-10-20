@@ -1072,7 +1072,7 @@ kind = "read"
 returns = "{on, device, connected, mode, axes, buttons, quantities, command, command_base, controller, joint, link, goal, hold, kp, kd, deadzone, error}"
 
 ["policy.load"]
-summary = "Attaches an NKML locomotion policy to the loaded robots in place of the one before, and sends it teleop's command; the dialog asks without `path`, `host` runs the host MLP."
+summary = "Attaches an NKML locomotion policy to the loaded robots in place of the one before, and sends it teleop's command; the dialog asks without `path`, `host` runs the host MLP. A policy with a `<name>.contract.json` beside it, as a training run writes one, runs on every robot with the contract's joints through its observation terms and gains; any other runs under the Go2 contract."
 kind = "process"
 args.path = "string, the policy file (.nkml or .bin), default: a file dialog"
 args.host = "bool, run the MLP on the CPU instead of the GPU, default false"
@@ -1092,7 +1092,13 @@ returns = "the policy status"
 ["policy.status"]
 summary = "The loaded policy, its contract, the joints it drives and the command it reads."
 kind = "read"
-returns = "{loaded, on, path, error, robot, ...}"
+returns = "{loaded, on, path, error, device, robots, obs_dim, act_dim, decimation, rate_hz, action_scale, joints, command, action_norm, contract, roots, arrows_on, arrows: [{at, command, velocity}]}"
+
+["policy.arrows"]
+summary = "Shows or hides the arrows of the command and the measured velocity over the policy's robots. Bare, it toggles."
+kind = "view"
+args.on = "bool, show them, default: toggles"
+returns = "the policy status"
 
 ["demo.record"]
 summary = "Records the shown environment, with `all` every displayed one, each step at the head: drive targets, joint states and the teleop device's axes. The stop cuts each environment's consecutive steps into an episode. Bare, it toggles."
