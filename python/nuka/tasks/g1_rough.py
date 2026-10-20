@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -84,8 +85,8 @@ def _match(table, name, default):
 
 
 def training_scene(scene: str) -> tuple[Path, dict]:
-    """The scene flattened into a temporary .nks without mesh, hull or static collision shapes, and its parsed
-    tree."""
+    """The scene flattened into a .nks in a new temporary folder, which the caller removes, without mesh, hull or
+    static collision shapes, and its parsed tree."""
     folder = Path(tempfile.mkdtemp(prefix="nuka_g1_"))
     out = folder / "scene.nks"
     loaded = nuka.Scene.load(scene)
@@ -189,6 +190,8 @@ class G1RoughEnv:
             heightfield_nrow=n, heightfield_ncol=n, heightfield_cell=float(t["cell"]),
             terrain_grid_height_max=float(t["bump_height"]), terrain_grid_width=float(t["bump_cell"]),
             terrain_step_height=float(t["step_height"]), terrain_step_width=0.3, terrain_platform_width=1.0)
+        # The world holds the scene in memory, so the flattened copy goes now rather than piling up in the temp folder.
+        shutil.rmtree(path.parent)
         self.terrain = TerrainSampler(self.world, self._dev)
         grid = torch.arange(origins, device=self._dev)
         self._origins = torch.stack(((grid % side).float(), (grid // side).float()), 1) * env_spacing
