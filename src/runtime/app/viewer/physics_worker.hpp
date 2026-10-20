@@ -13,6 +13,7 @@
 #include "runtime/app/viewer/robot_view.hpp"
 #include "runtime/app/viewer/script_host.hpp"
 #include "runtime/app/viewer/sensor_view.hpp"
+#include "runtime/app/viewer/sysid.hpp"
 #include "runtime/app/viewer/timeline_view.hpp"
 #include "runtime/inference/world_controller.hpp"
 #include "scene/format/json.hpp"
@@ -38,7 +39,7 @@ using WorkerClock = std::chrono::steady_clock;
 
 enum class CommandKind : uint8_t {
     EditApply, Teleport, ParamSet, Perturb, Transport, ScriptCall, Timeline, Beauty, GainTest, IkSolve, SensorRead,
-    Observe
+    Observe, SysIdEval
 };
 enum class ParamKind : uint8_t {
     Field, HoldGains, ControllerCommand, DisplayEnv, ScatterRows, Overlay, Registry, Telemetry, Iterations, Heatmap,
@@ -87,7 +88,8 @@ struct TickCommand {
     // sweep budget, heatmap or joint watch flag, ghost flag, the keyframe interval and budget [MB],
     // a target ramp's (link, from, to) triples, the worker stamping `from`, a target track's links
     // then its rows, the teleop axes, a gain test's (sine, amplitude, frequency, duration), a
-    // randomization as PhysicsWorker::Randomize reads it, or what PhysicsWorker::Observe writes.
+    // randomization as PhysicsWorker::Randomize reads it, what PhysicsWorker::Observe writes, or an
+    // identification's registry writes as (param, element, value) triples.
     std::vector<float> values;
     // DisplayEnv, TargetTrack, SensorRead; the worker stamps pose writes with the shown one.
     uint32_t env = 0u;
@@ -113,6 +115,7 @@ struct TickCommand {
     // targets while playing and the joints at rest as well while paused.
     nuka_ik_request_t ik{};
     std::vector<nuka_ik_target_t> ik_targets;
+    std::shared_ptr<const SysIdEpisode> sysid;  // SysIdEval: the episode it replays
 
     static TickCommand Transport(TransportOp op);
     static TickCommand Param(ParamKind param, std::vector<float> values);
@@ -388,6 +391,8 @@ public:
     bool TakeIk(IkReport* out);
     // Moves the newest sensor reading into `out` once; readable from any thread.
     bool TakeSensorReading(SensorReading* out);
+    // Moves the newest identification replay's score into `out` once; readable from any thread.
+    bool TakeSysId(SysIdResult* out);
     // Copies the joint samples numbered `since` on, 0 being the first of `session`; returns the
     // count taken in it. Readable from any thread.
     uint64_t ReadJoints(uint64_t since, std::vector<JointSample>* out, uint64_t* session);
@@ -409,6 +414,7 @@ private:
     void SampleDemo();
     void SampleStream();
     void RunGainTest(const TickCommand& cmd);
+    void RunSysId(const TickCommand& cmd);
     void SolveIk(const TickCommand& cmd);
     void Randomize(const TickCommand& cmd);
     void Observe(const TickCommand& cmd);
@@ -570,6 +576,9 @@ private:
     std::mutex sensor_mu_;
     SensorReading sensor_;
     bool sensor_ready_ = false;
+    std::mutex sysid_mu_;
+    SysIdResult sysid_;
+    bool sysid_ready_ = false;
 };
 
 }  // namespace nuka::runtime::app::viewer

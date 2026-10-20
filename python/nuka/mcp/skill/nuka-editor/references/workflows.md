@@ -67,6 +67,11 @@ Imported environments (rooms, warehouses, terrain) often bring visual meshes onl
 - Poses: `robot.pose_capture {name}`, `robot.pose_apply {name, duration}`, `robot.pose_initial {name}`
   (the start state after `sim.reset`).
 - `robot.gain_test {joint, kind: "step"}` fits rise, overshoot and settling, then read `robot.gain_status`.
+- System identification: record a demonstration episode (below) of the real or reference motion, then
+  `sysid.run {params: [{param: "joint_damping", min: 0, max: 2}], generations: 20}`; poll
+  `sysid.status` until `running` is false, compare `start_loss` with `best_loss`, and `sysid.apply`
+  writes the values in one undoable edit. Params: joint_damping, joint_armature, joint_frictionloss
+  (only when some joint authors friction), link_mass_scale.
 - IK: `robot.ik {link, pos, quat, apply: true}`.
 - Assembly: `robot.attach_asset {path, parent, mount}` mounts another asset (a hand, a sensor) on a link.
 - Clips: `clip.new {name, duration}`, `clip.key_pose {time, pose}`, `clip.play {loop: true}`.

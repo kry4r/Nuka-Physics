@@ -20,7 +20,7 @@ GROUPS = [
     (("scene",), "Scene: add, collision, nodes"),
     (("asset", "assets"), "Assets"),
     (("material",), "Materials"),
-    (("robot",), "Robots: joints, poses, gains, IK"),
+    (("robot", "sysid"), "Robots: joints, poses, gains, identification, IK"),
     (("clip", "demo", "teleop", "policy"), "Motion: clips, demonstrations, teleoperation, policies"),
     (("sim", "timeline", "solver", "rerun"), "Simulation, timeline, solver and Rerun"),
     (("sensor", "label", "dataset", "dr"), "Sensors, labels, datasets and randomization"),

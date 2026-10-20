@@ -79,7 +79,7 @@ This page is generated from assets/editor/actions.toml by tools/skill_actions.py
 - `material.make_unique` {path?} [edit]: The part at `path` (else the Material section's) takes a copy of its material of its own, as one undoable edit.
 - `material.select_users` {material} [view]: Selects the shapes that draw with `material`, and lists them.
 
-## Robots: joints, poses, gains, IK
+## Robots: joints, poses, gains, identification, IK
 
 - `robot.joints` [read]: The moving joints of the scene's robots with their limits and drives, and the shown environment's live values; the roots and whether the base floats.
 - `robot.set_targets` {targets} [sim]: Sets drive targets for the shown environment by joint name, in rad or m; the next step reads them.
@@ -102,6 +102,11 @@ This page is generated from assets/editor/actions.toml by tools/skill_actions.py
 - `robot.gain_runs` {trace?} [read]: The gain test runs the tuner keeps, oldest first; `trace` adds each one's samples.
 - `robot.gain_clear` [view]: Forgets the gain test runs the tuner keeps.
 - `robot.gain_tuner` {on?} [view]: Opens or closes the Gain Tuner window; `on` sets it, else it toggles.
+- `sysid.run` {episode?, params?, generations?, population?, sigma?, seed?} [sim]: Identifies joint damping, armature, friction loss or a link mass scale from a demonstration episode: CMA-ES searches each quantity between its min and max, and every candidate replays the episode's drive targets from its first step in a copy of the world, scored by the mean squared error against the joint positions it recorded.
+- `sysid.status` [read]: The identification's progress and its best fit so far: each quantity's mean value before the search and the best found; the loss is the mean squared joint error in rad² or m², and the curve holds the best loss after each generation.
+- `sysid.stop` [sim]: Ends the running identification with the best values found so far.
+- `sysid.apply` [edit]: Writes the finished identification's best values to its joints and links in one undoable edit; a mass scale multiplies each link's mass from before the search.
+- `sysid.panel` {on?} [view]: Opens or closes the System Identification window; `on` sets it, else it toggles.
 - `robot.links` [read]: The shown environment's robot links in link order, each with its parent link, incoming joint and mass, and where it and its centre of mass are; the robot's total mass, centre of mass and degrees of freedom.
 - `robot.asset_links` {path?, profile?} [read]: Reads an asset file without importing it and lists its links, its roots first: the mounts robot.attach_asset takes.
 - `robot.attach` {child, parent, joint?, axis?, frame?, mount?, joint_name?} [edit]: Hangs the body `child`, and what its joints carry, off the link `parent` through a new joint, as one undoable edit.

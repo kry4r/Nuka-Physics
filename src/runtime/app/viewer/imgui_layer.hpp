@@ -567,6 +567,8 @@ private:
     void DrawCollisionDialog();
     // The floating Gain Tuner while it is open.
     void DrawGainTuner();
+    // The floating System Identification window while it is open, with the search's fit.
+    void DrawSysId();
     // The floating Export Dataset window while it is open, with the running export's progress.
     void DrawDatasetExporter();
     // The floating Clip Editor while it is open: its toolbar, dope sheet and curve editor.

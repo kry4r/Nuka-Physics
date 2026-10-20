@@ -1,0 +1,37 @@
+{
+  "name": "sysid",
+  "launch": [],
+  "steps": [
+    {"action": "file.open", "args": {"path": "${scenario_dir}/../../examples/assets/nuka_lab/stage.nks"}},
+    {"frames": 20},
+    {"action": "sysid.status", "expect_value": {"running": false, "params": [], "curve": [], "error": null}},
+    {"action": "file.import", "args": {"path": "${scenario_dir}/arm3.urdf", "mode": "add", "profile": "legacy", "name": "arm",
+     "pose": {"pos": [0.3, -0.4, 0.0], "quat": [1.0, 0.0, 0.0, 0.0]}}, "bind": "arm"},
+    {"frames": 10},
+    {"action": "window.layout_robot"},
+    {"action": "view.frame_all"},
+    {"action": "robot.drive", "args": {"kp": 60.0}},
+    {"frames": 10},
+
+    {"python": "import builtins, time\nfrom nuka.editor.app import ActionError\ndef frames(n):\n    for _ in range(n):\n        app.update(True)\ndef tick():\n    return app.actions.run('timeline.status')['tick']\ndef until_tick(n):\n    deadline = time.monotonic() + 60.0\n    while tick() != n:\n        assert time.monotonic() < deadline, (tick(), n)\n        app.update(True)\n    frames(3)\ndef step(n):\n    t = tick()\n    app.actions.run('sim.step', steps=n)\n    until_tick(t + n)\ndef fails(action, text, **args):\n    try:\n        app.actions.run(action, **args)\n    except ActionError as e:\n        assert text in str(e), (action, args, str(e))\n    else:\n        raise AssertionError((action, args))\ndef damping(value):\n    joints = app.actions.run('robot.joints')['joints']\n    ops = [{'target': j['path'], 'field': 'joint.damping', 'after': value} for j in joints]\n    app.actions.run('edit.apply', label='Damping', ops=ops)\n    frames(4)\n    return {j['name']: j['damping'] for j in app.actions.run('robot.joints')['joints']}\ndef finish(seconds):\n    deadline = time.monotonic() + seconds\n    while True:\n        s = app.actions.run('sysid.status')\n        if not s['running']:\n            return s\n        assert time.monotonic() < deadline, {k: v for k, v in s.items() if k != 'curve'}\n        app.update(True)\nbuiltins.si_frames, builtins.si_step, builtins.si_fails = frames, step, fails\nbuiltins.si_damping, builtins.si_finish, builtins.si_until_tick = damping, finish, until_tick\nfails('sysid.run', '', params=[{'param': 'joint_damping'}])\nd = damping(0.8)\nassert all(abs(v - 0.8) < 1e-6 for v in d.values()) and len(d) == 3, d"},
+
+    {"python": "import builtins\napp.actions.run('sim.reset')\nbuiltins.si_until_tick(0)\napp.demos.record(True)\nbuiltins.si_frames(4)\nfor a, b, c in [(0.6, 0.4, -1.0), (-0.5, -0.3, -0.4), (0.9, 0.7, -1.6), (0.0, 0.1, -0.2), (-0.8, -0.6, -1.2), (0.3, 0.2, -0.7)]:\n    app.actions.run('robot.set_targets', targets={'shoulder_yaw': a, 'shoulder_pitch': b, 'elbow': c})\n    builtins.si_frames(2)\n    builtins.si_step(40)\ns = app.demos.record(False)\nassert len(s['episodes']) == 1 and s['episodes'][0]['steps'] == 240, s['episodes']\nd = builtins.si_damping(1.2)\nassert all(abs(v - 1.2) < 1e-6 for v in d.values()), d"},
+
+    {"python": "import builtins\nf = builtins.si_fails\nall3 = [{'param': 'joint_damping'}]\nf('sysid.run', 'lists no parameter', params=[])\nf('sysid.run', \"'bogus' is not joint_damping\", params=[{'param': 'bogus'}])\nf('sysid.run', \"the demonstrations have no joint 'nope'\", params=[{'param': 'joint_damping', 'joints': ['nope']}])\nf('sysid.run', 'wants a finite min below its max', params=[{'param': 'joint_damping', 'min': 2.0, 'max': 1.0}])\nf('sysid.run', 'a mass scale stays above 0', params=[{'param': 'link_mass_scale', 'min': 0.0}])\nf('sysid.run', 'has no live joint.frictionloss', params=[{'param': 'joint_frictionloss', 'max': 1.0}])\nf('sysid.run', 'the episode is one of 0..0', episode=3, params=all3)\nf('sysid.run', 'the population is 2..256', population=1, params=all3)\nf('sysid.run', 'the generations are 1..1000', generations=0, params=all3)\nf('sysid.run', 'sigma is in (0, 1]', sigma=2.0, params=all3)\nf('sysid.stop', '')\nf('sysid.apply', '')\nr = app.actions.run('sysid.run', params=[{'param': 'link_mass_scale', 'joints': ['elbow']}, {'param': 'joint_armature', 'max': 0.05}], generations=50, population=6)\nassert r == {'episode': 0, 'steps': 240, 'params': 2, 'evaluations': 301}, r\nf('sysid.run', 'an identification is running', params=all3)\nbuiltins.si_frames(6)\ns = app.actions.run('sysid.stop')\nprint('SYSID_STOP', {k: v for k, v in s.items() if k != 'curve'})\nassert not s['running'] and s['error'] is None and s['generations'] == 50 and s['population'] == 6, s\nassert [p['param'] for p in s['params']] == ['link_mass_scale', 'joint_armature'], s['params']\nassert s['params'][0]['nominal'] == 1.0 and s['params'][0]['joints'] == ['elbow'], s['params']\nassert s['evaluations'] < 301 and s['generation'] < 50, s\nbuiltins.si_frames(10)\nassert not app.actions.run('sysid.status')['running']"},
+
+    {"python": "import builtins\nr = app.actions.run('sysid.run', params=[{'param': 'joint_damping', 'min': 0.2, 'max': 2.0}], generations=15, population=8, seed=3)\nprint('SYSID_RUN', r)\nassert r == {'episode': 0, 'steps': 240, 'params': 1, 'evaluations': 121}, r\ns = builtins.si_finish(240.0)\nprint('SYSID_DONE', {k: v for k, v in s.items() if k != 'curve'}, s['curve'][-3:])\np = s['params'][0]\nassert s['error'] is None and s['generation'] >= 1 and s['evaluations'] <= 121 and s['steps'] == 240, s\nassert p['joints'] == ['shoulder_yaw', 'shoulder_pitch', 'elbow'] and abs(p['nominal'] - 1.2) < 1e-5, p\nassert abs(p['value'] - 0.8) < 0.08, p\nassert s['best_loss'] < 0.05 * s['start_loss'], (s['start_loss'], s['best_loss'])\nassert all(a >= b for a, b in zip(s['curve'], s['curve'][1:])), s['curve']"},
+    {"action": "sysid.panel", "args": {"on": true}, "expect_value": {"on": true}},
+    {"action": "window.maximize"},
+    {"frames": 10},
+    {"screenshot": "00_sysid"},
+    {"action": "window.restore"},
+    {"action": "sysid.panel", "args": {"on": false}, "expect_value": {"on": false}},
+
+    {"python": "import builtins\nvalue = app.actions.run('sysid.status')['params'][0]['value']\napp.actions.run('sysid.apply')\nbuiltins.si_frames(4)\nj = {x['name']: x['damping'] for x in app.actions.run('robot.joints')['joints']}\nprint('SYSID_APPLY', value, j)\nassert all(abs(d - value) < 1e-4 for d in j.values()), (j, value)\napp.actions.run('edit.undo')\nbuiltins.si_frames(4)\nj = {x['name']: x['damping'] for x in app.actions.run('robot.joints')['joints']}\nassert all(abs(d - 1.2) < 1e-5 for d in j.values()), j"},
+
+    {"action": "file.close", "args": {"discard": true}},
+    {"frames": 4},
+    {"expect": {"loaded": false}},
+    {"action": "sysid.status", "expect_value": {"running": false, "params": [], "curve": [], "error": null}}
+  ]
+}

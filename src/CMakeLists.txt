@@ -1315,6 +1315,7 @@ if(CMAKE_CUDA_COMPILER)
             runtime/app/viewer/physics_history.cpp
             runtime/app/viewer/robot_tools.cpp
             runtime/app/viewer/script_host.cpp
+            runtime/app/viewer/sysid.cpp
         )
         set_target_properties(nuka_editor_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
         target_include_directories(nuka_editor_core PUBLIC ${CMAKE_SOURCE_DIR}/src)

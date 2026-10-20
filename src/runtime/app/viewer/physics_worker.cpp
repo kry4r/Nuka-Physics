@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <exception>
+#include <limits>
 #include <utility>
 
 namespace nuka::runtime::app::viewer {
@@ -366,6 +367,14 @@ bool PhysicsWorker::TakeGainTrace(GainTrace* out) {
     return true;
 }
 
+bool PhysicsWorker::TakeSysId(SysIdResult* out) {
+    std::lock_guard<std::mutex> lock(sysid_mu_);
+    if (!sysid_ready_) return false;
+    *out = sysid_;
+    sysid_ready_ = false;
+    return true;
+}
+
 bool PhysicsWorker::TakeIk(IkReport* out) {
     std::lock_guard<std::mutex> lock(ik_mu_);
     if (!ik_ready_) return false;
@@ -650,6 +659,9 @@ bool PhysicsWorker::Apply(const TickCommand& cmd) {
         }
         case CommandKind::GainTest:
             RunGainTest(cmd);
+            return false;
+        case CommandKind::SysIdEval:
+            RunSysId(cmd);
             return false;
         case CommandKind::IkSolve:
             SolveIk(cmd);
@@ -972,6 +984,71 @@ void PhysicsWorker::RunGainTest(const TickCommand& cmd) {
     std::lock_guard<std::mutex> lock(gain_mu_);
     gain_ = std::move(trace);
     gain_ready_ = true;
+}
+
+// Puts the episode's environment in its first step's state, then replays the later steps' targets
+// under the registry values `cmd.values` holds, scoring the joint positions after each step; the
+// world and the registry values go back afterwards.
+void PhysicsWorker::RunSysId(const TickCommand& cmd) {
+    const SysIdEpisode& e = *cmd.sysid;
+    Keyframe before;
+    CheckResult(nuka_world_checkpoint_capture(bind_.world, &before.state), "nuka_world_checkpoint_capture");
+    const size_t writes = cmd.values.size() / 3u;
+    const auto at = [&](size_t i, size_t k) { return static_cast<uint32_t>(cmd.values[i * 3u + k]); };
+    std::vector<double> kept(writes);
+    for (size_t i = 0; i < writes; ++i) {
+        CheckResult(nuka_world_get_param(bind_.world, at(i, 0), at(i, 1), &kept[i]), "nuka_world_get_param");
+        CheckResult(nuka_world_set_param(bind_.world, at(i, 0), at(i, 1), cmd.values[i * 3u + 2u]),
+                    "nuka_world_set_param");
+    }
+    const WorldLayout& l = bind_.layout;
+    const size_t bytes = size_t{l.links_per_env} * sizeof(float), offset = size_t{e.env} * bytes;
+    const auto row = [&](nuka_state_field_t field, std::vector<float>* values, bool upload) {
+        values->resize(l.links_per_env);
+        CheckResult(upload ? nuka_world_upload_field(bind_.world, field, values->data(), bytes, offset)
+                           : nuka_world_download_field(bind_.world, field, values->data(), bytes, offset),
+                    upload ? "upload an identification row" : "download an identification row");
+    };
+    std::vector<float> q, qd, target;
+    row(NUKA_FIELD_JOINT_POSITION, &q, false);
+    row(NUKA_FIELD_JOINT_VELOCITY, &qd, false);
+    row(NUKA_FIELD_DRIVE_TARGET, &target, false);
+    const size_t joints = e.links.size();
+    for (size_t j = 0; j < joints; ++j) {
+        q[e.links[j]] = e.q[j];
+        qd[e.links[j]] = e.qd[j];
+    }
+    row(NUKA_FIELD_JOINT_POSITION, &q, true);
+    row(NUKA_FIELD_JOINT_VELOCITY, &qd, true);
+    for (const SysIdEpisode::Root& r : e.roots) {
+        const size_t base = size_t{e.env} * l.articulations_per_env + r.articulation;
+        const size_t link = size_t{e.env} * l.links_per_env + r.link;
+        CheckResult(nuka_world_upload_field(bind_.world, NUKA_FIELD_BASE_POSE, r.values, 7u * sizeof(float),
+                                            base * 7u * sizeof(float)),
+                    "upload an identification base pose");
+        CheckResult(nuka_world_upload_field(bind_.world, NUKA_FIELD_LINK_VELOCITY, r.values + 7, 6u * sizeof(float),
+                                            link * 6u * sizeof(float)),
+                    "upload an identification base velocity");
+    }
+    CheckResult(nuka_world_forward_kinematics(bind_.world), "nuka_world_forward_kinematics");
+    double sum = 0.0;
+    for (size_t s = 1; s < e.steps; ++s) {
+        for (size_t j = 0; j < joints; ++j) target[e.links[j]] = e.action[s * joints + j];
+        row(NUKA_FIELD_DRIVE_TARGET, &target, true);
+        nuka_world_step(bind_.world);
+        row(NUKA_FIELD_JOINT_POSITION, &q, false);
+        for (size_t j = 0; j < joints; ++j) {
+            const double d = static_cast<double>(q[e.links[j]]) - e.q[s * joints + j];
+            sum += d * d;
+        }
+    }
+    const double loss = sum / static_cast<double>((e.steps - 1u) * joints);
+    for (size_t i = 0; i < writes; ++i)
+        CheckResult(nuka_world_set_param(bind_.world, at(i, 0), at(i, 1), kept[i]), "nuka_world_set_param");
+    CheckResult(nuka_world_checkpoint_restore(bind_.world, before.state), "nuka_world_checkpoint_restore");
+    std::lock_guard<std::mutex> lock(sysid_mu_);
+    sysid_ = SysIdResult{cmd.seq, std::isfinite(loss) ? loss : std::numeric_limits<double>::infinity()};
+    sysid_ready_ = true;
 }
 
 IkReport RunIk(nuka_world_handle world, uint32_t links_per_env, const TickCommand& cmd) {

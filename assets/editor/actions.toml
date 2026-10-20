@@ -900,6 +900,39 @@ kind = "view"
 args.on = "bool, open it, default: toggles"
 returns = "{on}"
 
+["sysid.run"]
+summary = "Identifies joint damping, armature, friction loss or a link mass scale from a demonstration episode: CMA-ES searches each quantity between its min and max, and every candidate replays the episode's drive targets from its first step in a copy of the world, scored by the mean squared error against the joint positions it recorded. Candidates run one at a time because the registry values are shared by every environment; the world is put back after each. One search runs at a time; sysid.status reports it and sysid.apply writes the result."
+kind = "sim"
+args.episode = "int, the demonstration episode, default the newest"
+args.params = "list of {param, joints, min, max}: param is joint_damping, joint_armature, joint_frictionloss or link_mass_scale; joints default to every joint of the demonstrations; min and max default to 0 and twice the largest value in force, or 0.5 and 2 for a mass scale"
+args.generations = "int, 1..1000, default the window's (20)"
+args.population = "int, candidates per generation, 2..256, default the window's (8)"
+args.sigma = "float, the initial step as a share of each range, in (0, 1], default 0.3"
+args.seed = "int, the sampler's seed, default 0"
+returns = "{episode, steps, params, evaluations}: evaluations counts the replays the search may run"
+example = '{"episode": 0, "params": [{"param": "joint_damping", "min": 0.0, "max": 2.0}], "generations": 15}'
+
+["sysid.status"]
+summary = "The identification's progress and its best fit so far: each quantity's mean value before the search and the best found; the loss is the mean squared joint error in rad² or m², and the curve holds the best loss after each generation."
+kind = "read"
+returns = "{running, generation, generations, population, evaluations, steps, start_loss, best_loss, params: [{param, joints, nominal, value}], curve, error}"
+
+["sysid.stop"]
+summary = "Ends the running identification with the best values found so far."
+kind = "sim"
+returns = "as sysid.status"
+
+["sysid.apply"]
+summary = "Writes the finished identification's best values to its joints and links in one undoable edit; a mass scale multiplies each link's mass from before the search. Fails when the search did not improve on the values in force."
+kind = "edit"
+returns = "{focus}"
+
+["sysid.panel"]
+summary = "Opens or closes the System Identification window; `on` sets it, else it toggles."
+kind = "view"
+args.on = "bool, open it, default: toggles"
+returns = "{on}"
+
 ["robot.links"]
 summary = "The shown environment's robot links in link order, each with its parent link, incoming joint and mass, and where it and its centre of mass are; the robot's total mass, centre of mass and degrees of freedom."
 kind = "read"

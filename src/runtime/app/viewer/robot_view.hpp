@@ -122,6 +122,41 @@ struct GainTuner {
     std::deque<GainRun> runs;  // the newest last
 };
 
+// A quantity the System Identification window searches: a registry parameter on one joint or all of
+// the demonstrations' joints, between `min` and `max`.
+struct SysIdParam {
+    std::string param = "joint_damping";  // joint_damping, joint_armature, joint_frictionloss or link_mass_scale
+    std::string joint;                    // empty is every joint
+    float min = 0.0f;
+    float max = 1.0f;
+};
+
+// What a search settled on for one quantity: the joints' mean before it (1 for a scale) and after.
+struct SysIdFound {
+    std::string param;
+    std::vector<std::string> joints;
+    double nominal = 0.0;
+    double value = 0.0;
+};
+
+// The System Identification window's form, the search's progress and what it found.
+struct SysIdView {
+    bool open = false;
+    int episode = -1;  // by index into the demonstrations; -1 is the newest
+    std::vector<SysIdParam> params = {SysIdParam{}};
+    int generations = 20;
+    int population = 8;
+    bool running = false;
+    uint32_t generation = 0u;
+    uint32_t total = 0u;  // the search's generations
+    uint32_t evaluations = 0u;
+    double start_loss = 0.0;  // with the values in force [rad² or m²]
+    double best_loss = 0.0;
+    std::vector<double> curve;  // the best loss after each generation
+    std::vector<SysIdFound> found;
+    std::string error;
+};
+
 // The Robot Assembler's choices: an asset's link or a scene body, the link it hangs off and the joint.
 struct Assembler {
     bool open = false;
@@ -202,6 +237,7 @@ struct RobotView {
     std::vector<JointPose> poses;  // the document's pose library
     float pose_blend = 0.5f;       // the simulated seconds a click on a pose blends over
     GainTuner tuner;
+    SysIdView sysid;
     Assembler assembler;
     IkState ik;
     RobotOverlays overlays;

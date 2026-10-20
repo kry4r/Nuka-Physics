@@ -1,6 +1,6 @@
 // The Joints panel: each moving joint's limits, value, drive target and effort, the selected
 // joint's curves, drive conversion, the fixed base, the gizmo's IK and teleop; the
-// Poses panel, the Policy panel and the Gain Tuner.
+// Poses panel, the Policy panel, the Gain Tuner and System Identification.
 
 #include "runtime/app/viewer/imgui_layer.hpp"
 
@@ -152,6 +152,8 @@ void ImGuiLayer::BuildJoints(nui::VStack& root) {
     overlays.checked_fn = [robot] { return robot().overlays.on; };
     auto& tuner = hero.Add<nui::IconButton>(icon::kWaves, "Gain Tuner").Action("robot.gain_tuner");
     tuner.checked_fn = [robot] { return robot().tuner.open; };
+    auto& sysid = hero.Add<nui::IconButton>(icon::kMagicWand, "System Identification").Action("sysid.panel");
+    sysid.checked_fn = [robot] { return robot().sysid.open; };
     auto& assembler = hero.Add<nui::IconButton>(icon::kPlug, "Robot Assembler").Action("robot.assembler");
     assembler.checked_fn = [robot] { return robot().assembler.open; };
     auto& watch = hero.Add<nui::IconButton>(icon::kPlot, "Watch Joints").Action("robot.watch");
@@ -1015,6 +1017,206 @@ void ImGuiLayer::DrawGainTuner() {
     }
     ImGui::End();
     if (!open) Queue("robot.gain_tuner", Args({{"on", json::Value::Bool(false)}}));
+}
+
+void ImGuiLayer::DrawSysId() {
+    RobotView& v = frame_.ui->robot;
+    SysIdView& id = v.sysid;
+    if (!id.open || v.joints.empty()) return;
+    const DemoView& demos = frame_.ui->demos;
+    const float s = nui::Scale();
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    const ImVec2 size(std::min(560.0f * s, vp->WorkSize.x * 0.9f), std::min(620.0f * s, vp->WorkSize.y * 0.9f));
+    ImGui::SetNextWindowSize(size, ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(vp->GetWorkCenter(), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
+    bool open = true;
+    const std::string title = std::string(Tr("System Identification")) + "###sysid";
+    if (ImGui::Begin(title.c_str(), &open, ImGuiWindowFlags_NoCollapse)) {
+        const int episodes = static_cast<int>(demos.episodes.size());
+        if (episodes == 0) {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextDisabled("%s", Tr("Record or load a demonstration in the Demos panel first: identification "
+                                         "replays its targets and fits the joint positions it recorded."));
+            ImGui::PopTextWrapPos();
+        } else {
+            if (id.episode >= episodes) id.episode = -1;
+            const int shown = id.episode < 0 ? episodes - 1 : id.episode;
+            const auto episode_name = [&demos](int k) {
+                const DemoView::Episode& e = demos.episodes[static_cast<size_t>(k)];
+                return Fmt(Tr("episode %d: env %u, %zu steps"), k, e.env, e.steps);
+            };
+            if (ImGui::BeginTable("##sysid_options", 2, ImGuiTableFlags_SizingStretchProp)) {
+                ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed, 120.0f * s);
+                ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
+                TunerLabel("Episode");
+                if (ImGui::BeginCombo("##episode", episode_name(shown).c_str())) {
+                    for (int k = 0; k < episodes; ++k)
+                        if (ImGui::Selectable(episode_name(k).c_str(), k == shown)) id.episode = k;
+                    ImGui::EndCombo();
+                }
+                TunerLabel("Generations");
+                ImGui::DragInt("##generations", &id.generations, 0.2f, 1, 1000, "%d", ImGuiSliderFlags_AlwaysClamp);
+                TunerLabel("Population");
+                ImGui::DragInt("##population", &id.population, 0.1f, 2, 256, "%d", ImGuiSliderFlags_AlwaysClamp);
+                ImGui::EndTable();
+            }
+
+            // Each row searches one quantity over [min, max]; a scale multiplies the links' masses.
+            nui::draw::SectionHeader(Tr("Parameters"));
+            static const char* const kKeys[] = {"joint_damping", "joint_armature", "joint_frictionloss",
+                                                "link_mass_scale"};
+            static const char* const kNames[] = {"Damping", "Armature", "Friction loss", "Mass scale"};
+            const auto name_of = [](const std::string& key) {
+                for (size_t k = 0; k < 4u; ++k)
+                    if (key == kKeys[k]) return Tr(kNames[k]);
+                return key.c_str();
+            };
+            int remove = -1;
+            if (ImGui::BeginTable("##sysid_params", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
+                                                           ImGuiTableFlags_SizingStretchProp)) {
+                ImGui::TableSetupColumn(Tr("Parameter"));
+                ImGui::TableSetupColumn(Tr("Joint"));
+                ImGui::TableSetupColumn(Tr("Min"));
+                ImGui::TableSetupColumn(Tr("Max"));
+                ImGui::TableSetupColumn("##remove", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFrameHeight());
+                ImGui::TableHeadersRow();
+                for (size_t i = 0; i < id.params.size(); ++i) {
+                    SysIdParam& p = id.params[i];
+                    ImGui::PushID(static_cast<int>(i));
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    if (ImGui::BeginCombo("##param", name_of(p.param))) {
+                        for (size_t k = 0; k < 4u; ++k) {
+                            if (!ImGui::Selectable(Tr(kNames[k]), p.param == kKeys[k]) || p.param == kKeys[k]) continue;
+                            p.param = kKeys[k];
+                            const bool scale = k == 3u;
+                            p.min = scale ? 0.5f : 0.0f;
+                            p.max = scale ? 2.0f : 1.0f;
+                        }
+                        ImGui::EndCombo();
+                    }
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    if (ImGui::BeginCombo("##joint", p.joint.empty() ? Tr("All joints") : p.joint.c_str())) {
+                        if (ImGui::Selectable(Tr("All joints"), p.joint.empty())) p.joint.clear();
+                        for (const RobotJoint& joint : v.joints)
+                            if (ImGui::Selectable(joint.name.c_str(), p.joint == joint.name)) p.joint = joint.name;
+                        ImGui::EndCombo();
+                    }
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    ImGui::DragFloat("##min", &p.min, 0.01f, 0.0f, FLT_MAX, "%.4g", ImGuiSliderFlags_AlwaysClamp);
+                    ImGui::TableSetColumnIndex(3);
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    ImGui::DragFloat("##max", &p.max, 0.01f, 0.0f, FLT_MAX, "%.4g", ImGuiSliderFlags_AlwaysClamp);
+                    ImGui::TableSetColumnIndex(4);
+                    ImGui::BeginDisabled(id.params.size() == 1u);
+                    if (ImGui::SmallButton(icon::kTrash)) remove = static_cast<int>(i);
+                    ImGui::EndDisabled();
+                    ImGui::PopID();
+                }
+                ImGui::EndTable();
+            }
+            if (remove >= 0) id.params.erase(id.params.begin() + remove);
+            if (ImGui::SmallButton(Iconed(icon::kAdd, Tr("Add Parameter")).c_str())) id.params.push_back(SysIdParam{});
+
+            ImGui::Spacing();
+            ImGui::BeginDisabled(id.running);
+            if (ImGui::Button(Iconed(icon::kRun, Tr("Identify")).c_str())) {
+                json::Value params = json::Value::Array();
+                for (const SysIdParam& p : id.params) {
+                    json::Value joints = json::Value::Array();
+                    if (!p.joint.empty()) joints.PushBack(json::Value::Str(p.joint));
+                    params.PushBack(Args({{"param", json::Value::Str(p.param)},
+                                          {"joints", std::move(joints)},
+                                          {"min", json::Value::Float(p.min)},
+                                          {"max", json::Value::Float(p.max)}}));
+                }
+                Queue("sysid.run", Args({{"episode", json::Value::Int(shown)},
+                                         {"params", std::move(params)},
+                                         {"generations", json::Value::Int(id.generations)},
+                                         {"population", json::Value::Int(id.population)}}));
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!id.running);
+            if (ImGui::Button(Iconed(icon::kStop, Tr("Stop")).c_str())) Queue("sysid.stop");
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            const bool improved = !id.running && !id.found.empty() && id.best_loss < id.start_loss;
+            ImGui::BeginDisabled(!improved);
+            if (ImGui::Button(Iconed(icon::kOk, Tr("Apply")).c_str())) Queue("sysid.apply");
+            ImGui::EndDisabled();
+            if (id.running) {
+                const float done = static_cast<float>(id.generation) / static_cast<float>(std::max(id.total, 1u));
+                const std::string over =
+                    Fmt(Tr("generation %u / %u, %u replays"), id.generation, id.total, id.evaluations);
+                ImGui::ProgressBar(done, ImVec2(-FLT_MIN, 0.0f), over.c_str());
+            }
+            if (!id.error.empty()) {
+                ImGui::PushTextWrapPos(0.0f);
+                ImGui::TextColored(theme::kWarn, "%s", id.error.c_str());
+                ImGui::PopTextWrapPos();
+            }
+
+            nui::draw::SectionHeader(Tr("Fit"));
+            if (id.found.empty()) {
+                ImGui::PushTextWrapPos(0.0f);
+                ImGui::TextDisabled("%s", Tr("Each replay starts from the episode's first step in a copy of the world "
+                                             "and scores the mean squared joint error; the world is put back."));
+                ImGui::PopTextWrapPos();
+            } else {
+                const double cut = id.start_loss > 0.0 ? 100.0 * (1.0 - id.best_loss / id.start_loss) : 0.0;
+                const std::string fit = Fmt(Tr("Joint error %.3g \xE2\x86\x92 %.3g (%.1f%% lower)"), id.start_loss,
+                                            id.best_loss, cut);
+                ImGui::TextUnformatted(fit.c_str());
+                if (!id.curve.empty()) {
+                    // Generation 0 is the values in force.
+                    std::vector<double> x(id.curve.size() + 1u), y{id.start_loss};
+                    for (size_t k = 0; k < x.size(); ++k) x[k] = static_cast<double>(k);
+                    y.insert(y.end(), id.curve.begin(), id.curve.end());
+                    // A factor of two of room on the log axis; a perfect fit's zero stays above its floor.
+                    const auto [lo, hi] = std::minmax_element(y.begin(), y.end());
+                    const double bottom = std::max(*lo, *hi * 1e-15);
+                    ImPlot::PushStyleVar(ImPlotStyleVar_PlotPadding, ImVec2(theme::kSpace * s, theme::kSpace * s));
+                    if (ImPlot::BeginPlot("##sysid_plot", ImVec2(-FLT_MIN, 180.0f * s),
+                                          ImPlotFlags_NoMenus | ImPlotFlags_NoBoxSelect | ImPlotFlags_NoFrame |
+                                              ImPlotFlags_NoLegend)) {
+                        ImPlot::SetupAxes(Tr("generation"), Tr("best loss"), ImPlotAxisFlags_AutoFit);
+                        ImPlot::SetupAxisScale(ImAxis_Y1, ImPlotScale_Log10);
+                        ImPlot::SetupAxisLimits(ImAxis_Y1, bottom * 0.5, *hi * 2.0, ImPlotCond_Always);
+                        ImPlot::PlotLine(Tr("best"), x.data(), y.data(), static_cast<int>(x.size()),
+                                         Line(ImPlot::GetColormapColor(0), 1.5f));
+                        ImPlot::EndPlot();
+                    }
+                    ImPlot::PopStyleVar();
+                }
+                if (ImGui::BeginTable("##sysid_found", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
+                                                              ImGuiTableFlags_SizingStretchProp)) {
+                    for (const char* head : {"Parameter", "Joints", "Before", "Identified"})
+                        ImGui::TableSetupColumn(Tr(head));
+                    ImGui::TableHeadersRow();
+                    for (const SysIdFound& f : id.found) {
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::TextUnformatted(name_of(f.param));
+                        ImGui::TableSetColumnIndex(1);
+                        const std::string joints =
+                            f.joints.size() == 1u ? f.joints.front() : Fmt(Tr("%zu joints"), f.joints.size());
+                        ImGui::TextUnformatted(joints.c_str());
+                        ImGui::TableSetColumnIndex(2);
+                        ImGui::Text("%.4g", f.nominal);
+                        ImGui::TableSetColumnIndex(3);
+                        ImGui::TextColored(f.value == f.nominal ? theme::kFgMuted : theme::kInfo, "%.4g", f.value);
+                    }
+                    ImGui::EndTable();
+                }
+            }
+        }
+    }
+    ImGui::End();
+    if (!open) Queue("sysid.panel", Args({{"on", json::Value::Bool(false)}}));
 }
 
 void ImGuiLayer::DrawAssembler() {

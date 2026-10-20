@@ -44,6 +44,7 @@
 #include "runtime/app/viewer/property_schema.hpp"
 #include "runtime/app/viewer/robot_tools.hpp"
 #include "runtime/app/viewer/script_host.hpp"
+#include "runtime/app/viewer/sysid.hpp"
 #include "runtime/app/viewer/teleop.hpp"
 #include "runtime/app/viewer/train_observe.hpp"
 #include "runtime/inference/go2_policy_controller.hpp"
@@ -682,6 +683,22 @@ json::Value StrList(const std::vector<std::string>& values) {
     return list;
 }
 
+// Each searched quantity at `best`, a point of the unit cube; an empty point is the values in force.
+std::vector<SysIdFound> SysIdFoundAt(const std::vector<SysIdDimension>& dims, const std::vector<double>& best) {
+    std::vector<SysIdFound> found;
+    for (size_t d = 0; d < dims.size(); ++d) {
+        const SysIdDimension& dim = dims[d];
+        double nominal = 1.0;
+        if (!dim.scale) {
+            nominal = 0.0;
+            for (const double x : dim.nominal) nominal += x;
+            nominal /= static_cast<double>(dim.nominal.size());
+        }
+        found.push_back(SysIdFound{dim.key, dim.joints, nominal, best.empty() ? nominal : dim.Value(best[d])});
+    }
+    return found;
+}
+
 // x, y, z, qw, qx, qy, qz
 json::Value TransformJson(const math::Transform& t) {
     json::Value a = json::Value::Array();
@@ -994,6 +1011,7 @@ struct EditorHost::State : DocumentHost {
     void RegisterRobotActions();
     void RegisterPoseActions();
     void RegisterGainActions();
+    void RegisterSysIdActions();
     void RegisterAssemblyActions();
     void RegisterIkActions();
     void RegisterOverlayActions();
@@ -1242,6 +1260,12 @@ struct EditorHost::State : DocumentHost {
     void StepSensorPreview();
     // Adds a finished gain test to the tuner's runs with what it measured.
     void SyncGainTest();
+    // Scores the identification's finished replay and sends the next one, closing generations as they fill.
+    void StepSysId();
+    void PushSysId(const std::vector<double>& point);
+    // Ends the search with what it found so far; `error` says why it stopped short.
+    void EndSysId(const std::string& error);
+    json::Value SysIdJson() const;
     // The selection and the scene body's offset from its parent link the Robot Assembler shows.
     void SyncAssembler();
     // The link `name` names by node path or incoming joint, by index into the robot's links; -1 when none.
@@ -1409,6 +1433,18 @@ struct EditorHost::State : DocumentHost {
     std::optional<VideoExport> video_;
     json::Value exported_;  // the last export's path and frames, with an error when it failed
     bool streaming_ = false;  // nuka.editor.stream sends the worker's pose samples to Rerun
+    // The system identification searching or searched last; the worker replays one candidate at a time.
+    struct SysIdJob {
+        std::shared_ptr<const SysIdEpisode> episode;
+        std::vector<SysIdDimension> dims;
+        Cmaes search;
+        uint32_t population = 0u;
+        std::vector<std::vector<double>> points;  // the generation's candidates; empty for the values in force
+        std::vector<double> losses;               // theirs so far
+        std::vector<double> best;                 // the best candidate; empty while the values in force are
+        uint64_t waiting = 0u;                    // the replay in flight; 0 once the search ended
+    };
+    std::optional<SysIdJob> sysid_;
     // The RT preview; one request is in flight at a time and `chain` is the view its samples refine.
     struct RtPreview {
         bool on = false;
@@ -2203,6 +2239,8 @@ void EditorHost::State::BindWorker(uint64_t tick, double sim_time) {
         const std::string names = json::Value::Str(RecordingIdentity().Dump(0)).Dump(0);
         RunPython("import nuka.editor.stream\nnuka.editor.stream.rename(" + names + ")\n", "<rerun>");
     }
+    // An identification compares replays of one world.
+    if (sysid_ && sysid_->waiting != 0u) EndSysId("the world was rebuilt during the search");
     // The new binding starts from nominal values and draws again from the same seed.
     physics_drawn_ = false;
     if (randomize.config.Active())
@@ -2494,6 +2532,71 @@ void EditorHost::State::SyncGainTest() {
     g.runs.push_back(std::move(run));
     while (g.runs.size() > kGainRuns) g.runs.pop_front();
     g.running = 0u;
+}
+
+void EditorHost::State::StepSysId() {
+    SysIdResult r;
+    if (!sysid_ || sysid_->waiting == 0u || !worker_.TakeSysId(&r) || r.request != sysid_->waiting) return;
+    SysIdJob& j = *sysid_;
+    SysIdView& v = ui_state_.robot.sysid;
+    ++v.evaluations;
+    if (j.points.empty()) {
+        v.start_loss = v.best_loss = r.loss;
+    } else {
+        j.losses.push_back(r.loss);
+        if (r.loss < v.best_loss) {
+            v.best_loss = r.loss;
+            j.best = j.points[j.losses.size() - 1u];
+            v.found = SysIdFoundAt(j.dims, j.best);
+        }
+        if (j.losses.size() < j.points.size()) return PushSysId(j.points[j.losses.size()]);
+        j.search.Tell(j.points, j.losses);
+        v.curve.push_back(v.best_loss);
+        if (++v.generation >= v.total || j.search.Converged()) return EndSysId(std::string());
+    }
+    j.points = j.search.Ask();
+    j.losses.clear();
+    PushSysId(j.points.front());
+}
+
+void EditorHost::State::PushSysId(const std::vector<double>& point) {
+    TickCommand cmd;
+    cmd.kind = CommandKind::SysIdEval;
+    if (!point.empty()) cmd.values = SysIdWrites(sysid_->dims, point);
+    cmd.sysid = sysid_->episode;
+    sysid_->waiting = worker_.Push(std::move(cmd));
+}
+
+void EditorHost::State::EndSysId(const std::string& error) {
+    SysIdView& v = ui_state_.robot.sysid;
+    sysid_->waiting = 0u;
+    v.running = false;
+    v.error = error;
+    v.found = SysIdFoundAt(sysid_->dims, sysid_->best);
+}
+
+json::Value EditorHost::State::SysIdJson() const {
+    const SysIdView& v = ui_state_.robot.sysid;
+    json::Value params = json::Value::Array();
+    for (const SysIdFound& f : v.found)
+        params.PushBack(Object({{"param", json::Value::Str(f.param)},
+                                {"joints", StrList(f.joints)},
+                                {"nominal", json::Value::Float(f.nominal)},
+                                {"value", json::Value::Float(f.value)}}));
+    json::Value curve = json::Value::Array();
+    for (const double loss : v.curve) curve.PushBack(json::Value::Float(loss));
+    const auto count = [](size_t n) { return json::Value::Int(static_cast<int64_t>(n)); };
+    return Object({{"running", json::Value::Bool(v.running)},
+                   {"generation", count(v.generation)},
+                   {"generations", count(v.total)},
+                   {"population", count(sysid_ ? sysid_->population : 0u)},
+                   {"evaluations", count(v.evaluations)},
+                   {"steps", count(sysid_ ? sysid_->episode->steps : 0u)},
+                   {"start_loss", json::Value::Float(v.start_loss)},
+                   {"best_loss", json::Value::Float(v.best_loss)},
+                   {"params", std::move(params)},
+                   {"curve", std::move(curve)},
+                   {"error", v.error.empty() ? json::Value::Null() : json::Value::Str(v.error)}});
 }
 
 void EditorHost::State::SyncAssembler() {
@@ -3938,6 +4041,8 @@ void EditorHost::State::OnLoaded(const std::string& path) {
     SyncScripts();
     ui_state_.robot.tuner.runs.clear();
     ui_state_.robot.tuner.running = 0u;
+    sysid_.reset();
+    ui_state_.robot.sysid = SysIdView{ui_state_.robot.sysid.open};
     ui_state_.inspector = InspectorState{};
     last_seeded_ = scene::kInvalidEntity;
     xform_gesture_active_ = mat_gesture_active_ = gizmo_using_prev_ = false;
@@ -4597,6 +4702,7 @@ void EditorHost::State::RegisterRobotActions() {
                   }});
     RegisterPoseActions();
     RegisterGainActions();
+    RegisterSysIdActions();
     RegisterAssemblyActions();
     RegisterIkActions();
     RegisterOverlayActions();
@@ -6725,6 +6831,177 @@ void EditorHost::State::RegisterGainActions() {
                       GainTuner& g = ui_state_.robot.tuner;
                       g.open = BoolArg(args, "on", !g.open);
                       return Ok(Object({{"on", json::Value::Bool(g.open)}}));
+                  }});
+}
+
+void EditorHost::State::RegisterSysIdActions() {
+    const auto has_joints = [this] { return loaded_ != nullptr && !ui_state_.robot.joints.empty(); };
+    // Searches registry values under which a demonstration episode's replay tracks its recorded joints:
+    // every candidate replays the episode's targets from its first step in a copy of the world.
+    actions_.Add({"sysid.run", "Identify Parameters", "robot", "", ShortcutScope::Global,
+                  [this] { return loaded_ != nullptr && !demos_.episodes.empty(); }, {},
+                  [this](const json::Value& args) {
+                      SysIdView& v = ui_state_.robot.sysid;
+                      if (v.running) return ActionResult::Fail("an identification is running");
+                      if (demos_.episodes.empty()) return ActionResult::Fail("record or load a demonstration first");
+                      const int64_t last = static_cast<int64_t>(demos_.episodes.size()) - 1;
+                      const double asked = NumArg(args, "episode", static_cast<double>(last));
+                      if (!(asked >= 0.0 && asked <= static_cast<double>(last) && asked == std::floor(asked)))
+                          return ActionResult::Fail(
+                              Format("the episode is one of 0..%lld", static_cast<long long>(last)));
+                      const size_t index = static_cast<size_t>(asked);
+                      const DemoEpisode& e = demos_.episodes[index];
+                      const WorldLayout& layout = loaded_->Layout();
+                      if (e.Steps() < 2u) return ActionResult::Fail("the episode has fewer than two steps");
+                      if (e.env >= layout.env_count)
+                          return ActionResult::Fail("the episode's environment is not in this world");
+                      const RobotView& robot = ui_state_.robot;
+                      auto episode = std::make_shared<SysIdEpisode>();
+                      episode->env = e.env;
+                      episode->steps = e.Steps();
+                      episode->q = e.q;
+                      episode->qd = e.qd;
+                      episode->action = e.action;
+                      for (const std::string& name : demos_.joints) {
+                          const int j = FindJoint(robot.joints, name);
+                          if (j < 0) return ActionResult::Fail("this scene has no joint '" + name + "'");
+                          episode->links.push_back(robot.joints[static_cast<size_t>(j)].link);
+                      }
+                      std::vector<uint32_t> roots;
+                      for (uint32_t i = 0; i < layout.links_per_env; ++i)
+                          if (layout.links[i].is_root != 0u) roots.push_back(i);
+                      if (roots.size() != e.roots)
+                          return ActionResult::Fail("the episode's roots are not this scene's");
+                      for (size_t k = 0; k < roots.size(); ++k) {
+                          const nuka_link_binding_t& l = layout.links[roots[k]];
+                          if (l.is_floating == 0u) continue;
+                          SysIdEpisode::Root root{roots[k], l.articulation_index, {}};
+                          std::copy_n(e.root_pose.begin() + static_cast<std::ptrdiff_t>(k * 7u), 7, root.values);
+                          std::copy_n(e.root_vel.begin() + static_cast<std::ptrdiff_t>(k * 6u), 6, root.values + 7);
+                          episode->roots.push_back(root);
+                      }
+                      const json::Value* params = args.Find("params");
+                      if (params == nullptr || !params->IsArray() || params->Size() == 0u)
+                          return ActionResult::Fail("'params' lists no parameter");
+                      const std::vector<nuka_param_info_t>& infos = doc_.Params();
+                      std::vector<SysIdDimension> dims;
+                      std::vector<double> mean;
+                      for (const json::Value& p : params->Elements()) {
+                          SysIdDimension dim;
+                          dim.key = StrArg(p, "param");
+                          dim.scale = dim.key == "link_mass_scale";
+                          const std::string key = dim.scale ? "link_mass" : dim.key;
+                          if (!dim.scale && key != "joint_damping" && key != "joint_armature" &&
+                              key != "joint_frictionloss")
+                              return ActionResult::Fail("'" + dim.key + "' is not joint_damping, joint_armature, "
+                                                        "joint_frictionloss or link_mass_scale");
+                          const auto info = std::find_if(infos.begin(), infos.end(),
+                                                         [&](const nuka_param_info_t& i) { return key == i.key; });
+                          if (info == infos.end()) return ActionResult::Fail("this world has no " + key);
+                          dim.param = static_cast<uint32_t>(info - infos.begin());
+                          dim.field = info->scene_field;
+                          dim.joints = StrListArg(p, "joints");
+                          if (dim.joints.empty()) dim.joints = demos_.joints;
+                          for (const std::string& name : dim.joints) {
+                              if (std::find(demos_.joints.begin(), demos_.joints.end(), name) == demos_.joints.end())
+                                  return ActionResult::Fail("the demonstrations have no joint '" + name + "'");
+                              const int j = FindJoint(robot.joints, name);
+                              const RobotJoint& joint = robot.joints[static_cast<size_t>(j)];
+                              if (!doc_.LiveField(joint.path, dim.field))
+                                  return ActionResult::Fail("'" + name + "' has no live " + dim.field +
+                                                            "; author it first");
+                              float value = 0.0f;
+                              scene::GetSceneField(loaded_->scene, TargetAt(loaded_->scene, joint.path), dim.field,
+                                                   &value);
+                              dim.links.push_back(joint.link);
+                              dim.nominal.push_back(value);
+                          }
+                          const double top = *std::max_element(dim.nominal.begin(), dim.nominal.end());
+                          dim.min = NumArg(p, "min", dim.scale ? 0.5 : 0.0);
+                          dim.max = NumArg(p, "max", dim.scale ? 2.0 : 2.0 * top);
+                          if (!(std::isfinite(dim.min) && std::isfinite(dim.max) && dim.min < dim.max))
+                              return ActionResult::Fail("'" + dim.key + "' wants a finite min below its max");
+                          if (dim.scale && dim.min <= 0.0) return ActionResult::Fail("a mass scale stays above 0");
+                          if (!dim.scale && (dim.min < info->min_value || dim.max > info->max_value))
+                              return ActionResult::Fail(Format("'%s' stays within %g..%g", dim.key.c_str(),
+                                                               info->min_value, info->max_value));
+                          const double start = SysIdFoundAt({dim}, {}).front().nominal;
+                          mean.push_back(std::clamp((start - dim.min) / (dim.max - dim.min), 0.0, 1.0));
+                          dims.push_back(std::move(dim));
+                      }
+                      const auto whole = [](double x, double lo, double hi) {
+                          return x >= lo && x <= hi && x == std::floor(x);
+                      };
+                      const double generations = NumArg(args, "generations", v.generations);
+                      const double population = NumArg(args, "population", v.population);
+                      const double sigma = NumArg(args, "sigma", 0.3);
+                      const double seed = NumArg(args, "seed", 0.0);
+                      if (!whole(generations, 1.0, 1000.0)) return ActionResult::Fail("the generations are 1..1000");
+                      if (!whole(population, 2.0, 256.0)) return ActionResult::Fail("the population is 2..256");
+                      if (!(sigma > 0.0 && sigma <= 1.0)) return ActionResult::Fail("sigma is in (0, 1]");
+                      if (!whole(seed, 0.0, 9007199254740992.0))
+                          return ActionResult::Fail("the seed is a whole number from 0");
+                      const uint32_t lambda = static_cast<uint32_t>(population);
+                      sysid_ = SysIdJob{episode, dims, Cmaes(mean, sigma, lambda, static_cast<uint64_t>(seed)), lambda,
+                                        {}, {}, {}, 0u};
+                      // The window's form shows the search, a row per quantity, or per joint of a partial set.
+                      std::vector<SysIdParam> rows;
+                      for (const SysIdDimension& dim : dims) {
+                          const bool all = dim.joints == demos_.joints;
+                          for (size_t i = 0; i < (all ? 1u : dim.joints.size()); ++i)
+                              rows.push_back(SysIdParam{dim.key, all ? std::string() : dim.joints[i],
+                                                        static_cast<float>(dim.min), static_cast<float>(dim.max)});
+                      }
+                      v = SysIdView{v.open, static_cast<int>(index), std::move(rows), static_cast<int>(generations),
+                                    static_cast<int>(population)};
+                      v.running = true;
+                      v.total = static_cast<uint32_t>(generations);
+                      v.found = SysIdFoundAt(dims, {});
+                      PushSysId({});
+                      const double evaluations = 1.0 + generations * population;
+                      return Ok(Object({{"episode", json::Value::Int(static_cast<int64_t>(index))},
+                                        {"steps", json::Value::Int(static_cast<int64_t>(episode->steps))},
+                                        {"params", json::Value::Int(static_cast<int64_t>(dims.size()))},
+                                        {"evaluations", json::Value::Int(static_cast<int64_t>(evaluations))}}));
+                  }});
+    // The search's progress and what it found so far: each quantity's value before and the best since.
+    actions_.Add({"sysid.status", "Identification Status", "robot", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value&) { return Ok(SysIdJson()); }});
+    actions_.Add({"sysid.stop", "Stop Identification", "robot", "", ShortcutScope::Global,
+                  [this] { return ui_state_.robot.sysid.running; }, {},
+                  [this](const json::Value&) {
+                      if (!ui_state_.robot.sysid.running) return ActionResult::Fail("no identification is running");
+                      EndSysId(std::string());
+                      return Ok(SysIdJson());
+                  }});
+    // Writes the best values to the joints and links in one undoable edit; a scale multiplies each
+    // link's mass from before the search.
+    actions_.Add({"sysid.apply", "Apply Identified Parameters", "robot", "", ShortcutScope::Global,
+                  [this] { return sysid_ && sysid_->waiting == 0u && !sysid_->best.empty(); }, {},
+                  [this](const json::Value&) {
+                      if (!sysid_ || sysid_->waiting != 0u || sysid_->best.empty())
+                          return ActionResult::Fail("no finished identification improved on the values in force");
+                      const RobotView& robot = ui_state_.robot;
+                      EditTxn txn{"Identified Parameters", {}};
+                      for (size_t d = 0; d < sysid_->dims.size(); ++d) {
+                          const SysIdDimension& dim = sysid_->dims[d];
+                          const double value = dim.Value(sysid_->best[d]);
+                          for (size_t i = 0; i < dim.joints.size(); ++i) {
+                              const int j = FindJoint(robot.joints, dim.joints[i]);
+                              if (j < 0) return ActionResult::Fail("this scene has no joint '" + dim.joints[i] + "'");
+                              const double after = dim.scale ? dim.nominal[i] * value : value;
+                              txn.ops.push_back(EditOp{robot.joints[static_cast<size_t>(j)].path, dim.field,
+                                                       json::Value(), json::Value::Float(after)});
+                          }
+                      }
+                      return SubmitTxn(txn);
+                  }});
+    actions_.Add({"sysid.panel", "System Identification", "robot", "", ShortcutScope::Global, has_joints,
+                  [this] { return ui_state_.robot.sysid.open; },
+                  [this](const json::Value& args) {
+                      SysIdView& v = ui_state_.robot.sysid;
+                      v.open = BoolArg(args, "on", !v.open);
+                      return Ok(Object({{"on", json::Value::Bool(v.open)}}));
                   }});
 }
 
@@ -9516,6 +9793,8 @@ void EditorHost::State::ApplyUnload() {
     demo_recording_ = false;
     worker_.TakeDemo();
     SyncDemoView();
+    sysid_.reset();
+    ui_state_.robot.sysid = SysIdView{ui_state_.robot.sysid.open};
     entity_drag_.Cancel();
     loaded_.reset();
     hidden_meshes_.clear();
@@ -9777,6 +10056,7 @@ void EditorHost::State::Frame(bool step_physics) {
     StepSensorPreview();
     StepDataset();
     SyncGainTest();
+    StepSysId();
     if (loaded_) SyncAssembler();
     if (loaded_) worker_.ReadTimeline(&ui_state_.timeline);
     double apply_ms = Ms(Clock::now() - apply_t0);

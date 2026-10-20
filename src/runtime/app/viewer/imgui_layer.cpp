@@ -178,7 +178,8 @@ const std::vector<MenuSpec>& Menus() {
             {"Robot",
              {"robot"},
              {"robot.fix_base", "robot.drive", "robot.reset_targets", "robot.radians", "robot.watch", "robot.gain_tuner",
-              "robot.assembler", "clip.editor", "-", "robot.pose_capture", "robot.poses_save", "robot.poses_load"}},
+              "sysid.panel", "robot.assembler", "clip.editor", "-", "robot.pose_capture", "robot.poses_save",
+              "robot.poses_load"}},
             {"Tools",
              {"script", "tools"},
              {"script.new", "script.open", "script.save", "-", "script.run", "script.stop", "script.toggle_rerun", "-",
@@ -633,7 +634,9 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
                                     std::pair{"robot.poses_save", icon::kSave}, std::pair{"robot.poses_load", icon::kOpen},
                                     std::pair{"robot.gain_tuner", icon::kWaves}, std::pair{"robot.gain_test", icon::kRun},
                                     std::pair{"robot.gain_clear", icon::kTrash}, std::pair{"robot.assembler", icon::kPlug},
-                                    std::pair{"robot.reset_targets", icon::kReset}})
+                                    std::pair{"robot.reset_targets", icon::kReset},
+                                    std::pair{"sysid.panel", icon::kMagicWand}, std::pair{"sysid.run", icon::kRun},
+                                    std::pair{"sysid.stop", icon::kStop}, std::pair{"sysid.apply", icon::kOk}})
         registry.Decorate(id, glyph, false);
     for (const auto& [id, glyph] : {std::pair{"demo.record", icon::kRecord}, std::pair{"demo.play", icon::kPlay},
                                     std::pair{"demo.stop", icon::kStop}, std::pair{"demo.save", icon::kSave},
@@ -664,8 +667,8 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
                            "sim.perturb", "sim.grab_particle", "sim.release", "sim.loads", "view.layout", "view.view",
                            "view.views", "robot.joints", "robot.set_targets", "robot.samples", "robot.poses",
                            "robot.pose_apply", "robot.pose_initial", "robot.pose_rename", "robot.pose_remove",
-                           "robot.gain_status", "robot.gain_runs", "robot.links", "robot.asset_links", "robot.attach",
-                           "robot.attach_asset", "robot.ik", "robot.ik_settings", "view.robot_overlays",
+                           "robot.gain_status", "robot.gain_runs", "sysid.status", "robot.links", "robot.asset_links",
+                           "robot.attach", "robot.attach_asset", "robot.ik", "robot.ik_settings", "view.robot_overlays",
                            "demo.episodes", "clip.list", "clip.get", "clip.set", "clip.rename", "clip.key",
                            "clip.remove_keys", "clip.move_keys", "clip.sample"})
         registry.Decorate(id, "", true);
@@ -1686,6 +1689,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
     DrawReimportConfirm();
     DrawCollisionDialog();
     DrawGainTuner();
+    DrawSysId();
     DrawDatasetExporter();
     DrawClipEditor();
     DrawAssembler();
