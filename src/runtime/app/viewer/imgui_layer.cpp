@@ -1611,7 +1611,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
         layout_settle_ = 3;
     }
     // Docked tabs arrive over a few frames and ImGui selects the last to arrive, so once they have their widths
-    // each column selects and scrolls to its preset tab, and a panel focused meanwhile comes to the front.
+    // each column selects and scrolls to its preset tab, and a panel focused meanwhile reopens at the front.
     if (layout_settle_ > 0 && --layout_settle_ == 0) {
         const ImGuiID nodes[] = {dock_left_, dock_right_, dock_bottom_};
         for (size_t i = 0; i < 3u; ++i) {
@@ -1620,7 +1620,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
             node->TabBar->NextSelectedTabId = layout_tabs_[i] != 0u ? layout_tabs_[i] : node->TabBar->SelectedTabId;
         }
         std::lock_guard<std::recursive_mutex> lock(host_.Mutex());
-        if (nui::Panel* panel = host_.FindPanel(layout_focus_)) panel->focus_request = true;
+        if (nui::Panel* panel = host_.FindPanel(layout_focus_)) panel->open = panel->focus_request = true;
         layout_focus_.clear();
     }
     ImGui::DockSpaceOverViewport(dockspace, ImGui::GetMainViewport(), ImGuiDockNodeFlags_PassthruCentralNode);
