@@ -726,7 +726,9 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
                       nui::Panel* panel = host_.FindPanel(pid);
                       if (panel == nullptr) return ActionResult::Fail("no panel '" + pid + "'");
                       panel->open = true;
-                      panel->focus_request = true;
+                      // A layout still being applied would bury the tab, so the focus waits for it to settle.
+                      if (layout_pending_ || layout_settle_ > 0) layout_focus_ = pid;
+                      else panel->focus_request = true;
                       return ActionResult{};
                   },
                   "", true});
@@ -1608,11 +1610,19 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
         layout_pending_ = false;
         layout_settle_ = 3;
     }
-    // Overflowing tab bars scroll to the selected tab once the docked tabs have their widths.
-    if (layout_settle_ > 0 && --layout_settle_ == 0)
-        for (const ImGuiID id : {dock_left_, dock_right_, dock_bottom_})
-            if (ImGuiDockNode* node = ImGui::DockBuilderGetNode(id); node != nullptr && node->TabBar != nullptr)
-                node->TabBar->NextSelectedTabId = node->TabBar->SelectedTabId;
+    // Docked tabs arrive over a few frames and ImGui selects the last to arrive, so once they have their widths
+    // each column selects and scrolls to its preset tab, and a panel focused meanwhile comes to the front.
+    if (layout_settle_ > 0 && --layout_settle_ == 0) {
+        const ImGuiID nodes[] = {dock_left_, dock_right_, dock_bottom_};
+        for (size_t i = 0; i < 3u; ++i) {
+            ImGuiDockNode* node = ImGui::DockBuilderGetNode(nodes[i]);
+            if (node == nullptr || node->TabBar == nullptr) continue;
+            node->TabBar->NextSelectedTabId = layout_tabs_[i] != 0u ? layout_tabs_[i] : node->TabBar->SelectedTabId;
+        }
+        std::lock_guard<std::recursive_mutex> lock(host_.Mutex());
+        if (nui::Panel* panel = host_.FindPanel(layout_focus_)) panel->focus_request = true;
+        layout_focus_.clear();
+    }
     ImGui::DockSpaceOverViewport(dockspace, ImGui::GetMainViewport(), ImGuiDockNodeFlags_PassthruCentralNode);
     host_.DrawPanels([this](const nui::Panel& panel) -> ImGuiID {
         const std::string_view dock = panel.dock.empty() && Builtin(panel.id) ? HomeColumn(panel.id)
@@ -1736,7 +1746,7 @@ void ImGuiLayer::DockLayout(ImGuiID dockspace) {
         if (nui::Panel* panel = host_.FindPanel(p.id)) panel->open = false;
     // Tabs follow the preset's order and a rebuilt node selects its saved tab, here the column's
     // first panel; disabled built-in extensions leave gaps.
-    const auto place = [this](const std::vector<const char*>& ids, ImGuiID node) {
+    const auto place = [this](const std::vector<const char*>& ids, ImGuiID node) -> ImGuiID {
         const char* first = nullptr;
         short order = 0;
         for (const char* id : ids) {
@@ -1751,13 +1761,15 @@ void ImGuiLayer::DockLayout(ImGuiID dockspace) {
             else
                 ImGui::FindWindowSettingsByID(ImHashStr(name.c_str()))->DockOrder = order++;
         }
-        if (first == nullptr) return;
+        if (first == nullptr) return 0u;
         const ImGuiID window = ImHashStr((std::string("###") + first).c_str());
-        ImGui::DockBuilderGetNode(node)->SelectedTabId = ImHashStr("#TAB", 0, window);
+        const ImGuiID tab = ImHashStr("#TAB", 0, window);
+        ImGui::DockBuilderGetNode(node)->SelectedTabId = tab;
+        return tab;
     };
-    place(preset.left, dock_left_);
-    place(preset.right, dock_right_);
-    place(preset.bottom, dock_bottom_);
+    layout_tabs_[0] = place(preset.left, dock_left_);
+    layout_tabs_[1] = place(preset.right, dock_right_);
+    layout_tabs_[2] = place(preset.bottom, dock_bottom_);
     // Script panels keep their open state and return to the column they asked for.
     for (const auto& panel : host_.Panels()) {
         if (Builtin(panel->id)) continue;

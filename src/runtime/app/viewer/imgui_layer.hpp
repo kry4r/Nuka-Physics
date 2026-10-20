@@ -699,8 +699,10 @@ private:
 
     std::string layout_ = "authoring";
     bool layout_pending_ = true;
-    int layout_settle_ = 0;  // frames until the new layout's tab bars scroll to their selected tabs
+    int layout_settle_ = 0;  // frames until the new layout's columns select their tabs
     unsigned int dock_left_ = 0u, dock_right_ = 0u, dock_bottom_ = 0u;
+    unsigned int layout_tabs_[3] = {};  // the tab each column selects when the layout settles
+    std::string layout_focus_;          // a panel focused while a layout was being applied
     float ui_scale_ = 1.0f;
     float applied_scale_ = 0.0f;
 

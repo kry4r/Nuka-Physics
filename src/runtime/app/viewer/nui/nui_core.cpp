@@ -603,12 +603,17 @@ std::string Panel::WindowName() const { return WithIcon(icon, Tr(title)) + "###"
 
 void Panel::Draw(Host&) {
     if (!open) return;
-    if (focus_request) {
+    const bool focus = focus_request;
+    if (focus) {
         ImGui::SetNextWindowFocus();
         focus_request = false;
     }
     const std::string name = WindowName();
-    if (ImGui::Begin(name.c_str(), &open, flags | ImGuiWindowFlags_NoCollapse)) {
+    const bool shown = ImGui::Begin(name.c_str(), &open, flags | ImGuiWindowFlags_NoCollapse);
+    // A focused tab also comes into view in an overflowing dock tab bar.
+    if (ImGuiWindow* window = ImGui::GetCurrentWindow(); focus && window->DockNode && window->DockNode->TabBar)
+        window->DockNode->TabBar->NextSelectedTabId = window->TabId;
+    if (shown) {
         const uint64_t k = key ? key() : 0u;
         if (build && (!built_ || k != key_)) {
             root_->Clear();
