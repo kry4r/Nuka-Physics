@@ -1452,6 +1452,18 @@ nuka_result_t nuka_world_rebuild_with_envs(nuka_world_handle world, const char* 
     return result;
 }
 
+nuka_result_t nuka_world_rebuild_with_dt(nuka_world_handle world, const char* scene_path, float dt) {
+    if (!(dt > 0.0f)) return NUKA_RESULT_INVALID_ARG;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    const float previous = record->recipe.desc.fixed_dt;
+    record->recipe.desc.fixed_dt = dt;
+    const nuka_result_t result = nuka_world_rebuild_from_scene(world, scene_path, 0u);
+    record->recipe.desc.fixed_dt = result == NUKA_RESULT_OK ? dt : previous;
+    record->step_options.dt = record->recipe.desc.fixed_dt;
+    return result;
+}
+
 nuka_result_t nuka_world_get_generation(nuka_world_handle world, uint64_t* out_generation) {
     if (out_generation == nullptr) return NUKA_RESULT_INVALID_ARG;
     auto* record = nuka::c_abi::WorldTable().Get(world);

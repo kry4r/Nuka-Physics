@@ -617,6 +617,8 @@ public:
     // Remove one camera or light; later ones re-densify. False when `id` is invalid.
     bool RemoveCamera(CameraId id);
     bool RemoveLight(LightId id);
+    // Remove one terrain field; later ones shift down one. False when `id` is invalid.
+    bool RemoveTerrain(TerrainId id);
     // Add a shape after its body's last one, the id a reload gives it; later shapes and
     // the <pair> overrides naming them shift up by one.
     ShapeId InsertCollisionShape(CollisionShapeRecord record);

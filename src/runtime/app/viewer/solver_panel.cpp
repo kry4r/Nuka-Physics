@@ -33,6 +33,7 @@ namespace {
 
 constexpr uint32_t kBudgets[] = {10u, 32u, 128u, 512u};
 constexpr float kAlerts[] = {1.0e-4f, 1.0e-3f, 1.0e-2f};
+constexpr float kTimeSteps[] = {0.001f, 0.002f, 1.0f / 240.0f, 0.005f};
 // Log axes clamp exact zeros to this floor.
 constexpr float kFloor = 1.0e-9f;
 
@@ -113,6 +114,21 @@ void ImGuiLayer::BuildSolver(nui::VStack& root) {
     auto& locate = root.Add<nui::Button>("Locate worst", icon::kTarget).Action("solver.locate");
     locate.enabled_if = [view, has_scene] { return has_scene() && !view().history.empty(); };
 
+    root.Add<nui::Separator>("Time step");
+    auto& step = root.Add<nui::Segmented>(
+        std::vector<std::string>{"1 ms", "2 ms", "1/240 s", "5 ms"},
+        nui::Bind<int>(
+            [view] {
+                const float dt = view().dt;
+                for (size_t i = 0; i < std::size(kTimeSteps); ++i)
+                    if (std::fabs(dt - kTimeSteps[i]) <= kTimeSteps[i] * 1.0e-4f) return static_cast<int>(i);
+                return -1;
+            },
+            [this](const int& i) {
+                Queue("sim.dt", Args({{"seconds", json::Value::Float(kTimeSteps[static_cast<size_t>(i)])}}));
+            }));
+    step.enabled_if = has_scene;
+    step.tooltip = "The physics step; a change rebuilds the world and keeps its state.";
     root.Add<nui::Separator>("Sweep budget");
     std::vector<std::string> budgets;
     for (const uint32_t n : kBudgets) budgets.push_back(std::to_string(n));

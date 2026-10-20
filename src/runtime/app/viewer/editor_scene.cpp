@@ -133,6 +133,11 @@ std::string ResizeEditorEnvs(EditorScene& es, SceneCache& cache, uint32_t envs) 
                                [&](const char* file) { return nuka_world_rebuild_with_envs(es.world, file, envs); });
 }
 
+std::string RetimeEditorScene(EditorScene& es, SceneCache& cache, float dt) {
+    return RebuildFromDocument(es, cache,
+                               [&](const char* file) { return nuka_world_rebuild_with_dt(es.world, file, dt); });
+}
+
 bool ResetWorldPhysics(nuka_world_handle world, const std::vector<float>& rest_targets) {
     if (nuka_world_reset(world) != NUKA_RESULT_OK) return false;
     return rest_targets.empty() ||

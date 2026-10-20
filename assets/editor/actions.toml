@@ -252,6 +252,37 @@ summary = "Opens the Generate Collision dialog on the selection with its preview
 kind = "view"
 returns = "the preview, as scene.collision_preview returns it"
 
+["scene.terrain"]
+summary = "Sets the scene's terrain field, which the cook bakes into a static heightfield, or removes it with kind none. Each size defaults to the bump field g1_rough trains on; undo restores the previous field."
+kind = "edit"
+args.kind = "string, flat, bumps, slope, stairs, mixed, or none to remove the terrain"
+args.size = "[x, y] in m, the field's extent, default [20, 20]"
+args.center = "[x, y] in m, the field's center, default [0, 0]"
+args.cell = "number in m, the grid spacing, 0.02 or more, default 0.1"
+args.base = "number in m, the floor's height, default 0"
+args.height = "number in m, bumps and mixed: the tallest bump, default 0.05"
+args.bump = "number in m, bumps and mixed: a bump's footprint, default 0.4"
+args.grade = "number, slope: the rise per m along +X, default 0.1"
+args.rise = "number in m, stairs and mixed: each step's rise, negative digs a pit, default 0.08"
+args.width = "number in m, stairs and mixed: each step's width, default 0.3"
+args.platform = "number in m, stairs and mixed: the central platform's side, default 1"
+args.count = "int, stairs and mixed: steps from the floor, 1 to 64, default 8"
+args.tile = "number in m, mixed: a tile's side, default 5"
+args.margin = "number in m, mixed: the flat rim of each tile, default 0.6"
+args.seed = "int, mixed: picks each tile's features, default 0"
+returns = "the field's arguments as scene.terrain_info returns them, or null after a removal"
+example = '{"kind": "bumps", "size": [30, 30], "height": 0.06}'
+
+["scene.terrain_info"]
+summary = "The scene's terrain field as scene.terrain arguments, every size filled in; null when the scene has none."
+kind = "read"
+returns = "{kind, size, center, cell, base, height, bump, grade, rise, width, platform, count, tile, margin, seed}, plus image for a field read from a height map"
+
+["scene.terrain_dialog"]
+summary = "Opens the Terrain dialog on the scene's field, or on the default bump field when there is none."
+kind = "view"
+returns = "the arguments the dialog starts from"
+
 ["file.import_analyze"]
 summary = "Reads an asset file (URDF, MJCF, USD, mesh, NKS) without importing it: whether it imports, its diagnostics and its size."
 kind = "read"
@@ -659,10 +690,17 @@ kind = "sim"
 args.n = "int, sweeps per step, at least 1"
 returns = "{n}"
 
+["sim.dt"]
+summary = "{seconds} rebuilds the world to step that often, its state carried over; without it, the current step. A loaded policy keeps the step it was trained at, so unload it first."
+kind = "sim"
+args.seconds = "number, the physics step in s, 0.0001 to 0.05, default the current one"
+returns = "{seconds, rate_hz}"
+example = '{"seconds": 0.005}'
+
 ["solver.status"]
 summary = "The solver telemetry's state: channels, alert, sweep budget, heatmap, records kept and capped, the newest record and the located marker."
 kind = "read"
-returns = "{mask, alert, iterations, heatmap, records, caps, recent_caps, recent_records, dropped, first, next, applied, last, marker}"
+returns = "{mask, alert, iterations, dt, heatmap, records, caps, recent_caps, recent_records, dropped, first, next, applied, last, marker}"
 
 ["solver.records"]
 summary = "Pages forward through the kept telemetry records: `since` on, at most `limit`, oldest first."

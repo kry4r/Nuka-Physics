@@ -2225,6 +2225,7 @@ void EditorHost::State::BindWorker(uint64_t tick, double sim_time) {
     binding.env = ui_state_.env_index % layout.env_count;
     binding.shown = OtherShownEnvs(binding.env);
     binding.dt = opt_.dt;
+    ui_state_.solver.dt = opt_.dt;
     binding.speed = ui_state_.speed;
     binding.colliders = ui_state_.show_colliders;
     binding.contacts = ui_state_.show_contacts;
@@ -7927,6 +7928,46 @@ void EditorHost::State::RegisterSceneActions() {
                       ui_state_.collision.appear = true;
                       return RunAction("scene.collision_preview", CollisionArgs(ui_state_.collision), "ui");
                   }});
+    // Kind none removes the terrain; another kind replaces it with the field TerrainFromArgs describes.
+    actions_.Add({"scene.terrain", "Set Terrain", "scene", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      json::Value after;
+                      const bool remove = StrArg(args, "kind") == "none";
+                      if (!remove) {
+                          scene::TerrainRecord t;
+                          std::string error;
+                          if (!TerrainFromArgs(args, &t, &error)) return ActionResult::Fail(error);
+                          after = TerrainArgs(t);
+                      }
+                      const ActionResult r = SubmitTxn(EditTxn{remove ? "Remove Terrain" : "Set Terrain",
+                                                               {EditOp{"", "terrain", json::Value(), after}}});
+                      if (!r.ok) return r;
+                      ui_state_.terrain.dismiss = true;
+                      return Ok(after);
+                  }});
+    actions_.Add({"scene.terrain_info", "Terrain", "scene", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value&) {
+                      const std::vector<scene::TerrainRecord>& t = loaded_->scene.Terrain();
+                      return Ok(t.empty() ? json::Value::Null() : TerrainArgs(t.front()));
+                  },
+                  "", true});
+    // A scene without terrain offers the field g1_rough trains on.
+    actions_.Add({"scene.terrain_dialog", "Terrain...", "scene", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value&) {
+                      const std::vector<scene::TerrainRecord>& terrain = loaded_->scene.Terrain();
+                      scene::TerrainRecord fresh;
+                      std::string error;
+                      if (terrain.empty())
+                          TerrainFromArgs(Object({{"kind", json::Value::Str("bumps")}}), &fresh, &error);
+                      const json::Value args = TerrainArgs(terrain.empty() ? fresh : terrain.front());
+                      if (args.At("kind").AsString() == "image")
+                          return ActionResult::Fail(
+                              "the scene's terrain comes from an image; edit it in the scene file");
+                      TerrainDialogFrom(args, &ui_state_.terrain);
+                      ui_state_.terrain.exists = !terrain.empty();
+                      ui_state_.terrain.appear = true;
+                      return Ok(args);
+                  }});
 }
 
 void EditorHost::State::RegisterAssetActions() {
@@ -9140,6 +9181,36 @@ void EditorHost::State::RegisterSolverActions() {
                       solver_seq_ = worker_.Push(TickCommand::Param(ParamKind::Iterations, {static_cast<float>(n)}));
                       return Ok(Object({{"n", json::Value::Int(n)}}));
                   }});
+    // {seconds} rebuilds the world to step that often, its state carried over; without it, the current step.
+    actions_.Add({"sim.dt", "Time Step", "sim", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      const auto dt = static_cast<float>(NumArg(args, "seconds", opt_.dt));
+                      if (!(dt >= 1.0e-4f && dt <= 0.05f)) return ActionResult::Fail("seconds: 0.0001 to 0.05");
+                      if (dt != opt_.dt && policy_ctrl_)
+                          return ActionResult::Fail("a policy is loaded at the current step; unload it first");
+                      std::string why;
+                      if (dt != opt_.dt) {
+                          worker_.Exclusive([&] {
+                              entity_drag_.Cancel();
+                              present_->WaitIdle();
+                              const uint64_t tick = worker_.Tick();
+                              const double sim_time = worker_.SimTime();
+                              for (const PoseWrite& write : loaded_->sim->TakePoseWrites())
+                                  ApplyPoseWrite(world_, loaded_->Layout(), sent_env_, write);
+                              why = RetimeEditorScene(*loaded_, cache_, dt);
+                              if (!why.empty()) return;
+                              opt_.dt = dt;
+                              opt_.dt_set = true;
+                              OnRebound(tick, sim_time);
+                              const std::string label = Format("%.4g ms step", static_cast<double>(dt) * 1000.0);
+                              doc_.AddBranch(TimelineBranch{tick, Generation(), label});
+                          });
+                      }
+                      if (!why.empty()) return ActionResult::Fail("the world refused the step: " + why);
+                      return Ok(Object({{"seconds", json::Value::Float(opt_.dt)},
+                                        {"rate_hz", json::Value::Float(1.0f / opt_.dt)}}));
+                  },
+                  "", true});
     actions_.Add({"solver.status", "Solver Status", "solver", "", ShortcutScope::Global, {}, {},
                   [this](const json::Value&) {
                       const SolverView& v = ui_state_.solver;
@@ -9154,6 +9225,7 @@ void EditorHost::State::RegisterSolverActions() {
                           {{"mask", json::Value::Int(v.mask)},
                            {"alert", json::Value::Float(v.alert)},
                            {"iterations", json::Value::Int(v.iterations)},
+                           {"dt", json::Value::Float(v.dt)},
                            {"heatmap", json::Value::Bool(v.heatmap)},
                            {"records", json::Value::Int(static_cast<int64_t>(v.records))},
                            {"caps", json::Value::Int(static_cast<int64_t>(v.caps))},
@@ -9677,8 +9749,9 @@ std::unique_ptr<inference::PolicyController> EditorHost::State::MakeContractCont
         return nullptr;
     }
     if (std::fabs(dt - opt_.dt) > 1e-6f) {
-        *error = Format("the policy was trained at a %g s step; the scene steps every %g s", static_cast<double>(dt),
-                        static_cast<double>(opt_.dt));
+        *error = Format("the policy was trained at a %g s step; the scene steps every %g s (the Solver panel's "
+                        "Time step, or sim.dt, sets it)",
+                        static_cast<double>(dt), static_cast<double>(opt_.dt));
         return nullptr;
     }
     // A robot is an articulation with every joint the contract names.

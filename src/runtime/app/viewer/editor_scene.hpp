@@ -56,6 +56,9 @@ std::string RecookEditorScene(EditorScene& es, SceneCache& cache);
 // The same rebuild with `envs` environments, every one from the scene's initial state.
 std::string ResizeEditorEnvs(EditorScene& es, SceneCache& cache, uint32_t envs);
 
+// The same rebuild, state carried over, stepping every `dt` seconds.
+std::string RetimeEditorScene(EditorScene& es, SceneCache& cache, float dt);
+
 // Restores the initial physical state and the drive targets captured at bind time.
 bool ResetWorldPhysics(nuka_world_handle world, const std::vector<float>& rest_targets);
 

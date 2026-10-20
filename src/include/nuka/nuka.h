@@ -410,6 +410,8 @@ nuka_result_t nuka_world_rebuild_from_scene(nuka_world_handle world, const char*
 // The same rebuild from the scene's initial state with `env_count` environments; later rebuilds keep it.
 nuka_result_t nuka_world_rebuild_with_envs(nuka_world_handle world, const char* scene_path,
                                            uint32_t env_count);
+// The same rebuild, state carried over, stepping every `dt` seconds; later rebuilds keep it.
+nuka_result_t nuka_world_rebuild_with_dt(nuka_world_handle world, const char* scene_path, float dt);
 nuka_result_t nuka_world_get_generation(nuka_world_handle world, uint64_t* out_generation);
 // A lease keeps the current generation's view storage alive across rebuilds until released.
 nuka_result_t nuka_world_retain_storage(nuka_world_handle world, uint64_t* out_generation);

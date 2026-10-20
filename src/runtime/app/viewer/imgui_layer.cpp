@@ -137,6 +137,14 @@ const char* LayoutColumn(const LayoutPreset& preset, std::string_view id) {
     return has(preset.left) ? "left" : has(preset.right) ? "right" : has(preset.bottom) ? "bottom" : "";
 }
 
+// The column a built-in panel opened outside the current layout docks into: the one the first preset
+// listing it uses, else the right one.
+std::string_view HomeColumn(std::string_view id) {
+    for (const LayoutPreset& preset : kLayouts)
+        if (const char* column = LayoutColumn(preset, id); *column != '\0') return column;
+    return "right";
+}
+
 // A menu lists its actions in this order; actions of its categories it does not name follow.
 struct MenuSpec {
     std::string title;
@@ -162,7 +170,7 @@ const std::vector<MenuSpec>& Menus() {
             {"Create",
              {"scene"},
              {"scene.add_box", "scene.add_sphere", "scene.add_capsule", "scene.add_cylinder", "scene.add_plane", "-",
-              "file.import", "scene.collision_dialog"}},
+              "scene.terrain_dialog", "-", "file.import", "scene.collision_dialog"}},
             {"View",
              {"view"},
              {"app.command_palette", "-", "view.frame_all", "view.frame_selected", "view.reset_camera", "-",
@@ -615,7 +623,8 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
         {"view.contacts", icon::kAtom},     {"view.hide_overlays", icon::kVisual},    {"view.screenshot", icon::kCamera},
         {"dataset.exporter", icon::kDatabase},
         {"file.import", icon::kImport},     {"scene.collision_dialog", icon::kHull},  {"scene.set_visible", icon::kEyeSlash},
-        {"scene.set_locked", icon::kLock},  {"assets.add_folder", icon::kFolderPlus}, {"assets.rescan", icon::kReset}};
+        {"scene.set_locked", icon::kLock},  {"assets.add_folder", icon::kFolderPlus}, {"assets.rescan", icon::kReset},
+        {"scene.terrain_dialog", icon::kWaves}};
     for (const auto& [id, glyph] : icons) registry.Decorate(id, glyph, false);
     for (const auto& [id, glyph] : {std::pair{"view.layout_single", icon::kViewSingle}, std::pair{"view.layout_split", icon::kViewSplit},
                                     std::pair{"view.layout_quad", icon::kViewQuad}, std::pair{"view.maximize", icon::kMaximize}})
@@ -1602,10 +1611,12 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
                 node->TabBar->NextSelectedTabId = node->TabBar->SelectedTabId;
     ImGui::DockSpaceOverViewport(dockspace, ImGui::GetMainViewport(), ImGuiDockNodeFlags_PassthruCentralNode);
     host_.DrawPanels([this](const nui::Panel& panel) -> ImGuiID {
-        const ImGuiID node = panel.dock == "left"     ? dock_left_
-                             : panel.dock == "right"  ? dock_right_
-                             : panel.dock == "bottom" ? dock_bottom_
-                                                      : 0u;
+        const std::string_view dock = panel.dock.empty() && Builtin(panel.id) ? HomeColumn(panel.id)
+                                                                              : std::string_view(panel.dock);
+        const ImGuiID node = dock == "left"     ? dock_left_
+                             : dock == "right"  ? dock_right_
+                             : dock == "bottom" ? dock_bottom_
+                                                : 0u;
         return node != 0u && ImGui::DockBuilderGetNode(node) != nullptr ? node : 0u;
     });
 
@@ -1688,6 +1699,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
     DrawImportWizard();
     DrawReimportConfirm();
     DrawCollisionDialog();
+    DrawTerrainDialog();
     DrawGainTuner();
     DrawSysId();
     DrawDatasetExporter();

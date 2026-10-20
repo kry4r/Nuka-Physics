@@ -44,6 +44,9 @@ This page is generated from assets/editor/actions.toml by tools/skill_actions.py
 - `scene.collision_preview` {paths?, path?, method?, max_pieces?, replace?, only_missing?, subtree?} [read]: What scene.generate_collision would do with the same arguments, body by body, without changing anything; the Generate Collision dialog shows it.
 - `scene.generate_collision` {paths?, path?, method?, max_pieces?, replace?, only_missing?, subtree?} [edit]: Builds colliders for bodies from their visual meshes, as one undoable edit: a convex hull, a convex decomposition, an SDF or the triangle mesh itself.
 - `scene.collision_dialog` [view]: Opens the Generate Collision dialog on the selection with its preview.
+- `scene.terrain` {kind, size?, center?, cell?, base?, height?, bump?, grade?, rise?, width?, platform?, count?, tile?, margin?, seed?} [edit]: Sets the scene's terrain field, which the cook bakes into a static heightfield, or removes it with kind none.
+- `scene.terrain_info` [read]: The scene's terrain field as scene.terrain arguments, every size filled in; null when the scene has none.
+- `scene.terrain_dialog` [view]: Opens the Terrain dialog on the scene's field, or on the default bump field when there is none.
 - `scene.nodes` {under?, kind?} [read]: The scene's nodes in tree order: all, those under `under`, or those of one `kind`.
 - `scene.fields` {paths?, path?} [read]: The fields the Properties panel edits for `paths` (else `path`, else the selection; "" or no selection gives the world options), in groups: each group's `targets` are what an edit.apply op names as its target, each field's `field` the op's field.
 - `scene.add_box` [edit]: Adds a box above the selection, else above the origin, as one undoable edit; scene.spawn with kind box.
@@ -170,6 +173,7 @@ This page is generated from assets/editor/actions.toml by tools/skill_actions.py
 - `solver.telemetry` {mask?, alert?} [sim]: Records solver telemetry each step: per-step residuals, sweep counts and capped steps.
 - `solver.heatmap` {on?} [view]: Colours the solver's per-vertex residuals over the scene; the heatmap needs the per-vertex channel and turns it on.
 - `solver.set_iterations` {n} [sim]: Sets the solver's sweep budget per step, live.
+- `sim.dt` {seconds?} [sim]: {seconds} rebuilds the world to step that often, its state carried over; without it, the current step.
 - `solver.status` [read]: The solver telemetry's state: channels, alert, sweep budget, heatmap, records kept and capped, the newest record and the located marker.
 - `solver.records` {since?, limit?, capped?} [read]: Pages forward through the kept telemetry records: `since` on, at most `limit`, oldest first.
 - `solver.locate` {record?, clear?} [view]: Frames and selects the worst element of a kept record: the given one, else the newest capped one, else the newest; {"clear": true} drops the marker.

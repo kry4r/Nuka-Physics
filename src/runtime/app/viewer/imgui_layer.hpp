@@ -164,6 +164,59 @@ inline nui::json::Value CollisionArgs(const CollisionDialog& d) {
     return args;
 }
 
+// The terrain dialog: the field it sets up, as scene.terrain arguments.
+struct TerrainDialog {
+    bool appear = false;
+    bool dismiss = false;  // a set or a removal closes the open dialog
+    bool exists = false;   // the scene has a terrain to replace or remove
+    std::string kind;      // flat, bumps, slope, stairs or mixed
+    float size[2] = {0.0f, 0.0f};
+    float center[2] = {0.0f, 0.0f};
+    float cell = 0.0f, base = 0.0f, height = 0.0f, bump = 0.0f, grade = 0.0f;
+    float rise = 0.0f, width = 0.0f, platform = 0.0f, tile = 0.0f, margin = 0.0f;
+    int count = 0, seed = 0;
+};
+
+inline nui::json::Value TerrainDialogArgs(const TerrainDialog& d) {
+    using V = nui::json::Value;
+    const auto pair = [](const float* v) {
+        V a = V::Array();
+        a.PushBack(V::Float(v[0]));
+        a.PushBack(V::Float(v[1]));
+        return a;
+    };
+    V args = V::Object();
+    args.Set("kind", V::Str(d.kind));
+    args.Set("size", pair(d.size));
+    args.Set("center", pair(d.center));
+    for (const auto& [key, value] : {std::pair{"cell", d.cell}, std::pair{"base", d.base},
+                                     std::pair{"height", d.height}, std::pair{"bump", d.bump},
+                                     std::pair{"grade", d.grade}, std::pair{"rise", d.rise},
+                                     std::pair{"width", d.width}, std::pair{"platform", d.platform},
+                                     std::pair{"tile", d.tile}, std::pair{"margin", d.margin}})
+        args.Set(key, V::Float(value));
+    args.Set("count", V::Int(d.count));
+    args.Set("seed", V::Int(d.seed));
+    return args;
+}
+
+// Fills the dialog from scene.terrain_info's arguments.
+inline void TerrainDialogFrom(const nui::json::Value& args, TerrainDialog* d) {
+    d->kind = args.At("kind").AsString();
+    for (int i = 0; i < 2; ++i) {
+        d->size[i] = args.At("size").Elements()[i].AsFloat();
+        d->center[i] = args.At("center").Elements()[i].AsFloat();
+    }
+    for (const auto& [key, field] : {std::pair{"cell", &d->cell}, std::pair{"base", &d->base},
+                                     std::pair{"height", &d->height}, std::pair{"bump", &d->bump},
+                                     std::pair{"grade", &d->grade}, std::pair{"rise", &d->rise},
+                                     std::pair{"width", &d->width}, std::pair{"platform", &d->platform},
+                                     std::pair{"tile", &d->tile}, std::pair{"margin", &d->margin}})
+        *field = args.At(key).AsFloat();
+    d->count = static_cast<int>(args.At("count").AsInt());
+    d->seed = static_cast<int>(args.At("seed").AsInt());
+}
+
 // A field edit that rebuilds the world, held until Apply & Rebuild.
 struct StagedEdit {
     std::string target;
@@ -177,6 +230,7 @@ struct SolverView {
     uint32_t mask = 0u;     // nuka_telemetry_bits_t the world records; 0 is off
     float alert = 1.0e-3f;  // [m/s]
     uint32_t iterations = 0u;
+    float dt = 0.0f;  // [s] the world's step
     bool heatmap = false;
     uint64_t session = 0u;
     uint64_t records = 0u, caps = 0u, dropped = 0u;
@@ -380,6 +434,7 @@ struct ViewerUiState {
     AssetBrowser assets;
     ImportWizard import;
     CollisionDialog collision;
+    TerrainDialog terrain;
     // The selection's fields, host-built whenever the selection or the document changes.
     std::vector<PropertyGroup> properties;
     uint64_t properties_version = 0u;  // bumped with every rebuild of `properties`
@@ -565,6 +620,7 @@ private:
     void DrawReimportConfirm();
     void DrawImportWizard();
     void DrawCollisionDialog();
+    void DrawTerrainDialog();
     // The floating Gain Tuner while it is open.
     void DrawGainTuner();
     // The floating System Identification window while it is open, with the search's fit.

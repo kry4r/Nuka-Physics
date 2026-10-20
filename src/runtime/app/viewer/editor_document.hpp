@@ -40,6 +40,11 @@ math::Transform TransformFromJson(const scene::json::Value& v);
 scene::json::Value MaterialToJson(const scene::RenderMaterial& m);
 bool ParsePrimitiveKind(const std::string& s, PrimitiveKind* out);
 const char* PrimitiveKindName(PrimitiveKind kind);
+// The terrain field `args` describes: a kind (flat, bumps, slope, stairs or mixed), its extent and the
+// kind's sizes, each defaulting to the training field's. False with `error` set on a bad value.
+bool TerrainFromArgs(const scene::json::Value& args, scene::TerrainRecord* out, std::string* error);
+// The arguments that describe `t`, every size filled in.
+scene::json::Value TerrainArgs(const scene::TerrainRecord& t);
 
 // A rebuild cut the timeline at this tick; the rebuilt world continues from it.
 struct TimelineBranch {

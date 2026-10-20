@@ -253,6 +253,12 @@ TerrainId SceneIR::AddTerrain(TerrainRecord record) {
     return id;
 }
 
+bool SceneIR::RemoveTerrain(TerrainId id) {
+    if (id >= terrain_.size()) return false;
+    terrain_.erase(terrain_.begin() + id);
+    return true;
+}
+
 ScriptId SceneIR::AddScript(ScriptRecord record) {
     const auto id = static_cast<ScriptId>(scripts_.size());
     record.id = id;

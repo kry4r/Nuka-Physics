@@ -28,7 +28,7 @@ bool IsStructural(const std::string& field) {
            field == "reimport" || field == "collision" || field == "static" || field == "pin" || field == "drive" ||
            field == "initial_position" || field == "attach" || field == "sensor" || field == "material_new" ||
            field == "material_rename" || field == "material_delete" || field == "material_assign" ||
-           field == "material_unique" || field == "material_friction";
+           field == "material_unique" || field == "material_friction" || field == "terrain";
 }
 
 // Moves the import sources recorded at node `from` or under it to `to`; an empty `to` drops them.
@@ -226,6 +226,125 @@ const char* PrimitiveKindName(PrimitiveKind kind) {
         case PrimitiveKind::Cylinder: return "cylinder";
     }
     return "";
+}
+
+namespace {
+
+// What a terrain call leaves out: g1_rough's bump field and the tiled field's steps.
+constexpr float kTerrainSize = 20.0f, kTerrainCell = 0.1f, kBumpHeight = 0.05f, kBumpCell = 0.4f, kGrade = 0.1f;
+constexpr float kStepRise = 0.08f, kStepWidth = 0.3f, kPlatform = 1.0f, kTile = 5.0f, kTileMargin = 0.6f;
+constexpr int64_t kSteps = 8;
+constexpr uint32_t kMaxTerrainCells = 4096u;
+
+std::string TerrainKind(const scene::TerrainRecord& t) {
+    if (!t.image_path.empty()) return "image";
+    if (t.feature_cell > 0.0f) return "mixed";
+    if (t.ring_rise != 0.0f) return "stairs";
+    if (t.grade_x != 0.0f || t.grade_y != 0.0f) return "slope";
+    return t.bump_height > 0.0f ? "bumps" : "flat";
+}
+
+}  // namespace
+
+bool TerrainFromArgs(const json::Value& args, scene::TerrainRecord* out, std::string* error) {
+    const json::Value* kind_arg = args.Find("kind");
+    const std::string kind = kind_arg != nullptr ? kind_arg->AsString() : std::string();
+    if (kind != "flat" && kind != "bumps" && kind != "slope" && kind != "stairs" && kind != "mixed") {
+        *error = "the terrain kind is flat, bumps, slope, stairs or mixed";
+        return false;
+    }
+    const auto num = [&](const char* key, float fallback) {
+        const json::Value* v = args.Find(key);
+        return v != nullptr ? v->AsFloat() : fallback;
+    };
+    const auto count = [&](const char* key, int64_t fallback) {
+        const json::Value* v = args.Find(key);
+        return v != nullptr ? v->AsInt() : fallback;
+    };
+    float size[2] = {kTerrainSize, kTerrainSize}, center[2] = {0.0f, 0.0f};
+    if (const json::Value* v = args.Find("size")) ReadFloats(*v, size, 2u);
+    if (const json::Value* v = args.Find("center")) ReadFloats(*v, center, 2u);
+    const float cell = num("cell", kTerrainCell);
+    const float cells[2] = {size[0] / cell, size[1] / cell};
+    if (!(cell >= 0.02f) || !(cells[0] >= 4.0f && cells[1] >= 4.0f) ||
+        !(cells[0] <= kMaxTerrainCells && cells[1] <= kMaxTerrainCells)) {
+        *error = "a terrain side spans 4 to 4096 cells of 0.02 m or more";
+        return false;
+    }
+    scene::TerrainRecord t;
+    t.name = "terrain";
+    t.cell = cell;
+    t.ncol = static_cast<uint32_t>(std::lround(cells[0])) + 1u;
+    t.nrow = static_cast<uint32_t>(std::lround(cells[1])) + 1u;
+    t.origin = math::Vec3{center[0] - 0.5f * cell * static_cast<float>(t.ncol - 1u),
+                          center[1] - 0.5f * cell * static_cast<float>(t.nrow - 1u), 0.0f};
+    t.base_z = num("base", 0.0f);
+    if (kind == "bumps" || kind == "mixed") {
+        t.bump_height = num("height", kBumpHeight);
+        t.bump_cell = num("bump", kBumpCell);
+        if (!(t.bump_height > 0.0f) || !(t.bump_cell >= cell)) {
+            *error = "bumps need a height above 0 and a footprint of a cell or more";
+            return false;
+        }
+    }
+    if (kind == "slope") {
+        t.grade_x = num("grade", kGrade);
+        if (t.grade_x == 0.0f || !std::isfinite(t.grade_x)) {
+            *error = "a slope needs a grade other than 0";
+            return false;
+        }
+    }
+    if (kind == "stairs" || kind == "mixed") {
+        t.ring_rise = num("rise", kStepRise);
+        t.ring_width = num("width", kStepWidth);
+        t.ring_platform = num("platform", kPlatform);
+        const int64_t steps = count("count", kSteps);
+        if (t.ring_rise == 0.0f || !std::isfinite(t.ring_rise) || !(t.ring_width >= cell) ||
+            !(t.ring_platform >= 0.0f) || steps < 1 || steps > 64) {
+            *error = "stairs need a rise other than 0 (below 0 digs a pit), steps a cell wide or more, and 1 to 64 "
+                     "of them";
+            return false;
+        }
+        t.ring_count = static_cast<uint32_t>(steps);
+    }
+    if (kind == "mixed") {
+        t.feature_cell = num("tile", kTile);
+        t.feature_margin = num("margin", kTileMargin);
+        const int64_t seed = count("seed", 0);
+        if (!(t.feature_margin >= 0.0f) || !(t.feature_cell > 2.0f * t.feature_margin) || seed < 0) {
+            *error = "a mixed field's tiles are wider than twice their rim, and its seed is 0 or more";
+            return false;
+        }
+        t.feature_seed = static_cast<uint32_t>(seed);
+    }
+    *out = std::move(t);
+    return true;
+}
+
+json::Value TerrainArgs(const scene::TerrainRecord& t) {
+    const std::string kind = TerrainKind(t);
+    const bool bumps = kind == "bumps" || kind == "mixed", stairs = kind == "stairs" || kind == "mixed";
+    const bool mixed = kind == "mixed";
+    const float size[2] = {t.cell * static_cast<float>(std::max(t.ncol, 1u) - 1u),
+                           t.cell * static_cast<float>(std::max(t.nrow, 1u) - 1u)};
+    const float center[2] = {t.origin.x + 0.5f * size[0], t.origin.y + 0.5f * size[1]};
+    json::Value v = Obj({{"kind", json::Value::Str(kind)},
+                         {"size", Floats(size, 2u)},
+                         {"center", Floats(center, 2u)},
+                         {"cell", json::Value::Float(t.cell)},
+                         {"base", json::Value::Float(t.base_z)},
+                         {"height", json::Value::Float(bumps ? t.bump_height : kBumpHeight)},
+                         {"bump", json::Value::Float(bumps ? t.bump_cell : kBumpCell)},
+                         {"grade", json::Value::Float(kind == "slope" ? t.grade_x : kGrade)},
+                         {"rise", json::Value::Float(stairs ? t.ring_rise : kStepRise)},
+                         {"width", json::Value::Float(stairs ? t.ring_width : kStepWidth)},
+                         {"platform", json::Value::Float(stairs ? t.ring_platform : kPlatform)},
+                         {"count", json::Value::Int(stairs ? static_cast<int64_t>(t.ring_count) : kSteps)},
+                         {"tile", json::Value::Float(mixed ? t.feature_cell : kTile)},
+                         {"margin", json::Value::Float(mixed ? t.feature_margin : kTileMargin)},
+                         {"seed", json::Value::Int(mixed ? static_cast<int64_t>(t.feature_seed) : 0)}});
+    if (kind == "image") v.Set("image", json::Value::Str(t.image_path));
+    return v;
 }
 
 void EditorDocument::Attach(EditorScene* es, DocumentHost* host) {
@@ -474,6 +593,23 @@ bool EditorDocument::ApplyOp(const EditOp& op, EditOp* done, EditOp* inverse, Op
         if (out->focus.empty()) {
             *error = "cannot spawn under '" + op.target + "'";
             return false;
+        }
+        out->rebuild = true;
+    } else if (op.field == "terrain") {
+        // `after` describes the field the cook bakes (TerrainFromArgs); null removes it.
+        const bool had = es_->scene.TerrainCount() > 0u;
+        if (op.after.IsNull() && !had) {
+            *error = "the scene has no terrain";
+            return false;
+        }
+        done->before = had ? TerrainArgs(es_->scene.Terrain().front()) : json::Value::Null();
+        if (op.after.IsNull()) {
+            es_->scene.RemoveTerrain(0u);
+        } else {
+            scene::TerrainRecord t;
+            if (!TerrainFromArgs(op.after, &t, error)) return false;
+            if (had) es_->scene.GetTerrainMut(0u) = std::move(t);
+            else es_->scene.AddTerrain(std::move(t));
         }
         out->rebuild = true;
     } else if (op.field == "import") {

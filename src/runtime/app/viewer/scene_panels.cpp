@@ -801,6 +801,93 @@ void ImGuiLayer::DrawCollisionDialog() {
     ImGui::EndPopup();
 }
 
+// ---- terrain dialog -----------------------------------------------------------------------
+
+void ImGuiLayer::DrawTerrainDialog() {
+    TerrainDialog& d = frame_.ui->terrain;
+    const std::string title = std::string(Tr("Terrain")) + "###terrain";
+    const bool dismiss = d.dismiss;
+    d.dismiss = false;
+    if (d.appear) {
+        ImGui::OpenPopup(title.c_str());
+        d.appear = false;
+    }
+    const float s = nui::Scale();
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(480.0f * s, 0.0f), ImVec2(480.0f * s, FLT_MAX));
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize;
+    if (!ImGui::BeginPopupModal(title.c_str(), nullptr, flags)) return;
+    if (dismiss) {
+        ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        return;
+    }
+
+    static const char* const kTerrainKinds[] = {"flat", "bumps", "slope", "stairs", "mixed"};
+    if (ImGui::BeginTable("##terrain_options", 2, ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed, 110.0f * s);
+        ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
+        OptionLabel("Kind");
+        const auto* const at = std::find(std::begin(kTerrainKinds), std::end(kTerrainKinds), d.kind);
+        int kind = static_cast<int>(at - std::begin(kTerrainKinds));
+        nui::Segmented kinds({"Flat", "Bumps", "Slope", "Stairs", "Mixed"}, nui::Ref(&kind));
+        kinds.id = "kind";
+        kinds.tips = {"A level field", "Blocks of random height up to the bump height", "A ramp rising along +X",
+                      "Square steps up to a central platform; a negative rise digs a pit",
+                      "Tiles that mix steps, pits and bumps"};
+        kinds.on_change = [&](int v) { d.kind = kTerrainKinds[v]; };
+        kinds.Draw();
+        const auto field = [&](const char* label, const char* id, float* v, float lo, float hi, const char* format) {
+            OptionLabel(label);
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::DragFloat(id, v, (hi - lo) / 400.0f, lo, hi, format, ImGuiSliderFlags_AlwaysClamp);
+        };
+        OptionLabel("Size");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::DragFloat2("##size", d.size, 0.1f, 2.0f, 200.0f, "%.1f m", ImGuiSliderFlags_AlwaysClamp);
+        field("Cell", "##cell", &d.cell, 0.02f, 0.5f, "%.2f m");
+        if (d.kind == "bumps" || d.kind == "mixed") {
+            field("Bump height", "##height", &d.height, 0.005f, 0.5f, "%.3f m");
+            field("Bump size", "##bump", &d.bump, 0.05f, 2.0f, "%.2f m");
+        }
+        if (d.kind == "slope") field("Grade", "##grade", &d.grade, -1.0f, 1.0f, "%.2f");
+        if (d.kind == "stairs" || d.kind == "mixed") {
+            field("Step rise", "##rise", &d.rise, -0.3f, 0.3f, "%.3f m");
+            field("Step width", "##width", &d.width, 0.05f, 2.0f, "%.2f m");
+            field("Platform", "##platform", &d.platform, 0.0f, 20.0f, "%.1f m");
+            OptionLabel("Steps");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::SliderInt("##count", &d.count, 1, 64, "%d", ImGuiSliderFlags_AlwaysClamp);
+        }
+        if (d.kind == "mixed") {
+            field("Tile", "##tile", &d.tile, 1.0f, 20.0f, "%.1f m");
+            OptionLabel("Seed");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::InputInt("##seed", &d.seed)) d.seed = std::max(d.seed, 0);
+        }
+        ImGui::EndTable();
+    }
+    ImGui::Dummy(ImVec2(0.0f, 8.0f * s));
+
+    const float bw = 120.0f * s, spacing = ImGui::GetStyle().ItemSpacing.x;
+    if (d.exists) {
+        if (ImGui::Button(Tr("Remove"), ImVec2(bw, 0.0f))) {
+            Queue("scene.terrain", Args({{"kind", json::Value::Str("none")}}));
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+    }
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - bw * 2.0f - spacing);
+    if (ImGui::Button(Tr("Cancel"), ImVec2(bw, 0.0f)) || ImGui::IsKeyPressed(ImGuiKey_Escape))
+        ImGui::CloseCurrentPopup();
+    ImGui::SameLine();
+    if (PrimaryButton(Tr(d.exists ? "Replace" : "Create"), bw, true)) {
+        Queue("scene.terrain", TerrainDialogArgs(d));
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
 // ---- properties ---------------------------------------------------------------------------
 
 nui::Collapsible& ImGuiLayer::Fold(nui::Collapsible& group, const std::string& key) {
