@@ -621,7 +621,7 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
         {"sim.step", icon::kStep},          {"sim.reset", icon::kReset},              {"view.frame_all", icon::kFrame},
         {"view.frame_selected", icon::kTarget}, {"view.reset_camera", icon::kHome},   {"view.colliders", icon::kCollider},
         {"view.contacts", icon::kAtom},     {"view.hide_overlays", icon::kVisual},    {"view.screenshot", icon::kCamera},
-        {"dataset.exporter", icon::kDatabase},
+        {"dataset.exporter", icon::kDatabase}, {"view.record", icon::kRecord},
         {"file.import", icon::kImport},     {"scene.collision_dialog", icon::kHull},  {"scene.set_visible", icon::kEyeSlash},
         {"scene.set_locked", icon::kLock},  {"assets.add_folder", icon::kFolderPlus}, {"assets.rescan", icon::kReset},
         {"scene.terrain_dialog", icon::kWaves}};
@@ -679,7 +679,8 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
                            "robot.gain_status", "robot.gain_runs", "sysid.status", "robot.links", "robot.asset_links",
                            "robot.attach", "robot.attach_asset", "robot.ik", "robot.ik_settings", "view.robot_overlays",
                            "demo.episodes", "clip.list", "clip.get", "clip.set", "clip.rename", "clip.key",
-                           "clip.remove_keys", "clip.move_keys", "clip.sample"})
+                           "clip.remove_keys", "clip.move_keys", "clip.sample", "view.record_status", "view.project",
+                           "ui.pointer", "ui.pointer_status"})
         registry.Decorate(id, "", true);
     registry.Rebind("file.open", "Ctrl+O");
     registry.Rebind("file.save", "Ctrl+S");

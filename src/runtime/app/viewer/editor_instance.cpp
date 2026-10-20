@@ -2,8 +2,10 @@
 
 #include "runtime/app/viewer/editor_profile.hpp"
 
+#include <algorithm>
 #include <mutex>
 #include <thread>
+#include <utility>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -14,8 +16,12 @@
 #endif
 #include <windows.h>
 #else
+#include <cerrno>
+#include <fcntl.h>
+#include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
+#include <sys/wait.h>
 #include <unistd.h>
 extern char** environ;
 #endif
@@ -163,6 +169,89 @@ bool ProcessAlive(uint32_t pid) {
     return alive;
 }
 
+struct PipedProcess::Impl {
+    HANDLE process = nullptr;
+    HANDLE input = nullptr;
+};
+
+PipedProcess::PipedProcess(const std::vector<std::string>& argv, const std::string& log, std::string* error)
+    : impl_(std::make_unique<Impl>()) {
+    SECURITY_ATTRIBUTES inherit{sizeof(inherit), nullptr, TRUE};
+    HANDLE read = nullptr;
+    if (!CreatePipe(&read, &impl_->input, &inherit, 0u)) {
+        *error = "cannot create a pipe (Windows error " + std::to_string(GetLastError()) + ")";
+        return;
+    }
+    SetHandleInformation(impl_->input, HANDLE_FLAG_INHERIT, 0u);
+    HANDLE out = CreateFileW(Utf8Path(log).wstring().c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                             &inherit, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (out == INVALID_HANDLE_VALUE) {
+        *error = "cannot open " + log + " (Windows error " + std::to_string(GetLastError()) + ")";
+        CloseHandle(read);
+        CloseHandle(std::exchange(impl_->input, nullptr));
+        return;
+    }
+    // The child inherits these two handles and no others.
+    HANDLE handles[2] = {read, out};
+    SIZE_T size = 0u;
+    InitializeProcThreadAttributeList(nullptr, 1u, 0u, &size);
+    std::vector<char> storage(size);
+    auto* attributes = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(storage.data());
+    InitializeProcThreadAttributeList(attributes, 1u, 0u, &size);
+    UpdateProcThreadAttribute(attributes, 0u, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, handles, sizeof(handles), nullptr,
+                              nullptr);
+    STARTUPINFOEXW startup{};
+    startup.StartupInfo.cb = sizeof(startup);
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = read;
+    startup.StartupInfo.hStdOutput = out;
+    startup.StartupInfo.hStdError = out;
+    startup.lpAttributeList = attributes;
+    std::wstring line;
+    for (const std::string& arg : argv) line += (line.empty() ? L"" : L" ") + Quoted(Utf8Path(arg).wstring());
+    PROCESS_INFORMATION process{};
+    const BOOL started = CreateProcessW(nullptr, line.data(), nullptr, nullptr, TRUE,
+                                        CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr,
+                                        &startup.StartupInfo, &process);
+    const DWORD why = GetLastError();
+    DeleteProcThreadAttributeList(attributes);
+    CloseHandle(read);
+    CloseHandle(out);
+    if (!started) {
+        *error = "cannot start " + argv.front() + " (Windows error " + std::to_string(why) + ")";
+        CloseHandle(std::exchange(impl_->input, nullptr));
+        return;
+    }
+    CloseHandle(process.hThread);
+    impl_->process = process.hProcess;
+}
+
+PipedProcess::~PipedProcess() { Finish(); }
+
+bool PipedProcess::Started() const { return impl_->process != nullptr; }
+
+bool PipedProcess::Write(const void* data, size_t bytes) {
+    const char* at = static_cast<const char*>(data);
+    while (bytes > 0u) {
+        DWORD wrote = 0u;
+        const DWORD chunk = static_cast<DWORD>(std::min<size_t>(bytes, size_t{1} << 30));
+        if (impl_->input == nullptr || !WriteFile(impl_->input, at, chunk, &wrote, nullptr)) return false;
+        at += wrote;
+        bytes -= wrote;
+    }
+    return true;
+}
+
+int PipedProcess::Finish() {
+    if (impl_->input != nullptr) CloseHandle(std::exchange(impl_->input, nullptr));
+    if (impl_->process == nullptr) return -1;
+    WaitForSingleObject(impl_->process, INFINITE);
+    DWORD code = 0u;
+    GetExitCodeProcess(impl_->process, &code);
+    CloseHandle(std::exchange(impl_->process, nullptr));
+    return static_cast<int>(code);
+}
+
 #else
 
 // No Unix-socket primary yet: every launch on this platform runs on its own.
@@ -191,6 +280,71 @@ uint64_t SpawnDetached(const std::vector<std::string>& argv, std::string* error)
 uint32_t ProcessId() { return static_cast<uint32_t>(getpid()); }
 
 bool ProcessAlive(uint32_t pid) { return kill(static_cast<pid_t>(pid), 0) == 0; }
+
+struct PipedProcess::Impl {
+    pid_t pid = 0;
+    int input = -1;
+};
+
+PipedProcess::PipedProcess(const std::vector<std::string>& argv, const std::string& log, std::string* error)
+    : impl_(std::make_unique<Impl>()) {
+    int ends[2] = {-1, -1};
+    if (pipe(ends) != 0) {
+        *error = "cannot create a pipe (errno " + std::to_string(errno) + ")";
+        return;
+    }
+    fcntl(ends[1], F_SETFD, FD_CLOEXEC);
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_adddup2(&actions, ends[0], 0);
+    posix_spawn_file_actions_addclose(&actions, ends[0]);
+    posix_spawn_file_actions_addopen(&actions, 1, log.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    posix_spawn_file_actions_adddup2(&actions, 1, 2);
+    std::vector<char*> args;
+    for (const std::string& arg : argv) args.push_back(const_cast<char*>(arg.c_str()));
+    args.push_back(nullptr);
+    const int failed = posix_spawnp(&impl_->pid, args.front(), &actions, nullptr, args.data(), environ);
+    posix_spawn_file_actions_destroy(&actions);
+    close(ends[0]);
+    if (failed != 0) {
+        *error = "cannot start " + argv.front() + " (errno " + std::to_string(failed) + ")";
+        close(ends[1]);
+        impl_->pid = 0;
+        return;
+    }
+    impl_->input = ends[1];
+}
+
+PipedProcess::~PipedProcess() { Finish(); }
+
+bool PipedProcess::Started() const { return impl_->pid != 0; }
+
+bool PipedProcess::Write(const void* data, size_t bytes) {
+    // A closed pipe then answers EPIPE instead of a SIGPIPE that would end the editor.
+    sigset_t pipe_signal;
+    sigemptyset(&pipe_signal);
+    sigaddset(&pipe_signal, SIGPIPE);
+    pthread_sigmask(SIG_BLOCK, &pipe_signal, nullptr);
+    const char* at = static_cast<const char*>(data);
+    while (bytes > 0u) {
+        const ssize_t wrote = impl_->input < 0 ? -1 : write(impl_->input, at, bytes);
+        if (wrote < 0 && errno == EINTR) continue;
+        if (wrote <= 0) return false;
+        at += wrote;
+        bytes -= static_cast<size_t>(wrote);
+    }
+    return true;
+}
+
+int PipedProcess::Finish() {
+    if (impl_->input >= 0) close(std::exchange(impl_->input, -1));
+    if (impl_->pid == 0) return -1;
+    int status = 0;
+    while (waitpid(impl_->pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    impl_->pid = 0;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
 
 #endif
 

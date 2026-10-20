@@ -181,6 +181,26 @@ Ray CameraController::ScreenRay(float px, float py, uint32_t width,
     return ray;
 }
 
+bool CameraController::ScreenPoint(const math::Vec3& p, uint32_t width, uint32_t height, float* px,
+                                   float* py) const {
+    const math::Vec3 eye = ResolvedEye();
+    const math::Vec3 fwd = (target_ - eye).Normalized();
+    math::Vec3 right = fwd.Cross(math::Vec3{0.0f, 0.0f, 1.0f});
+    if (right.LengthSq() < 1e-8f) right = math::Vec3{1.0f, 0.0f, 0.0f};
+    right = right.Normalized();
+    const math::Vec3 up = right.Cross(fwd).Normalized();
+    const math::Vec3 d = p - eye;
+    const float depth = d.Dot(fwd);
+    if (depth <= 1e-6f || width == 0u || height == 0u) return false;
+    const float tan_half_y = std::tan(std::max(fov_degrees, 1.0f) * 3.14159265358979323846f / 360.0f);
+    const float tan_half_x = tan_half_y * static_cast<float>(width) / static_cast<float>(height);
+    const float ndc_x = d.Dot(right) / (depth * tan_half_x);
+    const float ndc_y = d.Dot(up) / (depth * tan_half_y);
+    *px = (ndc_x + 1.0f) * 0.5f * static_cast<float>(width) - 0.5f;
+    *py = (1.0f - ndc_y) * 0.5f * static_cast<float>(height) - 0.5f;
+    return true;
+}
+
 bool CameraController::RayPlaneHit(const Ray& ray, const math::Vec3& plane_point,
                                    const math::Vec3& plane_normal,
                                    math::Vec3* out) const {

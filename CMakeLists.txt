@@ -261,9 +261,13 @@ if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)
         ${CMAKE_SOURCE_DIR}/external/implot/implot_items.cpp
         # ImGuiColorTextEdit (MIT, vendored): the script editor with Python highlighting.
         ${CMAKE_SOURCE_DIR}/external/imgui_color_text_edit/TextEditor.cpp
+        # The item hooks the editor's demo pointer finds widgets by label with.
+        ${CMAKE_SOURCE_DIR}/src/render/imgui/imgui_item_hooks.cpp
     )
     add_library(imgui STATIC ${NUKA_IMGUI_SOURCES})
     target_compile_definitions(imgui PUBLIC IMGUI_USE_WCHAR32)
+    # ImGui reports each item to the hooks while they record and skips them otherwise.
+    target_compile_definitions(imgui PRIVATE IMGUI_ENABLE_TEST_ENGINE)
     # TextEditor.cpp carries UTF-8 comments; MSVC would read them in the system code page.
     if(MSVC)
         target_compile_options(imgui PRIVATE /utf-8)

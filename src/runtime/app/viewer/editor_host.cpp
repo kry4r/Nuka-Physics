@@ -31,8 +31,10 @@
 #include "runtime/app/viewer/editor_import.hpp"
 #include "runtime/app/viewer/editor_instance.hpp"
 #include "runtime/app/viewer/editor_materials.hpp"
+#include "runtime/app/viewer/editor_pointer.hpp"
 #include "runtime/app/viewer/editor_profile.hpp"
 #include "runtime/app/viewer/editor_randomize.hpp"
+#include "runtime/app/viewer/editor_record.hpp"
 #include "runtime/app/viewer/editor_scene.hpp"
 #include "runtime/app/viewer/editor_sensors.hpp"
 #include "runtime/app/viewer/editor_training.hpp"
@@ -145,6 +147,7 @@ struct LaunchOptions {
     std::string scene_path;
     bool empty_requested = false;
     bool offscreen = false;
+    uint32_t window_width = 1280u, window_height = 720u;
     int max_frames = 0;  // 0 runs until the window closes
     float dt = kDefaultDt;
     bool dt_set = false;
@@ -282,7 +285,8 @@ void WriteThumbnail(const std::string& capture, const fs::path& out) {
 
 void PrintUsage() {
     std::printf("usage: nuka-editor [scene.nks] [--policy <bin>] [--play] [--frames N] [--dt SECONDS]\n"
-                "  [--offscreen] [--cam tx,ty,tz,dist,yaw_deg,pitch_deg]\n"
+                "  [--offscreen] [--window WxH sets the window size, default 1280x720]\n"
+                "  [--cam tx,ty,tz,dist,yaw_deg,pitch_deg]\n"
                 "  [--cams FILE.json loads camera bookmarks for the scene it opens]\n"
                 "  [--capture-frame N --capture-out FILE.ppm]\n"
                 "  [--run-script FILE.py runs a script once against the loaded scene]\n"
@@ -315,6 +319,10 @@ bool ParseOptions(const std::vector<std::string>& args, LaunchOptions* opt) {
         if (a == "--scene" && has_value) opt->scene_path = args[++i];
         else if (a == "--empty") opt->empty_requested = true;
         else if (a == "--offscreen") opt->offscreen = true;
+        else if (a == "--window" && has_value) {
+            if (std::sscanf(args[++i].c_str(), "%ux%u", &opt->window_width, &opt->window_height) != 2)
+                std::fprintf(stderr, "[nuka_editor] --window wants WIDTHxHEIGHT\n");
+        }
         else if (a == "--frames" && has_value) opt->max_frames = std::atoi(args[++i].c_str());
         else if (a == "--dt" && has_value) {
             opt->dt = static_cast<float>(std::atof(args[++i].c_str()));
@@ -1559,6 +1567,8 @@ struct EditorHost::State : DocumentHost {
 
     void* native_window_ = nullptr;
     std::string window_title_;
+    FrameRecorder recorder_;  // outlives the renderer that feeds it
+    DemoPointer pointer_;
     std::unique_ptr<render::PresentRenderer> present_;
     render::imgui::NukaImGuiContext imgui_;
     ImGuiLayer ui_;
@@ -1719,8 +1729,8 @@ void EditorHost::State::OpenLog() {
 void EditorHost::State::StartShell() {
     window::SurfaceBackendKind kind = window::SurfaceBackendKind::Headless;
     std::unique_ptr<window::WindowSurface> surface =
-        opt_.offscreen ? window::MakeHeadlessSurface(1280u, 720u)
-                       : window::MakeSurface("Nuka Editor", 1280u, 720u, &kind);
+        opt_.offscreen ? window::MakeHeadlessSurface(opt_.window_width, opt_.window_height)
+                       : window::MakeSurface("Nuka Editor", opt_.window_width, opt_.window_height, &kind);
     if (!surface || kind == window::SurfaceBackendKind::None)
         throw std::runtime_error("no window surface: no SDL video driver and no VK_EXT_headless_surface");
 
@@ -1730,7 +1740,10 @@ void EditorHost::State::StartShell() {
     surface->SetNativeEventHook([this](const void* event) {
         const SDL_Event* e = static_cast<const SDL_Event*>(event);
         if (e->type == SDL_EVENT_DROP_FILE && e->drop.data != nullptr) dropped_.push_back({e->drop.data, e->drop.x, e->drop.y});
-        if (ImGui::GetCurrentContext() != nullptr) ImGui_ImplSDL3_ProcessEvent(e);
+        // The demo pointer stands in for the mouse while it is shown.
+        const bool mouse = e->type == SDL_EVENT_MOUSE_MOTION || e->type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
+                           e->type == SDL_EVENT_MOUSE_BUTTON_UP || e->type == SDL_EVENT_MOUSE_WHEEL;
+        if (ImGui::GetCurrentContext() != nullptr && !(mouse && pointer_.On())) ImGui_ImplSDL3_ProcessEvent(e);
     });
     present_ = std::make_unique<render::PresentRenderer>(std::move(surface));
     if (opt_.capture_frame >= 0) present_->SetCaptureFrame(opt_.capture_frame, opt_.capture_out);
@@ -8788,6 +8801,135 @@ void EditorHost::State::RegisterViewActions() {
                       present_->SetCaptureFrame(static_cast<int>(present_->SubmittedFrames()), path);
                       return Ok(Object({{"path", json::Value::Str(path)}}));
                   }});
+    const auto recording = [](const FrameRecorder::Totals& t, bool on) {
+        json::Value out = Object({{"on", json::Value::Bool(on)},
+                                  {"file", json::Value::Str(t.file)},
+                                  {"frames", json::Value::Int(static_cast<int64_t>(t.frames))},
+                                  {"dropped", json::Value::Int(static_cast<int64_t>(t.dropped))},
+                                  {"seconds", json::Value::Float(t.seconds)},
+                                  {"width", json::Value::Int(t.width)},
+                                  {"height", json::Value::Int(t.height)}});
+        if (!t.error.empty()) out.Set("error", json::Value::Str(t.error));
+        return out;
+    };
+    // {on, file, fps, codec, quality}: every presented frame, the UI included, goes into an mp4 that
+    // ffmpeg from the PATH encodes; turning it off returns what was written.
+    actions_.Add({"view.record", "Record Window", "view", "", ShortcutScope::Global, {},
+                  [this] { return recorder_.Recording(); },
+                  [this, recording](const json::Value& args) {
+                      if (!BoolArg(args, "on", !recorder_.Recording())) {
+                          if (!recorder_.Recording()) return ActionResult::Fail("the window is not being recorded");
+                          present_->SetFrameSink({});
+                          const FrameRecorder::Totals t = recorder_.Stop();
+                          if (!t.error.empty()) return ActionResult::Fail(t.error);
+                          return Ok(recording(t, false));
+                      }
+                      if (recorder_.Recording()) return ActionResult::Fail("the window is already being recorded");
+                      if (!present_->Report().capture_supported)
+                          return ActionResult::Fail("this window's surface cannot be read back");
+                      FrameRecorder::Settings s;
+                      s.fps = NumArg(args, "fps", 30.0);
+                      s.quality = static_cast<int>(NumArg(args, "quality", 18.0));
+                      const std::string codec = StrArg(args, "codec", "nvenc");
+                      if (codec != "nvenc" && codec != "x264") return ActionResult::Fail("the codec is nvenc or x264");
+                      if (!(s.fps >= 1.0 && s.fps <= 120.0) || s.quality < 0 || s.quality > 51)
+                          return ActionResult::Fail("fps: 1 to 120; quality: 0 to 51");
+                      s.codec = codec == "nvenc" ? "h264_nvenc" : "libx264";
+                      s.file = StrArg(args, "file");
+                      if (s.file.empty())
+                          s.file = PathText(profile_->Dir() / "recordings" /
+                                            ("nuka-" + LocalTimeText(UnixNow(), "%Y%m%d-%H%M%S") + ".mp4"));
+                      s.file = NormalPath(s.file);
+                      fs::create_directories(Utf8Path(s.file).parent_path());
+                      recorder_.Start(s);
+                      present_->SetFrameSink([this](const uint8_t* pixels, uint32_t w, uint32_t h, bool bgra) {
+                          recorder_.Push(pixels, w, h, bgra);
+                      });
+                      return Ok(Object({{"on", json::Value::Bool(true)}, {"file", json::Value::Str(s.file)}}));
+                  }});
+    actions_.Add({"view.record_status", "Recording Status", "view", "", ShortcutScope::Global, {}, {},
+                  [this, recording](const json::Value&) {
+                      return Ok(recording(recorder_.Progress(), recorder_.Recording()));
+                  }});
+    // Where the world `point` shows in the window, in the points ui.pointer takes.
+    actions_.Add({"view.project", "Project Point", "view", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value& args) {
+                      const SceneViewportRect& rect = ui_.Viewport();
+                      if (!rect.Valid()) return ActionResult::Fail("the viewport is hidden");
+                      math::Vec3 p;
+                      if (!Vec3Arg(args, "point", &p)) return ActionResult::Fail("point: [x, y, z] in metres");
+                      float px = 0.0f, py = 0.0f;
+                      if (!camera_.ScreenPoint(p, rect.pixels.width, rect.pixels.height, &px, &py))
+                          return ActionResult::Fail("the point is behind the camera");
+                      const float x = rect.x + px / rect.scale_x, y = rect.y + py / rect.scale_y;
+                      return Ok(Object({{"x", json::Value::Float(x)},
+                                        {"y", json::Value::Float(y)},
+                                        {"inside", json::Value::Bool(rect.Contains(x, y))}}));
+                  }});
+    // Moves the drawn demo pointer to an item's label or a window point and clicks, drags, holds or
+    // turns the wheel there; moves queue behind the ones still playing.
+    actions_.Add({"ui.pointer", "Demo Pointer", "view", "", ShortcutScope::Global, {},
+                  [this] { return pointer_.On(); },
+                  [this](const json::Value& args) {
+                      const ImVec2 size = ImGui::GetIO().DisplaySize;
+                      const bool on = BoolArg(args, "on", true);
+                      if (!on) {
+                          pointer_.Show(false, 0.0f, 0.0f);
+                          return Ok(Object({{"on", json::Value::Bool(false)}}));
+                      }
+                      // A pointer that is not shown yet appears in the middle of the window.
+                      const float from_x = pointer_.On() ? pointer_.X() : 0.5f * size.x;
+                      const float from_y = pointer_.On() ? pointer_.Y() : 0.5f * size.y;
+                      const auto point = [](const json::Value& v, float* x, float* y) {
+                          if (v.Size() != 2u) throw std::runtime_error("a point wants two numbers");
+                          *x = v.Elements()[0].AsFloat();
+                          *y = v.Elements()[1].AsFloat();
+                      };
+                      DemoPointer::Move m;
+                      m.x = from_x;
+                      m.y = from_y;
+                      if (const json::Value* to = args.Find("to"); to != nullptr && !to->IsNull()) {
+                          if (to->IsArray()) point(*to, &m.x, &m.y);
+                          else m.label = to->AsString();
+                      }
+                      if (!m.label.empty()) {
+                          m.x = m.y = 0.0f;
+                          if (const json::Value* offset = args.Find("offset"); offset != nullptr && !offset->IsNull())
+                              point(*offset, &m.x, &m.y);
+                      }
+                      m.window = StrArg(args, "window");
+                      m.seconds = static_cast<float>(NumArg(args, "seconds", -1.0));
+                      const std::string button = StrArg(args, "button", "left");
+                      if (button != "left" && button != "middle" && button != "right")
+                          return ActionResult::Fail("the button is left, middle or right");
+                      m.button = button == "left" ? 0 : button == "middle" ? 1 : 2;
+                      m.clicks = BoolArg(args, "double", false) ? 2 : BoolArg(args, "click", false) ? 1 : 0;
+                      m.hold = static_cast<float>(NumArg(args, "hold", 0.0));
+                      if (const json::Value* drag = args.Find("drag"); drag != nullptr && !drag->IsNull()) {
+                          m.drag = true;
+                          if (drag->IsArray()) point(*drag, &m.drag_x, &m.drag_y);
+                          else m.drag_label = drag->AsString();
+                      }
+                      m.drag_seconds = static_cast<float>(NumArg(args, "drag_seconds", -1.0));
+                      m.wheel = static_cast<int>(NumArg(args, "wheel", 0.0));
+                      m.wait = static_cast<float>(NumArg(args, "wait", 0.0));
+                      if (!pointer_.On()) pointer_.Show(true, from_x, from_y);
+                      pointer_.Queue(m);
+                      return Ok(Object({{"on", json::Value::Bool(true)},
+                                        {"queued", json::Value::Int(static_cast<int64_t>(pointer_.Queued()))}}));
+                  }});
+    actions_.Add({"ui.pointer_status", "Demo Pointer Status", "view", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value&) {
+                      json::Value out = Object({{"on", json::Value::Bool(pointer_.On())},
+                                                {"busy", json::Value::Bool(pointer_.Busy())},
+                                                {"queued", json::Value::Int(static_cast<int64_t>(pointer_.Queued()))},
+                                                {"x", json::Value::Float(pointer_.X())},
+                                                {"y", json::Value::Float(pointer_.Y())},
+                                                {"pressed", json::Value::Bool(pointer_.Pressed())}});
+                      const std::string& error = pointer_.Error();
+                      out.Set("error", error.empty() ? json::Value::Null() : json::Value::Str(error));
+                      return Ok(out);
+                  }});
     actions_.Add({"view.stats", "Frame Stats", "view", "", ShortcutScope::Global, {}, {},
                   [this](const json::Value&) {
                       return Ok(Object({{"frame", json::Value::Int(static_cast<int64_t>(frame_index_))},
@@ -10249,6 +10391,7 @@ void EditorHost::State::Frame(bool step_physics) {
 
     events_.clear();
     present_->PollEvents(events_);
+    pointer_.Advance(&events_);
     ImGuiIO& io = ImGui::GetIO();
     const uint32_t vp_w = present_->Report().width;
     const uint32_t vp_h = present_->Report().height;
@@ -10392,6 +10535,7 @@ void EditorHost::State::Frame(bool step_physics) {
     io.DeltaTime = (frame_dt > 0.0) ? static_cast<float>(std::min(frame_dt, kMaxFrameDt)) : (1.0f / 60.0f);
     // SDL3 replaces the display size with logical points and sets the framebuffer scale.
     if (native_window_ != nullptr) ImGui_ImplSDL3_NewFrame();
+    pointer_.FeedImGui(io);
     // Re-seed on a new selection; otherwise track a movable body's live pose.
     if (loaded_) {
         if (ui_state_.selected_entity != last_seeded_) {
@@ -10419,6 +10563,9 @@ void EditorHost::State::Frame(bool step_physics) {
     ui_.PrepareFrame(sdl_window != nullptr ? SDL_GetWindowDisplayScale(sdl_window) / SDL_GetWindowPixelDensity(sdl_window)
                                            : 1.0f);
     imgui_.NewFrame();
+    // A label the demo pointer goes to is looked up among this frame's items.
+    const bool finding = pointer_.Finding();
+    if (finding) render::imgui::BeginItemCapture();
     SyncViews(render_world);
     agents_.Fill(&ui_state_.agents);
     ui_.RecordUi(render_world, stats, camera_, ui_state_, loaded_ ? &loaded_->scene : nullptr,
@@ -10681,6 +10828,8 @@ void EditorHost::State::Frame(bool step_physics) {
         if (cf != 0.0f || cr != 0.0f || cu != 0.0f)
             camera_.Move(cf, cr, cu, static_cast<float>(frame_dt) * (shift_held ? 4.0f : 1.0f));
     }
+    if (finding) pointer_.Found(render::imgui::EndItemCapture());
+    pointer_.Draw(ImGui::GetForegroundDrawList(), ImGui::GetFontSize() / 15.0f);
     ImGui::Render();
     PushTransport();
     PushEdits();

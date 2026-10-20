@@ -109,6 +109,8 @@ public:
     // onto the geometry the user sees. width/height/fov degenerate -> a forward
     // ray from the eye. Deterministic (no time input) for the recorded UI.
     Ray ScreenRay(float px, float py, uint32_t width, uint32_t height) const;
+    // The inverse: the pixel world point `p` shows at; false when it is behind the eye.
+    bool ScreenPoint(const math::Vec3& p, uint32_t width, uint32_t height, float* px, float* py) const;
 
     // Intersect `ray` with the plane through `plane_point` whose normal is
     // `plane_normal` (need not be unit). On a hit in front of the ray origin,

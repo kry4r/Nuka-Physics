@@ -1332,6 +1332,8 @@ if(CMAKE_CUDA_COMPILER)
             runtime/app/viewer/editor_extensions.cpp
             runtime/app/viewer/editor_profile.cpp
             runtime/app/viewer/editor_instance.cpp
+            runtime/app/viewer/editor_pointer.cpp
+            runtime/app/viewer/editor_record.cpp
             runtime/app/viewer/teleop_devices.cpp
             runtime/app/viewer/train_observe.cpp
         )

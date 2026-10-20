@@ -1,0 +1,27 @@
+{
+  "name": "pointer",
+  "launch": ["--window", "1600x900"],
+  "steps": [
+    {"action": "file.open", "args": {"path": "${scenario_dir}/../../examples/assets/nuka_lab/stage.nks"}},
+    {"frames": 20},
+    {"python": "import builtins, time\nfrom nuka.editor.app import ActionError\ndef fails(action, text, **args):\n    try:\n        app.actions.run(action, **args)\n    except ActionError as e:\n        assert text in str(e), (action, args, str(e))\n    else:\n        raise AssertionError((action, args))\ndef settle():\n    deadline = time.monotonic() + 30.0\n    while app.actions.run('ui.pointer_status')['busy']:\n        assert time.monotonic() < deadline, app.actions.run('ui.pointer_status')\n        app.update(True)\n    for _ in range(3):\n        app.update(True)\n    return app.actions.run('ui.pointer_status')\ndef point(**args):\n    app.actions.run('ui.pointer', **args)\n    return settle()\ndef checked(action):\n    return next(a for a in app.actions.list() if a['id'] == action)['checked']\nfor k, v in dict(fails=fails, settle=settle, point=point, checked=checked).items():\n    setattr(builtins, 'pt_' + k, v)\nr = app.actions.run('view.record_status')\nassert r['on'] is False and r['frames'] == 0, r\nfails('view.record', 'the codec is nvenc or x264', on=True, codec='h265')\nfails('view.record', 'fps: 1 to 120', on=True, fps=0)\nfails('view.record', 'the window is not being recorded', on=False)\nfails('ui.pointer', 'the button is left, middle or right', to=[10, 10], button='side')\nfails('view.project', 'point: [x, y, z]')\np = app.actions.run('ui.pointer_status')\nassert p['on'] is False and p['busy'] is False and p['error'] is None, p"},
+
+    {"action": "view.record", "args": {"on": true, "file": "${out}/pointer.mp4", "fps": 30}, "bind": "rec"},
+    {"frames": 10},
+    {"python": "rec = ${rec}\nassert rec['on'] and rec['file'].replace('\\\\', '/').endswith('/pointer.mp4'), rec\nr = app.actions.run('view.record_status')\nprint('POINTER_REC', r)\nassert r['on'] and r['width'] == 1600 and r['height'] == 900 and r['frames'] > 0, r"},
+
+    {"python": "import builtins\nassert not app.actions.run('view.stats')['playing']\np = builtins.pt_point(to='sim.toggle_play', click=True)\nprint('POINTER_PLAY', p)\nassert p['on'] and p['error'] is None and not p['pressed'], p\nassert app.actions.run('view.stats')['playing'], 'the click did not start the simulation'\np = builtins.pt_point(to='sim.toggle_play', click=True)\nassert not app.actions.run('view.stats')['playing'], 'the second click did not pause it'"},
+    {"python": "import builtins\np = builtins.pt_point(to='No Such Button', click=True)\nprint('POINTER_MISS', p)\nassert p['busy'] is False and 'no visible item is labelled \"No Such Button\"' in p['error'], p"},
+
+    {"python": "import builtins\nc = app.actions.run('view.camera')\nv = app.actions.run('view.stats')['viewport']\nq = app.actions.run('view.project', point=c['target'])\ncx, cy = v['x'] + 0.5 * v['width'], v['y'] + 0.5 * v['height']\nprint('POINTER_PROJECT', q, cx, cy)\nassert q['inside'] and abs(q['x'] - cx) < 2.0 and abs(q['y'] - cy) < 2.0, (q, cx, cy)\nbuiltins.pt_point(to=[cx, cy + 0.2 * v['height']], seconds=0.4)\np = builtins.pt_point(drag=[0.25 * v['width'], 0.0], drag_seconds=0.6)\nc1 = app.actions.run('view.camera')\nprint('POINTER_ORBIT', c['yaw'], c1['yaw'])\nassert p['error'] is None and abs(c1['yaw'] - c['yaw']) > 20.0, (c['yaw'], c1['yaw'])\np = builtins.pt_point(to=[cx, cy], wheel=4)\nc2 = app.actions.run('view.camera')\nprint('POINTER_ZOOM', c1['distance'], c2['distance'])\nassert c2['distance'] < 0.9 * c1['distance'], (c1['distance'], c2['distance'])"},
+
+    {"python": "import builtins\nfog = builtins.pt_checked('view.fog')\np = builtins.pt_point(to='View', click=True)\nassert p['error'] is None, p\np = builtins.pt_point(to='Distance Fog', seconds=0.5)\nassert p['error'] is None, p"},
+    {"screenshot": "00_menu"},
+    {"python": "import builtins\nbefore = builtins.pt_checked('view.fog')\np = builtins.pt_point(click=True)\nafter = builtins.pt_checked('view.fog')\nprint('POINTER_MENU', before, after)\nassert p['error'] is None and after != before, (before, after)"},
+
+    {"action": "ui.pointer", "args": {"on": false}},
+    {"frames": 4},
+    {"action": "view.record", "args": {"on": false}, "bind": "done"},
+    {"python": "import os, subprocess\nd = ${done}\nprint('POINTER_DONE', d)\nassert d['on'] is False and d['frames'] >= 30 and d['seconds'] > 1.0 and (d['width'], d['height']) == (1600, 900), d\nassert os.path.getsize(d['file']) > 10000, os.path.getsize(d['file'])\nassert not os.path.exists(d['file'] + '.log')\nprobe = subprocess.run(['ffmpeg', '-hide_banner', '-i', d['file']], capture_output=True, text=True).stderr\nprint('POINTER_PROBE', [l.strip() for l in probe.splitlines() if 'Video:' in l or 'Duration' in l])\nassert 'Video: h264' in probe and '1600x900' in probe, probe\nassert app.actions.run('ui.pointer_status')['on'] is False\nr = app.actions.run('view.record_status')\nassert r['on'] is False and r['frames'] == d['frames'], r"}
+  ]
+}

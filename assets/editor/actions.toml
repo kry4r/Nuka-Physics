@@ -509,6 +509,53 @@ kind = "file"
 args.path = 'string, the .ppm to write, default "nuka_screenshot.ppm"'
 returns = "{path}"
 
+["view.record"]
+summary = "Records the whole window, the UI included, into an mp4: each presented frame goes to ffmpeg from the PATH and stays on until the next one is due, so the video keeps wall-clock time. Turning it off waits for ffmpeg to finish the file. Fails on a surface that cannot be read back."
+kind = "file"
+args.on = "bool, start or stop, default: toggles"
+args.file = "string, the .mp4 to write, default recordings/nuka-<time>.mp4 in the editor's profile"
+args.fps = "number, video frames a second, 1 to 120, default 30"
+args.codec = 'string, nvenc (NVIDIA hardware) or x264, default "nvenc"'
+args.quality = "int, constant quality 0 to 51, lower is better, default 18"
+returns = "{on, file} when it starts; {on: false, file, frames, dropped, seconds, width, height} when it stops"
+example = '{"on": true, "file": "C:/videos/walk.mp4", "fps": 30}'
+
+["view.record_status"]
+summary = "The recording in progress, or the last one: its file, the video frames written so far, presented frames dropped, seconds of video and the frame size."
+kind = "read"
+returns = "{on, file, frames, dropped, seconds, width, height, error}; error only when ffmpeg failed"
+
+["view.project"]
+summary = "Where a world point shows in the window, in the window points ui.pointer takes, and whether it falls inside the viewport."
+kind = "read"
+args.point = "[x, y, z], the world point in metres"
+returns = "{x, y, inside}"
+example = '{"point": [0.3, -0.2, 0.9]}'
+
+["ui.pointer"]
+summary = "Shows a drawn mouse pointer and plays a move with it, for demos and recordings: it glides to an item found by its label, or to a window point, then clicks, double-clicks, drags, holds or turns the wheel there. While it is shown it replaces the real mouse. Moves queue behind the ones still playing; ui.pointer_status says when they are done and why a label was not found."
+kind = "app"
+args.on = "bool, false hides the pointer and drops the queued moves, default true"
+args.to = "string or [x, y], a visible item's label (as shown or its ## id; an exact match first, else one containing it) or a window point, default where it is"
+args.window = "string, only items in windows whose name contains this, default any"
+args.offset = "[dx, dy], window points from the item's centre, default [0, 0]"
+args.seconds = "number, the glide, default from the distance (0.3 to 0.9 s)"
+args.click = "bool, click at the target, default false"
+args.double = "bool, double-click at the target, default false"
+args.button = 'string, left, middle or right, default "left"'
+args.drag = "string or [dx, dy], press at the target and drag onto this item or by this many window points, default none"
+args.drag_seconds = "number, the drag's glide, default from the distance"
+args.hold = "number, seconds the button stays down before a drag moves, or a long press without one, default 0"
+args.wheel = "int, wheel notches at the target, + away from the user, default 0"
+args.wait = "number, seconds to pause after the move, default 0"
+returns = "{on, queued}"
+example = '{"to": "Play", "click": true}'
+
+["ui.pointer_status"]
+summary = "The demo pointer: whether it is shown and still playing moves, the steps queued, where it is, whether a button is down, and why the last label was not found."
+kind = "read"
+returns = "{on, busy, queued, x, y, pressed, error}"
+
 ["view.stats"]
 summary = "The editor's frame timings: frame count, frames per second, frame and UI time percentiles, the physics tick, how snapshots reach the renderer, whether it plays, the view mode and the viewport's pixel rectangle."
 kind = "read"

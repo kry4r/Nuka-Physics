@@ -1,7 +1,8 @@
 #pragma once
 // The primary editor of a profile and the launches that hand it files: a local pipe that
-// takes only {"open": path} requests. Also starts detached editor processes.
+// takes only {"open": path} requests. Also starts detached and piped child processes.
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -33,6 +34,27 @@ bool SendToPrimary(const std::string& name, const std::string& request);
 
 // Starts `argv` detached from this process and returns its id, or 0 with `error` set.
 uint64_t SpawnDetached(const std::vector<std::string>& argv, std::string* error);
+
+// A child process fed through its standard input; its output goes to a log file.
+class PipedProcess {
+public:
+    // Starts `argv` appending its output to `log`; on failure Started() is false and `error` says why.
+    PipedProcess(const std::vector<std::string>& argv, const std::string& log, std::string* error);
+    ~PipedProcess();
+    PipedProcess(const PipedProcess&) = delete;
+    PipedProcess& operator=(const PipedProcess&) = delete;
+
+    bool Started() const;
+    // Writes all `bytes`; false once the child stopped reading.
+    bool Write(const void* data, size_t bytes);
+    // Closes the child's input, waits for it to exit and returns its exit code.
+    int Finish();
+
+    struct Impl;
+
+private:
+    std::unique_ptr<Impl> impl_;
+};
 
 uint32_t ProcessId();
 bool ProcessAlive(uint32_t pid);

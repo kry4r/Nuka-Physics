@@ -166,6 +166,10 @@ public:
     void SetCaptureFrame(int frame_index, std::string ppm_path);
     // Capture only the scene viewport of DrawFrame `frame_index`, as drawn before the overlay.
     void SetSceneCaptureFrame(int frame_index, std::string ppm_path);
+    // While set, every presented frame is read back and handed over: width x height pixels of 4
+    // bytes, top row first, BGRA when `bgra` and RGBA otherwise. An empty sink stops it.
+    using FrameSink = std::function<void(const uint8_t* pixels, uint32_t width, uint32_t height, bool bgra)>;
+    void SetFrameSink(FrameSink sink);
 
 private:
     struct Impl;

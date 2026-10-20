@@ -240,6 +240,9 @@ This page is generated from assets/editor/actions.toml by tools/skill_actions.py
 - `view.fog` {on?} [view]: Fades distant geometry into the sky in the Lit view; `on` sets it, else it toggles.
 - `view.ground_grid` {mode?} [view]: The Lit view's ground grid: mode auto (under scenes without a floor), on or off; a bare call flips what is shown.
 - `view.screenshot` {path?} [file]: Writes the next drawn frame, the whole window, as a PPM.
+- `view.record` {on?, file?, fps?, codec?, quality?} [file]: Records the whole window, the UI included, into an mp4: each presented frame goes to ffmpeg from the PATH and stays on until the next one is due, so the video keeps wall-clock time.
+- `view.record_status` [read]: The recording in progress, or the last one: its file, the video frames written so far, presented frames dropped, seconds of video and the frame size.
+- `view.project` {point} [read]: Where a world point shows in the window, in the window points ui.pointer takes, and whether it falls inside the viewport.
 - `view.stats` [read]: The editor's frame timings: frame count, frames per second, frame and UI time percentiles, the physics tick, how snapshots reach the renderer, whether it plays, the view mode and the viewport's pixel rectangle.
 - `view.mode` {mode?} [view]: The shading the viewport draws with; without a mode it reports the current one.
 - `view.layout` {layout?} [view]: The panes: one, two side by side or four; without a layout it reports the current one.
@@ -285,6 +288,8 @@ This page is generated from assets/editor/actions.toml by tools/skill_actions.py
 - `tool.pin` {on?} [view]: Makes Pin the viewport tool (clicking a body holds it where it is), or goes back to Select; `on` sets it.
 - `tool.measure` {a?, b?, at?, on?} [view]: `a` and `b` set the Measure tool's ends (a link's node path, a joint's name, or "ground" for b) and return the measurement; `at` takes link ends at their origin or com.
 - `tool.measure_clear` [view]: Clears the Measure tool's ends.
+- `ui.pointer` {on?, to?, window?, offset?, seconds?, click?, double?, button?, drag?, drag_seconds?, hold?, wheel?, wait?} [app]: Shows a drawn mouse pointer and plays a move with it, for demos and recordings: it glides to an item found by its label, or to a window point, then clicks, double-clicks, drags, holds or turns the wheel there.
+- `ui.pointer_status` [read]: The demo pointer: whether it is shown and still playing moves, the steps queued, where it is, whether a button is down, and why the last label was not found.
 - `tool.ik` {on?} [view]: While on, the gizmo on a jointed link poses the robot through IK; without `on` it toggles.
 - `window.layout_authoring` [view]: Arranges the panels for building a scene: Stage and File left, Properties and Camera right, Assets, Console, Script, Stats, Timeline and Sensors below.
 - `window.layout_debug` [view]: Arranges the panels for debugging the solver: Stage left, Solver, Debug, Stats and Properties right, Console, Timeline, Script and Assets below.

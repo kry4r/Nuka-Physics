@@ -711,6 +711,10 @@ struct PresentRenderer::Impl {
     int         scene_capture_frame_ = -1;
     std::string scene_capture_path_;
     uint64_t    draw_counter_ = 0;
+    // The frame sink's readback buffer lives across frames and follows the swapchain's size.
+    FrameSink    frame_sink_;
+    GpuBuffer    sink_buf_{};
+    VkDeviceSize sink_bytes_ = 0;
 
     VkDevice         device = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
@@ -828,6 +832,7 @@ struct PresentRenderer::Impl {
         vkDestroySampler(device, maps_sampler, nullptr);
         DestroyImage(maps);
         Destroy(material_buffer);
+        Destroy(sink_buf_);
         if (command_pool != VK_NULL_HANDLE) vkDestroyCommandPool(device, command_pool, nullptr);
         // ORDERED teardown (the VkSurfaceKHR is owned by window_surface but was
         // created against the renderer's VkInstance): the surface MUST be destroyed
@@ -2647,6 +2652,14 @@ struct PresentRenderer::Impl {
                 static_cast<VkDeviceSize>(shot.width) * shot.height * 4u,
                 VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         }
+        // Each sink frame waits its fence below, so the buffer is idle when it is replaced.
+        const bool do_sink = static_cast<bool>(frame_sink_) && report.capture_supported;
+        const VkDeviceSize frame_bytes = static_cast<VkDeviceSize>(extent.width) * extent.height * 4u;
+        if (do_sink && sink_bytes_ != frame_bytes) {
+            Destroy(sink_buf_);
+            sink_buf_ = CreateHostBuffer(frame_bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            sink_bytes_ = frame_bytes;
+        }
 
         // -- record ----------------------------------------------------------
         VkCommandBuffer cmd = command_buffers[frame];
@@ -2743,6 +2756,10 @@ struct PresentRenderer::Impl {
             RecordReadback(cmd, images[image_index], VkRect2D{{0, 0}, extent}, capture_buf.buffer,
                            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
         }
+        if (do_sink) {
+            RecordReadback(cmd, images[image_index], VkRect2D{{0, 0}, extent}, sink_buf_.buffer,
+                           VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+        }
         CheckVk(vkEndCommandBuffer(cmd), "vkEndCommandBuffer(present)");
 
         // -- submit ----------------------------------------------------------
@@ -2788,7 +2805,7 @@ struct PresentRenderer::Impl {
         // the frame pipelines (the top-of-frame fence wait bounds frames-in-flight).
         // The readback path is the one exception: the copy lives in THIS command
         // buffer, so wait its fence before mapping the host-visible capture buffer.
-        if (do_capture || do_scene_capture) {
+        if (do_capture || do_scene_capture || do_sink) {
             CheckVk(vkWaitForFences(device, 1u, &in_flight[frame], VK_TRUE,
                                     std::numeric_limits<uint64_t>::max()),
                     "vkWaitForFences(capture)");
@@ -2796,6 +2813,13 @@ struct PresentRenderer::Impl {
         if (do_capture) FinishReadback(capture_buf, extent.width, extent.height, capture_path_);
         if (do_scene_capture)
             FinishReadback(scene_capture_buf, shot.width, shot.height, scene_capture_path_);
+        if (do_sink) {
+            void* sink_pixels = nullptr;
+            CheckVk(vkMapMemory(device, sink_buf_.memory, 0, sink_bytes_, 0, &sink_pixels), "vkMapMemory(sink)");
+            const bool bgra = surface_format == VK_FORMAT_B8G8R8A8_UNORM || surface_format == VK_FORMAT_B8G8R8A8_SRGB;
+            frame_sink_(static_cast<const uint8_t*>(sink_pixels), extent.width, extent.height, bgra);
+            vkUnmapMemory(device, sink_buf_.memory);
+        }
 
         current_frame = (current_frame + 1u) % kFramesInFlight;
         ++draw_counter_;
@@ -2936,6 +2960,13 @@ void PresentRenderer::SetCaptureFrame(int frame_index, std::string ppm_path) {
 void PresentRenderer::SetSceneCaptureFrame(int frame_index, std::string ppm_path) {
     impl_->scene_capture_frame_ = frame_index;
     impl_->scene_capture_path_ = std::move(ppm_path);
+}
+
+void PresentRenderer::SetFrameSink(FrameSink sink) {
+    impl_->frame_sink_ = std::move(sink);
+    if (impl_->frame_sink_) return;
+    impl_->Destroy(impl_->sink_buf_);
+    impl_->sink_bytes_ = 0;
 }
 
 void PresentRenderer::SetInteropTransforms(NkVkDescriptorSetLayout ssbo_set_layout) {
