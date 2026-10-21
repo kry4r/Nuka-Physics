@@ -14,6 +14,7 @@ exclude_docs: |
   roadmap/
   specs/
   media/*.mp4
+  media/*.gif
   media/demo_recordings.json
 
 theme:
