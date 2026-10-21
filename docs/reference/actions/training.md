@@ -2,7 +2,7 @@
 
 # Training
 
-15 actions. Run one from the command palette (++ctrl+p++), from Python with `app.actions.run(id, **args)` or through MCP with `action_run`.
+16 actions. Run one from the command palette (++ctrl+p++), from Python with `app.actions.run(id, **args)` or through MCP with `action_run`.
 
 ## `train.tasks`
 
@@ -11,6 +11,24 @@
 The training tasks (go2\_velocity, Go2 velocity tracking, and any registered from Python): each one's groups of parameters, the robot its scene holds and the step it trains at.
 
 **Returns:** a list of {name, title, module, root, robot, groups: \[{name, params: \[{key, type, default, ...}\]}\], ...}
+
+## `train.new_task`
+
+**Kind:** [file](index.md#kinds)
+
+Starts a training task of the user's own: an extension in the profile's extensions folder (my\_task, my\_task\_2, ...) whose module registers a task built on `from` plus a Goal group (speed, turn). The extension is enabled, its module opens in the Script panel and the task becomes the document's; saving the module reloads it and the Training panel shows its groups as declared.
+
+**Arguments**
+
+- `from`: string, the registered task to build on, default the document's task
+
+**Returns:** {name, title, file}
+
+**Example**
+
+```json
+{"id": "train.new_task", "args": {"from": "g1_rough"}}
+```
 
 ## `train.config`
 

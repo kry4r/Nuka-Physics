@@ -1130,16 +1130,25 @@ void ImGuiLayer::BuildFile(nui::VStack& root) {
 }
 
 void ImGuiLayer::BuildStats(nui::VStack& root) {
+    // A watched training run steps in its own process, so its rate stands in for the step time.
     auto& hero = root.Add<nui::HStack>();
     auto& step = hero.Add<nui::Label>(std::string(), Tone::Accent, TextStyle::Hero);
     step.text_fn = [this] {
+        if (frame_.ui->train.observing) return Fmt(Tr("%.1fK steps/s"), frame_.ui->train.fps / 1000.0);
         return frame_.stats->cpu_timing_available ? Fmt("%.2f ms", frame_.stats->step_time_ms) : std::string(Tr("N/A"));
     };
-    step.tone_fn = [this] { return frame_.stats->step_healthy ? Tone::Accent : Tone::Warn; };
+    step.tone_fn = [this] {
+        return frame_.ui->train.observing || frame_.stats->step_healthy ? Tone::Accent : Tone::Warn;
+    };
     auto& live = hero.Add<nui::Badge>();
-    live.text_fn = [this] { return std::string(Tr(frame_.ui->playing ? "live" : "idle")); };
-    live.tone_fn = [this] { return frame_.ui->playing ? Tone::Ok : Tone::Dim; };
-    root.Add<nui::Label>("Physics step", Tone::Dim, TextStyle::Label);
+    live.text_fn = [this] {
+        return std::string(Tr(frame_.ui->train.observing ? "training" : frame_.ui->playing ? "live" : "idle"));
+    };
+    live.tone_fn = [this] { return frame_.ui->train.observing || frame_.ui->playing ? Tone::Ok : Tone::Dim; };
+    auto& hero_label = root.Add<nui::Label>(std::string(), Tone::Dim, TextStyle::Label);
+    hero_label.text_fn = [this] {
+        return std::string(Tr(frame_.ui->train.observing ? "Training run, all environments" : "Physics step"));
+    };
     auto& step_plot = root.Add<nui::Plot>();
     step_plot.sparkline = true;
     step_plot.height = 40.0f;
@@ -1160,7 +1169,10 @@ void ImGuiLayer::BuildStats(nui::VStack& root) {
     frame_plot.series.push_back(nui::Series{"frame", {}, {}});
     frame_plot_ = &frame_plot;
     stat("sub-steps", [this] { return Fmt("x%u", frame_.stats->sub_steps); });
-    stat("ticks", [this] { return Fmt("%llu", static_cast<unsigned long long>(frame_.stats->sim_ticks)); });
+    stat("ticks", [this] {
+        const TrainView& t = frame_.ui->train;
+        return Fmt("%llu", static_cast<unsigned long long>(t.observing ? t.steps : frame_.stats->sim_ticks));
+    });
     stat("snapshot age", [this] {
         return frame_.stats->cpu_timing_available ? Fmt("%.1f ms", frame_.stats->snapshot_age_ms) : std::string(Tr("N/A"));
     });
@@ -1212,7 +1224,7 @@ void ImGuiLayer::BuildDebug(nui::VStack& root) {
         const float s = nui::Scale();
         const std::pair<ImVec4, const char*> legend[] = {{theme::Hex(0x26D940), "Dynamic collider"},
                                                          {theme::Hex(0xD92ED9), "Static collider"},
-                                                         {theme::Hex(0xFF730D), "Contact marker"}};
+                                                         {theme::Hex(0xFF730D), "Contact patch"}};
         for (const auto& [color, text] : legend) {
             const ImVec2 p = ImGui::GetCursorScreenPos();
             const float h = ImGui::GetTextLineHeight();
@@ -1228,7 +1240,7 @@ void ImGuiLayer::BuildDebug(nui::VStack& root) {
     root.Add<nui::Stat>("proxies", [this] {
         return frame_.stats->debug_colliders_available ? Fmt("%u", frame_.stats->debug_colliders) : std::string(Tr("N/A"));
     });
-    root.Add<nui::Stat>("markers", [this] {
+    root.Add<nui::Stat>("contact points", [this] {
         return frame_.stats->debug_contacts_available ? Fmt("%u", frame_.stats->debug_contacts) : std::string(Tr("N/A"));
     });
     const auto warning = [&root, has_scene](std::function<std::string()> text, std::function<bool()> when) {
@@ -1251,9 +1263,9 @@ void ImGuiLayer::BuildDebug(nui::VStack& root) {
                        static_cast<unsigned long long>(frame_.stats->debug_omitted_instances));
         },
         [this] { return frame_.stats->debug_omitted_instances != 0u; });
-    warning([] { return std::string(Tr("Contacts not read: collider proxies used the overlay budget.")); },
-            [this] { return frame_.stats->debug_contacts_budget_skipped; });
-    root.Add<nui::Label>("N/A: disabled, unavailable or not read. Markers show positions, not forces.", Tone::Dim).wrap = true;
+    root.Add<nui::Label>("N/A: disabled, unavailable or not read. Patches show where bodies touch, not forces.",
+                         Tone::Dim)
+        .wrap = true;
 }
 
 void ImGuiLayer::BuildCamera(nui::VStack& root) {
@@ -1575,7 +1587,10 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
         ui_state.drive_dirty.assign(ui_state.drive_targets.size(), 0u);
     const float sample_x = static_cast<float>(stats.frame_index);
     if (frame_plot_ != nullptr && stats.frame_timing_available) frame_plot_->Push(0u, sample_x, stats.frame_time_ms, 240u);
-    if (step_plot_ != nullptr && stats.cpu_timing_available) step_plot_->Push(0u, sample_x, stats.step_time_ms, 240u);
+    if (step_plot_ != nullptr && ui_state.train.observing)
+        step_plot_->Push(0u, sample_x, static_cast<float>(ui_state.train.fps / 1000.0), 240u);
+    else if (step_plot_ != nullptr && stats.cpu_timing_available)
+        step_plot_->Push(0u, sample_x, stats.step_time_ms, 240u);
 
     // A new scene opens the stage on its top level; a selection made elsewhere scrolls into view.
     if (scene != stage_scene_ && stage_tree_ != nullptr) {
@@ -1677,11 +1692,11 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
         if (ui_state.has_scene) {
             DrawRtImage(vmin, vmax);
             if (pane_count > 1u) DrawPaneHeaders(cmin, cmax, pane, gap);
+            const bool observing = ui_state.train.observing;
+            const auto count = static_cast<unsigned long long>(observing ? ui_state.train.steps : stats.sim_ticks);
             std::vector<std::string> hud = {Fmt(Tr("FOV %.0f\xC2\xB0"), camera.fov_degrees),
-                                            Tr(ui_state.train.observing ? "OBSERVING"
-                                               : ui_state.playing       ? "LIVE"
-                                                                        : "PAUSED"),
-                                            Fmt(Tr("TICK %llu"), static_cast<unsigned long long>(stats.sim_ticks))};
+                                            Tr(observing ? "OBSERVING" : ui_state.playing ? "LIVE" : "PAUSED"),
+                                            Fmt(Tr(observing ? "STEP %llu" : "TICK %llu"), count)};
             const RtView& rt = ui_state.rt;
             if (rt.on)
                 hud.push_back(rt.converged ? Fmt(Tr("RT %u SPP"), rt.spp) + " " + icon::kOk
@@ -1695,6 +1710,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
             DrawSolverHud(vmin, vmax);
             DrawRobotHud(vmin, vmax);
             DrawSensorHud(vmin, vmax);
+            DrawContactHud(vmin, vmax);
             DrawPerturbHud(vmin, vmax);
             DrawTrainHud(vmin, vmax, hud_top);
             DrawViewTools(vmin, vmax);
@@ -2678,6 +2694,39 @@ ImTextureData* ImGuiLayer::Thumbnail(const std::string& file) {
         pixels[i * 4u + 3u] = 255u;
     }
     return it->texture.get();
+}
+
+void ImGuiLayer::DrawContactHud(const ImVec2& vmin, const ImVec2& vmax) {
+    const std::vector<ContactPatch>& contacts = frame_.ui->contacts;
+    if (contacts.empty()) return;
+    const ViewProjector project = Projector(vmin, vmax);
+    ImDrawList* list = ImGui::GetBackgroundDrawList();
+    list->PushClipRect(vmin, vmax, true);
+    const float s = nui::Scale();
+    const ImVec4 tint = theme::Hex(0xFF730D);
+    const ImU32 ink = U32(tint), fill = U32(theme::Alpha(tint, 0.3f)), rim = U32(theme::Alpha(theme::kBg0, 0.9f));
+    for (const ContactPatch& c : contacts) {
+        ImVec2 p[4];
+        uint32_t n = 0u;
+        for (uint32_t k = 0; k < c.count; ++k) n += project(c.points[k], &p[n]) ? 1u : 0u;
+        if (n >= 3u) {
+            // The points in angle order about their centre outline the patch.
+            float cx = 0.0f, cy = 0.0f;
+            for (uint32_t k = 0; k < n; ++k) cx += p[k].x / static_cast<float>(n), cy += p[k].y / static_cast<float>(n);
+            std::sort(p, p + n, [cx, cy](const ImVec2& a, const ImVec2& b) {
+                return std::atan2(a.y - cy, a.x - cx) < std::atan2(b.y - cy, b.x - cx);
+            });
+            list->AddConvexPolyFilled(p, static_cast<int>(n), fill);
+            list->AddPolyline(p, static_cast<int>(n), ink, ImDrawFlags_Closed, 1.5f * s);
+        } else if (n == 2u) {
+            list->AddLine(p[0], p[1], ink, 2.0f * s);
+        }
+        for (uint32_t k = 0; k < n; ++k) {
+            list->AddCircleFilled(p[k], 3.5f * s, rim);
+            list->AddCircleFilled(p[k], 2.0f * s, ink);
+        }
+    }
+    list->PopClipRect();
 }
 
 void ImGuiLayer::DrawPerturbHud(const ImVec2& vmin, const ImVec2& vmax) {

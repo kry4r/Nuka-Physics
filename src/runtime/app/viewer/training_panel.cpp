@@ -358,7 +358,7 @@ void ImGuiLayer::DrawTrainTask() {
     ImGui::AlignTextToFramePadding();
     ImGui::TextColored(theme::kFgMuted, "%s", Tr("Task"));
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::SetNextItemWidth(-(ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.x));
     if (draw::BeginCombo("##task", schema != nullptr ? Tr(schema->At("title").AsString()).c_str() : task.c_str())) {
         for (const json::Value& t : p.tasks.Elements()) {
             const std::string& name = t.At("name").AsString();
@@ -372,9 +372,11 @@ void ImGuiLayer::DrawTrainTask() {
         std::string robot;
         for (const auto& [key, count] : schema->At("robot").Items())
             robot += (robot.empty() ? "" : ", ") + Fmt("%lld ", static_cast<long long>(count.AsInt())) + Tr(key);
-        ImGui::SetTooltip("%s", Fmt(Tr("One robot (%s) per environment, stepped at %.0f Hz"), robot.c_str(),
-                                    1.0 / schema->At("dt").AsDouble()).c_str());
+        ImGui::SetTooltip("%s", Fmt(Tr("One robot (%s) per environment, stepped every %.3g ms"), robot.c_str(),
+                                    1000.0 * schema->At("dt").AsDouble()).c_str());
     }
+    ImGui::SameLine();
+    if (draw::IconButton("##new_task", icon::kAdd, false, Tr("New Task"))) Queue("train.new_task");
     const size_t problems = errors.Size();
     if (problems == 0u)
         draw::Badge(Tr("Ready to train"), Tone::Ok, icon::kOk);

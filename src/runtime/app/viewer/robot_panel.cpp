@@ -371,19 +371,28 @@ void ImGuiLayer::BuildJoints(nui::VStack& root) {
         const auto use = [this](const char* key, json::Value value) { Queue("teleop.use", Args({{key, std::move(value)}})); };
         const TeleopDeviceInfo* device = ActiveDevice(t);
         ImGui::TextDisabled("%s", Tr("Device"));
-        ImGui::SetNextItemWidth(-FLT_MIN);
-        const std::string current = device != nullptr ? std::string(Tr(device->label.c_str())) : Fmt(Tr("%s (gone)"), t.device.c_str());
-        if (nui::draw::BeginCombo("##teleop_device", current.c_str())) {
-            for (const TeleopDeviceInfo& d : t.devices) {
-                ImGui::PushID(d.id.c_str());
-                if (ImGui::Selectable(Tr(d.label.c_str()), d.id == t.device)) use("device", json::Value::Str(d.id));
-                if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort))
-                    ImGui::SetTooltip("%s  \xC2\xB7  %s%s%s", d.id.c_str(), d.kind.c_str(), d.owner.empty() ? "" : "  \xC2\xB7  ",
-                                      d.owner.c_str());
-                ImGui::PopID();
+        // Every device is a chip, wrapped to the panel, so the one driving reads at a glance.
+        const float gap = 4.0f * nui::Scale(), room = ImGui::GetContentRegionAvail().x;
+        float x = 0.0f;
+        for (const TeleopDeviceInfo& d : t.devices) {
+            const bool pad = d.kind.find("gamepad") != std::string::npos;
+            const char* glyph = d.kind == "keyboard" ? icon::kKeyboard : pad ? icon::kGamepad : icon::kPlug;
+            const std::string text = Iconed(glyph, Tr(d.label.c_str()));
+            const float w = ImGui::CalcTextSize(text.c_str()).x + 16.0f * nui::Scale();
+            if (x > 0.0f && x + gap + w <= room) {
+                ImGui::SameLine(0.0f, gap);
+                x += gap;
+            } else {
+                x = 0.0f;
             }
-            ImGui::EndCombo();
+            x += w;
+            if (nui::draw::Chip(d.id.c_str(), text, d.id == t.device) && d.id != t.device)
+                use("device", json::Value::Str(d.id));
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort))
+                ImGui::SetTooltip("%s  \xC2\xB7  %s%s%s", d.id.c_str(), d.kind.c_str(),
+                                  d.owner.empty() ? "" : "  \xC2\xB7  ", d.owner.c_str());
         }
+        if (device == nullptr) ImGui::TextColored(theme::kWarn, "%s", Fmt(Tr("%s (gone)"), t.device.c_str()).c_str());
         const auto mode_label = [&](const std::string& id) -> std::string {
             const auto m = std::find(kTeleopModes.begin(), kTeleopModes.end(), id);
             if (m != kTeleopModes.end()) return Tr(kTeleopModeLabels[m - kTeleopModes.begin()]);
@@ -686,7 +695,8 @@ void ImGuiLayer::BuildPolicy(nui::VStack& root) {
             row("Robots", Fmt("%u", p.robots));
             row("Observations", Fmt("%u", p.obs_dim));
             row("Actions", Fmt(Tr("%u per robot"), p.act_dim));
-            row("Decisions", Fmt(Tr("%.0f Hz (%u steps)"), static_cast<double>(p.rate_hz), p.decimation));
+            const double every_ms = 1000.0 / static_cast<double>(p.rate_hz);
+            row("Decisions", Fmt(Tr("every %.3g ms (%u steps)"), every_ms, p.decimation));
             row("Action norm", Fmt("%.3f", static_cast<double>(p.norm)));
             ImGui::EndTable();
         }

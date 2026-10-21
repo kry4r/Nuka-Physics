@@ -1407,6 +1407,8 @@ struct EditorHost::State : DocumentHost {
     Clock::time_point train_panel_due_{};
     std::string train_panel_doc_ = "\n";
     uint64_t train_panel_scene_ = ~0ull;
+    // Extensions register tasks: the extension revision the panel's task list is of.
+    uint64_t train_panel_tasks_ = 0u;
     // The run the viewport watches and the layout its frames were asked for.
     struct Observing {
         std::unique_ptr<TrainObserve> link;
@@ -5807,6 +5809,33 @@ void EditorHost::State::RegisterTrainActions() {
                       return Ok(out.At("tasks"));
                   },
                   "", true});
+    // A task of the user's own: an extension in the profile built on `from` (the document's task by
+    // default), enabled, opened in the Script panel and made the document's task.
+    actions_.Add({"train.new_task", "New Training Task", "train", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      std::string base = StrArg(args, "from");
+                      if (base.empty()) {
+                          const ActionResult config = TrainConfig(json::Value::Object(), std::string(), false);
+                          if (!config.ok) return config;
+                          base = config.value.At("task").AsString();
+                      }
+                      json::Value made;
+                      const json::Value request =
+                          Object({{"op", json::Value::Str("scaffold")}, {"base", json::Value::Str(base)},
+                                  {"folder", json::Value::Str(PathText(profile_->Dir() / "extensions"))}});
+                      if (const std::string why = TrainExchange(request, &made); !why.empty())
+                          return ActionResult::Fail(why);
+                      actions_.Run("extensions.rescan", json::Value::Object(), "train.new_task", frame_index_);
+                      const ActionResult enabled = actions_.Run("extensions.enable", Object({{"id", made.At("name")}}),
+                                                                "train.new_task", frame_index_);
+                      if (!enabled.ok) return enabled;
+                      actions_.Run("script.open", Object({{"path", made.At("file")}}), "train.new_task", frame_index_);
+                      actions_.Run("window.focus", Object({{"panel", json::Value::Str("script")}}), "train.new_task",
+                                   frame_index_);
+                      const ActionResult config = TrainConfig(json::Value::Object(), made.At("name").AsString(), true);
+                      if (!config.ok) return config;
+                      return Ok(std::move(made));
+                  }});
     // The document's task and full configuration, the values that differ from the defaults (`changed`)
     // and what keeps them from training the scene (`errors`); `task` switches to that task's defaults.
     actions_.Add({"train.config", "Training Configuration", "train", "", ShortcutScope::Global, has_scene, {},
@@ -6267,11 +6296,13 @@ void EditorHost::State::RefreshTraining(bool now) {
             ++p.config_version;
         }
         train_panel_scene_ = ~0ull;
-    } else if (ui_state_.scene_version != train_panel_scene_) {
+    } else if (ui_state_.scene_version != train_panel_scene_ || extensions_.Revision() != train_panel_tasks_) {
         train_panel_scene_ = ui_state_.scene_version;
         json::Value out;
-        if (!p.tasks.IsArray() && TrainExchange(Object({{"op", json::Value::Str("tasks")}}), &out).empty())
+        if (extensions_.Revision() != train_panel_tasks_ &&
+            TrainExchange(Object({{"op", json::Value::Str("tasks")}}), &out).empty())
             p.tasks = out.At("tasks");
+        train_panel_tasks_ = extensions_.Revision();
         if (!p.python.IsObject()) {
             const std::string why = Trainer(&out);
             p.python = why.empty() ? out
@@ -9931,9 +9962,9 @@ std::unique_ptr<inference::PolicyController> EditorHost::State::MakeContractCont
         return nullptr;
     }
     if (std::fabs(dt - opt_.dt) > 1e-6f) {
-        *error = Format("the policy was trained at a %g s step; the scene steps every %g s (the Solver panel's "
+        *error = Format("the policy was trained at a %.3g ms step; the scene steps every %.3g ms (the Solver panel's "
                         "Time step, or sim.dt, sets it)",
-                        static_cast<double>(dt), static_cast<double>(opt_.dt));
+                        1000.0 * static_cast<double>(dt), 1000.0 * static_cast<double>(opt_.dt));
         return nullptr;
     }
     // A robot is an articulation with every joint the contract names.
@@ -10526,7 +10557,6 @@ void EditorHost::State::Frame(bool step_physics) {
     stats.debug_invalid_colliders = debug_report.invalid_colliders;
     stats.debug_invalid_contacts = debug_report.invalid_contacts;
     stats.debug_omitted_instances = debug_report.omitted_instances;
-    stats.debug_contacts_budget_skipped = loaded_ && debug_report.contacts_budget_skipped;
     stats.debug_colliders_available = loaded_ && debug_overlay_.CollidersAvailable();
     stats.debug_contacts_available = loaded_ && debug_overlay_.ContactsAvailable();
     stats.frame_index = frame_index_;
@@ -10886,6 +10916,16 @@ void EditorHost::State::Frame(bool step_physics) {
     if (loaded_ && shown_ != nullptr)
         debug_overlay_.Rebuild(shown_->overlay, loaded_->sim->GetRenderWorld(), ui_state_.show_colliders,
                                ui_state_.show_contacts);
+    ui_state_.contacts.clear();
+    if (loaded_ && shown_ != nullptr && ui_state_.show_contacts && shown_->overlay.contacts_valid) {
+        const OverlayData& o = shown_->overlay;
+        for (size_t s = 0; s < o.contact_counts.size(); ++s) {
+            if (o.contact_counts[s] == 0u) continue;
+            ContactPatch& c = ui_state_.contacts.emplace_back();
+            c.count = std::min(o.contact_counts[s], 4u);
+            std::copy_n(o.contact_points.begin() + static_cast<std::ptrdiff_t>(s * 4u), 4, c.points);
+        }
+    }
     apply_ms += Ms(Clock::now() - overlay_t0);
 
     if (video_) StepVideo();

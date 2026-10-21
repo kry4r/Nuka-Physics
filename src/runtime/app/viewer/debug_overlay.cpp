@@ -14,7 +14,7 @@ namespace {
 
 using nuka::math::Transform;
 using nuka::math::Vec3;
-constexpr float kContactSig[3] = {1.0f, 0.45f, 0.05f};
+constexpr float kStaticSig[3] = {0.85f, 0.18f, 0.85f};
 constexpr float kDebugOverlayAlpha = 0.5f;
 static_assert(sizeof(Vec3) == 3u * sizeof(float), "UcontactPoint wire layout");
 
@@ -64,20 +64,17 @@ void DebugOverlay::Reset() {
 
 void DebugOverlay::EnsureMaterials(render::RenderWorld& render_world) {
     const bool intact =
-        materials_ready_ && mat_contact_ < render_world.materials.size() &&
-        render_world.materials[mat_contact_].base_color[0] == kContactSig[0] &&
-        render_world.materials[mat_contact_].base_color[1] == kContactSig[1] &&
-        render_world.materials[mat_contact_].base_color[2] == kContactSig[2];
+        materials_ready_ && mat_static_ < render_world.materials.size() &&
+        render_world.materials[mat_static_].base_color[0] == kStaticSig[0] &&
+        render_world.materials[mat_static_].base_color[1] == kStaticSig[1] &&
+        render_world.materials[mat_static_].base_color[2] == kStaticSig[2];
     if (intact) return;
     mat_dynamic_ = static_cast<uint32_t>(render_world.materials.size());
     render_world.materials.emplace_back();
     SetColor(render_world.materials.back(), 0.15f, 0.85f, 0.25f, 0.45f);  // dynamic: green
     mat_static_ = static_cast<uint32_t>(render_world.materials.size());
     render_world.materials.emplace_back();
-    SetColor(render_world.materials.back(), 0.85f, 0.18f, 0.85f, 0.45f);  // static: magenta
-    mat_contact_ = static_cast<uint32_t>(render_world.materials.size());
-    render_world.materials.emplace_back();
-    SetColor(render_world.materials.back(), 1.0f, 0.45f, 0.05f, 0.9f);    // contact: orange
+    SetColor(render_world.materials.back(), kStaticSig[0], kStaticSig[1], kStaticSig[2], 0.45f);  // static: magenta
     materials_ready_ = true;
 }
 
@@ -99,27 +96,18 @@ void DebugOverlay::Rebuild(const OverlayData& data, render::RenderWorld& render_
             batch_.AppendCollider(render_world, collider.kind, collider.params, pose, mat);
         }
     }
-    const auto slots = static_cast<uint32_t>(data.contact_counts.size());
     if (show_contacts && data.contacts_valid) {
-        if (slots == 0u) {
-            contacts_available_ = true;
-        } else if (batch_.ShouldReadContacts(slots)) {
-            contacts_available_ = true;
-            for (uint32_t s = 0; s < slots; ++s) {
-                const uint32_t count = std::min(data.contact_counts[s], 4u);
-                for (uint32_t p = 0; p < count; ++p)
-                    batch_.AppendContact(render_world, data.contact_points[static_cast<size_t>(s) * 4u + p],
-                                         mat_contact_);
-            }
-        }
+        contacts_available_ = true;
+        for (size_t s = 0; s < data.contact_counts.size(); ++s)
+            for (uint32_t p = 0; p < std::min(data.contact_counts[s], 4u); ++p)
+                batch_.CountContact(data.contact_points[s * 4u + p]);
     }
 
     const auto& report = batch_.Report();
-    const bool omitted = report.omitted_instances != 0u || report.contacts_budget_skipped;
+    const bool omitted = report.omitted_instances != 0u;
     if (omitted && !overflow_logged_) {
-        std::fprintf(stderr, "[debug_overlay] omitted=%llu; contacts unread due to budget=%s\n",
-                     static_cast<unsigned long long>(report.omitted_instances),
-                     report.contacts_budget_skipped ? "yes" : "no");
+        const auto count = static_cast<unsigned long long>(report.omitted_instances);
+        std::fprintf(stderr, "[debug_overlay] omitted=%llu\n", count);
     }
     overflow_logged_ = omitted;
 }

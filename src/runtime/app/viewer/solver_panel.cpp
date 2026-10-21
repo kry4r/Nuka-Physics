@@ -115,7 +115,7 @@ void ImGuiLayer::BuildSolver(nui::VStack& root) {
 
     root.Add<nui::Separator>("Time step");
     auto& step = root.Add<nui::Segmented>(
-        std::vector<std::string>{"1 ms", "2 ms", "1/240 s", "5 ms"},
+        std::vector<std::string>{"1 ms", "2 ms", "4.17 ms", "5 ms"},
         nui::Bind<int>(
             [view] {
                 const float dt = view().dt;
@@ -131,12 +131,20 @@ void ImGuiLayer::BuildSolver(nui::VStack& root) {
     root.Add<nui::Separator>("Sweep budget");
     std::vector<std::string> budgets;
     for (const uint32_t n : kBudgets) budgets.push_back(std::to_string(n));
-    auto& budget = root.Add<nui::Segmented>(
-        budgets, nui::Bind<int>([view] { return IndexOf(kBudgets, std::size(kBudgets), view().iterations); },
-                                [this](const int& i) {
-                                    Queue("solver.set_iterations",
-                                          Args({{"n", json::Value::Int(kBudgets[static_cast<size_t>(i)])}}));
-                                }));
+    auto& budget = root.Add<nui::Segmented>(budgets);
+    // A budget set elsewhere that no preset matches shows as one more, selected choice.
+    budget.model = nui::Bind<int>(
+        [view, &budget] {
+            const uint32_t n = view().iterations;
+            const int preset = IndexOf(kBudgets, std::size(kBudgets), n);
+            budget.options.resize(std::size(kBudgets));
+            if (preset >= 0 || n == 0u) return preset;
+            budget.options.push_back(std::to_string(n));
+            return static_cast<int>(std::size(kBudgets));
+        },
+        [this](const int& i) {
+            Queue("solver.set_iterations", Args({{"n", json::Value::Int(kBudgets[static_cast<size_t>(i)])}}));
+        });
     budget.enabled_if = has_scene;
     budget.tooltip = "Velocity sweeps per substep; the solve stops early at the tolerance.";
     root.Add<nui::Separator>("Alert residual");

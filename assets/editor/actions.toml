@@ -1512,6 +1512,13 @@ summary = "The training tasks (go2_velocity, Go2 velocity tracking, and any regi
 kind = "read"
 returns = "a list of {name, title, module, root, robot, groups: [{name, params: [{key, type, default, ...}]}], ...}"
 
+["train.new_task"]
+summary = "Starts a training task of the user's own: an extension in the profile's extensions folder (my_task, my_task_2, ...) whose module registers a task built on `from` plus a Goal group (speed, turn). The extension is enabled, its module opens in the Script panel and the task becomes the document's; saving the module reloads it and the Training panel shows its groups as declared."
+kind = "file"
+args.from = "string, the registered task to build on, default the document's task"
+returns = "{name, title, file}"
+example = '{"from": "g1_rough"}'
+
 ["train.config"]
 summary = "The document's task and full configuration, the values that differ from the defaults (`changed`) and what keeps them from training the scene (`errors`); `task` switches to that task's defaults."
 kind = "read"

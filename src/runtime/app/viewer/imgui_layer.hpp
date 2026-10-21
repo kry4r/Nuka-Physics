@@ -318,6 +318,12 @@ struct RtView {
 enum class ViewLayout : uint8_t { Single, Split, Quad };
 inline constexpr uint32_t kViewPanes = 4u;
 
+// One touching pair of the shown environment: the world points of its patch, `count` of four in use.
+struct ContactPatch {
+    uint32_t count = 0u;
+    math::Vec3 points[4];
+};
+
 // Whether the Lit view draws its ground grid: under scenes without a floor of their own, always or never.
 enum class GroundGrid : uint8_t { Auto, On, Off };
 
@@ -350,6 +356,7 @@ struct ViewerUiState {
 
     bool show_colliders = false;
     bool show_contacts = false;
+    std::vector<ContactPatch> contacts;  // the host's, while show_contacts
     // The Lit view's sun shadows, distance fog and ground grid.
     bool shadows = true;
     bool fog = false;
@@ -472,7 +479,6 @@ struct ViewerStats {
     uint32_t debug_invalid_colliders = 0u;
     uint32_t debug_invalid_contacts = 0u;
     uint64_t debug_omitted_instances = 0u;
-    bool debug_contacts_budget_skipped = false;
     bool debug_colliders_available = false;
     bool debug_contacts_available = false;
     float snapshot_age_ms = 0.0f;  // wall time since the shown snapshot was published
@@ -648,6 +654,8 @@ private:
     void DrawRobotHud(const ImVec2& vmin, const ImVec2& vmax);
     // Camera frustums, lidar fans, state sensors' axes and their names; the selected one brightest.
     void DrawSensorHud(const ImVec2& vmin, const ImVec2& vmax);
+    // Each contact patch as dots joined into a line or a filled outline, drawn over what hides it.
+    void DrawContactHud(const ImVec2& vmin, const ImVec2& vmax);
     // A watched training run's velocity arrows above its robots, and its plate `hud_top` lower than the chips.
     void DrawTrainHud(const ImVec2& vmin, const ImVec2& vmax, float hud_top);
     // The selected sensor's fields in Properties; each finished edit is one sensor.set.

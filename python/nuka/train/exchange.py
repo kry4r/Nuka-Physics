@@ -6,6 +6,8 @@
   Without `task` it is the first registered one whose robot the scene holds, else the first registered one.
 - `trainer`: {python} -> {python, argv, ready, error}: the interpreter a run starts in, `argv` +
   [job.json] being its command.
+- `scaffold`: {folder, base} -> {name, title, file}: a new task extension in `folder`, built on task
+  `base`; see scaffold.write.
 A request the package cannot answer, such as one for an unknown task, is answered `{"failed": why}`.
 """
 
@@ -17,6 +19,7 @@ import sys
 from pathlib import Path
 
 from .config import changed, resolve, scene_errors
+from .scaffold import write
 from .tasks import TASKS
 
 # The run imports this editor's nuka, whatever the interpreter has installed.
@@ -71,7 +74,11 @@ def _trainer(req: dict) -> dict:
     return out
 
 
-OPS = {"tasks": _tasks, "resolve": _resolve, "trainer": _trainer}
+def _scaffold(req: dict) -> dict:
+    return write(req["folder"], req["base"])
+
+
+OPS = {"tasks": _tasks, "resolve": _resolve, "trainer": _trainer, "scaffold": _scaffold}
 
 
 def call(request: str, response: str) -> None:

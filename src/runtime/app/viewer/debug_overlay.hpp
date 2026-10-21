@@ -1,6 +1,6 @@
 #pragma once
-// A read-only physics debug layer: collider proxies (green dynamic, magenta static) and
-// contact markers in RenderWorld::debug_instances, built from data the physics thread read.
+// A read-only physics debug layer: collider proxies (green dynamic, magenta static) in
+// RenderWorld::debug_instances, and the contact points the viewport HUD draws, read by the physics thread.
 
 #include "runtime/app/viewer/debug_draw.hpp"
 #include "runtime/app/viewer/editor_world.hpp"
@@ -44,7 +44,6 @@ private:
 
     uint32_t mat_dynamic_ = 0u;
     uint32_t mat_static_ = 0u;
-    uint32_t mat_contact_ = 0u;
     bool materials_ready_ = false;
     bool overflow_logged_ = false;
     bool colliders_available_ = false;

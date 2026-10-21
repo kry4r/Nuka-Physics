@@ -48,6 +48,8 @@ public:
     void Shutdown();
     // Reloads extensions whose files changed, and retries failed ones; checks once a second.
     void Poll();
+    // Counts the changes to the extensions: found, enabled, disabled or reloaded.
+    uint64_t Revision() const;
     void DrawOverlays(const CameraController& camera, uint64_t tick);
     // An extension's action ran; a callback that keeps failing disables its extension.
     void Report(const std::string& owner, const std::string& callback, bool ok);

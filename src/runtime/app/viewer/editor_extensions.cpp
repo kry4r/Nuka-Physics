@@ -1190,6 +1190,8 @@ void ExtensionManager::Poll() {
     }
 }
 
+uint64_t ExtensionManager::Revision() const { return impl_->revision; }
+
 void ExtensionManager::DrawOverlays(const CameraController& camera, uint64_t tick) {
     Impl& m = *impl_;
     const SceneViewportRect& vp = m.services.ui->Viewport();

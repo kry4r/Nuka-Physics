@@ -354,6 +354,11 @@ def register(spec: TaskSpec) -> None:
     TASKS[spec.name] = spec
 
 
+def unregister(name: str) -> None:
+    """Drops a task, as the extension that registered it stops."""
+    TASKS.pop(name)
+
+
 register(TaskSpec(name="go2_velocity", title="Go2 velocity tracking", env="nuka_go2", groups=_go2_groups(),
                   robot={"links": 13, "joints": 12}, dt=0.005, spacing=1.0, build=_go2_build, check=_batch_check))
 register(TaskSpec(name="g1_rough", title="G1 rough-terrain walking", env="nuka_g1", groups=_g1_groups(),

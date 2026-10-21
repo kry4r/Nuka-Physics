@@ -1,0 +1,40 @@
+{
+  "name": "train_task",
+  "launch": [],
+  "steps": [
+    {"action": "file.open", "args": {"path": "${scenario_dir}/../../examples/assets/nuka_lab/stage.nks"}},
+    {"frames": 10},
+    {"action": "file.import", "args": {"path": "${scenario_dir}/../../examples/scenes/go2_float.usda", "mode": "add",
+     "name": "go2", "pose": {"pos": [0.0, 0.0, 0.6], "quat": [1.0, 0.0, 0.0, 0.0]}}},
+    {"frames": 10},
+    {"action": "train.new_task", "bind": "made"},
+    {"python": "m = ${made}\nimport os\nassert m['name'] == 'my_task' and m['title'] == 'My task', m\nassert os.path.isfile(m['file']) and os.path.isfile(os.path.join(os.path.dirname(m['file']), 'extension.toml')), m\nassert m['file'].replace('\\\\', '/').endswith('/profile/extensions/my_task/my_task.py'), m"},
+    {"action": "train.config", "bind": "c0"},
+    {"python": "c = ${c0}\nassert c['task'] == 'my_task' and c['config']['goal'] == {'speed': 0.8, 'turn': 0.0}, c['config'].get('goal')\nassert c['errors'] == [], c['errors']"},
+    {"action": "train.tasks", "bind": "t0"},
+    {"python": "t = {x['name']: x for x in ${t0}}\nassert list(t) == ['go2_velocity', 'g1_rough', 'my_task'], list(t)\nm = t['my_task']\nassert m['module'] == 'my_task' and m['env'] == 'nuka_go2' and m['groups'][-1]['key'] == 'goal', m['groups'][-1]\nassert [g['key'] for g in m['groups'][:-1]] == [g['key'] for g in t['go2_velocity']['groups']], m['groups']"},
+    {"action": "script.tabs", "bind": "tabs"},
+    {"python": "assert any(t['path'].endswith('my_task.py') for t in ${tabs}), ${tabs}"},
+
+    {"python": "p = ${made}['file']\ns = open(p, encoding='utf-8').read()\nline = '        Param(\"turn\", \"float\", 0.0, -1.0, 1.0, unit=\"rad/s\", help=\"The yaw rate every robot is asked for\"),\\n'\nassert line in s, s\ns = s.replace(line, line + '        Param(\"side\", \"float\", 0.1, -0.5, 0.5, unit=\"m/s\", help=\"The sideways speed\"),\\n')\ns = s.replace('[goal[\"speed\"], 0.0, goal[\"turn\"]]', '[goal[\"speed\"], goal[\"side\"], goal[\"turn\"]]')\nopen(p, 'w', encoding='utf-8').write(s)\nimport time\ntime.sleep(1.5)"},
+    {"frames": 30},
+    {"action": "train.panel", "bind": "tp"},
+    {"action": "train.config", "bind": "c1"},
+    {"python": "c = ${c1}\nassert c['task'] == 'my_task' and c['config']['goal'] == {'speed': 0.8, 'turn': 0.0, 'side': 0.1}, c['config'].get('goal')"},
+    {"action": "train.set", "args": {"path": "goal.speed", "value": 1.2}},
+    {"action": "train.set", "args": {"path": "goal.speed", "value": 3.0}, "expect_error": true},
+    {"python": "from nuka.train import TASKS, resolve\ntask = TASKS['my_task']\nconfig, errors = resolve(task, {'goal': {'speed': 1.2}})\nenv = task.build(config, 'scene.nks', 'run')['config']['env_config']\nassert env['fixed_command'] and env['command'] == [1.2, 0.1, 0.0], env['command']"},
+    {"action": "train.validate", "expect_value": {"ok": true, "errors": []}},
+
+    {"action": "extensions.disable", "args": {"id": "my_task"}},
+    {"frames": 5},
+    {"action": "train.tasks", "bind": "t1"},
+    {"python": "assert [x['name'] for x in ${t1}] == ['go2_velocity', 'g1_rough'], ${t1}"},
+    {"action": "train.config", "expect_error": true},
+    {"action": "train.new_task", "args": {"from": "go2_velocity"}, "bind": "made2"},
+    {"python": "m = ${made2}\nassert m['name'] == 'my_task_2' and m['title'] == 'My task 2', m"},
+    {"action": "train.config", "bind": "c2"},
+    {"python": "assert ${c2}['task'] == 'my_task_2', ${c2}['task']"},
+    {"action": "train.new_task", "args": {"from": "nope"}, "expect_error": true}
+  ]
+}

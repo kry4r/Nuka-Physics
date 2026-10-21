@@ -113,11 +113,18 @@ void ImGuiLayer::BuildAgents(nui::VStack& root) {
         for (const ModeSpec& m : kModes) {
             if (ImGui::RadioButton(Tr(m.label), a.mode == m.mode) && a.mode != m.mode)
                 Queue("agent.mode", Args({{"mode", json::Value::Str(m.mode)}}));
+            // What a mode lets agents do shows on hover, not under the choices.
+            if (ImGui::BeginItemTooltip()) {
+                ImGui::PushTextWrapPos(ImGui::GetFontSize() * 22.0f);
+                nui::PushTextStyle(TextStyle::Strong);
+                ImGui::TextColored(theme::kAccent, "%s", Tr(m.badge));
+                nui::PopTextStyle();
+                ImGui::TextUnformatted(Tr(m.text));
+                ImGui::PopTextWrapPos();
+                ImGui::EndTooltip();
+            }
             if (&m != &kModes[3]) ImGui::SameLine();
         }
-        ImGui::PushTextWrapPos(0.0f);
-        ImGui::TextDisabled("%s", Tr(ModeOf(a.mode).text));
-        ImGui::PopTextWrapPos();
         const char* hint = Tr("action ids, comma separated; * matches anything");
         ImGui::TextColored(theme::kFgMuted, "%s", Tr("Always allow"));
         ImGui::SetNextItemWidth(-FLT_MIN);

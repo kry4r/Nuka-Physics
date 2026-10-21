@@ -156,11 +156,6 @@ bool DebugDrawBatch::Reserve() {
     return false;
 }
 
-bool DebugDrawBatch::ShouldReadContacts(uint32_t capacity) {
-    report_.contacts_budget_skipped = capacity != 0u && Remaining() == 0u;
-    return capacity != 0u && !report_.contacts_budget_skipped;
-}
-
 void DebugDrawBatch::AppendCollider(render::RenderWorld& world, uint32_t kind,
                                     const float* params, const Transform& pose, uint32_t material) {
     if (kind > kPlane && kind != kCylinder) { ++report_.unsupported_shapes; return; }
@@ -206,12 +201,8 @@ void DebugDrawBatch::AppendCollider(render::RenderWorld& world, uint32_t kind,
     ++report_.colliders;
 }
 
-void DebugDrawBatch::AppendContact(render::RenderWorld& world, const Vec3& point, uint32_t material) {
+void DebugDrawBatch::CountContact(const Vec3& point) {
     if (!Finite(point)) { ++report_.invalid_contacts; return; }
-    if (!Reserve()) return;
-    const uint32_t mesh = world.meshes.InternPrimitive(
-        "dbgcontact:marker", [] { return MakeSphere(kContactMarkerRadius, 8u, 10u); });
-    world.debug_instances.push_back(MakeDebugInstance(mesh, material, {point, math::Quat::Identity()}));
     ++report_.contacts;
 }
 

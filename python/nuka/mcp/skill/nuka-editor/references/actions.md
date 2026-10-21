@@ -213,6 +213,7 @@ This page is generated from assets/editor/actions.toml by tools/skill_actions.py
 ## Training
 
 - `train.tasks` [read]: The training tasks (go2_velocity, Go2 velocity tracking, and any registered from Python): each one's groups of parameters, the robot its scene holds and the step it trains at.
+- `train.new_task` {from?} [file]: Starts a training task of the user's own: an extension in the profile's extensions folder (my_task, my_task_2, ...) whose module registers a task built on `from` plus a Goal group (speed, turn).
 - `train.config` {task?} [read]: The document's task and full configuration, the values that differ from the defaults (`changed`) and what keeps them from training the scene (`errors`); `task` switches to that task's defaults.
 - `train.set` {values?, path?, value, task?} [edit]: Sets `values` ({"group.key": value}), or `path` to `value`, after switching to `task` if given; a value that does not fit fails the call and changes nothing.
 - `train.validate` [read]: Whether the document's training configuration can train the scene as it stands.

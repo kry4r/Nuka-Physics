@@ -2,7 +2,7 @@
 
 # Actions
 
-Every menu item, toolbar button, shortcut and panel command in the editor runs an *action*: an id such as `file.import` with JSON arguments. The same actions are what scripts, extensions, smoke scenarios and agents run, so this reference covers everything the editor does. It lists 316 actions; extensions add their own.
+Every menu item, toolbar button, shortcut and panel command in the editor runs an *action*: an id such as `file.import` with JSON arguments. The same actions are what scripts, extensions, smoke scenarios and agents run, so this reference covers everything the editor does. It lists 317 actions; extensions add their own.
 
 | Group | Actions |
 | --- | --- |
@@ -15,7 +15,7 @@ Every menu item, toolbar button, shortcut and panel command in the editor runs a
 | [Motion: clips, demonstrations, teleoperation, policies](motion.md) | 36 |
 | [Simulation, timeline, solver and Rerun](simulation.md) | 31 |
 | [Sensors, labels, datasets and randomization](sensors.md) | 16 |
-| [Training](training.md) | 15 |
+| [Training](training.md) | 16 |
 | [View and camera](view.md) | 47 |
 | [Windows, panels and tools](windows.md) | 41 |
 | [Scripts and console](scripts.md) | 18 |
