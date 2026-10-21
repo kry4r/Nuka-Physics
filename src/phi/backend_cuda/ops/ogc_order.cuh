@@ -202,10 +202,11 @@ __device__ inline void WriteRecord(const OgcDetectParams& p, const DataView& dat
     for (uint32_t s = 0u; s < 2u; ++s) {
         const bool point = r.side_kind[s] == nk::kUContactSidePointEndpoint;
         sides[s] = point ? endpoint + s : r.side[s];
-        data.point_endpoint_ranges[endpoint + s] = point
-            ? nk::PointEndpointRange{term + s * kSideTerms, r.term_count[s]} : nk::PointEndpointRange{};
-        for (uint32_t k = 0u; k < kSideTerms; ++k)
-            data.point_endpoint_terms[term + s * kSideTerms + k] = r.terms[s * kSideTerms + k];
+        if (point) {
+            data.point_endpoint_ranges[endpoint + s] = {term + s * kSideTerms, r.term_count[s]};
+            for (uint32_t k = 0u; k < kSideTerms; ++k)
+                data.point_endpoint_terms[term + s * kSideTerms + k] = r.terms[s * kSideTerms + k];
+        }
     }
     data.ucontact_point[at] = r.point;
     data.ucontact_witness_a[at] = r.witness_a;

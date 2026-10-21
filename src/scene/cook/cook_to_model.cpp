@@ -272,10 +272,10 @@ void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base
     if (cap.mpm_grid_nodes_per_env > 0u || cap.ogc_contacts_per_env > 0u) {
         const uint32_t surfaces = cap.particle_surfaces_per_env > 0u ? cap.mpm_contact_capacity_per_env : 0u;
         const bool grid = cap.mpm_grid_nodes_per_env > 0u;
-        const uint64_t endpoints = uint64_t{cap.ogc_contacts_per_env} * 2u +
+        const uint64_t endpoints = uint64_t{cap.OgcPointSlotCapacity()} * 2u +
             (grid ? nk::MpmPointEndpointCount(cap.particles_per_env, surfaces,
                                               cap.mpm_stress_cells_per_env) : 0u);
-        const uint64_t terms = uint64_t{cap.ogc_contacts_per_env} * 6u +
+        const uint64_t terms = uint64_t{cap.OgcPointSlotCapacity()} * 6u +
             (grid ? nk::MpmPointEndpointTermCount(cap.particles_per_env, surfaces,
                                                   cap.mpm_stress_cells_per_env) : 0u);
         if (endpoints > std::numeric_limits<uint32_t>::max() || terms > std::numeric_limits<uint32_t>::max())

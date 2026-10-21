@@ -421,11 +421,10 @@ Status OpOgcDetect(const ModelView& model, const DataView& data,
         return Status::Ok;
     if (p->slot_base > p->slot_stride ||
         p->slot_capacity > p->slot_stride - p->slot_base ||
-        p->point_endpoint_first + uint64_t{p->slot_capacity} * 2u > p->point_endpoints_per_env ||
-        p->point_endpoint_term_first + uint64_t{p->slot_capacity} * 6u >
-            p->point_endpoint_terms_per_env ||
         (p->surfaces_per_env > 0u &&
-            (!model.particle_surface_info ||
+            (p->point_endpoint_first + uint64_t{p->slot_capacity} * 2u > p->point_endpoints_per_env ||
+             p->point_endpoint_term_first + uint64_t{p->slot_capacity} * 6u > p->point_endpoint_terms_per_env ||
+             !data.point_endpoint_ranges || !data.point_endpoint_terms || !model.particle_surface_info ||
              (p->triangles_per_env > 0u && (!model.particle_surface_triangles ||
                                            !data.particle_surface_nodes ||
                                            !model.particle_surface_triangle_edges)) ||
@@ -455,7 +454,6 @@ Status OpOgcDetect(const ModelView& model, const DataView& data,
                      !model.mesh_vertex_reach || !data.q || !data.qdot ||
                      !data.dat_joint_motion || !data.dat_joint_rate)))) ||
         !data.ogc_contact_count || !data.contact_count ||
-        !data.point_endpoint_ranges || !data.point_endpoint_terms ||
         !data.ucontact_count || !data.ucontact_point || !data.ucontact_normal ||
         !data.ucontact_witness_a || !data.ucontact_witness_b ||
         !data.ucontact_depth || !data.ucontact_a || !data.ucontact_b ||

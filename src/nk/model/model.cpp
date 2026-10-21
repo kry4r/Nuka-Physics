@@ -1193,10 +1193,10 @@ phi::Status ModelCapacities::Validate(std::string* reason) const {
             throw std::invalid_argument("grid contact identity exceeds handle range");
         const uint32_t surface_contacts = particle_surfaces_per_env > 0u ? mpm_contact_capacity_per_env : 0u;
         const bool grid_endpoints = mpm_grid_nodes_per_env > 0u;
-        const uint64_t required_endpoints = uint64_t{ogc_contacts_per_env} * 2u +
+        const uint64_t required_endpoints = uint64_t{OgcPointSlotCapacity()} * 2u +
             (grid_endpoints ? MpmPointEndpointCount(
                 particles_per_env, surface_contacts, mpm_stress_cells_per_env) : 0u);
-        const uint64_t required_terms = uint64_t{ogc_contacts_per_env} * 6u +
+        const uint64_t required_terms = uint64_t{OgcPointSlotCapacity()} * 6u +
             (grid_endpoints ? MpmPointEndpointTermCount(
                 particles_per_env, surface_contacts, mpm_stress_cells_per_env) : 0u);
         if (point_endpoints_per_env < required_endpoints ||

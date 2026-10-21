@@ -155,6 +155,9 @@ struct ModelCapacities {
     // Body-particle contact slots of one env above the rigid budget; grid-owned particles hold none.
     // Vertex blocks reserve them only when an analytic body exists; meshed bodies meet them in OGC.
     uint64_t ParticleContactReserve(uint32_t grid_particles) const;
+    uint32_t OgcPointSlotCapacity() const {
+        return particle_surfaces_per_env > 0u ? ogc_contacts_per_env : 0u;
+    }
 };
 
 // A cook-time articulation template (one per env, replicated). The arrays are

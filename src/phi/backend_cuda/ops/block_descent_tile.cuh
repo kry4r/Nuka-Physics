@@ -917,10 +917,12 @@ __device__ bool AssembleWideTileBlock(const TileContext& c, const TileBlock& b, 
                 float staged[kBatch][kSpan];
 #pragma unroll
                 for (uint32_t k = 0u; k < kBatch; ++k) {
-                    const float* const from = c.jacobian + size_t{c.chunk_rows[first_row + k].x} * c.width;
+                    const float* const from = first_row + k < end
+                        ? c.jacobian + size_t{c.chunk_rows[first_row + k].x} * c.width : nullptr;
 #pragma unroll
                     for (uint32_t r = 0u; r < kSpan; ++r)
-                        staged[k][r] = first_row + k < end ? from[c.lane + r * kTileLanes] : 0.0f;
+                        staged[k][r] = first_row + k < end && c.lane + r * kTileLanes < c.width
+                            ? from[c.lane + r * kTileLanes] : 0.0f;
                 }
 #pragma unroll
                 for (uint32_t k = 0u; k < kBatch; ++k)
@@ -1625,9 +1627,9 @@ __global__ void __launch_bounds__(TileWarps<kN>() * kTileLanes) DescendDenseTile
         c.first_articulation = c.env * c.articulations;
         c.capacity = s.tile_head_capacity;
         c.staged = kNoTileBlock;
-        c.width = kN;
+        c.width = TileJacobianWidth(p);
         c.fields = s.tile_fields + size_t{slot} * kTileFields * c.capacity;
-        c.jacobian = s.tile_jacobian + size_t{slot} * s.tile_row_capacity * kN;
+        c.jacobian = s.tile_jacobian + size_t{slot} * s.tile_row_capacity * c.width;
         c.mass = tile_shared + size_t{warp} * TileWarpFloats<kN>();
         c.factor = c.mass + kN * (kN + 1u);
         c.chunk_terms = reinterpret_cast<float4*>(c.factor + kN * (kN + 1u));

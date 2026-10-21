@@ -202,6 +202,10 @@ uint32_t TileWidth(const BlockDescentSolveParams& p) {
     return p.max_dof <= kTileLanes ? std::max(8u, (p.max_dof + 3u) & ~3u) : kMaxArticulationDof;
 }
 
+__host__ __device__ uint32_t TileJacobianWidth(const BlockDescentSolveParams& p) {
+    return ((p.max_independent_dof > kRigidBlockDof ? p.max_independent_dof : kRigidBlockDof) + 3u) & ~3u;
+}
+
 // Warps the tile kernel keeps resident; each stages one environment at a time in its own slot.
 uint32_t TileWarpSlots(const BlockDescentSolveParams& p);
 
@@ -491,7 +495,7 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     const uint64_t tile_slots = tile ? TileWarpSlots(p) : 0u;
     if (tile && tile_slots == 0u) return 0u;
     s.tile_fields = reinterpret_cast<float*>(take(tile_slots * kTileFields * s.tile_head_capacity));
-    s.tile_jacobian = reinterpret_cast<float*>(take(tile_slots * s.tile_row_capacity * TileWidth(p)));
+    s.tile_jacobian = reinterpret_cast<float*>(take(tile_slots * s.tile_row_capacity * TileJacobianWidth(p)));
     s.tile_next = take(tile ? 1u : 0u);
     s.tile_order = take(tile ? p.env_count : 0u);
     s.tile_cost = take(tile ? p.env_count : 0u);

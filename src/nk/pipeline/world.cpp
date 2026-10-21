@@ -87,9 +87,10 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
     }
     control_cap.rigid_contact_rows_per_env = static_cast<uint32_t>(rigid_rows);
     const RigidContactCapacity distinct = DistinctOwnerContactCapacity(model_);
+    const bool multiple_owners = control_cap.particles_per_env > 0u || distinct.CandidateCount() > 0u;
     control_cap.distinct_owner_rows_per_env = static_cast<uint32_t>(
         distinct.RowsForSlots(std::min(control_cap.max_contacts_per_env - point_slots, distinct.CandidateCount())) +
-        point_slots * kPairDrivenParticleRowsPerSlot);
+        (multiple_owners ? point_slots * kPairDrivenParticleRowsPerSlot : 0u));
     control_cap.max_rows_per_env = std::max(control_cap.max_rows_per_env, static_cast<uint32_t>(row_count));
     control_cap.joint_drive_rows_per_env = drive_rows;
     control_cap.inverse_dynamics_controls =
@@ -100,10 +101,10 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
         const uint32_t surfaces = control_cap.particle_surfaces_per_env > 0u
             ? control_cap.mpm_contact_capacity_per_env : 0u;
         const bool grid = control_cap.mpm_grid_nodes_per_env > 0u;
-        const uint64_t endpoints = uint64_t{control_cap.ogc_contacts_per_env} * 2u +
+        const uint64_t endpoints = uint64_t{control_cap.OgcPointSlotCapacity()} * 2u +
             (grid ? MpmPointEndpointCount(control_cap.particles_per_env, surfaces,
                                           control_cap.mpm_stress_cells_per_env) : 0u);
-        const uint64_t terms = uint64_t{control_cap.ogc_contacts_per_env} * 6u +
+        const uint64_t terms = uint64_t{control_cap.OgcPointSlotCapacity()} * 6u +
             (grid ? MpmPointEndpointTermCount(control_cap.particles_per_env, surfaces,
                                               control_cap.mpm_stress_cells_per_env) : 0u);
         if (endpoints > std::numeric_limits<uint32_t>::max() || terms > std::numeric_limits<uint32_t>::max()) {
