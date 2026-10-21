@@ -10,11 +10,11 @@ This preview uses a saved gripper pose. Physics measurements belong to the captu
 
 | File | Contents |
 | --- | --- |
-| [appearance.nks](../examples/assets/nuka_lab/appearance.nks) | Shared PBR materials, sky colors, ambient illumination and beauty settings |
-| [gripper.nks](../examples/assets/nuka_lab/gripper.nks) | Full-size lab, equipment cabinet, overview and contact cameras |
-| [bunny.nks](../examples/assets/nuka_lab/bunny.nks) | Impact layout, 5 cm grid, overview and close cameras |
-| [compression.nks](../examples/assets/nuka_lab/compression.nks) | Compression layout, 2.5 cm grid and overview camera |
-| [lab_geometry.nka](../examples/assets/nuka_lab/lab_geometry.nka) | Shared triangle meshes, including bevels, signs and the seamless backdrop |
+| [appearance.nks](https://github.com/kry4r/Nuka-Physics/blob/master/examples/assets/nuka_lab/appearance.nks) | Shared PBR materials, sky colors, ambient illumination and beauty settings |
+| [gripper.nks](https://github.com/kry4r/Nuka-Physics/blob/master/examples/assets/nuka_lab/gripper.nks) | Full-size lab, equipment cabinet, overview and contact cameras |
+| [bunny.nks](https://github.com/kry4r/Nuka-Physics/blob/master/examples/assets/nuka_lab/bunny.nks) | Impact layout, 5 cm grid, overview and close cameras |
+| [compression.nks](https://github.com/kry4r/Nuka-Physics/blob/master/examples/assets/nuka_lab/compression.nks) | Compression layout, 2.5 cm grid and overview camera |
+| [lab_geometry.nka](https://github.com/kry4r/Nuka-Physics/blob/master/examples/assets/nuka_lab/lab_geometry.nka) | Shared triangle meshes, including bevels, signs and the seamless backdrop |
 
 Each layout imports `appearance.nks` and references meshes in `lab_geometry.nka`. Panels, frames, signs, lamps and cabinet parts are named visual nodes. Their positions and rotations are editable in the NKS tree. Units are metres; quaternions use `[w, x, y, z]`.
 
@@ -78,7 +78,7 @@ For the gripper, `--renderer rt` uses ray tracing and `--renderer raster` uses V
 
 ## Rebuild the modeled geometry
 
-The offline [asset builder](../tools/media/build_nuka_lab.py) models the beveled parts and converts [the Nuka logo](media/nuka-logo.png) and the bundled JetBrains Mono typeface into sign meshes. It requires NumPy and Pillow:
+The offline [asset builder](https://github.com/kry4r/Nuka-Physics/blob/master/tools/media/build_nuka_lab.py) models the beveled parts and converts [the Nuka logo](media/nuka-logo.png) and the bundled JetBrains Mono typeface into sign meshes. It requires NumPy and Pillow:
 
 ```bash
 python tools/media/build_nuka_lab.py

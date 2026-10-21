@@ -30,7 +30,7 @@ pip install -e python
 
 The Python extension links against `build-cuda128/src/libnuka.so`. Advanced
 build-directory and CUDA-library overrides are listed in
-[`python/README.md`](../python/README.md).
+[`python/README.md`](https://github.com/kry4r/Nuka-Physics/blob/master/python/README.md).
 
 Check the installation:
 
@@ -176,4 +176,4 @@ python tools/lint/physics_smell.py
 
 The lint enforces the physics-code rules, public-header constraints,
 and generated-file policy. Contribution requirements live in
-[`CONTRIBUTING.md`](../CONTRIBUTING.md).
+[`CONTRIBUTING.md`](https://github.com/kry4r/Nuka-Physics/blob/master/CONTRIBUTING.md).

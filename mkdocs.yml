@@ -1,0 +1,136 @@
+# The Nuka Wiki: `mkdocs serve` previews it, `mkdocs build` writes site/. It needs mkdocs 1.6 and
+# mkdocs-material 9.7 (or Zensical, which reads this file); see docs/contributing-docs.md.
+site_name: Nuka Physics
+site_description: Manual for the Nuka physics engine and its editor
+repo_url: https://github.com/kry4r/Nuka-Physics
+repo_name: kry4r/Nuka-Physics
+edit_uri: edit/master/docs/
+docs_dir: docs
+copyright: Nuka Physics contributors
+
+exclude_docs: |
+  plans/
+  research/
+  roadmap/
+  specs/
+  media/*.mp4
+  media/demo_recordings.json
+
+theme:
+  name: material
+  logo: media/nuka-logo-light.png
+  favicon: media/nuka-logo.png
+  # System fonts: the site must not reach for Google Fonts, which some readers cannot load.
+  font: false
+  icon:
+    repo: fontawesome/brands/github
+  palette:
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-sunny
+        name: Light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-night
+        name: Dark mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - navigation.footer
+    - navigation.instant
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - toc.follow
+
+extra_css:
+  - stylesheets/nuka.css
+
+# A broken link or a missing heading anchor is a warning, so `mkdocs build --strict` fails on it.
+validation:
+  links:
+    not_found: warn
+    anchors: warn
+    unrecognized_links: warn
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - Build the engine: getting-started.md
+      - Install the editor: editor/install.md
+      - A first session: editor/first-session.md
+  - Editor manual:
+      - editor/index.md
+      - Documents and files: editor/documents.md
+      - Importing assets: editor/import.md
+      - Building scenes: editor/scene.md
+      - Materials: editor/materials.md
+      - Viewport and camera: editor/viewport.md
+      - Simulation: editor/simulation.md
+      - Robots: editor/robots.md
+      - Teleop, policies, demos and clips: editor/motion.md
+      - Sensors and datasets: editor/sensors.md
+      - Training: editor/training.md
+      - Inspecting physics: editor/inspect.md
+      - Scripting: editor/scripting.md
+      - Agents and MCP: editor/agents.md
+      - Extensions: editor/extensions.md
+  - Python:
+      - python/index.md
+      - Driving the editor: python/editor.md
+  - Concepts:
+      - Architecture: concepts/architecture.md
+      - Collision detection: concepts/collision-detection.md
+      - Coupling: concepts/coupling.md
+      - Soft bodies, fluids and differentiability: concepts/solver-soft-fluid-diff.md
+      - Sensors: concepts/sensors.md
+      - Isaac Lab compatibility: concepts/isaaclab-compat.md
+      - URDF import profiles: import/urdf_profiles.md
+      - Nuka Dynamics Lab: nuka-stage.md
+  - Reference:
+      - Keyboard and mouse: reference/shortcuts.md
+      - Command line: reference/command-line.md
+      - File formats: reference/file-formats.md
+      - Actions:
+          - reference/actions/index.md
+          - Documents: reference/actions/documents.md
+          - Edits: reference/actions/edits.md
+          - Scene: reference/actions/scene.md
+          - Assets: reference/actions/assets.md
+          - Materials: reference/actions/materials.md
+          - Robots: reference/actions/robots.md
+          - Motion: reference/actions/motion.md
+          - Simulation: reference/actions/simulation.md
+          - Sensors and data: reference/actions/sensors.md
+          - Training: reference/actions/training.md
+          - View: reference/actions/view.md
+          - Windows and tools: reference/actions/windows.md
+          - Scripts: reference/actions/scripts.md
+          - Editor, agents, extensions: reference/actions/editor.md
+      - Writing these docs: contributing-docs.md

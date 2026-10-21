@@ -113,3 +113,6 @@ runs/
 # bridge_export.py emits the flat MLP weights + golden triples here.
 python/spikes/out/
 __pycache__/
+
+# The Wiki's build output (mkdocs build).
+/site/
