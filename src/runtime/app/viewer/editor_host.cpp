@@ -15,6 +15,8 @@
 #include "render/raster/interop_transform_ssbo.hpp"
 #include "render/raster/vulkan_present_renderer.hpp"
 #include "render/render_world.hpp"
+#include "render/irradiance_volume.hpp"
+#include "render/rt_backend.hpp"
 #include "render/scene_asset.hpp"
 #include "render/viewer_resources.hpp"
 #include "render/window/window_surface.hpp"
@@ -1233,6 +1235,8 @@ struct EditorHost::State : DocumentHost {
     // The measurement between the tool's ends, null while they do not resolve.
     json::Value MeasureJson() const;
     const render::RenderWorld& ShownWorld() const { return loaded_ ? loaded_->sim->GetRenderWorld() : empty_world_; }
+    bool local_lighting_ = true;
+    uint64_t probe_revision_ = 0u;
 
     void Frame(bool step_physics);
     // Editor output goes to `stream` and the session log, and with `console` to the Console panel.
@@ -3159,6 +3163,9 @@ void EditorHost::State::LightView(render::RasterOptions& opts) {
     const auto rgb = [](float* dst, float r, float g, float b) { dst[0] = r; dst[1] = g; dst[2] = b; };
     opts.viewport_sky = opts.use_sun_light = true;
     opts.viewport_ao_radius = ui_state_.ambient_occlusion ? 0.5f : 0.0f;
+    opts.viewport_local_lighting = local_lighting_;
+    if (loaded_ && doc_.Revision() != probe_revision_)
+        loaded_->sim->GetRenderWorld().irradiance_volume.reset();
     rgb(opts.sky_top, 0.33f, 0.46f, 0.66f);
     rgb(opts.sky_bottom, 0.70f, 0.75f, 0.80f);
     rgb(opts.ground_color, 0.13f, 0.13f, 0.125f);
@@ -8866,6 +8873,51 @@ void EditorHost::State::RegisterViewActions() {
                   [this](const json::Value& args) {
                       ui_state_.ambient_occlusion = BoolArg(args, "on", !ui_state_.ambient_occlusion);
                       return Ok();
+                  }});
+    actions_.Add({"view.probes", "Local Lighting", "view", "", ShortcutScope::Global, has_scene,
+                  [this] { return local_lighting_; },
+                  [this](const json::Value& args) {
+                      local_lighting_ = BoolArg(args, "on", !local_lighting_);
+                      return Ok();
+                  }});
+    actions_.Add({"view.probes.bake", "Bake Local Lighting", "view", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      render::IrradianceBakeOptions bake;
+                      const double spacing = NumArg(args, "spacing", 1.0);
+                      const double count = NumArg(args, "count", 3.0);
+                      const double size = NumArg(args, "face_size", 8.0);
+                      const double samples = NumArg(args, "samples", 4.0);
+                      if (!std::isfinite(spacing) || spacing <= 0.0 || spacing > 1000.0 ||
+                          count < 2.0 || count > 16.0 || count != std::floor(count) ||
+                          size < 4.0 || size > 32.0 || size != std::floor(size) ||
+                          samples < 1.0 || samples > 64.0 || samples != std::floor(samples))
+                          return ActionResult::Fail("invalid local lighting spacing, count or sample size");
+                      math::Vec3 centre = camera_.ResolvedTarget();
+                      Vec3Arg(args, "center", &centre);
+                      bake.spacing = math::Vec3{1, 1, 1} * static_cast<float>(spacing);
+                      bake.dimensions.fill(static_cast<uint32_t>(count));
+                      bake.origin = centre - bake.spacing * static_cast<float>((count - 1.0) * 0.5);
+                      bake.face_size = static_cast<uint32_t>(size);
+                      bake.lighting.samples = static_cast<uint32_t>(samples);
+                      render::RasterOptions view;
+                      LightView(view);
+                      bake.lighting.sky_top = {view.sky_top[0], view.sky_top[1], view.sky_top[2]};
+                      bake.lighting.sky_bottom = {view.sky_bottom[0], view.sky_bottom[1], view.sky_bottom[2]};
+                      bake.lighting.sky_ground = {view.ground_color[0], view.ground_color[1], view.ground_color[2]};
+                      bake.fallback_light.direction = math::Vec3{
+                          -view.sun_direction[0], -view.sun_direction[1], -view.sun_direction[2]}.Normalized();
+                      bake.fallback_light.color = {view.sun_color[0], view.sun_color[1], view.sun_color[2]};
+                      try {
+                          auto backend = render::CreateCudaRtBackend();
+                          if (!backend) return ActionResult::Fail("local lighting renderer is unavailable");
+                          auto volume = render::BakeIrradianceVolume(*backend, ShownWorld(), bake);
+                          const auto probes = volume->probes.size();
+                          loaded_->sim->GetRenderWorld().irradiance_volume = std::move(volume);
+                          probe_revision_ = doc_.Revision();
+                          local_lighting_ = true;
+                          return Ok(Object({{"probes", json::Value::Int(static_cast<int64_t>(probes))},
+                                            {"center", Vec3Json(centre)}, {"spacing", json::Value::Float(spacing)}}));
+                      } catch (const std::exception& e) { return ActionResult::Fail(e.what()); }
                   }});
     // The Lit view's ground grid: mode auto (under scenes without a floor), on or off; a bare call
     // flips what is shown.

@@ -327,6 +327,7 @@ struct RasterOptions {
     bool        viewport_sky = false;
     float       viewport_ao_radius = 0.0f;
     float       viewport_ao_strength = 1.0f;
+    bool        viewport_local_lighting = true;
     bool        viewport_grid = false;
     float       viewport_grid_height = 0.0f;
 };

@@ -146,6 +146,7 @@ nuka_set_warnings(nuka_particle_geometry)
 
 add_library(nuka_render STATIC
     render/render_world.cpp
+    render/irradiance_volume.cpp
     # Host image decode (stb_image) -> rt::Texture / rt::EnvironmentMap for the
     # offline beauty texture + HDR-environment pipeline. ZERO CUDA.
     render/texture_image.cpp
@@ -1348,6 +1349,7 @@ if(CMAKE_CUDA_COMPILER)
             PRIVATE
                 nuka
                 nuka_editor_core
+                nuka_phi2_rt
                 nuka_inference
                 nuka_viewer
                 nuka_present

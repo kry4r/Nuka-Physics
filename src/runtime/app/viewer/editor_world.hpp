@@ -151,7 +151,7 @@ public:
     void QueuePoseWrite(const PoseWrite& write) { pose_writes_.push_back(write); }
     std::vector<PoseWrite> TakePoseWrites();
     // Counts in-place moves of static instances, whose world pose the zero-copy rows carry.
-    void MarkStaticMoved() { ++static_revision_; }
+    void MarkStaticMoved() { ++static_revision_; render_world_.irradiance_volume.reset(); }
     uint64_t StaticRevision() const { return static_revision_; }
 
     render::RenderWorld& GetRenderWorld() { return render_world_; }

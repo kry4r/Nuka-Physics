@@ -53,6 +53,8 @@ class SceneMap;
 
 namespace nuka::render {
 
+struct IrradianceVolume;
+
 // Sentinel "no row / no id" matching SceneMap::kNoRow / Registry::kNoSlot.
 inline constexpr uint32_t kNoId = ~uint32_t(0);
 
@@ -178,6 +180,7 @@ struct RenderInstance {
     math::Transform world_xform       = math::Transform::Identity();  // live frame pose
     math::Transform cached_visual_local = math::Transform::Identity(); // physics-frame -> visual-frame
     PoseSource      pose_source;                       // where to read the live pose
+    bool            deforming = false;
 };
 
 // Camera / light entries are flat copies of the corresponding components with
@@ -312,6 +315,7 @@ struct RenderWorld {
     // Empty textures and a disabled environment use material colors and the procedural sky.
     TextureLibrary                     textures;
     rt::EnvironmentMap                 environment;
+    std::shared_ptr<const IrradianceVolume> irradiance_volume;
 
     // The scene's ground: its highest static upward plane collider with no size or look of its own, which a
     // viewport draws endless at this height rather than as an instance. Empty when the scene has none.

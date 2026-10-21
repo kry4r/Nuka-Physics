@@ -84,6 +84,37 @@ Applies ambient occlusion to indirect light in the Lit view. Enabled by default.
 
 **Returns:** nothing
 
+## `view.probes`
+
+**Kind:** [view](index.md#kinds)
+
+Toggles baked local diffuse lighting in the Lit viewport. Requires an open scene.
+
+**Arguments**
+
+- `on`: bool, use local lighting, default: toggles
+
+**Returns:** nothing
+
+## `view.probes.bake`
+
+**Kind:** [view](index.md#kinds)
+
+Bakes a local lighting volume from static geometry, lights and the environment. Moving objects receive
+the field. Static scene edits invalidate the bake; it lasts for the current editor session.
+
+**Arguments**
+
+- `center`: [x, y, z] in metres, default: camera target
+- `spacing`: positive probe spacing in metres, at most 1000, default: 1
+- `count`: integer probes per axis, 2–16, default: 3
+- `face_size`: integer visibility resolution per cube face, 4–32, default: 8
+- `samples`: integer samples per pixel, 1–64, default: 4
+
+**Returns:** `{probes, center, spacing}`. Oversized volumes are rejected with an error.
+
+See [Local lighting](../../editor/viewport.md#local-lighting) for placement and limitations.
+
 ## `view.fog`
 
 **Kind:** [view](index.md#kinds)

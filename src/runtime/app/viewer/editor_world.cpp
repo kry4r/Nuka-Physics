@@ -450,6 +450,7 @@ EditorSim::EditorSim(WorldLayout layout, render::RenderWorld render_world, const
     }
     for (const ParticleSurfaceBinding& s : layout_.surfaces) {
         render::RenderInstance inst;
+        inst.deforming = true;
         inst.entity = scene.EntityOfMedia(s.info.medium);
         inst.mesh_id = render_world_.meshes.AppendGeometry({}, render::MeshSource::PrimitiveFallback);
         inst.render_material_id = s.info.render_material_id < render_world_.default_material_id

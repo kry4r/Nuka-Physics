@@ -27,6 +27,65 @@ layout(set = 0, binding = 1) uniform sampler2D uShadowMap;
 layout(set = 0, binding = 2) uniform sampler2DArray uMaps;
 layout(set = 0, binding = 4) uniform sampler2D uSceneDepth;
 layout(set = 0, binding = 5) uniform sampler2D uEnvironment;
+layout(std430, set = 0, binding = 6) readonly buffer ProbeVolume { vec4 values[]; } local_light;
+
+// Distance moments suppress interpolation from probes hidden behind nearby surfaces.
+float ProbeVisibility(int probe, vec3 delta) {
+    const vec3 a = abs(delta);
+    const int axis = a.x >= a.y && a.x >= a.z ? 0 : a.y >= a.z ? 1 : 2;
+    const int face = axis * 2 + (delta[axis] >= 0.0 ? 0 : 1);
+    const vec3 right[6] = vec3[6](vec3(0,-1,0), vec3(0,1,0), vec3(1,0,0),
+        vec3(-1,0,0), vec3(-1,0,0), vec3(1,0,0));
+    const vec3 up = axis == 2 ? vec3(0,1,0) : vec3(0,0,1);
+    const int size = int(local_light.values[0].w);
+    const vec2 uv = vec2(dot(delta, right[face]), -dot(delta, up)) / max(a[axis], 1e-6) * 0.5 + 0.5;
+    const vec2 pixel = clamp(uv * float(size) - 0.5, vec2(0), vec2(size - 1));
+    const ivec2 base = ivec2(floor(pixel));
+    const vec2 blend = fract(pixel);
+    const int first = 3 + probe * (9 + 6 * size * size) + 9 + face * size * size;
+    vec2 moments = vec2(0);
+    for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) {
+        const ivec2 at = min(base + ivec2(x, y), ivec2(size - 1));
+        const float weight = (x == 0 ? 1.0 - blend.x : blend.x) * (y == 0 ? 1.0 - blend.y : blend.y);
+        moments += weight * local_light.values[first + at.y * size + at.x].xy;
+    }
+    const float bias = 0.02 * min(local_light.values[1].x, min(local_light.values[1].y, local_light.values[1].z));
+    const float excess = max(length(delta) - moments.x - bias, 0.0);
+    const float variance = max(moments.y - moments.x * moments.x, 1e-6);
+    return pow(variance / (variance + excess * excess), 3.0);
+}
+
+vec3 LocalDiffuse(vec3 position, vec3 n, vec3 fallback) {
+    if (scene.counts.y == 0) return fallback;
+    const vec3 origin = local_light.values[0].xyz, spacing = local_light.values[1].xyz;
+    const ivec3 dims = ivec3(local_light.values[2].xyz);
+    const vec3 coordinate = (position - origin) / spacing;
+    const vec3 edge = min(coordinate + 0.5, vec3(dims) - 0.5 - coordinate);
+    if (any(lessThanEqual(edge, vec3(0)))) return fallback;
+    const vec3 grid = clamp(coordinate, vec3(0), vec3(dims - 1));
+    const ivec3 base = min(ivec3(floor(grid)), dims - 2);
+    const vec3 blend = grid - vec3(base);
+    const float basis[9] = float[9](0.2820948, 0.4886025 * n.y, 0.4886025 * n.z, 0.4886025 * n.x,
+        1.0925484 * n.x * n.y, 1.0925484 * n.y * n.z, 0.3153916 * (3.0 * n.z * n.z - 1.0),
+        1.0925484 * n.x * n.z, 0.5462742 * (n.x * n.x - n.y * n.y));
+    const int size = int(local_light.values[0].w);
+    vec3 total = vec3(0);
+    float weights = 0.0;
+    for (int z = 0; z < 2; ++z) for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) {
+        const ivec3 at = base + ivec3(x, y, z);
+        const int probe = (at.z * dims.y + at.y) * dims.x + at.x;
+        const vec3 delta = position - (origin + vec3(at) * spacing);
+        const vec3 tri = mix(vec3(1) - blend, blend, vec3(x, y, z));
+        const float facing = max(0.05, dot(n, -delta / max(length(delta), 1e-5)));
+        const float weight = tri.x * tri.y * tri.z * facing * facing * ProbeVisibility(probe, delta);
+        vec3 value = vec3(0);
+        for (int k = 0; k < 9; ++k) value += local_light.values[3 + probe * (9 + 6 * size * size) + k].rgb * basis[k];
+        total += max(value, vec3(0)) * weight;
+        weights += weight;
+    }
+    const float fade = smoothstep(0.0, 0.5, min(edge.x, min(edge.y, edge.z)));
+    return mix(fallback, weights > 1e-8 ? total / weights : vec3(0), fade);
+}
 
 vec3 EnvironmentDirection(vec3 direction) {
     const float c = cos(scene.environment.y), s = sin(scene.environment.y);

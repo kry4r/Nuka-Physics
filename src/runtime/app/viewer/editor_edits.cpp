@@ -174,6 +174,7 @@ void ApplyMaterialEdit(EditorScene& es, const MaterialBinding& bind,
                        const scene::RenderMaterial& mat, bool commit) {
     render::RenderWorld& rw = es.sim->GetRenderWorld();
     if (bind.render_slot != render::kNoId && bind.render_slot < rw.MaterialCount()) {
+        rw.irradiance_volume.reset();
         rw.materials[bind.render_slot] = mat;
         // A map the world has not drawn yet decodes once here.
         render::DecodeMaterialTextures(rw);

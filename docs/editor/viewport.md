@@ -56,8 +56,32 @@ Ambient occlusion is enabled by default and darkens nearby corners and contact a
 Use `view.ao {on: false}` to turn it off. It uses visible depth, so geometry outside the view cannot occlude it.
 
 A scene's `environment.hdri` also lights the Lit viewport, supplies reflections and replaces the sky background.
-The viewport honors `yaw_deg` and `intensity`. Diffuse lighting uses a global environment probe;
-local light probes and indirect light bouncing between room surfaces are not included.
+The viewport honors `yaw_deg` and `intensity`. Diffuse lighting uses a global environment probe
+until local lighting is baked.
+
+### Local lighting
+
+**View → Bake Local Lighting** samples static geometry, lights and the environment around the camera's
+target. The Lit viewport interpolates this field to add diffuse bounce lighting and room occlusion.
+Distance samples reduce light leaking through walls. Moving objects receive the baked light.
+**View → Local Lighting** toggles the result.
+
+For a larger room, set the volume explicitly from the Python console:
+
+```python
+app.actions.run("view.probes.bake", center=[0, 0, 1.5], spacing=1.0,
+                count=5, face_size=16, samples=16)
+```
+
+`center` and `spacing` use scene metres. `count` is the number of probes on each axis (2–16);
+`face_size` controls visibility resolution (4–32), and `samples` controls bake quality (1–64).
+The default is a 3 × 3 × 3 grid with one metre spacing around the camera target.
+Place probes throughout the room's free space and include its receiving surfaces within the volume.
+Lighting fades to the global environment outside the volume.
+
+The bake is kept for the current editor session. Changes to static geometry, materials, lights or
+the environment invalidate it; bake again after editing. Moving objects do not contribute occlusion
+or bounce light to this static field. Specular reflections continue to use the environment map.
 
 ## Overlays
 

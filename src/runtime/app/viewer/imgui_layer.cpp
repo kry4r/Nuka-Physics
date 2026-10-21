@@ -176,6 +176,7 @@ const std::vector<MenuSpec>& Menus() {
              {"app.command_palette", "-", "view.frame_all", "view.frame_selected", "view.reset_camera", "-",
               "view.layout_single", "view.layout_split", "view.layout_quad", "view.maximize", "-",
               "view.colliders", "view.contacts", "view.hide_overlays", "-", "view.shadows", "view.ao", "view.fog",
+              "view.probes", "view.probes.bake",
               "view.ground_grid", "-", "scene.expand_all", "scene.collapse_all", "-",
               "view.ui_scale_up", "view.ui_scale_down", "view.ui_scale_reset", "view.toggle_language", "-", "view.screenshot"}},
             {"Simulation",

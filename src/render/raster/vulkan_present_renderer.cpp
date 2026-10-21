@@ -15,6 +15,7 @@
 // ---------------------------------------------------------------------------
 
 #include "render/raster/vulkan_present_renderer.hpp"
+#include "render/irradiance_volume.hpp"
 #include "render/raster/present_surface.hpp"
 
 #include <vulkan/vulkan.h>
@@ -611,6 +612,8 @@ struct PresentRenderer::Impl {
     const float*   environment_source = nullptr;
     uint32_t       environment_width = 0u, environment_height = 0u;
     std::array<std::array<float, 4>, 9> environment_irradiance{};
+    GpuBuffer probe_buffer;
+    std::shared_ptr<const IrradianceVolume> probe_source;
     VkSampler      maps_sampler = VK_NULL_HANDLE;
     uint64_t       maps_version = 0u;
     uint32_t       map_layers = 0u;  // the library images that got a layer
@@ -798,6 +801,7 @@ struct PresentRenderer::Impl {
         CreateMapSampler();
         UploadMaps({});
         UploadEnvironment({});
+        UploadProbes(nullptr);
         CreateOutlineLayout();
         NegotiateSurface();
         CreateSwapchain();
@@ -849,6 +853,7 @@ struct PresentRenderer::Impl {
         vkDestroySampler(device, maps_sampler, nullptr);
         DestroyImage(maps);
         DestroyImage(environment_map);
+        Destroy(probe_buffer);
         vkDestroySampler(device, environment_sampler, nullptr);
         Destroy(material_buffer);
         Destroy(sink_buf_);
@@ -1470,6 +1475,46 @@ struct PresentRenderer::Impl {
         CheckVk(vkCreateSampler(device, &si, nullptr, &maps_sampler), "vkCreateSampler(present maps)");
     }
 
+    void UploadProbes(std::shared_ptr<const IrradianceVolume> volume) {
+        std::vector<std::array<float, 4>> values(3u);
+        if (volume) {
+            const auto& v = *volume;
+            v.Validate();
+            const size_t entries = 3u + v.probes.size() * (9u + size_t{6u} * v.face_size * v.face_size);
+            VkPhysicalDeviceProperties properties{};
+            vkGetPhysicalDeviceProperties(physical, &properties);
+            if (entries > properties.limits.maxStorageBufferRange / sizeof(values[0]))
+                throw std::runtime_error("lighting volume exceeds the device storage buffer limit");
+            values.reserve(entries);
+            values[0] = {v.origin.x, v.origin.y, v.origin.z, float(v.face_size)};
+            values[1] = {v.spacing.x, v.spacing.y, v.spacing.z, v.max_distance};
+            values[2] = {float(v.dimensions[0]), float(v.dimensions[1]), float(v.dimensions[2]), 0.0f};
+            for (const auto& probe : v.probes) {
+                for (const auto& c : probe.diffuse) values.push_back({c.x, c.y, c.z, 0.0f});
+                for (float d : probe.distance) values.push_back({d, d * d, 0.0f, 0.0f});
+            }
+        }
+        GpuBuffer next = CreateHostBuffer(values.size() * sizeof(values[0]), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        Upload(next, values.data(), values.size() * sizeof(values[0]));
+        Destroy(probe_buffer);
+        probe_buffer = next;
+        probe_source = std::move(volume);
+    }
+
+    void WriteProbeDescriptors() {
+        VkDescriptorBufferInfo info{probe_buffer.buffer, 0u, VK_WHOLE_SIZE};
+        for (const UboSlot& slot : ubo_slots) {
+            VkWriteDescriptorSet write{};
+            write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            write.dstSet = slot.set;
+            write.dstBinding = 6u;
+            write.descriptorCount = 1u;
+            write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            write.pBufferInfo = &info;
+            vkUpdateDescriptorSets(device, 1u, &write, 0u, nullptr);
+        }
+    }
+
     void WriteEnvironmentDescriptors() {
         VkDescriptorImageInfo image{environment_sampler, environment_map.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         for (const UboSlot& slot : ubo_slots) {
@@ -1745,7 +1790,7 @@ struct PresentRenderer::Impl {
         // Set 0: binding 0 = per-frame SceneUbo (camera + light rig); binding 1 =
         // the shadow map sampler, both as in the offscreen renderer's layout; binding 2
         // = the material maps array and binding 3 = each material's map slots, read only by the viewport's shaders.
-        std::array<VkDescriptorSetLayoutBinding, 6> set_bindings{};
+        std::array<VkDescriptorSetLayoutBinding, 7> set_bindings{};
         set_bindings[0].binding = 0u;
         set_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         set_bindings[0].descriptorCount = 1u;
@@ -1763,6 +1808,8 @@ struct PresentRenderer::Impl {
         set_bindings[4].binding = 4u;
         set_bindings[5] = set_bindings[1];
         set_bindings[5].binding = 5u;
+        set_bindings[6] = set_bindings[3];
+        set_bindings[6].binding = 6u;
         VkDescriptorSetLayoutCreateInfo set_info{};
         set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         set_info.bindingCount = static_cast<uint32_t>(set_bindings.size());
@@ -2002,7 +2049,7 @@ struct PresentRenderer::Impl {
         const std::array<VkDescriptorPoolSize, 3> sizes{{
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, slot_count},
             {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4u * slot_count},
-            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, slot_count}}};
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2u * slot_count}}};
         VkDescriptorPoolCreateInfo pool_info{};
         pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         pool_info.maxSets = slot_count;
@@ -2046,6 +2093,7 @@ struct PresentRenderer::Impl {
         UploadMaterialMaps(material_maps);
         WriteOcclusionDescriptors();
         WriteEnvironmentDescriptors();
+        WriteProbeDescriptors();
     }
 
     void CreateSyncObjects() {
@@ -2461,6 +2509,11 @@ struct PresentRenderer::Impl {
         // geometry-set change). Per-frame work below is just transforms + materials.
         SyncMeshCache(world);
         SyncMaps(world);
+        if (probe_source != world.irradiance_volume) {
+            CheckVk(vkDeviceWaitIdle(device), "vkDeviceWaitIdle(local lighting)");
+            UploadProbes(world.irradiance_volume);
+            WriteProbeDescriptors();
+        }
         const auto& environment = world.environment;
         if (environment.texels.data() != environment_source || environment.width != environment_width ||
             environment.height != environment_height) {
@@ -2548,6 +2601,7 @@ struct PresentRenderer::Impl {
         const Mat4 proj = Perspective(fov_y, aspect, cam.near_clip, cam.far_clip);
         view.ubo = BuildSceneUbo(world, Multiply(proj, view_matrix), cam.eye, options, view.rect);
         view.ubo.environment[0] = world.environment.Enabled() ? 1.0f : 0.0f;
+        view.ubo.counts[1] = options.viewport_local_lighting && probe_source && !probe_source->probes.empty() ? 1 : 0;
         view.ubo.environment[1] = world.environment.yaw;
         view.ubo.environment[2] = world.environment.intensity;
         std::memcpy(view.ubo.irradiance, environment_irradiance.data(), sizeof(view.ubo.irradiance));

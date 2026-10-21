@@ -255,6 +255,7 @@ void main() {
     vec3  ambient_color = mix(scene.ambient_ground.rgb, scene.ambient.rgb, hemi);
 #ifdef NUKA_VIEW_MODES
     if (scene.environment.x > 0.5) ambient_color = EnvironmentDiffuse(n);
+    ambient_color = LocalDiffuse(vWorldPos, n, ambient_color);
 #endif
 
     // Diffuse ambient is albedo-tinted (a black body absorbs it) -- this term
