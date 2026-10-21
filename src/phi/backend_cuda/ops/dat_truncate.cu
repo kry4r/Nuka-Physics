@@ -221,14 +221,22 @@ __global__ void ClearDatCountersKernel(DatTruncateParams p, ModelView model, Dat
         }
         capped |= radius > collision::kDatQueryRadiusMax;
     }
-    const uint64_t pairs = uint64_t{p.bodies_per_env} * p.bodies_per_env;
-    for (uint64_t item = threadIdx.x; item < pairs; item += blockDim.x) {
-        const uint32_t source = static_cast<uint32_t>(item / p.bodies_per_env);
-        const uint32_t target = static_cast<uint32_t>(item % p.bodies_per_env);
-        if (target <= source ||
-            model.mesh_surface_info[source].vertex_count == 0u ||
-            model.mesh_surface_info[target].vertex_count == 0u ||
-            !DatBodyPairAllowed(p, model, source, target)) continue;
+    capped = __syncthreads_or(capped) != 0;
+    if (threadIdx.x == 0u) data.dat_query_limit_count[env] = capped;
+}
+
+// Body pairs of the environments, a thread each after ClearDatCountersKernel; a capped pair raises its
+// environment's query limit.
+__global__ void DatBodyPairLimitKernel(DatTruncateParams p, ModelView model, DataView data) {
+    const uint32_t env = blockIdx.y;
+    const uint64_t item = uint64_t{blockIdx.x} * blockDim.x + threadIdx.x;
+    const uint32_t source = static_cast<uint32_t>(item / p.bodies_per_env);
+    const uint32_t target = static_cast<uint32_t>(item % p.bodies_per_env);
+    bool capped = false;
+    if (item < uint64_t{p.bodies_per_env} * p.bodies_per_env && target > source &&
+        model.mesh_surface_info[source].vertex_count != 0u &&
+        model.mesh_surface_info[target].vertex_count != 0u &&
+        DatBodyPairAllowed(p, model, source, target)) {
         const uint32_t frame = DatCommonFrame(p, model, env, source, target);
         const float radius = frame != ~0u
             ? DatArticMotionRadius(p, model, data, env, source, target, frame, data.dat_prev_q)
@@ -242,10 +250,9 @@ __global__ void ClearDatCountersKernel(DatTruncateParams p, ModelView model, Dat
                              DatBodyWitness(p, model, env, source),
                              DatBodyWitness(p, model, env, target), 0.0f);
         }
-        capped |= radius > collision::kDatQueryRadiusMax;
+        capped = radius > collision::kDatQueryRadiusMax;
     }
-    capped = __syncthreads_or(capped) != 0;
-    if (threadIdx.x == 0u) data.dat_query_limit_count[env] = capped;
+    if (__syncthreads_or(capped) != 0 && threadIdx.x == 0u) atomicOr(data.dat_query_limit_count + env, 1u);
 }
 
 __device__ void FailPrimitivePair(const DatTruncateParams& p, const ModelView& model,
@@ -1594,6 +1601,10 @@ Status OpDatTruncate(const ModelView& model, const DataView& data,
     const dim3 particle_grid((static_cast<uint32_t>(particles) + kBlockSize - 1u) / kBlockSize);
     LaunchCuda(ClearDatCountersKernel, dim3(p->env_count),
                dim3(kBlockSize), 0u, stream, *p, model, data);
+    if (p->bodies_per_env > 1u)
+        LaunchCuda(DatBodyPairLimitKernel,
+                   dim3((p->bodies_per_env * p->bodies_per_env + kBlockSize - 1u) / kBlockSize, p->env_count),
+                   dim3(kBlockSize), 0u, stream, *p, model, data);
     const uint32_t owners = p->env_count *
         std::max(p->bodies_per_env, std::max(p->articulations_per_env, 1u));
     LaunchCuda(ClearDatOwnersKernel, dim3((owners + kBlockSize - 1u) / kBlockSize),

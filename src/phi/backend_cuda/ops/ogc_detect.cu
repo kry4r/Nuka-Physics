@@ -494,7 +494,7 @@ Status OpOgcDetect(const ModelView& model, const DataView& data,
                    dim3(kBlockSize), 0u, stream, *p, data);
     if (mixed && p->bodies_per_env > 0u)
         LaunchCuda(OgcBodyQueryKernel,
-                   dim3((p->env_count * p->bodies_per_env + kBlockSize - 1u) / kBlockSize),
+                   dim3((p->env_count * p->bodies_per_env * kOgcQueryLanes + kBlockSize - 1u) / kBlockSize),
                    dim3(kBlockSize), 0u, stream, *p, model, data);
     if (particles > 0u)
         LaunchCuda(OgcParticleVertexFaceKernel,

@@ -193,9 +193,10 @@ uint32_t TileHeadCapacity(const BlockDescentSolveParams& p) {
     return (heads + kTileLanes - 1u) / kTileLanes * kTileLanes;
 }
 
-// Lanes of a tile block: the articulation coordinates rounded up to four, and at least a rigid body's six.
+// Coordinates of a tile block: the articulation's rounded up to four within a warp and the largest articulation's
+// past it, and at least a rigid body's six.
 uint32_t TileWidth(const BlockDescentSolveParams& p) {
-    return std::max(8u, (p.max_dof + 3u) & ~3u);
+    return p.max_dof <= kTileLanes ? std::max(8u, (p.max_dof + 3u) & ~3u) : kMaxArticulationDof;
 }
 
 // Warps the tile kernel keeps resident; each stages one environment at a time in its own slot.

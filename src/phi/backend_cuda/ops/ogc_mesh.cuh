@@ -113,16 +113,20 @@ __global__ void OgcJointRateKernel(OgcDetectParams p, DataView data) {
     data.dat_joint_rate[link] = fmaxf(fabsf(data.qdot[link]), data.dat_joint_motion[link]);
 }
 
+constexpr uint32_t kOgcQueryLanes = 32u;
+
+// A warp per body: its lanes take the surfaces and the other bodies, and the minimum over them is order-free.
 __global__ void OgcBodyQueryKernel(OgcDetectParams p, ModelView model, DataView data) {
-    const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t item = (blockIdx.x * blockDim.x + threadIdx.x) / kOgcQueryLanes;
+    const uint32_t lane = threadIdx.x % kOgcQueryLanes;
     if (item >= p.env_count * p.bodies_per_env) return;
     const uint32_t env = item / p.bodies_per_env;
     const uint32_t body = item % p.bodies_per_env;
     const float speed = OgcBodySpeed(p, data, env, body);
-    data.dat_body_speed[item] = speed;
+    if (lane == 0u) data.dat_body_speed[item] = speed;
     float radius = collision::kDatQueryRadiusMax;
     if (model.mesh_surface_info[body].vertex_count > 0u) {
-        for (uint32_t s = 0u; s < p.surfaces_per_env; ++s) {
+        for (uint32_t s = lane; s < p.surfaces_per_env; s += kOgcQueryLanes) {
             if (model.particle_surface_info[s].vertex_count == 0u) continue;
             const float other = data.particle_surface_max_speed[
                 size_t{env} * p.surfaces_per_env + s];
@@ -131,7 +135,7 @@ __global__ void OgcBodyQueryKernel(OgcDetectParams p, ModelView model, DataView 
                 p.relaxation)));
         }
         // Links of one articulation are bounded per pair, relative to their common ancestor.
-        for (uint32_t other = 0u; other < p.bodies_per_env; ++other) {
+        for (uint32_t other = lane; other < p.bodies_per_env; other += kOgcQueryLanes) {
             if (!OgcBodyPairAllowed(p, model, body, other) ||
                 model.mesh_surface_info[other].vertex_count == 0u ||
                 DatCommonFrame(p, model, env, body, other) != ~0u) continue;
@@ -140,7 +144,9 @@ __global__ void OgcBodyQueryKernel(OgcDetectParams p, ModelView model, DataView 
                 p.relaxation)));
         }
     }
-    data.dat_body_query_radius[item] = radius;
+    for (uint32_t offset = kOgcQueryLanes / 2u; offset > 0u; offset /= 2u)
+        radius = fminf(radius, __shfl_xor_sync(~0u, radius, offset));
+    if (lane == 0u) data.dat_body_query_radius[item] = radius;
 }
 
 __device__ float OgcBodyFriction(const ModelView& model, const DataView& data,

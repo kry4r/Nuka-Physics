@@ -628,10 +628,10 @@ struct RecordTelemetryParams {
     float velocity_tolerance = 0.0f;
 };
 
-// Environments of rigid bodies and articulations without particles or grid nodes, whose articulations fit a
-// warp of coordinates, solve as one warp tile each; only the tiles run position iterations.
+// Environments of rigid bodies and articulations without particles or grid nodes solve as one warp tile each,
+// a lane holding up to two coordinates; only the tiles run position iterations.
 inline bool BlockDescentTileRoute(uint32_t particles, uint32_t grid_nodes, uint32_t blocks, uint32_t max_dof) {
-    return particles == 0u && grid_nodes == 0u && blocks > 0u && max_dof <= 32u;
+    return particles == 0u && grid_nodes == 0u && blocks > 0u && max_dof <= kMaxArticulationDof;
 }
 
 // Outer iterations of the warp tiles when the caller sets none.

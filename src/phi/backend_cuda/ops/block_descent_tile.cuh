@@ -61,6 +61,49 @@ __device__ __forceinline__ float TileWarpMax(float value) {
     return value;
 }
 
+// Coordinates a lane holds in a tile of width kN: lane l holds coordinates l, l + 32 and so on.
+template <uint32_t kN>
+__host__ __device__ constexpr uint32_t TileSpan() {
+    return (kN + kTileLanes - 1u) / kTileLanes;
+}
+
+// A chunk of heads lists up to three Jacobian rows each on a block; half of them stage at a time.
+constexpr uint32_t kTileChunkRows = 3u * kTileLanes;
+constexpr uint32_t kTileStageRows = kTileChunkRows / 2u;
+
+// Shared floats per warp: the mass and factor buffers, then past a warp of coordinates a chunk's row list
+// and its staged rows.
+template <uint32_t kN>
+__host__ __device__ constexpr uint32_t TileWarpFloats() {
+    return 2u * kN * (kN + 1u) + (TileSpan<kN>() > 1u ? kTileChunkRows * 6u + kTileStageRows * kN : 0u);
+}
+
+// Warps per block of the tile kernel: up to kTileWarps whose shared buffers fit the 48 KiB of shared
+// memory a block takes without opting in.
+template <uint32_t kN>
+__host__ __device__ constexpr uint32_t TileWarps() {
+    const uint32_t fit = 48u * 1024u / (TileWarpFloats<kN>() * uint32_t{sizeof(float)});
+    return fit < kTileWarps ? fit : kTileWarps;
+}
+
+// Coordinate k of a per-lane array laid out as above, for a k the whole warp shares.
+template <uint32_t kSpan>
+__device__ __forceinline__ float TileCoordinate(const float (&x)[kSpan], uint32_t k) {
+    float value = x[0];
+#pragma unroll
+    for (uint32_t r = 1u; r < kSpan; ++r) value = k / kTileLanes == r ? x[r] : value;
+    return __shfl_sync(~0u, value, k % kTileLanes);
+}
+
+// A lane's share of a dot product over its coordinates.
+template <uint32_t kSpan>
+__device__ __forceinline__ float TileDot(const float (&a)[kSpan], const float (&b)[kSpan]) {
+    float value = a[0] * b[0];
+#pragma unroll
+    for (uint32_t r = 1u; r < kSpan; ++r) value += a[r] * b[r];
+    return value;
+}
+
 struct TileContext {
     uint32_t env;
     uint32_t lane;
@@ -77,6 +120,9 @@ struct TileContext {
     float* jacobian;
     float* mass;
     float* factor;
+    uint2* chunk_rows;
+    float4* chunk_terms;
+    float* stage;
     __device__ float& Value(uint32_t field, uint32_t h) const {
         return fields[size_t{h / kTileHeadGroup} * kTileFields * kTileHeadGroup +
                       size_t{field} * kTileHeadGroup + h % kTileHeadGroup];
@@ -126,10 +172,11 @@ struct TileBlock {
             }
         } else {
             const size_t at = size_t{slot} * p.max_dof + roots[i];
+            // The chains are inputs of the solve, so they read through the read-only cache.
             if (row.a.kind == kNkSideArtic && row.a.index == index)
-                value += static_cast<const float*>(data.chain_jacobian)[at];
+                value += __ldg(static_cast<const float*>(data.chain_jacobian) + at);
             if (row.b.kind == kNkSideArtic && row.b.index == index)
-                value += static_cast<const float*>(data.chain_jacobian_b)[at];
+                value += __ldg(static_cast<const float*>(data.chain_jacobian_b) + at);
         }
         return value;
     }
@@ -249,6 +296,16 @@ __device__ float TileSideVelocity(BlockDescentSolveParams p, BlockScratch s, con
     return jacobian[size_t{slot} * p.max_dof + s.articulation_roots[base + c]] * s.articulation_velocity[base + c];
 }
 
+// A row side's whole velocity J u, summed in coordinate order.
+__device__ float TileSideSpeed(BlockDescentSolveParams p, BlockScratch s, const NkRowSide& side,
+                               const float* jacobian, uint32_t slot) {
+    const uint32_t count = side.kind == kNkSideRigid ? kRigidBlockDof
+        : side.kind == kNkSideArtic ? s.articulation_dimensions[side.index] : 0u;
+    float along = 0.0f;
+    for (uint32_t c = 0u; c < count; ++c) along += TileSideVelocity(p, s, side, jacobian, slot, c);
+    return along;
+}
+
 // RowInertialResponse in float: J M^-1 J^T over the row's rigid bodies and articulations, with both sides
 // on one owner summed first; `coupling` is the product of the two owners' shares.
 __device__ float TileInertialResponse(DataView data, BlockDescentSolveParams p, const NkRow& row, uint32_t slot,
@@ -332,7 +389,9 @@ __device__ void InitializeTileHead(DataView data, BlockDescentSolveParams p, Blo
 
 // Jacobians on moving blocks and residuals at free velocities, including kinematic sides. Single-coordinate
 // rows store their coordinate and value; other rows store one vector of block coordinates per axis.
+template <uint32_t kN>
 __device__ void InitializeTileRows(DataView data, BlockDescentSolveParams p, BlockScratch s, const TileContext& c) {
+    constexpr uint32_t kSpan = TileSpan<kN>();
     const auto* row_data = reinterpret_cast<const NkRow*>(data.urows);
     const auto* chain_a = static_cast<const float*>(data.chain_jacobian);
     const auto* chain_b = static_cast<const float*>(data.chain_jacobian_b);
@@ -347,32 +406,52 @@ __device__ void InitializeTileRows(DataView data, BlockDescentSolveParams p, Blo
             const uint32_t block = c.Index(kTileOwner + incidence, h);
             TileBlock b{};
             if (block != kNoTileBlock) b = LoadTileBlock(data, p, s, c, block);
-            const bool coordinate = block != kNoTileBlock && c.lane < b.dimension;
-            float value[3]{};
+            // A side off the tile's blocks keeps the empty block, whose dimension is zero.
+            float value[3][kSpan]{};
 #pragma unroll
             for (uint32_t axis = 0u; axis < 3u; ++axis) {
                 if (axis >= axes) continue;
                 const uint32_t row_slot = slot + axis * stride;
                 const NkRow& row = row_data[row_slot];
-                if (coordinate) value[axis] = b.Jacobian(data, p, row, row_slot, c.lane);
+#pragma unroll
+                for (uint32_t r = 0u; r < kSpan; ++r) {
+                    const uint32_t i = c.lane + r * kTileLanes;
+                    if (i < b.dimension) value[axis][r] = b.Jacobian(data, p, row, row_slot, i);
+                }
                 if (incidence == 0u) {
-                    SetAxisComponent(velocity, axis, TileSideVelocity(p, s, row.a, chain_a, row_slot, c.lane) +
-                                                     TileSideVelocity(p, s, row.b, chain_b, row_slot, c.lane));
+                    float along = TileSideVelocity(p, s, row.a, chain_a, row_slot, c.lane) +
+                                  TileSideVelocity(p, s, row.b, chain_b, row_slot, c.lane);
+#pragma unroll
+                    for (uint32_t r = 1u; r < kSpan; ++r)
+                        along += TileSideVelocity(p, s, row.a, chain_a, row_slot, c.lane + r * kTileLanes) +
+                                 TileSideVelocity(p, s, row.b, chain_b, row_slot, c.lane + r * kTileLanes);
+                    SetAxisComponent(velocity, axis, along);
                     SetAxisComponent(rhs, axis, __fmul_rn(__fmul_rn(row.rhs, p.dt), axis == 0u ? scale : 1.0f));
                 }
             }
             if (block == kNoTileBlock) continue;
-            const uint32_t support = __ballot_sync(~0u, value[0] != 0.0f);
+            uint32_t support[kSpan], supported = 0u;
+#pragma unroll
+            for (uint32_t r = 0u; r < kSpan; ++r) {
+                support[r] = __ballot_sync(~0u, value[0][r] != 0.0f);
+                supported += __popc(support[r]);
+            }
             uint32_t row = ~0u, unit = ~0u;
             float unit_value = 0.0f;
-            if (axes == 1u && __popc(support) <= 1u) {
-                unit = support != 0u ? __ffs(support) - 1u : 0u;
-                unit_value = __shfl_sync(~0u, value[0], unit);
+            if (axes == 1u && supported <= 1u) {
+                unit = 0u;
+#pragma unroll
+                for (uint32_t r = 0u; r < kSpan; ++r)
+                    if (support[r] != 0u) unit = r * kTileLanes + __ffs(support[r]) - 1u;
+                unit_value = TileCoordinate(value[0], unit);
             } else {
                 row = rows;
 #pragma unroll
                 for (uint32_t axis = 0u; axis < 3u; ++axis)
-                    if (axis < axes && c.lane < c.width) c.jacobian[size_t{row + axis} * c.width + c.lane] = value[axis];
+#pragma unroll
+                    for (uint32_t r = 0u; r < kSpan; ++r)
+                        if (axis < axes && c.lane + r * kTileLanes < c.width)
+                            c.jacobian[size_t{row + axis} * c.width + c.lane + r * kTileLanes] = value[axis][r];
                 rows += axes;
             }
             if (c.lane == 0u) {
@@ -389,8 +468,86 @@ __device__ void InitializeTileRows(DataView data, BlockDescentSolveParams p, Blo
     __syncwarp();
 }
 
+// InitializeTileRows past a warp of coordinates, a lane per head walking its block coordinates; a warp scan
+// places the Jacobian rows in head order.
+template <uint32_t kN>
+__device__ void InitializeWideTileRows(DataView data, BlockDescentSolveParams p, BlockScratch s,
+                                       const TileContext& c) {
+    const auto* row_data = reinterpret_cast<const NkRow*>(data.urows);
+    const auto* chain_a = static_cast<const float*>(data.chain_jacobian);
+    const auto* chain_b = static_cast<const float*>(data.chain_jacobian_b);
+    uint32_t rows = 0u;
+    for (uint32_t chunk = 0u; chunk < c.heads; chunk += kTileLanes) {
+        const uint32_t h = chunk + c.lane;
+        const bool live = h < c.heads;
+        const uint32_t slot = live ? c.Index(kTileSlot, h) : 0u;
+        const uint32_t stride = live ? c.Index(kTileStride, h) : 0u;
+        const uint32_t axes = live ? c.Index(kTileAxes, h) : 0u;
+        const float scale = live ? RowStateScale(data, p, slot) : 0.0f;
+        Vec3 velocity{}, rhs{};
+        for (uint32_t axis = 0u; axis < axes; ++axis) {
+            const uint32_t row_slot = slot + axis * stride;
+            const NkRow row = row_data[row_slot];
+            SetAxisComponent(velocity, axis, TileSideSpeed(p, s, row.a, chain_a, row_slot) +
+                                             TileSideSpeed(p, s, row.b, chain_b, row_slot));
+            SetAxisComponent(rhs, axis, __fmul_rn(__fmul_rn(row.rhs, p.dt), axis == 0u ? scale : 1.0f));
+        }
+        if (live)
+            c.Store3(kTileResidual, h, {__fsub_rn(rhs.x, velocity.x), __fsub_rn(rhs.y, velocity.y),
+                                        __fsub_rn(rhs.z, velocity.z)});
+        TileBlock blocks[2]{};
+        uint32_t staged[2] = {0u, 0u};
+#pragma unroll
+        for (uint32_t incidence = 0u; incidence < 2u; ++incidence) {
+            const uint32_t block = live ? c.Index(kTileOwner + incidence, h) : kNoTileBlock;
+            if (block == kNoTileBlock) continue;
+            blocks[incidence] = LoadTileBlock(data, p, s, c, block);
+            const TileBlock& b = blocks[incidence];
+            const NkRow head = row_data[slot];
+            uint32_t supported = 0u, unit = 0u;
+            float unit_value = 0.0f;
+            for (uint32_t i = 0u; i < b.dimension; ++i) {
+                const float value = b.Jacobian(data, p, head, slot, i);
+                if (value == 0.0f) continue;
+                ++supported;
+                unit = i;
+                unit_value = value;
+            }
+            const bool single = axes == 1u && supported <= 1u;
+            staged[incidence] = single ? 0u : axes;
+            c.Index(kTileRow + incidence, h) = ~0u;
+            c.Index(kTileUnit + incidence, h) = single ? unit : ~0u;
+            c.Value(kTileUnitValue + incidence, h) = single ? unit_value : 0.0f;
+        }
+        const uint32_t own = staged[0] + staged[1];
+        uint32_t through = own;
+        for (uint32_t offset = 1u; offset < kTileLanes; offset <<= 1u) {
+            const uint32_t other = __shfl_up_sync(~0u, through, offset);
+            if (c.lane >= offset) through += other;
+        }
+        uint32_t row = rows + through - own;
+        rows += __shfl_sync(~0u, through, kTileLanes - 1u);
+#pragma unroll
+        for (uint32_t incidence = 0u; incidence < 2u; ++incidence) {
+            if (staged[incidence] == 0u) continue;
+            const TileBlock& b = blocks[incidence];
+            c.Index(kTileRow + incidence, h) = row;
+            for (uint32_t axis = 0u; axis < axes; ++axis) {
+                const uint32_t row_slot = slot + axis * stride;
+                const NkRow axis_row = row_data[row_slot];
+                float* const out = c.jacobian + size_t{row + axis} * c.width;
+                for (uint32_t i = 0u; i < c.width; ++i)
+                    out[i] = i < b.dimension ? b.Jacobian(data, p, axis_row, row_slot, i) : 0.0f;
+            }
+            row += axes;
+        }
+    }
+    __syncwarp();
+}
+
 // Free velocities, block coordinates, the environment's active head rows in slot order with their
 // Jacobians, and their residuals at the free velocities.
+template <uint32_t kN>
 __device__ void InitializeTile(ArticulationDeviceState state, DataView data, BlockDescentSolveParams p,
                                BlockScratch s, TileContext& c) {
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
@@ -419,20 +576,25 @@ __device__ void InitializeTile(ArticulationDeviceState state, DataView data, Blo
     for (uint32_t k = 0u; k < c.articulations; ++k) {
         const uint32_t articulation = c.first_articulation + k;
         const size_t base = size_t{articulation} * p.max_dof;
-        uint32_t link = 0u, component = 0u;
-        const bool located = c.lane < p.max_dof &&
-            ArticulationDofLocation(state, articulation, c.lane, &link, &component);
-        const float value = located
-            ? (component != ~0u ? state.link_velocity[link].v[component] : state.qdot[link]) : 0.0f;
-        const bool root = located && (p.mimic_couplings == 0u || data.mimic_root_dof[base + c.lane] == c.lane);
-        const uint32_t roots = __ballot_sync(~0u, root);
-        if (root) {
-            const uint32_t compact = __popc(roots & ((1u << c.lane) - 1u));
-            s.articulation_roots[base + compact] = c.lane;
-            s.articulation_free[base + compact] = value;
-            s.articulation_velocity[base + compact] = value;
+        uint32_t compacted = 0u;
+        for (uint32_t first = 0u; first < p.max_dof; first += kTileLanes) {
+            const uint32_t dof = first + c.lane;
+            uint32_t link = 0u, component = 0u;
+            const bool located = dof < p.max_dof &&
+                ArticulationDofLocation(state, articulation, dof, &link, &component);
+            const float value = located
+                ? (component != ~0u ? state.link_velocity[link].v[component] : state.qdot[link]) : 0.0f;
+            const bool root = located && (p.mimic_couplings == 0u || data.mimic_root_dof[base + dof] == dof);
+            const uint32_t roots = __ballot_sync(~0u, root);
+            if (root) {
+                const uint32_t compact = compacted + __popc(roots & ((1u << c.lane) - 1u));
+                s.articulation_roots[base + compact] = dof;
+                s.articulation_free[base + compact] = value;
+                s.articulation_velocity[base + compact] = value;
+            }
+            compacted += __popc(roots);
         }
-        if (c.lane == 0u) s.articulation_dimensions[articulation] = __popc(roots);
+        if (c.lane == 0u) s.articulation_dimensions[articulation] = compacted;
     }
     __syncwarp();
     const uint32_t first = c.env * p.rows_per_env;
@@ -462,7 +624,8 @@ __device__ void InitializeTile(ArticulationDeviceState state, DataView data, Blo
             if (base + c.lane < heads) s.active_rows[at + c.lane] = c.Index(kTileSlot, base + c.lane);
         }
     }
-    InitializeTileRows(data, p, s, c);
+    if constexpr (TileSpan<kN>() == 1u) InitializeTileRows<kN>(data, p, s, c);
+    else InitializeWideTileRows<kN>(data, p, s, c);
 }
 
 // The normal bound each head on `block` holds through its solve, and a zero move.
@@ -643,9 +806,320 @@ __device__ float SolveTileBlock(const float (&h)[kN], float inverse, float g, co
     return r;
 }
 
+// AssembleTileBlock past a warp of coordinates: H's upper triangle over the block's own coordinates goes to
+// the warp's factor buffer, lane i holding rows i, i + 32, ...; `pattern` marks each row's nonzero columns.
+template <uint32_t kN, uint32_t kSpan = TileSpan<kN>()>
+__device__ bool AssembleWideTileBlock(const TileContext& c, const TileBlock& b, const float (&u)[kSpan],
+                                      const float (&free)[kSpan], float (&force)[kSpan], float (&inertia)[kSpan],
+                                      uint64_t (&pattern)[kSpan], bool* converged) {
+    static_assert(kN <= 64u, "a row pattern is one 64-bit mask");
+    constexpr uint32_t kS = kN + 1u;
+    const uint32_t n = b.dimension;
+    float* const h = c.factor;
+    bool coordinate[kSpan];
+    float difference[kSpan], difference_error[kSpan], scale[kSpan], diagonal[kSpan];
+    TileSum inertial[kSpan], g[kSpan];
+#pragma unroll
+    for (uint32_t r = 0u; r < kSpan; ++r) {
+        coordinate[r] = c.lane + r * kTileLanes < n;
+        difference[r] = u[r] - free[r];
+        const float part = difference[r] - u[r];
+        difference_error[r] = (u[r] - (difference[r] - part)) + (-free[r] - part);
+        scale[r] = 0.0f;
+        diagonal[r] = 0.0f;
+    }
+    for (uint32_t k = 0u; k < n; ++k) {
+        const float high = TileCoordinate(difference, k);
+        const float low = TileCoordinate(difference_error, k);
+#pragma unroll
+        for (uint32_t r = 0u; r < kSpan; ++r) {
+            if (!coordinate[r]) continue;
+            const uint32_t i = c.lane + r * kTileLanes;
+            const float mass = c.mass[i * kS + k];
+            h[i * kS + k] = mass;
+            TileAddProduct(inertial[r], mass, high);
+            TileAddProduct(inertial[r], mass, low);
+            scale[r] += fabsf(mass) * fabsf(high);
+        }
+    }
+#pragma unroll
+    for (uint32_t r = 0u; r < kSpan; ++r) g[r] = {-inertial[r].value, -inertial[r].error};
+    for (uint32_t chunk = 0u; chunk < c.heads; chunk += kTileLanes) {
+        const uint32_t own = chunk + c.lane;
+        const uint32_t incidence = own < c.heads ? c.Incidence(own, b.local) : kNoTileIncidence;
+        Vec3 f{}, noise{};
+        SymmetricMat3 curvature{};
+        uint32_t unit = ~0u, first = 0u, axes = 1u;
+        float unit_value = 0.0f;
+        if (incidence != kNoTileIncidence) {
+            const TileHead t = LoadTileHead(c, own);
+            TileResponse(t, t.move, &f, &curvature);
+            noise = {fabsf(f.x) + curvature.xx * (fabsf(t.residual.x) + fabsf(t.move.x)),
+                     fabsf(f.y) + curvature.yy * (fabsf(t.residual.y) + fabsf(t.move.y)),
+                     fabsf(f.z) + curvature.zz * (fabsf(t.residual.z) + fabsf(t.move.z))};
+            unit = c.Index(kTileUnit + incidence, own);
+            first = c.Index(kTileRow + incidence, own);
+            unit_value = c.Value(kTileUnitValue + incidence, own);
+            axes = t.axes;
+        }
+        for (uint32_t pending = __ballot_sync(~0u, incidence != kNoTileIncidence && unit != ~0u); pending != 0u;
+             pending &= pending - 1u) {
+            const uint32_t source = __ffs(pending) - 1u;
+            const uint32_t target = __shfl_sync(~0u, unit, source);
+            const float v = __shfl_sync(~0u, unit_value, source);
+            const float fx = __shfl_sync(~0u, f.x, source);
+            const float cxx = __shfl_sync(~0u, curvature.xx, source);
+            const float nx = __shfl_sync(~0u, noise.x, source);
+#pragma unroll
+            for (uint32_t r = 0u; r < kSpan; ++r) {
+                if (c.lane + r * kTileLanes != target) continue;
+                diagonal[r] += v * cxx * v;
+                TileAddProduct(g[r], v, fx);
+                scale[r] += fabsf(v) * nx;
+            }
+        }
+        // The chunk's Jacobian rows on the block in head order, each with the list position of the other
+        // tangent axis's row, and its axis's curvature, coupling to that row, force and noise.
+        const uint32_t count = incidence != kNoTileIncidence && unit == ~0u ? axes : 0u;
+        uint32_t through = count;
+        for (uint32_t offset = 1u; offset < kTileLanes; offset <<= 1u) {
+            const uint32_t other = __shfl_up_sync(~0u, through, offset);
+            if (c.lane >= offset) through += other;
+        }
+        const uint32_t rows = __shfl_sync(~0u, through, kTileLanes - 1u);
+        const uint32_t half = __shfl_sync(~0u, through, kTileLanes / 2u - 1u);
+        __syncwarp();
+        for (uint32_t axis = 0u; axis < count; ++axis) {
+            const uint32_t at = through - count + axis;
+            c.chunk_rows[at] = {first + axis, axis == 0u ? at : axis == 1u ? at + 1u : at - 1u};
+            c.chunk_terms[at] = {axis == 0u ? curvature.xx : axis == 1u ? curvature.yy : curvature.zz,
+                                 axis == 0u ? 0.0f : curvature.yz, AxisComponent(f, axis), AxisComponent(noise, axis)};
+        }
+        // J^T C J of those rows into H's upper triangle, half the chunk's heads staged at a time and sixteen
+        // columns summed in registers; row i + 32 starts at column 32.
+        constexpr uint32_t kColumns = 16u;
+        for (uint32_t part = 0u; part < 2u; ++part) {
+            const uint32_t begin = part == 0u ? 0u : half, end = part == 0u ? half : rows;
+            if (begin == end) continue;
+            __syncwarp();
+            // A batch's loads all go out before its stores, so the copy waits on few round trips.
+            constexpr uint32_t kBatch = 16u;
+            for (uint32_t first_row = begin; first_row < end; first_row += kBatch) {
+                float staged[kBatch][kSpan];
+#pragma unroll
+                for (uint32_t k = 0u; k < kBatch; ++k) {
+                    const float* const from = c.jacobian + size_t{c.chunk_rows[first_row + k].x} * c.width;
+#pragma unroll
+                    for (uint32_t r = 0u; r < kSpan; ++r)
+                        staged[k][r] = first_row + k < end ? from[c.lane + r * kTileLanes] : 0.0f;
+                }
+#pragma unroll
+                for (uint32_t k = 0u; k < kBatch; ++k)
+#pragma unroll
+                    for (uint32_t r = 0u; r < kSpan; ++r)
+                        if (first_row + k < end)
+                            c.stage[(first_row + k - begin) * kN + c.lane + r * kTileLanes] = staged[k][r];
+            }
+            __syncwarp();
+            for (uint32_t base = 0u; base < n; base += kColumns) {
+                const uint32_t span = base / kTileLanes;
+                float block[kSpan][kColumns];
+#pragma unroll
+                for (uint32_t r = 0u; r < kSpan; ++r)
+#pragma unroll
+                    for (uint32_t q = 0u; q < kColumns; ++q)
+                        block[r][q] =
+                            coordinate[r] && r <= span ? h[(c.lane + r * kTileLanes) * kS + base + q] : 0.0f;
+#pragma unroll 2
+                for (uint32_t t = begin; t < end; ++t) {
+                    const float4 term = c.chunk_terms[t];
+                    const float* const self = c.stage + (t - begin) * kN;
+                    const float* const partner = c.stage + (c.chunk_rows[t].y - begin) * kN;
+                    float j[kSpan], a[kSpan];
+#pragma unroll
+                    for (uint32_t r = 0u; r < kSpan; ++r) {
+                        const uint32_t i = c.lane + r * kTileLanes;
+                        j[r] = self[i];
+                        a[r] = j[r] * term.x + partner[i] * term.y;
+                    }
+                    if (base == 0u) {
+#pragma unroll
+                        for (uint32_t r = 0u; r < kSpan; ++r) {
+                            TileAddProduct(g[r], j[r], term.z);
+                            scale[r] += fabsf(j[r]) * term.w;
+                        }
+                    }
+                    const float4* const columns = reinterpret_cast<const float4*>(self + base);
+#pragma unroll
+                    for (uint32_t q = 0u; q < kColumns / 4u; ++q) {
+                        const float4 v = columns[q];
+#pragma unroll
+                        for (uint32_t r = 0u; r < kSpan; ++r) {
+                            if (r > span) continue;
+                            block[r][4u * q] = fmaf(a[r], v.x, block[r][4u * q]);
+                            block[r][4u * q + 1u] = fmaf(a[r], v.y, block[r][4u * q + 1u]);
+                            block[r][4u * q + 2u] = fmaf(a[r], v.z, block[r][4u * q + 2u]);
+                            block[r][4u * q + 3u] = fmaf(a[r], v.w, block[r][4u * q + 3u]);
+                        }
+                    }
+                }
+#pragma unroll
+                for (uint32_t r = 0u; r < kSpan; ++r)
+#pragma unroll
+                    for (uint32_t q = 0u; q < kColumns; ++q)
+                        if (coordinate[r] && r <= span && base + q < n)
+                            h[(c.lane + r * kTileLanes) * kS + base + q] = block[r][q];
+            }
+        }
+    }
+    bool finite = true, settled = true;
+#pragma unroll
+    for (uint32_t r = 0u; r < kSpan; ++r) {
+        const uint32_t i = c.lane + r * kTileLanes;
+        if (coordinate[r]) h[i * kS + i] += diagonal[r];
+        force[r] = coordinate[r] ? g[r].value + g[r].error : 0.0f;
+        inertia[r] = coordinate[r] ? inertial[r].value + inertial[r].error : 0.0f;
+        finite &= isfinite(force[r]);
+        pattern[r] = 0u;
+    }
+    // A float velocity is off its optimum by up to a rounding, which moves g by H times it.
+    for (uint32_t k = 0u; k < n; ++k) {
+        const float along = fabsf(TileCoordinate(u, k));
+#pragma unroll
+        for (uint32_t r = 0u; r < kSpan; ++r) {
+            if (!coordinate[r]) continue;
+            const uint32_t i = c.lane + r * kTileLanes;
+            const float entry = h[min(i, k) * kS + max(i, k)];
+            finite &= isfinite(entry);
+            scale[r] += fabsf(entry) * along;
+            if (entry != 0.0f) pattern[r] |= uint64_t{1} << k;
+        }
+    }
+#pragma unroll
+    for (uint32_t r = 0u; r < kSpan; ++r)
+        settled &= !coordinate[r] || fabsf(force[r]) <= kDenseRoundings * FLT_EPSILON * scale[r];
+    *converged = __all_sync(~0u, settled);
+    return __all_sync(~0u, finite);
+}
+
+// FactorTileBlock past a warp of coordinates as H = U U^T in the factor buffer's upper triangle. Columns go
+// from the last coordinate down, so a tree's leaves go first and its pattern takes no fill; only rows on a
+// column's pattern take it, and entries off the pattern stay exact zeros.
+template <uint32_t kN, uint32_t kSpan = TileSpan<kN>()>
+__device__ bool FactorWideTileBlock(const TileContext& c, float (&inverse)[kSpan], uint64_t (&pattern)[kSpan],
+                                    uint32_t n) {
+    constexpr uint32_t kS = kN + 1u;
+    float* const h = c.factor;
+    bool valid = true;
+#pragma unroll
+    for (uint32_t r = 0u; r < kSpan; ++r) inverse[r] = 0.0f;
+    __syncwarp();
+    for (uint32_t k = n; k-- > 0u;) {
+        uint64_t column = 0u;
+#pragma unroll
+        for (uint32_t r = 0u; r < kSpan; ++r) {
+            const bool above = c.lane + r * kTileLanes < k && (pattern[r] >> k & 1u) != 0u;
+            column |= uint64_t{__ballot_sync(~0u, above)} << (r * kTileLanes);
+        }
+        const float* const pivot_row = h + k * kS;
+        float value[kSpan];
+        bool member[kSpan];
+#pragma unroll
+        for (uint32_t r = 0u; r < kSpan; ++r) {
+            const uint32_t i = c.lane + r * kTileLanes;
+            member[r] = i == k || (i < k && (column >> i & 1u) != 0u);
+            value[r] = 0.0f;
+            if (!member[r]) continue;
+            const float* const own = h + i * kS;
+            float v = own[k];
+#pragma unroll 4
+            for (uint32_t j = k + 1u; j < n; ++j) v -= own[j] * pivot_row[j];
+            value[r] = v;
+        }
+        const float pivot = TileCoordinate(value, k);
+        valid &= pivot > 0.0f && pivot <= FLT_MAX;
+        const float root = sqrtf(valid ? pivot : 1.0f);
+        const float scale = 1.0f / root;
+        // Eliminating column k joins the rows above it on the column.
+#pragma unroll
+        for (uint32_t r = 0u; r < kSpan; ++r) {
+            const uint32_t i = c.lane + r * kTileLanes;
+            if (i == k) inverse[r] = scale;
+            if (member[r]) h[i * kS + k] = i == k ? root : value[r] * scale;
+            if (member[r] && i != k) pattern[r] |= column;
+        }
+        __syncwarp();
+    }
+    return valid;
+}
+
+// SolveTileBlock past a warp of coordinates on the factor buffer's U: U w = g up its columns, then
+// U^T d = w down its rows.
+template <uint32_t kN, uint32_t kSpan = TileSpan<kN>()>
+__device__ void SolveWideTileBlock(const TileContext& c, const float (&inverse)[kSpan], const float (&g)[kSpan],
+                                   uint32_t n, float (&d)[kSpan]) {
+    constexpr uint32_t kS = kN + 1u;
+    const float* const h = c.factor;
+    float r[kSpan], scaled[kSpan];
+#pragma unroll
+    for (uint32_t s = 0u; s < kSpan; ++s) r[s] = g[s];
+    for (uint32_t j = n; j-- > 0u;) {
+#pragma unroll
+        for (uint32_t s = 0u; s < kSpan; ++s) scaled[s] = r[s] * inverse[s];
+        const float y = TileCoordinate(scaled, j);
+#pragma unroll
+        for (uint32_t s = 0u; s < kSpan; ++s) {
+            const uint32_t i = c.lane + s * kTileLanes;
+            if (i == j) r[s] = y;
+            else if (i < j) r[s] = fmaf(-h[i * kS + j], y, r[s]);
+        }
+    }
+    for (uint32_t j = 0u; j < n; ++j) {
+#pragma unroll
+        for (uint32_t s = 0u; s < kSpan; ++s) scaled[s] = r[s] * inverse[s];
+        const float x = TileCoordinate(scaled, j);
+#pragma unroll
+        for (uint32_t s = 0u; s < kSpan; ++s) {
+            const uint32_t i = c.lane + s * kTileLanes;
+            if (i == j) r[s] = x;
+            else if (i > j && i < n) r[s] = fmaf(-h[j * kS + i], x, r[s]);
+        }
+    }
+    __syncwarp();
+#pragma unroll
+    for (uint32_t s = 0u; s < kSpan; ++s) d[s] = r[s];
+}
+
+// The Newton direction d = H^-1 g at u and the forces g: H in registers within a warp of coordinates, in the
+// factor buffer past it.
+template <uint32_t kN, uint32_t kSpan = TileSpan<kN>()>
+__device__ nk::BlockSolveFailure TileNewtonDirection(const TileContext& c, const TileBlock& b, const float (&u)[kSpan],
+                                                     const float (&free)[kSpan], float (&force)[kSpan],
+                                                     float (&inertia)[kSpan], float (&d)[kSpan], bool* converged) {
+    if constexpr (kSpan == 1u) {
+        float h[kN];
+        float inverse = 0.0f;
+        if (!AssembleTileBlock<kN>(c, b, u[0], free[0], h, &force[0], &inertia[0], converged))
+            return nk::BlockSolveFailure::InvalidEquation;
+        if (*converged) return nk::BlockSolveFailure::None;
+        if (!FactorTileBlock<kN>(h, &inverse, c.lane, b.dimension)) return nk::BlockSolveFailure::Factorization;
+        d[0] = SolveTileBlock<kN>(h, inverse, force[0], c, b.dimension);
+    } else {
+        float inverse[kSpan];
+        uint64_t pattern[kSpan];
+        if (!AssembleWideTileBlock<kN>(c, b, u, free, force, inertia, pattern, converged))
+            return nk::BlockSolveFailure::InvalidEquation;
+        if (*converged) return nk::BlockSolveFailure::None;
+        if (!FactorWideTileBlock<kN>(c, inverse, pattern, b.dimension)) return nk::BlockSolveFailure::Factorization;
+        SolveWideTileBlock<kN>(c, inverse, force, b.dimension, d);
+    }
+    return nk::BlockSolveFailure::None;
+}
+
 // w = J d of every head on the block: a row on one coordinate scales that coordinate's step, other rows
 // sum over the warp.
-__device__ void TileRowSteps(const TileContext& c, uint32_t block, float d) {
+template <uint32_t kSpan>
+__device__ void TileRowSteps(const TileContext& c, uint32_t block, const float (&d)[kSpan]) {
     for (uint32_t chunk = 0u; chunk < c.heads; chunk += kTileLanes) {
         const uint32_t own = chunk + c.lane;
         const uint32_t incidence = own < c.heads ? c.Incidence(own, block) : kNoTileIncidence;
@@ -653,22 +1127,70 @@ __device__ void TileRowSteps(const TileContext& c, uint32_t block, float d) {
         const uint32_t unit = touches ? c.Index(kTileUnit + incidence, own) : ~0u;
         const uint32_t first = touches ? c.Index(kTileRow + incidence, own) : 0u;
         const uint32_t axes = touches ? c.Index(kTileAxes, own) : 1u;
-        const float along = __shfl_sync(~0u, d, unit != ~0u ? unit : 0u);
+        // Each lane reads its own head's coordinate, so every part of d crosses the warp.
+        const uint32_t coordinate = unit != ~0u ? unit : 0u;
+        float along = __shfl_sync(~0u, d[0], coordinate % kTileLanes);
+#pragma unroll
+        for (uint32_t r = 1u; r < kSpan; ++r) {
+            const float part = __shfl_sync(~0u, d[r], coordinate % kTileLanes);
+            along = coordinate / kTileLanes == r ? part : along;
+        }
         Vec3 step{};
         if (unit != ~0u) step.x = c.Value(kTileUnitValue + incidence, own) * along;
         for (uint32_t pending = __ballot_sync(~0u, touches && unit == ~0u); pending != 0u; pending &= pending - 1u) {
             const uint32_t source = __ffs(pending) - 1u;
-            const bool staged = c.lane < c.width;
-            const float* jacobian = c.jacobian + size_t{__shfl_sync(~0u, first, source)} * c.width +
-                                    (staged ? c.lane : 0u);
-            const float j0 = staged ? jacobian[0] : 0.0f;
+            const float* jacobian = c.jacobian + size_t{__shfl_sync(~0u, first, source)} * c.width;
+            float j0[kSpan];
+#pragma unroll
+            for (uint32_t r = 0u; r < kSpan; ++r)
+                j0[r] = c.lane + r * kTileLanes < c.width ? jacobian[c.lane + r * kTileLanes] : 0.0f;
             Vec3 w{};
-            if (__shfl_sync(~0u, axes, source) == 1u) w.x = TileWarpSum(j0 * d);
-            else w = TileWarpSum3({j0 * d, (staged ? jacobian[c.width] : 0.0f) * d,
-                                   (staged ? jacobian[2u * c.width] : 0.0f) * d});
+            if (__shfl_sync(~0u, axes, source) == 1u) {
+                w.x = TileWarpSum(TileDot(j0, d));
+            } else {
+                float j1[kSpan], j2[kSpan];
+#pragma unroll
+                for (uint32_t r = 0u; r < kSpan; ++r) {
+                    const uint32_t i = c.lane + r * kTileLanes;
+                    j1[r] = i < c.width ? jacobian[c.width + i] : 0.0f;
+                    j2[r] = i < c.width ? jacobian[2u * c.width + i] : 0.0f;
+                }
+                w = TileWarpSum3({TileDot(j0, d), TileDot(j1, d), TileDot(j2, d)});
+            }
             if (c.lane == source) step = w;
         }
         if (touches) c.Store3(kTileStep, own, step);
+    }
+    __syncwarp();
+}
+
+// TileRowSteps past a warp of coordinates: the step goes through the factor buffer, and a lane takes a head.
+template <uint32_t kN, uint32_t kSpan = TileSpan<kN>()>
+__device__ void WideTileRowSteps(const TileContext& c, uint32_t block, uint32_t n, const float (&d)[kSpan]) {
+    float* const staged = c.factor;
+#pragma unroll
+    for (uint32_t r = 0u; r < kSpan; ++r)
+        if (c.lane + r * kTileLanes < kN) staged[c.lane + r * kTileLanes] = d[r];
+    __syncwarp();
+    for (uint32_t h = c.lane; h < c.heads; h += kTileLanes) {
+        const uint32_t incidence = c.Incidence(h, block);
+        if (incidence == kNoTileIncidence) continue;
+        const uint32_t unit = c.Index(kTileUnit + incidence, h);
+        Vec3 step{};
+        if (unit != ~0u) {
+            step.x = c.Value(kTileUnitValue + incidence, h) * staged[unit];
+        } else {
+            const float* const jacobian = c.jacobian + size_t{c.Index(kTileRow + incidence, h)} * c.width;
+            const bool three = c.Index(kTileAxes, h) == 3u;
+            for (uint32_t i = 0u; i < n; ++i) {
+                step.x = fmaf(jacobian[i], staged[i], step.x);
+                if (three) {
+                    step.y = fmaf(jacobian[c.width + i], staged[i], step.y);
+                    step.z = fmaf(jacobian[2u * c.width + i], staged[i], step.z);
+                }
+            }
+        }
+        c.Store3(kTileStep, h, step);
     }
     __syncwarp();
 }
@@ -746,44 +1268,55 @@ template <uint32_t kN>
 __device__ void DescendTileBlock(DataView data, BlockDescentSolveParams p, BlockScratch s, TileContext& c,
                                  const TileBlock& b) {
     constexpr uint32_t kS = kN + 1u;
+    constexpr uint32_t kSpan = TileSpan<kN>();
     const uint32_t n = b.dimension;
-    const bool coordinate = c.lane < n;
+    bool coordinate[kSpan];
+#pragma unroll
+    for (uint32_t r = 0u; r < kSpan; ++r) coordinate[r] = c.lane + r * kTileLanes < n;
     // Coordinates past the block's carry unit mass and no rows, so their step stays zero.
     if (b.local != c.staged) {
         for (uint32_t i = 0u; i < kN; ++i)
-            if (c.lane < kN)
-                c.mass[i * kS + c.lane] = i < n && coordinate ? b.Mass(i, c.lane) : i == c.lane ? 1.0f : 0.0f;
+#pragma unroll
+            for (uint32_t r = 0u; r < kSpan; ++r) {
+                const uint32_t j = c.lane + r * kTileLanes;
+                if (j < kN) c.mass[i * kS + j] = i < n && coordinate[r] ? b.Mass(i, j) : i == j ? 1.0f : 0.0f;
+            }
         c.staged = b.local;
     }
     StartTileBlock(c, b.local);
-    const float start = coordinate ? b.velocity[c.lane] : 0.0f;
-    const float free = coordinate && b.free != nullptr ? b.free[c.lane] : 0.0f;
-    float u = start;
+    float start[kSpan], free[kSpan], u[kSpan];
+#pragma unroll
+    for (uint32_t r = 0u; r < kSpan; ++r) {
+        start[r] = coordinate[r] ? b.velocity[c.lane + r * kTileLanes] : 0.0f;
+        free[r] = coordinate[r] && b.free != nullptr ? b.free[c.lane + r * kTileLanes] : 0.0f;
+        u[r] = start[r];
+    }
     nk::BlockSolveFailure failure = nk::BlockSolveFailure::None;
     float first_decrement = 0.0f;
     for (uint32_t step = 0u; step < kDenseNewtonSteps; ++step) {
-        float h[kN];
-        float force = 0.0f, inertia = 0.0f, inverse = 0.0f;
+        float force[kSpan], inertia[kSpan], d[kSpan], mass_step[kSpan];
         bool converged = false;
-        if (!AssembleTileBlock<kN>(c, b, u, free, h, &force, &inertia, &converged)) {
-            failure = nk::BlockSolveFailure::InvalidEquation;
-            break;
-        }
-        if (converged) break;
-        if (!FactorTileBlock<kN>(h, &inverse, c.lane, n)) {
-            failure = nk::BlockSolveFailure::Factorization;
-            break;
-        }
-        const float d = SolveTileBlock<kN>(h, inverse, force, c, n);
-        float mass_step = 0.0f;
+        failure = TileNewtonDirection<kN>(c, b, u, free, force, inertia, d, &converged);
+        if (failure != nk::BlockSolveFailure::None || converged) break;
 #pragma unroll
-        for (uint32_t k = 0u; k < kN; ++k)
-            mass_step += (c.lane < kN ? c.mass[c.lane * kS + k] : 0.0f) * __shfl_sync(~0u, d, k);
+        for (uint32_t r = 0u; r < kSpan; ++r) mass_step[r] = 0.0f;
+        // Past a warp, coordinates beyond the block's have zero step and mass.
+#pragma unroll
+        for (uint32_t k = 0u; k < (kSpan == 1u ? kN : n); ++k) {
+            const float along = TileCoordinate(d, k);
+#pragma unroll
+            for (uint32_t r = 0u; r < kSpan; ++r) {
+                const uint32_t i = c.lane + r * kTileLanes;
+                mass_step[r] += (i < kN ? c.mass[i * kS + k] : 0.0f) * along;
+            }
+        }
         TileSum decrement{}, slope{}, curvature{};
-        if (coordinate) {
-            TileAddProduct(decrement, force, d);
-            TileAddProduct(slope, inertia, d);
-            TileAddProduct(curvature, d, mass_step);
+#pragma unroll
+        for (uint32_t r = 0u; r < kSpan; ++r) {
+            if (!coordinate[r]) continue;
+            TileAddProduct(decrement, force[r], d[r]);
+            TileAddProduct(slope, inertia[r], d[r]);
+            TileAddProduct(curvature, d[r], mass_step[r]);
         }
         const float total_decrement = TileWarpTotal(decrement);
         const float inertial_slope = TileWarpTotal(slope);
@@ -795,19 +1328,30 @@ __device__ void DescendTileBlock(DataView data, BlockDescentSolveParams p, Block
         if (!(total_decrement > 0.0f)) break;
         if (step == 0u) first_decrement = total_decrement;
         else if (total_decrement <= static_cast<float>(kDenseDecrementRatio) * first_decrement) break;
-        TileRowSteps(c, b.local, d);
+        if constexpr (kSpan == 1u) TileRowSteps(c, b.local, d);
+        else WideTileRowSteps<kN>(c, b.local, n, d);
         const float alpha = SearchTileLine(c, b.local, inertial_slope, inertial_curvature);
-        const float after = fmaf(alpha, d, u);
-        const bool finite = !coordinate || isfinite(after);
-        const float largest_step = TileWarpMax(coordinate ? fabsf(after - u) : 0.0f);
-        const float largest_value =
-            TileWarpMax(coordinate ? fmaxf(fabsf(after), fmaxf(fabsf(start), fabsf(free))) : 0.0f);
+        float after[kSpan], largest_step = 0.0f, largest_value = 0.0f;
+        bool finite = true;
+#pragma unroll
+        for (uint32_t r = 0u; r < kSpan; ++r) {
+            after[r] = fmaf(alpha, d[r], u[r]);
+            finite &= !coordinate[r] || isfinite(after[r]);
+            const float moved = coordinate[r] ? fabsf(after[r] - u[r]) : 0.0f;
+            const float value =
+                coordinate[r] ? fmaxf(fabsf(after[r]), fmaxf(fabsf(start[r]), fabsf(free[r]))) : 0.0f;
+            largest_step = r == 0u ? moved : fmaxf(largest_step, moved);
+            largest_value = r == 0u ? value : fmaxf(largest_value, value);
+        }
+        largest_step = TileWarpMax(largest_step);
+        largest_value = TileWarpMax(largest_value);
         if (!__all_sync(~0u, finite)) {
             failure = nk::BlockSolveFailure::InvalidCandidate;
             break;
         }
         if (!(alpha > 0.0f)) break;
-        u = after;
+#pragma unroll
+        for (uint32_t r = 0u; r < kSpan; ++r) u[r] = after[r];
         for (uint32_t head = c.lane; head < c.heads; head += kTileLanes) {
             if (c.Incidence(head, b.local) == kNoTileIncidence) continue;
             const Vec3 move = c.Load3(kTileMove, head);
@@ -820,7 +1364,9 @@ __device__ void DescendTileBlock(DataView data, BlockDescentSolveParams p, Block
     }
     EndTileBlock(c, b.local);
     if (failure != nk::BlockSolveFailure::None && c.lane == 0u) RecordTileFailure(data, p, s, c, b.owner, failure);
-    if (coordinate) b.velocity[c.lane] = u;
+#pragma unroll
+    for (uint32_t r = 0u; r < kSpan; ++r)
+        if (coordinate[r]) b.velocity[c.lane + r * kTileLanes] = u[r];
     __syncwarp();
 }
 
@@ -850,36 +1396,50 @@ __device__ void UpdateTileDuals(DataView data, const TileContext& c, bool veloci
 
 // Final velocities as the tails of DescendArticulationsKernel and DescendRigidBlocksKernel, then the
 // joint limit impulses as WriteBlockJointLimitImpulsesKernel.
+template <uint32_t kN>
 __device__ void FinishTile(ArticulationDeviceState state, DataView data, BlockDescentSolveParams p,
                            BlockScratch s, const TileContext& c) {
+    constexpr uint32_t kSpan = TileSpan<kN>();
     for (uint32_t k = 0u; k < c.articulations; ++k) {
         const uint32_t articulation = c.first_articulation + k;
         const size_t base = size_t{articulation} * p.max_dof;
-        const uint32_t dof = c.lane;
-        uint32_t link = 0u, component = 0u;
-        const bool located = dof < p.max_dof && ArticulationDofLocation(state, articulation, dof, &link, &component);
-        float value = 0.0f;
-        if (located) {
-            const uint32_t root = p.mimic_couplings != 0u ? data.mimic_root_dof[base + dof] : dof;
-            for (uint32_t compact = 0u; compact < s.articulation_dimensions[articulation]; ++compact) {
-                if (s.articulation_roots[base + compact] == root) {
-                    value = s.articulation_velocity[base + compact];
-                    break;
+        uint32_t link[kSpan], component[kSpan];
+        bool located[kSpan], invalid = false;
+        float value[kSpan];
+#pragma unroll
+        for (uint32_t r = 0u; r < kSpan; ++r) {
+            const uint32_t dof = c.lane + r * kTileLanes;
+            link[r] = component[r] = 0u;
+            located[r] = dof < p.max_dof &&
+                ArticulationDofLocation(state, articulation, dof, &link[r], &component[r]);
+            value[r] = 0.0f;
+            if (located[r]) {
+                const uint32_t root = p.mimic_couplings != 0u ? data.mimic_root_dof[base + dof] : dof;
+                for (uint32_t compact = 0u; compact < s.articulation_dimensions[articulation]; ++compact) {
+                    if (s.articulation_roots[base + compact] == root) {
+                        value[r] = s.articulation_velocity[base + compact];
+                        break;
+                    }
                 }
+                if (p.mimic_couplings != 0u) value[r] *= data.mimic_root_scale[base + dof];
             }
-            if (p.mimic_couplings != 0u) value *= data.mimic_root_scale[base + dof];
+            invalid |= !(fabsf(value[r]) <= FLT_MAX);
         }
-        if (__any_sync(~0u, !(fabsf(value) <= FLT_MAX))) {
+        if (__any_sync(~0u, invalid)) {
             if (c.lane == 0u)
                 RecordTileFailure(data, p, s, c, p.total_particle_count + p.total_body_count + articulation,
                                   nk::BlockSolveFailure::InvalidCandidate);
             continue;
         }
-        if (dof >= p.max_dof) continue;
-        data.qdot_flat[base + dof] = value;
-        if (!located) continue;
-        if (component == ~0u) state.qdot[link] = value;
-        else state.link_velocity[link].v[component] = value;
+#pragma unroll
+        for (uint32_t r = 0u; r < kSpan; ++r) {
+            const uint32_t dof = c.lane + r * kTileLanes;
+            if (dof >= p.max_dof) continue;
+            data.qdot_flat[base + dof] = value[r];
+            if (!located[r]) continue;
+            if (component[r] == ~0u) state.qdot[link[r]] = value[r];
+            else state.link_velocity[link[r]].v[component[r]] = value[r];
+        }
     }
     for (uint32_t k = c.lane; k < c.bodies; k += kTileLanes) {
         const uint32_t body = c.first_body + k;
@@ -931,7 +1491,8 @@ __device__ uint32_t InitializeTilePositions(DataView data, BlockDescentSolvePara
     for (uint32_t k = c.lane; k < c.bodies * kRigidBlockDof; k += kTileLanes)
         s.rigid_pseudo[size_t{c.first_body} * kRigidBlockDof + k] = 0.0f;
     for (uint32_t k = 0u; k < c.articulations; ++k)
-        if (c.lane < p.max_dof) s.articulation_pseudo[size_t{c.first_articulation + k} * p.max_dof + c.lane] = 0.0f;
+        for (uint32_t dof = c.lane; dof < p.max_dof; dof += kTileLanes)
+            s.articulation_pseudo[size_t{c.first_articulation + k} * p.max_dof + dof] = 0.0f;
     __syncwarp();
     if (!__any_sync(~0u, push)) return 0u;
     return __any_sync(~0u, coupled) ? p.position_iterations : 1u;
@@ -944,15 +1505,17 @@ __device__ void FinishTilePositions(ArticulationDeviceState state, DataView data
     for (uint32_t k = 0u; k < c.articulations; ++k) {
         const uint32_t articulation = c.first_articulation + k;
         const size_t base = size_t{articulation} * p.max_dof;
-        uint32_t link = 0u, component = 0u;
-        if (c.lane >= p.max_dof || !ArticulationDofLocation(state, articulation, c.lane, &link, &component)) continue;
-        const uint32_t root = p.mimic_couplings != 0u ? data.mimic_root_dof[base + c.lane] : c.lane;
-        float value = 0.0f;
-        for (uint32_t compact = 0u; compact < s.articulation_dimensions[articulation]; ++compact)
-            if (s.articulation_roots[base + compact] == root) value = s.articulation_pseudo[base + compact];
-        if (p.mimic_couplings != 0u) value *= data.mimic_root_scale[base + c.lane];
-        if (component == ~0u) data.qdot_pseudo[link] = value;
-        else link_pseudo[link].v[component] = value;
+        for (uint32_t dof = c.lane; dof < p.max_dof; dof += kTileLanes) {
+            uint32_t link = 0u, component = 0u;
+            if (!ArticulationDofLocation(state, articulation, dof, &link, &component)) continue;
+            const uint32_t root = p.mimic_couplings != 0u ? data.mimic_root_dof[base + dof] : dof;
+            float value = 0.0f;
+            for (uint32_t compact = 0u; compact < s.articulation_dimensions[articulation]; ++compact)
+                if (s.articulation_roots[base + compact] == root) value = s.articulation_pseudo[base + compact];
+            if (p.mimic_couplings != 0u) value *= data.mimic_root_scale[base + dof];
+            if (component == ~0u) data.qdot_pseudo[link] = value;
+            else link_pseudo[link].v[component] = value;
+        }
     }
     for (uint32_t k = c.lane; k < c.bodies; k += kTileLanes) {
         const uint32_t body = c.first_body + k;
@@ -984,13 +1547,13 @@ __device__ void DescendTileBlocks(DataView data, BlockDescentSolveParams p, Bloc
 template <uint32_t kN>
 __device__ void DescendTile(ArticulationDeviceState state, DataView data, BlockDescentSolveParams p, BlockScratch s,
                             TileContext& c) {
-    InitializeTile(state, data, p, s, c);
+    InitializeTile<kN>(state, data, p, s, c);
     for (uint32_t iteration = 0u; iteration < p.iterations; ++iteration) {
         c.iteration = iteration;
         DescendTileBlocks<kN>(data, p, s, c, false);
         UpdateTileDuals(data, c);
     }
-    FinishTile(state, data, p, s, c);
+    FinishTile<kN>(state, data, p, s, c);
     if (p.position_iterations == 0u) return;
     const uint32_t positions = InitializeTilePositions(data, p, s, c);
     for (uint32_t iteration = 0u; iteration < positions; ++iteration) {
@@ -1031,15 +1594,15 @@ __global__ void __launch_bounds__(kOrderTileThreads) OrderTilesKernel(BlockDesce
         s.tile_order[atomicAdd(offsets + TileCostBucket(s.tile_cost[env]), 1u)] = env;
 }
 
-// kN is the articulation coordinates rounded up to a multiple of four; rigid bodies descend at six. Resident
-// warps take environments in OrderTilesKernel's order, so a costly environment holds back only its own warp.
+// kN is the articulation coordinates rounded up to TileWidth; rigid bodies descend at six. Resident warps
+// take environments in OrderTilesKernel's order, so a costly environment holds back only its own warp.
 template <uint32_t kN>
-__global__ void __launch_bounds__(kTileWarps * kTileLanes) DescendDenseTilesKernel(
+__global__ void __launch_bounds__(TileWarps<kN>() * kTileLanes) DescendDenseTilesKernel(
     ArticulationDeviceState state, DataView data, BlockDescentSolveParams p, BlockScratch s) {
-    extern __shared__ float tile_shared[];
+    extern __shared__ __align__(16) float tile_shared[];
     const uint32_t warp = threadIdx.x / kTileLanes;
     const uint32_t lane = threadIdx.x % kTileLanes;
-    const uint32_t slot = blockIdx.x * kTileWarps + warp;
+    const uint32_t slot = blockIdx.x * TileWarps<kN>() + warp;
     for (;;) {
         uint32_t ticket = 0u;
         if (lane == 0u) ticket = atomicAdd(s.tile_next, 1u);
@@ -1058,8 +1621,11 @@ __global__ void __launch_bounds__(kTileWarps * kTileLanes) DescendDenseTilesKern
         c.width = kN;
         c.fields = s.tile_fields + size_t{slot} * kTileFields * c.capacity;
         c.jacobian = s.tile_jacobian + size_t{slot} * s.tile_row_capacity * kN;
-        c.mass = tile_shared + size_t{warp} * 2u * kN * (kN + 1u);
+        c.mass = tile_shared + size_t{warp} * TileWarpFloats<kN>();
         c.factor = c.mass + kN * (kN + 1u);
+        c.chunk_terms = reinterpret_cast<float4*>(c.factor + kN * (kN + 1u));
+        c.chunk_rows = reinterpret_cast<uint2*>(c.chunk_terms + kTileChunkRows);
+        c.stage = reinterpret_cast<float*>(c.chunk_rows + kTileChunkRows);
         c.iteration = ~0u;
         const long long start = clock64();
         DescendTile<kN>(state, data, p, s, c);
@@ -1069,17 +1635,18 @@ __global__ void __launch_bounds__(kTileWarps * kTileLanes) DescendDenseTilesKern
 
 template <uint32_t kN>
 constexpr size_t TileSharedBytes() {
-    return size_t{kTileWarps} * 2u * kN * (kN + 1u) * sizeof(float);
+    return size_t{TileWarps<kN>()} * TileWarpFloats<kN>() * sizeof(float);
 }
 
 // Blocks of the tile kernel resident for p's environments, with the cache carveout the launch uses.
 template <uint32_t kN>
 cudaError_t TileResidentBlocks(const BlockDescentSolveParams& p, uint32_t* blocks) {
+    constexpr uint32_t warps = TileWarps<kN>();
     const cudaError_t status =
-        PreferCacheCarveout(DescendDenseTilesKernel<kN>, kTileWarps * kTileLanes, TileSharedBytes<kN>());
+        PreferCacheCarveout(DescendDenseTilesKernel<kN>, warps * kTileLanes, TileSharedBytes<kN>());
     if (status != cudaSuccess) return status;
-    return ResidentGridSize(DescendDenseTilesKernel<kN>, kTileWarps * kTileLanes, TileSharedBytes<kN>(),
-                            (p.env_count + kTileWarps - 1u) / kTileWarps, blocks);
+    return ResidentGridSize(DescendDenseTilesKernel<kN>, warps * kTileLanes, TileSharedBytes<kN>(),
+                            (p.env_count + warps - 1u) / warps, blocks);
 }
 
 template <uint32_t kN>
@@ -1088,7 +1655,7 @@ cudaError_t LaunchDenseTiles(ArticulationDeviceState state, DataView data, Block
     uint32_t blocks = 0u;
     const cudaError_t status = TileResidentBlocks<kN>(p, &blocks);
     if (status != cudaSuccess) return status;
-    LaunchCuda(DescendDenseTilesKernel<kN>, dim3(blocks), dim3(kTileWarps * kTileLanes), TileSharedBytes<kN>(),
+    LaunchCuda(DescendDenseTilesKernel<kN>, dim3(blocks), dim3(TileWarps<kN>() * kTileLanes), TileSharedBytes<kN>(),
                stream, state, data, p, s);
     return cudaGetLastError();
 }
@@ -1103,14 +1670,18 @@ cudaError_t VisitTileWidth(const BlockDescentSolveParams& p, Visit&& visit) {
         case 20u: return visit(std::integral_constant<uint32_t, 20u>{});
         case 24u: return visit(std::integral_constant<uint32_t, 24u>{});
         case 28u: return visit(std::integral_constant<uint32_t, 28u>{});
-        default: return visit(std::integral_constant<uint32_t, 32u>{});
+        case 32u: return visit(std::integral_constant<uint32_t, 32u>{});
+        default: return visit(std::integral_constant<uint32_t, kMaxArticulationDof>{});
     }
 }
 
 uint32_t TileWarpSlots(const BlockDescentSolveParams& p) {
-    uint32_t blocks = 0u;
+    uint32_t slots = 0u;
     const cudaError_t status = VisitTileWidth(p, [&](auto width) {
-        return TileResidentBlocks<decltype(width)::value>(p, &blocks);
+        uint32_t blocks = 0u;
+        const cudaError_t resident = TileResidentBlocks<decltype(width)::value>(p, &blocks);
+        slots = blocks * TileWarps<decltype(width)::value>();
+        return resident;
     });
-    return status == cudaSuccess ? blocks * kTileWarps : 0u;
+    return status == cudaSuccess ? slots : 0u;
 }
