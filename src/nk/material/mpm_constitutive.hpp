@@ -4,6 +4,8 @@
 #include <cmath>
 #include <cstdint>
 
+#include "math/finite.hpp"
+
 #include "nk/material/hencky_j2.hpp"
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
@@ -311,7 +313,7 @@ NUKA_MPM_CONSTITUTIVE_HD inline MpmStressRowResponse EvaluateMpmStressRows(
     const MpmMaterial& material, const float* F, const float* stress) {
     MpmStressRowResponse response;
     const float J = mpm_detail::Mat3Det(F);
-    if (!(J > 0.0f) || !std::isfinite(J)) return response;
+    if (!(J > 0.0f) || !math::IsFinite(J)) return response;
     response.pressure = -(stress[0] + stress[4] + stress[8]) / 3.0f;
     response.viscosity = J * fmaxf(material.viscosity, 0.0f);
     const float kind = material.model_kind;
@@ -417,7 +419,7 @@ template <class Arithmetic = MpmArithmetic>
 NUKA_MPM_CONSTITUTIVE_HD inline ConstitutiveStatus EvaluateMpmMaterialTrial(
     const MpmMaterial& material, MpmMaterialHistory history, const float* C, float dt,
     MpmMaterialTrial& trial) {
-    if (history.elastic_f == nullptr || C == nullptr || !(dt > 0.0f) || !std::isfinite(dt))
+    if (history.elastic_f == nullptr || C == nullptr || !(dt > 0.0f) || !math::IsFinite(dt))
         return ConstitutiveStatus::InvalidState;
     const float kind = material.model_kind;
     if (!(kind == 0.0f || kind == 2.0f || kind == 3.0f || kind == 4.0f || kind == MpmMaterial::kHenckyJ2))
@@ -438,7 +440,7 @@ NUKA_MPM_CONSTITUTIVE_HD inline ConstitutiveStatus EvaluateMpmMaterialTrial(
     } else if (kind == 3.0f) {
         const float volume = mpm_detail::Mat3Det(history.elastic_f) *
             (1.0f + dt * (C[0] + C[4] + C[8]));
-        if (!(volume > 0.0f) || !std::isfinite(volume)) return ConstitutiveStatus::SingularDeformation;
+        if (!(volume > 0.0f) || !math::IsFinite(volume)) return ConstitutiveStatus::SingularDeformation;
         // Liquid bears no tension: separation opens voids instead of stretching the liquid.
         const float stretch = cbrtf(fminf(volume, 1.0f));
         for (int k = 0; k < 9; ++k) next.elastic_f[k] = (k % 4 == 0) ? stretch : 0.0f;

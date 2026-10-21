@@ -35,7 +35,8 @@ __global__ void ClothPredictKernel(DataView data, ClothStepParams p) {
     const math::Vec3 start = data.particle_pos[particle];
     const math::Vec3 before = data.particle_prev_pos[particle];
     const math::Vec3 velocity = data.particle_vel[particle];
-    const math::Vec3 earlier = data.vbd_history_vel[item];
+    const bool has_history = data.vbd_history_ready[env] != 0u;
+    const math::Vec3 earlier = has_history ? data.vbd_history_vel[item] : velocity;
     data.particle_prev_pos[particle] = start;
     data.particle_projection_delta[particle] = {};
     data.vbd_history_vel[item] = velocity;
@@ -52,7 +53,7 @@ __global__ void ClothPredictKernel(DataView data, ClothStepParams p) {
         return;
     }
     // A vertex a row pushed or truncation clipped last step restarts at backward Euler.
-    const bool second_order = p.integrator == 0u && data.vbd_history_ready[env] != 0u &&
+    const bool second_order = p.integrator == 0u && has_history &&
                               data.vbd_restart[item] == 0u;
     const float h = p.dt;
     const float ht = EffectiveStep(second_order, h);
@@ -65,7 +66,9 @@ __global__ void ClothPredictKernel(DataView data, ClothStepParams p) {
     const math::Vec3 u = nk::vbd::DisplacementRate(inertial, offset, h, ht);
     // The iterate starts with gravity scaled by the last step's acceleration along it, clamped to [0, 1]
     // (VBD adaptive initialization), so cloth at rest starts at rest while the target keeps full gravity.
-    const float along = fminf(fmaxf((velocity - earlier).Dot(gravity) / (h * gravity.Dot(gravity)), 0.0f), 1.0f);
+    const float gravity_sq = gravity.Dot(gravity);
+    const float along = has_history && gravity_sq > 0.0f
+        ? fminf(fmaxf((velocity - earlier).Dot(gravity) / (h * gravity_sq), 0.0f), 1.0f) : 1.0f;
     const math::Vec3 guess = nk::vbd::DisplacementRate(inertial - gravity * ((1.0f - along) * ht), offset, h, ht);
     data.vbd_offset[item] = offset;
     data.vbd_free_velocity[item] = inertial;

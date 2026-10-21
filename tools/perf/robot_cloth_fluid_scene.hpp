@@ -158,6 +158,8 @@ struct PreparedScene {
     uint32_t front_link;
     std::vector<Transform> link_geom_local;
     std::vector<float> settled_q, settled_qdot;
+    std::vector<Transform> settled_bases;
+    std::vector<float> settled_link_velocity;
 };
 
 inline PreparedScene Prepare(const std::filesystem::path& path, phi::Device* device,
@@ -185,6 +187,12 @@ inline PreparedScene Prepare(const std::filesystem::path& path, phi::Device* dev
             "calibration joint position download failed");
     Require(wp.GetData().DownloadField(nk::FieldId::Qdot, settled_qdot.data(), L * sizeof(float)),
             "calibration joint velocity download failed");
+    std::vector<Transform> settled_bases(wp.GetModel().capacities.articulations_per_env);
+    std::vector<float> settled_link_velocity(size_t{L} * 6u);
+    Require(wp.GetData().DownloadField(nk::FieldId::BasePose, settled_bases.data(),
+                settled_bases.size() * sizeof(Transform)), "calibration base pose download failed");
+    Require(wp.GetData().DownloadField(nk::FieldId::LinkVelocity, settled_link_velocity.data(),
+                settled_link_velocity.size() * sizeof(float)), "calibration link velocity download failed");
     std::vector<Vec3> foot_world;
     for (uint32_t l : foot_links)
         foot_world.push_back((link_pose[l] * link_geom_local[l]).position);
@@ -206,7 +214,8 @@ inline PreparedScene Prepare(const std::filesystem::path& path, phi::Device* dev
     front_centre = front_centre * (1.0f / static_cast<float>(nf));
     std::fprintf(stderr, "[robot-coupling] front_centre=(%.4f,%.4f) cloth_z=%.4f\n",
                  front_centre.x, front_centre.y, cloth_z);
-    return {path, config, front_centre, cloth_z, front_link, link_geom_local, std::move(settled_q), std::move(settled_qdot)};
+    return {path, config, front_centre, cloth_z, front_link, link_geom_local,
+        std::move(settled_q), std::move(settled_qdot), std::move(settled_bases), std::move(settled_link_velocity)};
 }
 
 inline nk::Model CookPrepared(const PreparedScene& scene, uint32_t envs = 1u,
@@ -271,6 +280,7 @@ inline nk::Model CookMpmPrepared(const PreparedScene& prepared, uint32_t envs,
         if (shape.body_id == free_body) shapes.push_back(shape.id);
     for (auto id : shapes) scene.GetShapeMut(id).radius = radius;
     const float cloth_x = 0.5f * (prepared.front_centre.x + body.local_transform.position.x);
+    const float cloth_span = body.local_transform.position.x - prepared.front_centre.x + 0.25f * radius;
     auto impact_body = body;
     impact_body.name = "impact_body";
     impact_body.local_transform.position.x = prepared.front_centre.x - radius - dx;
@@ -289,8 +299,10 @@ inline nk::Model CookMpmPrepared(const PreparedScene& prepared, uint32_t envs,
     nk::Model model = std::move(cooked.model);
     model.articulation.initial_q = prepared.settled_q;
     model.articulation.initial_qdot = prepared.settled_qdot;
+    model.articulation.base_poses = prepared.settled_bases;
+    model.articulation.base_pose = prepared.settled_bases.front();
+    model.articulation.initial_link_velocity = prepared.settled_link_velocity;
     // The membrane reaches past both contact points, so half of each body's footprint stays over bare material.
-    const float cloth_span = body.local_transform.position.x - prepared.front_centre.x + 0.25f * radius;
     auto cloth = BuildCloth(cloth_x, prepared.front_centre.y, cloth_z, kClothNx,
                             cloth_span / float(kClothNx - 1u));
     cloth.aero_drag_normal = cloth.aero_drag_tangent = cloth.aero_drag_max_dv = 0.0f;

@@ -78,68 +78,6 @@ __device__ inline bool MultilevelArrive(const BlockScratch& s, uint32_t env, uin
     return true;
 }
 
-// One shuffle round of two WarpSumDouble trees: lanes with the offset bit clear add as the tree of `low`
-// does, the others as the tree of `high` does, each add keeping its operands and their order.
-__device__ inline double MultilevelPairFold(double low, double high, uint32_t offset) {
-    const bool upper = (threadIdx.x & offset) != 0u;
-    const double other = __shfl_xor_sync(0xffffffffu, upper ? low : high, offset);
-    return (upper ? other : low) + (upper ? high : other);
-}
-
-// Lane holding plane sum k's warp tree after MultilevelWarpSums<first>.
-__host__ __device__ constexpr uint32_t MultilevelSumLane(uint32_t first, uint32_t k) {
-    return first == 0u ? (k == 0u ? 0u : k == 1u ? 16u : k == 2u ? 8u : k == 3u ? 24u : 4u)
-                       : (k == 2u ? 0u : k == 3u ? 16u : 8u);
-}
-
-// The WarpSumDouble trees of plane sums kFirst to 4, two per shuffle round while two remain.
-template <uint32_t kFirst>
-__device__ inline double MultilevelWarpSums(const double (&v)[kMultilevelSums]) {
-    static_assert(kFirst == 0u || kFirst == 2u);
-    if constexpr (kFirst == 2u) {
-        // Trees of +0.0 in every lane are +0.0.
-        if (__all_sync(0xffffffffu, (__double_as_longlong(v[2]) | __double_as_longlong(v[3]) |
-                                     __double_as_longlong(v[4])) == 0ll)) return 0.0;
-    }
-    double tail = v[4] + __shfl_down_sync(0xffffffffu, v[4], 16u);
-    double tree;
-    if constexpr (kFirst == 0u) {
-        tree = MultilevelPairFold(MultilevelPairFold(v[0], v[1], 16u), MultilevelPairFold(v[2], v[3], 16u), 8u);
-        tail += __shfl_down_sync(0xffffffffu, tail, 8u);
-        tree = MultilevelPairFold(tree, tail, 4u);
-    } else {
-        tree = MultilevelPairFold(MultilevelPairFold(v[2], v[3], 16u), tail, 8u);
-        tree += __shfl_down_sync(0xffffffffu, tree, 4u);
-    }
-    tree += __shfl_down_sync(0xffffffffu, tree, 2u);
-    tree += __shfl_down_sync(0xffffffffu, tree, 1u);
-    return tree;
-}
-
-// BlockSumsDouble of plane sums kFirst to 4, each warp total added by its own lane of warp 0; sums below
-// kFirst are +0.0 in every thread and stay so.
-template <uint32_t kFirst>
-__device__ inline void MultilevelBlockSums(double (&values)[kMultilevelSums],
-                                           double (&shared)[kMultilevelSums][kThreads / 32u]) {
-    const double tree = MultilevelWarpSums<kFirst>(values);
-    const uint32_t lane = threadIdx.x % warpSize;
-    const uint32_t warp = threadIdx.x / warpSize;
-    __syncthreads();
-#pragma unroll
-    for (uint32_t k = kFirst; k < kMultilevelSums; ++k)
-        if (lane == MultilevelSumLane(kFirst, k)) shared[k][warp] = tree;
-    __syncthreads();
-    if (warp != 0u) return;
-    double sum = 0.0;
-    if (lane >= kFirst && lane < kMultilevelSums)
-        for (uint32_t w = 0u; w < kThreads / 32u; ++w) sum += shared[lane][w];
-#pragma unroll
-    for (uint32_t k = kFirst; k < kMultilevelSums; ++k) {
-        const double total = __shfl_sync(0xffffffffu, sum, k);
-        if (lane == 0u) values[k] = total;
-    }
-}
-
 // An environment's block partials of the first kCount sums, added in a fixed thread-strided order and
 // read past the L1 cache since other blocks wrote them; thread 0 gets the sums.
 template <uint32_t kCount>
@@ -151,8 +89,7 @@ __device__ inline void MultilevelPartialSums(const BlockScratch& s, uint32_t env
         for (uint32_t k = 0u; k < kCount; ++k)
             sums[k] += __ldcg(s.multilevel_partials +
                               (size_t{env} * s.multilevel_parts + part) * kMultilevelSums + k);
-    if constexpr (kCount == kMultilevelSums) MultilevelBlockSums<0u>(sums, shared);
-    else BlockSumsDouble(sums, shared);
+    BlockSumsDouble(sums, shared);
 }
 
 __device__ inline uint32_t MultilevelPacked(uint32_t i, uint32_t j) { return j * (j + 1u) / 2u + i; }
@@ -1599,11 +1536,7 @@ __global__ void MultilevelFormsKernel(ModelView model, DataView data, BlockDesce
             [&](uint32_t element) { AddElementForms(b, data, s, env, element, sums); },
             [&](uint32_t) {});
     }
-    // Row and element-only blocks leave the force sums 0 and 1 at +0.0.
-    if (rows || (part - (s.multilevel_parts - s.multilevel_item_parts)) * kThreads >= p.vertex_blocks.vertices)
-        MultilevelBlockSums<2u>(sums, shared);
-    else
-        MultilevelBlockSums<0u>(sums, shared);
+    BlockSumsDouble(sums, shared);
     if (threadIdx.x == 0u) {
         double* out = s.multilevel_partials + (size_t{env} * s.multilevel_parts + part) * kMultilevelSums;
         for (uint32_t k = 0u; k < kMultilevelSums; ++k) out[k] = sums[k];

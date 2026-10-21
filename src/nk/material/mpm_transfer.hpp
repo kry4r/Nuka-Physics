@@ -3,6 +3,8 @@
 #include <cmath>
 #include <cstdint>
 
+#include "math/finite.hpp"
+
 #include "nk/material/mpm_material.hpp"
 
 #if defined(__CUDACC__)
@@ -39,7 +41,7 @@ NUKA_MPM_TRANSFER_HD inline int64_t MpmFloorHalf(int64_t value) {
 // Half-cell h = floor(2 g + 1/2) fixes the cell on both lattices: floor(h / 2) and
 // floor((h - 1) / 2). Non-finite coordinates land far outside every grid.
 NUKA_MPM_TRANSFER_HD inline int64_t MpmHalfCell(float coordinate) {
-    return std::isfinite(coordinate) && fabsf(coordinate) < 0x1p60f
+    return math::IsFinite(coordinate) && fabsf(coordinate) < 0x1p60f
         ? static_cast<int64_t>(floorf(2.0f * coordinate + 0.5f)) : -0x40000000;
 }
 
@@ -95,7 +97,7 @@ NUKA_MPM_TRANSFER_HD inline bool MpmApicInverse(const MpmCompactAxis (&axes)[3],
     const float cxx = yy * zz - yz * yz, cyy = xx * zz - xz * xz, czz = xx * yy - xy * xy;
     const float cxy = xz * yz - xy * zz, cxz = xy * yz - xz * yy, cyz = xy * xz - xx * yz;
     const float determinant = xx * cxx + xy * cxy + xz * cxz;
-    if (!(determinant > 0.0f) || !std::isfinite(determinant)) return false;
+    if (!(determinant > 0.0f) || !math::IsFinite(determinant)) return false;
     const float scale = inv_dx * inv_dx / determinant;
     out[0] = cxx * scale; out[1] = cyy * scale; out[2] = czz * scale;
     out[3] = cxy * scale; out[4] = cxz * scale; out[5] = cyz * scale;

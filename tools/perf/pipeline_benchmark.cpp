@@ -268,7 +268,7 @@ constexpr std::array<nk::FieldId, 14> kPhysicalFields{
     nk::FieldId::ParticlePos, nk::FieldId::ParticlePrevPos, nk::FieldId::ParticleVel,
     nk::FieldId::ParticleF, nk::FieldId::ParticleC, nk::FieldId::ParticlePlastic, nk::FieldId::ParticlePlasticF};
 
-std::vector<uint8_t> State(nk::World& world, bool cache = true) {
+std::vector<nk::FieldId> StateFields(bool cache) {
     std::vector<nk::FieldId> fields(kPhysicalFields.begin(), kPhysicalFields.end());
     if (cache) {
         for (const auto field : {nk::FieldId::ContactCachePair, nk::FieldId::ContactCacheFeature,
@@ -277,8 +277,12 @@ std::vector<uint8_t> State(nk::World& world, bool cache = true) {
                                 nk::FieldId::LinkContactWrench})
             fields.push_back(field);
     }
+    return fields;
+}
+
+std::vector<uint8_t> State(nk::World& world, bool cache = true) {
     std::vector<uint8_t> result;
-    for (const auto field : fields) {
+    for (const auto field : StateFields(cache)) {
         const auto count = world.GetModel().capacities.ElementCount(field);
         const auto bytes = count * nk::LayoutOf(field).elem_size;
         if (!bytes) continue;
@@ -288,6 +292,26 @@ std::vector<uint8_t> State(nk::World& world, bool cache = true) {
                          "state download failed");
     }
     return result;
+}
+
+Json StateDifferences(nk::World& world, const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+    fixture::Require(a.size() == b.size(), "state extent changed during replay");
+    Json differences = Json::Array();
+    size_t offset = 0u;
+    for (const auto field : StateFields(true)) {
+        const size_t bytes = world.GetModel().capacities.ElementCount(field) * nk::LayoutOf(field).elem_size;
+        size_t unequal = 0u;
+        for (size_t i = 0u; i < bytes; ++i) unequal += a[offset + i] != b[offset + i];
+        if (unequal != 0u) {
+            Json item = Json::Object();
+            item.Set("field_id", Json::Int(static_cast<uint32_t>(field)));
+            item.Set("different_bytes", Json::Int(unequal));
+            item.Set("field_bytes", Json::Int(bytes));
+            differences.PushBack(std::move(item));
+        }
+        offset += bytes;
+    }
+    return differences;
 }
 
 std::vector<uint32_t> MismatchedReplicas(nk::World& world, const std::vector<uint8_t>& state) {
@@ -1535,6 +1559,7 @@ Json Run(const Options& options) {
     config.dt = options.dt;
     config.substeps = options.substeps;
     config.vel_iters = static_cast<uint16_t>(options.velocity_iterations);
+    config.velocity_iterations_override = options.velocity_iterations_explicit;
     const bool four_systems = options.scene == "robot-rigid-mpm-cloth";
     const auto scene_path = options.scene == "robot-cloth-fluid" || four_systems
         ? std::filesystem::path(NUKA_SOURCE_DIR) / "examples/scenes/go2_stand.usda"
@@ -1851,6 +1876,7 @@ Json Run(const Options& options) {
     for (uint32_t env : masked_reset_errors) masked_errors.PushBack(Json::Int(env));
     quality.Set("masked_reset_mismatch_envs", std::move(masked_errors));
     quality.Set("timed_replay_bit_equal", Json::Bool(timed_state == replay_state));
+    quality.Set("timed_replay_differences", StateDifferences(world, timed_state, replay_state));
     quality.Set("state_fnv1a64", Json::Str(Digest(replay_state)));
     quality.Set("authoritative_state_fnv1a64", Json::Str(Digest(
         std::vector<uint8_t>(replay_state.begin(), replay_state.begin() + initial.size()))));

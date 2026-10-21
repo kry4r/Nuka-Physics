@@ -4,6 +4,8 @@
 #include <cmath>
 #include <cstdint>
 
+#include "math/finite.hpp"
+
 #include "nk/material/mpm_material.hpp"
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
@@ -29,19 +31,19 @@ struct HenckyResponse {
 };
 
 NUKA_MATERIAL_HD inline bool ValidHenckyJ2(const HenckyJ2Parameters& p) {
-    if (!std::isfinite(p.youngs) || !(p.youngs > 0.0f) ||
-        !std::isfinite(p.poisson) || !(p.poisson > -1.0f && p.poisson < 0.5f) ||
-        !std::isfinite(p.yield_stress) || !(p.yield_stress > 0.0f) ||
-        !std::isfinite(p.hardening_modulus) || p.hardening_modulus < 0.0f) return false;
+    if (!math::IsFinite(p.youngs) || !(p.youngs > 0.0f) ||
+        !math::IsFinite(p.poisson) || !(p.poisson > -1.0f && p.poisson < 0.5f) ||
+        !math::IsFinite(p.yield_stress) || !(p.yield_stress > 0.0f) ||
+        !math::IsFinite(p.hardening_modulus) || p.hardening_modulus < 0.0f) return false;
     const float mu = p.youngs / (2.0f * (1.0f + p.poisson));
     const float bulk = p.youngs / (3.0f * (1.0f - 2.0f * p.poisson));
-    return mu > 0.0f && bulk > 0.0f && std::isfinite(mu) && std::isfinite(bulk) &&
-           std::isfinite(3.0f * mu + p.hardening_modulus);
+    return mu > 0.0f && bulk > 0.0f && math::IsFinite(mu) && math::IsFinite(bulk) &&
+           math::IsFinite(3.0f * mu + p.hardening_modulus);
 }
 
 NUKA_MATERIAL_HD inline bool ValidMpmMaterial(const MpmMaterial& m) {
     if (m.model_kind == MpmMaterial::kHenckyJ2)
-        return std::isfinite(m.density) && m.density > 0.0f &&
+        return math::IsFinite(m.density) && m.density > 0.0f &&
                ValidHenckyJ2({m.youngs, m.poisson, m.yield_stress, m.hardening_modulus});
     return m.model_kind == 0.0f || m.model_kind == 2.0f ||
            m.model_kind == 3.0f || m.model_kind == 4.0f;
@@ -56,7 +58,7 @@ NUKA_MATERIAL_HD inline float Determinant(const float* a) {
 }
 
 NUKA_MATERIAL_HD inline bool FiniteMatrix(const float* a) {
-    for (int i = 0; i < 9; ++i) if (!std::isfinite(a[i])) return false;
+    for (int i = 0; i < 9; ++i) if (!math::IsFinite(a[i])) return false;
     return true;
 }
 
@@ -75,7 +77,7 @@ struct PrincipalStretch {
 NUKA_MATERIAL_HD inline ConstitutiveStatus Decompose(const float* f, PrincipalStretch& result) {
     double scale = 0.0;
     for (int i = 0; i < 9; ++i) {
-        if (!std::isfinite(f[i])) return ConstitutiveStatus::InvalidState;
+        if (!math::IsFinite(f[i])) return ConstitutiveStatus::InvalidState;
         scale = std::fmax(scale, std::fabs(double(f[i])));
     }
     if (!(scale > 0.0f)) return ConstitutiveStatus::SingularDeformation;
@@ -118,7 +120,7 @@ NUKA_MATERIAL_HD inline ConstitutiveStatus Decompose(const float* f, PrincipalSt
     for (int c = 0; c < 3; ++c) {
         const double length = std::sqrt(a[c] * a[c] + a[3 + c] * a[3 + c] + a[6 + c] * a[6 + c]);
         const double stretch = length * scale;
-        if (!(stretch > 0.0f) || !std::isfinite(stretch)) return ConstitutiveStatus::SingularDeformation;
+        if (!(stretch > 0.0f) || !math::IsFinite(stretch)) return ConstitutiveStatus::SingularDeformation;
         result.log_stretch[c] = std::log(stretch);
         for (int r = 0; r < 3; ++r) result.left[r * 3 + c] = a[r * 3 + c] / length;
     }
@@ -126,7 +128,7 @@ NUKA_MATERIAL_HD inline ConstitutiveStatus Decompose(const float* f, PrincipalSt
         for (int q = p + 1; q < 3; ++q) {
             double dot = 0.0;
             for (int r = 0; r < 3; ++r) dot += result.left[r * 3 + p] * result.left[r * 3 + q];
-            if (!std::isfinite(dot) || std::fabs(dot) > 32.0 * DBL_EPSILON)
+            if (!math::IsFinite(dot) || std::fabs(dot) > 32.0 * DBL_EPSILON)
                 return ConstitutiveStatus::DecompositionFailure;
         }
     return ConstitutiveStatus::Ok;
@@ -162,8 +164,8 @@ NUKA_MATERIAL_HD inline ConstitutiveStatus EvaluateHenckyJ2(
     detail::SpectralProduct(principal.left, tau, principal.left, output.kirchhoff);
     output.elastic_energy = static_cast<float>(mu * dev2 + 0.5 * bulk * trace * trace);
     output.equivalent_stress = static_cast<float>(2.0 * mu * std::sqrt(1.5 * dev2));
-    if (!detail::FiniteMatrix(output.kirchhoff) || !std::isfinite(output.elastic_energy) ||
-        !std::isfinite(output.equivalent_stress)) return ConstitutiveStatus::Overflow;
+    if (!detail::FiniteMatrix(output.kirchhoff) || !math::IsFinite(output.elastic_energy) ||
+        !math::IsFinite(output.equivalent_stress)) return ConstitutiveStatus::Overflow;
     response = output;
     return ConstitutiveStatus::Ok;
 }
@@ -174,8 +176,8 @@ NUKA_MATERIAL_HD inline ConstitutiveStatus ReturnHenckyJ2(
     float* plastic_f, float& alpha) {
     if (!ValidHenckyJ2(p)) return ConstitutiveStatus::InvalidParameters;
     const float plastic_volume = detail::Determinant(plastic_f);
-    if (!std::isfinite(alpha) || alpha < 0.0f || !detail::FiniteMatrix(plastic_f) ||
-        !std::isfinite(plastic_volume) || !(plastic_volume > 0.0f))
+    if (!math::IsFinite(alpha) || alpha < 0.0f || !detail::FiniteMatrix(plastic_f) ||
+        !math::IsFinite(plastic_volume) || !(plastic_volume > 0.0f))
         return ConstitutiveStatus::InvalidState;
     detail::PrincipalStretch principal;
     const auto status = detail::Decompose(trial_f, principal);
@@ -189,7 +191,7 @@ NUKA_MATERIAL_HD inline ConstitutiveStatus ReturnHenckyJ2(
     }
     const double q = 2.0 * mu * std::sqrt(1.5 * dev2);
     const double yield = p.yield_stress + double(p.hardening_modulus) * alpha;
-    if (!std::isfinite(q) || !std::isfinite(yield)) return ConstitutiveStatus::Overflow;
+    if (!math::IsFinite(q) || !math::IsFinite(yield)) return ConstitutiveStatus::Overflow;
     if (q <= yield) {
         for (int i = 0; i < 9; ++i) elastic_f[i] = trial_f[i];
         return ConstitutiveStatus::Ok;
@@ -209,9 +211,9 @@ NUKA_MATERIAL_HD inline ConstitutiveStatus ReturnHenckyJ2(
     detail::Multiply(plastic_increment, plastic_f, next_plastic);
     const float elastic_volume = detail::Determinant(next_elastic);
     const float next_plastic_volume = detail::Determinant(next_plastic);
-    if (!std::isfinite(next_alpha) || !detail::FiniteMatrix(next_elastic) ||
-        !detail::FiniteMatrix(next_plastic) || !std::isfinite(elastic_volume) ||
-        !std::isfinite(next_plastic_volume) || !(elastic_volume > 0.0f) ||
+    if (!math::IsFinite(next_alpha) || !detail::FiniteMatrix(next_elastic) ||
+        !detail::FiniteMatrix(next_plastic) || !math::IsFinite(elastic_volume) ||
+        !math::IsFinite(next_plastic_volume) || !(elastic_volume > 0.0f) ||
         !(next_plastic_volume > 0.0f)) return ConstitutiveStatus::Overflow;
     for (int i = 0; i < 9; ++i) {
         elastic_f[i] = next_elastic[i];
