@@ -179,7 +179,10 @@ constexpr uint32_t kTileSlot = 0u, kTileStride = 1u, kTileAxes = 2u, kTileOwner 
                    kTileUnit = 7u, kTileUnitValue = 9u, kTileRho = 11u, kTileCompliance = 12u, kTileLower = 13u,
                    kTileUpper = 14u, kTileMuFirst = 15u, kTileMuSecond = 16u, kTileNormalBound = 17u,
                    kTileResidual = 18u, kTileDual = 21u, kTileMove = 24u, kTileStep = 27u,
-                   kTileDualScale = 30u, kTileResidualScale = 31u, kTileFields = 32u;
+                   kTileDualScale = 30u, kTileResidualScale = 31u,
+                   kTileRelaxationStep = kTileResidualScale + 1u,
+                   kTileRelaxationWeight = kTileRelaxationStep + 3u,
+                   kTileFields = kTileRelaxationWeight + 1u;
 
 bool DenseTileRoute(const BlockDescentSolveParams& p) {
     return BlockDescentTileRoute(p.total_particle_count, p.total_grid_count,

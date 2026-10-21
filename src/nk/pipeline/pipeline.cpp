@@ -57,13 +57,7 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
     p_block_descent_substeps_.clear();
     p_telemetry_substeps_.clear();
     const auto& cap = model.capacities;
-    const bool articulated = cap.dofs_per_env > 0u || cap.links_per_env > 0u;
-    const bool tile = phi::BlockDescentTileRoute(cap.particles_per_env * cap.env_count,
-        cap.mpm_grid_nodes_per_env * cap.env_count,
-        (articulated ? cap.articulations_per_env : 0u) * cap.env_count + cap.bodies_per_env * cap.env_count,
-        cap.dofs_per_env);
     p_block_descent_ = {};
-    if (tile) p_block_descent_.iterations = phi::kBlockDescentTileIterations;
     if (cfg.velocity_iterations_override)
         p_block_descent_.iterations = cfg.vel_iters;
     if (!cfg.velocity_iterations_override) {

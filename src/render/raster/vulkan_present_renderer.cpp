@@ -332,8 +332,11 @@ struct SceneUbo {
     float    sky_ground[4];        // w the ground grid's height
     float    sun[4];               // xyz toward the first directional light; w the disc's cosine radius
     float    sun_color[4];
+    float    occlusion[4];
+    float    environment[4];
+    float    irradiance[9][4];
 };
-static_assert(sizeof(SceneUbo) == 768, "SceneUbo must match the std140 shader block");
+static_assert(sizeof(SceneUbo) == 944, "SceneUbo must match the std140 shader block");
 
 // The viewport sun disc's cosine radius (0.6 degrees).
 constexpr float kSunDiscCos = 0.99995f;
@@ -347,6 +350,8 @@ void CopyRgb(float* dst, const float* src, float w) {
 SceneUbo BuildSceneUbo(const RenderWorld& world, const Mat4& view_proj, const math::Vec3& eye,
                        const RasterOptions& options, const SceneViewport& rect) {
     SceneUbo ubo{};
+    ubo.occlusion[0] = options.viewport_ao_radius;
+    ubo.occlusion[1] = options.viewport_ao_strength;
     std::memcpy(ubo.view_proj, view_proj.m.data(), sizeof(ubo.view_proj));
     ubo.camera_pos[0] = eye.x; ubo.camera_pos[1] = eye.y;
     ubo.camera_pos[2] = eye.z; ubo.camera_pos[3] = 1.0f;
@@ -601,6 +606,11 @@ struct PresentRenderer::Impl {
     // set 0, binding 2: each texture-library image as one layer of a mipmapped RGBA8 array, rebuilt
     // when the library changes; a single white layer while it is empty.
     Image          maps;
+    Image          environment_map;
+    VkSampler      environment_sampler = VK_NULL_HANDLE;
+    const float*   environment_source = nullptr;
+    uint32_t       environment_width = 0u, environment_height = 0u;
+    std::array<std::array<float, 4>, 9> environment_irradiance{};
     VkSampler      maps_sampler = VK_NULL_HANDLE;
     uint64_t       maps_version = 0u;
     uint32_t       map_layers = 0u;  // the library images that got a layer
@@ -612,6 +622,11 @@ struct PresentRenderer::Impl {
     // The id pass renders kId* texels at swapchain size with its own depth, for the selection
     // outline and Pick; outline.frag samples it through outline_set.
     Image            id_image, id_depth;
+    Image            ao_depth;
+    VkRenderPass     ao_pass = VK_NULL_HANDLE;
+    VkFramebuffer    ao_framebuffer = VK_NULL_HANDLE;
+    VkPipeline       ao_pipeline = VK_NULL_HANDLE;
+    VkPipeline       ao_instanced_pipeline = VK_NULL_HANDLE;
     VkRenderPass     id_pass = VK_NULL_HANDLE;
     VkFramebuffer    id_framebuffer = VK_NULL_HANDLE;
     VkSampler        id_sampler = VK_NULL_HANDLE;
@@ -782,12 +797,14 @@ struct PresentRenderer::Impl {
         CreateShadowMap();
         CreateMapSampler();
         UploadMaps({});
+        UploadEnvironment({});
         CreateOutlineLayout();
         NegotiateSurface();
         CreateSwapchain();
         CreatePresentRenderPass();
         CreateDepthResources();
         CreateIdResources();
+        CreateOcclusionResources();
         CreateFramebuffers();
         CreatePipeline();
         CreateSceneDescriptors();
@@ -831,6 +848,8 @@ struct PresentRenderer::Impl {
         DestroyImage(shadow_map);
         vkDestroySampler(device, maps_sampler, nullptr);
         DestroyImage(maps);
+        DestroyImage(environment_map);
+        vkDestroySampler(device, environment_sampler, nullptr);
         Destroy(material_buffer);
         Destroy(sink_buf_);
         if (command_pool != VK_NULL_HANDLE) vkDestroyCommandPool(device, command_pool, nullptr);
@@ -1178,6 +1197,72 @@ struct PresentRenderer::Impl {
         vkUpdateDescriptorSets(device, 1u, &write, 0u, nullptr);
     }
 
+    void WriteOcclusionDescriptors() {
+        VkDescriptorImageInfo info{id_sampler, ao_depth.view, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
+        for (const UboSlot& slot : ubo_slots) {
+            if (slot.set == VK_NULL_HANDLE) continue;
+            VkWriteDescriptorSet write{};
+            write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            write.dstSet = slot.set;
+            write.dstBinding = 4u;
+            write.descriptorCount = 1u;
+            write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            write.pImageInfo = &info;
+            vkUpdateDescriptorSets(device, 1u, &write, 0u, nullptr);
+        }
+    }
+
+    void CreateOcclusionResources() {
+        ao_depth = MakeImage(kDepthFormat, extent,
+            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
+        VkAttachmentDescription attachment{};
+        attachment.format = kDepthFormat;
+        attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+        attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        attachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+        VkAttachmentReference ref{0u, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+        VkSubpassDescription subpass{};
+        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subpass.pDepthStencilAttachment = &ref;
+        std::array<VkSubpassDependency, 2> dependencies{};
+        dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+        dependencies[0].dstSubpass = 0u;
+        dependencies[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        dependencies[0].dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                      VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        dependencies[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        dependencies[0].dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        dependencies[1].srcSubpass = 0u;
+        dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+        dependencies[1].srcStageMask = dependencies[0].dstStageMask;
+        dependencies[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        dependencies[1].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        dependencies[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        VkRenderPassCreateInfo pass{};
+        pass.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        pass.attachmentCount = 1u;
+        pass.pAttachments = &attachment;
+        pass.subpassCount = 1u;
+        pass.pSubpasses = &subpass;
+        pass.dependencyCount = static_cast<uint32_t>(dependencies.size());
+        pass.pDependencies = dependencies.data();
+        CheckVk(vkCreateRenderPass(device, &pass, nullptr, &ao_pass), "vkCreateRenderPass(occlusion-depth)");
+        VkFramebufferCreateInfo fb{};
+        fb.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        fb.renderPass = ao_pass;
+        fb.attachmentCount = 1u;
+        fb.pAttachments = &ao_depth.view;
+        fb.width = extent.width;
+        fb.height = extent.height;
+        fb.layers = 1u;
+        CheckVk(vkCreateFramebuffer(device, &fb, nullptr, &ao_framebuffer), "vkCreateFramebuffer(occlusion-depth)");
+        WriteOcclusionDescriptors();
+    }
+
     // The outline pass's id sampler, its one descriptor set and its pipeline layout.
     void CreateOutlineLayout() {
         VkSamplerCreateInfo si{};
@@ -1385,6 +1470,98 @@ struct PresentRenderer::Impl {
         CheckVk(vkCreateSampler(device, &si, nullptr, &maps_sampler), "vkCreateSampler(present maps)");
     }
 
+    void WriteEnvironmentDescriptors() {
+        VkDescriptorImageInfo image{environment_sampler, environment_map.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        for (const UboSlot& slot : ubo_slots) {
+            if (slot.set == VK_NULL_HANDLE) continue;
+            VkWriteDescriptorSet write{};
+            write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            write.dstSet = slot.set;
+            write.dstBinding = 5u;
+            write.descriptorCount = 1u;
+            write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            write.pImageInfo = &image;
+            vkUpdateDescriptorSets(device, 1u, &write, 0u, nullptr);
+        }
+    }
+
+    // Keep HDR radiance for reflections and integrate the diffuse cosine convolution in nine harmonics.
+    void UploadEnvironment(const rt::EnvironmentMap& env) {
+        constexpr double pi = 3.14159265358979323846;
+        const uint32_t width = env.Enabled() ? env.width : 1u, height = env.Enabled() ? env.height : 1u;
+        if (env.Enabled() && env.texels.size() != size_t{width} * height * 3u)
+            throw std::runtime_error("environment texel count does not match its dimensions");
+        std::vector<float> pixels(size_t{width} * height * 4u, 0.0f);
+        double coefficients[9][3]{};
+        for (uint32_t y = 0u; y < height; ++y) {
+            const double theta = pi * (y + 0.5) / height;
+            const double z = std::cos(theta), radial = std::sin(theta);
+            const double weight = 2.0 * pi / width *
+                (std::cos(pi * y / height) - std::cos(pi * (y + 1u) / height));
+            for (uint32_t x = 0u; x < width; ++x) {
+                const double phi = 2.0 * pi * ((x + 0.5) / width - 0.5);
+                const double dx = radial * std::cos(phi), dy = radial * std::sin(phi);
+                const double basis[9] = {0.2820947918, 0.4886025119 * dy, 0.4886025119 * z, 0.4886025119 * dx,
+                    1.0925484306 * dx * dy, 1.0925484306 * dy * z, 0.3153915653 * (3.0 * z * z - 1.0),
+                    1.0925484306 * dx * z, 0.5462742153 * (dx * dx - dy * dy)};
+                const size_t at = size_t{y} * width + x;
+                for (uint32_t channel = 0u; channel < 3u; ++channel) {
+                    const float value = env.Enabled() ? env.texels[at * 3u + channel] : 0.0f;
+                    const float radiance = std::isfinite(value) ? std::max(value, 0.0f) : 0.0f;
+                    pixels[at * 4u + channel] = radiance;
+                    for (uint32_t i = 0u; i < 9u; ++i) coefficients[i][channel] += radiance * basis[i] * weight;
+                }
+                pixels[at * 4u + 3u] = 1.0f;
+            }
+        }
+        for (uint32_t i = 0u; i < 9u; ++i)
+            for (uint32_t channel = 0u; channel < 3u; ++channel)
+                environment_irradiance[i][channel] =
+                    static_cast<float>(coefficients[i][channel] * (i == 0u ? 1.0 : i < 4u ? 2.0 / 3.0 : 0.25));
+        environment_map = MakeImage(VK_FORMAT_R32G32B32A32_SFLOAT, {width, height},
+            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+        if (environment_sampler == VK_NULL_HANDLE) {
+            VkFormatProperties format{};
+            vkGetPhysicalDeviceFormatProperties(physical, VK_FORMAT_R32G32B32A32_SFLOAT, &format);
+            VkSamplerCreateInfo sampler{};
+            sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+            sampler.magFilter = sampler.minFilter =
+                (format.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0u
+                    ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+            sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+            sampler.addressModeV = sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            CheckVk(vkCreateSampler(device, &sampler, nullptr, &environment_sampler), "vkCreateSampler(environment)");
+        }
+        GpuBuffer staging = CreateHostBuffer(pixels.size() * sizeof(float), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        Upload(staging, pixels.data(), pixels.size() * sizeof(float));
+        const VkCommandBuffer cmd = BeginOneShot();
+        VkImageMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = environment_map.image;
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u};
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0u, 0u, nullptr, 0u, nullptr, 1u, &barrier);
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u};
+        region.imageExtent = {width, height, 1u};
+        vkCmdCopyBufferToImage(cmd, staging.buffer, environment_map.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1u, &region);
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             0u, 0u, nullptr, 0u, nullptr, 1u, &barrier);
+        EndOneShotAndWait(cmd);
+        Destroy(staging);
+        environment_source = env.texels.data();
+        environment_width = env.width;
+        environment_height = env.height;
+    }
+
     // Uploads each source as one layer of `maps` with its mip chain; none uploads one white texel.
     void UploadMaps(const std::vector<rt::Texture>& sources) {
         VkPhysicalDeviceProperties props{};
@@ -1568,7 +1745,7 @@ struct PresentRenderer::Impl {
         // Set 0: binding 0 = per-frame SceneUbo (camera + light rig); binding 1 =
         // the shadow map sampler, both as in the offscreen renderer's layout; binding 2
         // = the material maps array and binding 3 = each material's map slots, read only by the viewport's shaders.
-        std::array<VkDescriptorSetLayoutBinding, 4> set_bindings{};
+        std::array<VkDescriptorSetLayoutBinding, 6> set_bindings{};
         set_bindings[0].binding = 0u;
         set_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         set_bindings[0].descriptorCount = 1u;
@@ -1582,6 +1759,10 @@ struct PresentRenderer::Impl {
         set_bindings[3] = set_bindings[1];
         set_bindings[3].binding = 3u;
         set_bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        set_bindings[4] = set_bindings[1];
+        set_bindings[4].binding = 4u;
+        set_bindings[5] = set_bindings[1];
+        set_bindings[5].binding = 5u;
         VkDescriptorSetLayoutCreateInfo set_info{};
         set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         set_info.bindingCount = static_cast<uint32_t>(set_bindings.size());
@@ -1604,6 +1785,8 @@ struct PresentRenderer::Impl {
 
         const PipelineSpec scene{vert_module, frag_module, pipeline_layout, present_pass};
         pipeline = MakePipeline(scene, "vkCreateGraphicsPipelines(present)");
+        ao_pipeline = MakePipeline({vert_module, VK_NULL_HANDLE, pipeline_layout, ao_pass},
+                                   "vkCreateGraphicsPipelines(occlusion-depth)");
         PipelineSpec wire = scene;
         wire.polygon = WirePolygon();
         wire_pipeline = MakePipeline(wire, "vkCreateGraphicsPipelines(present-wire)");
@@ -1788,6 +1971,8 @@ struct PresentRenderer::Impl {
 
         PipelineSpec spec{instanced_vert_module, frag_module, instanced_pipeline_layout, present_pass};
         instanced_pipeline = MakePipeline(spec, "vkCreateGraphicsPipelines(present-instanced)");
+        ao_instanced_pipeline = MakePipeline({instanced_vert_module, VK_NULL_HANDLE, instanced_pipeline_layout, ao_pass},
+                                             "vkCreateGraphicsPipelines(occlusion-depth-instanced)");
         spec.polygon = WirePolygon();
         wire_instanced_pipeline = MakePipeline(spec, "vkCreateGraphicsPipelines(present-instanced-wire)");
         spec.polygon = VK_POLYGON_MODE_FILL;
@@ -1806,7 +1991,7 @@ struct PresentRenderer::Impl {
 
     void DestroyInstancedPipelines() {
         DestroyPipelines({&instanced_pipeline, &wire_instanced_pipeline, &id_instanced_pipeline,
-                          &ghost_instanced_pipeline, &shadow_instanced_pipeline});
+                          &ghost_instanced_pipeline, &shadow_instanced_pipeline, &ao_instanced_pipeline});
         vkDestroyPipelineLayout(device, instanced_pipeline_layout, nullptr);
         instanced_pipeline_layout = VK_NULL_HANDLE;
     }
@@ -1816,7 +2001,7 @@ struct PresentRenderer::Impl {
         const uint32_t slot_count = static_cast<uint32_t>(ubo_slots.size());
         const std::array<VkDescriptorPoolSize, 3> sizes{{
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, slot_count},
-            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2u * slot_count},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4u * slot_count},
             {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, slot_count}}};
         VkDescriptorPoolCreateInfo pool_info{};
         pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -1859,6 +2044,8 @@ struct PresentRenderer::Impl {
         }
         WriteMapsDescriptors();
         UploadMaterialMaps(material_maps);
+        WriteOcclusionDescriptors();
+        WriteEnvironmentDescriptors();
     }
 
     void CreateSyncObjects() {
@@ -1902,7 +2089,7 @@ struct PresentRenderer::Impl {
         // Every pipeline is built against present_pass or id_pass; destroy them before their
         // layouts so a swapchain recreate rebuilds them all.
         DestroyPipelines({&pipeline, &wire_pipeline, &id_pipeline, &outline_pipeline, &debug_pipeline,
-                          &ghost_pipeline, &sky_pipeline, &ground_pipeline, &shadow_pipeline});
+                          &ghost_pipeline, &sky_pipeline, &ground_pipeline, &shadow_pipeline, &ao_pipeline});
         if (pipeline_layout != VK_NULL_HANDLE) { vkDestroyPipelineLayout(device, pipeline_layout, nullptr); pipeline_layout = VK_NULL_HANDLE; }
         // INT-F1: the instanced pipelines + their layout go too; the instanced_vert_module
         // + the BORROWED ssbo_set/layout survive.
@@ -1915,6 +2102,11 @@ struct PresentRenderer::Impl {
         if (overlay_pass != VK_NULL_HANDLE) { vkDestroyRenderPass(device, overlay_pass, nullptr); overlay_pass = VK_NULL_HANDLE; }
         vkDestroyRenderPass(device, id_pass, nullptr);
         id_pass = VK_NULL_HANDLE;
+        vkDestroyFramebuffer(device, ao_framebuffer, nullptr);
+        ao_framebuffer = VK_NULL_HANDLE;
+        DestroyImage(ao_depth);
+        vkDestroyRenderPass(device, ao_pass, nullptr);
+        ao_pass = VK_NULL_HANDLE;
         for (VkImageView v : image_views) {
             if (v != VK_NULL_HANDLE) vkDestroyImageView(device, v, nullptr);
         }
@@ -1937,6 +2129,7 @@ struct PresentRenderer::Impl {
         CreatePresentRenderPass();
         CreateDepthResources();
         CreateIdResources();
+        CreateOcclusionResources();
         CreateFramebuffers();
         CreatePipeline();
         // DestroySwapchainDependents tore the instanced pipeline down with the old pass.
@@ -2268,6 +2461,14 @@ struct PresentRenderer::Impl {
         // geometry-set change). Per-frame work below is just transforms + materials.
         SyncMeshCache(world);
         SyncMaps(world);
+        const auto& environment = world.environment;
+        if (environment.texels.data() != environment_source || environment.width != environment_width ||
+            environment.height != environment_height) {
+            CheckVk(vkDeviceWaitIdle(device), "vkDeviceWaitIdle(environment)");
+            DestroyImage(environment_map);
+            UploadEnvironment(environment);
+            WriteEnvironmentDescriptors();
+        }
 
         // -- build per-instance draws from the cached geometry + scene AABB.
         PreparedView view;
@@ -2346,6 +2547,10 @@ struct PresentRenderer::Impl {
         const Mat4 view_matrix = LookAt(cam.eye, cam.target, cam.up);
         const Mat4 proj = Perspective(fov_y, aspect, cam.near_clip, cam.far_clip);
         view.ubo = BuildSceneUbo(world, Multiply(proj, view_matrix), cam.eye, options, view.rect);
+        view.ubo.environment[0] = world.environment.Enabled() ? 1.0f : 0.0f;
+        view.ubo.environment[1] = world.environment.yaw;
+        view.ubo.environment[2] = world.environment.intensity;
+        std::memcpy(view.ubo.irradiance, environment_irradiance.data(), sizeof(view.ubo.irradiance));
         view.focus = cam.target;
         view.focus_distance = (cam.eye - cam.target).Length();
         return view;
@@ -2424,6 +2629,31 @@ struct PresentRenderer::Impl {
             // skipped geometry-less instances, so the SSBO row != compacted index).
             vkCmdDrawIndexed(cmd, draw.index_count, 1u, 0u, 0, pose != nullptr ? draw.instance_row : 0u);
         }
+    }
+
+    // Populate the sampled scene depth for views with ambient occlusion enabled.
+    void RecordOcclusionPass(VkCommandBuffer cmd, const std::vector<PreparedView>& views,
+                             const std::vector<VkDescriptorSet>& sets, const std::vector<uint8_t>& flags,
+                             const PresentInterop* pose) {
+        VkClearValue clear{};
+        clear.depthStencil = {1.0f, 0u};
+        VkRenderPassBeginInfo pass{};
+        pass.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        pass.renderPass = ao_pass;
+        pass.framebuffer = ao_framebuffer;
+        pass.renderArea = {{0, 0}, extent};
+        pass.clearValueCount = 1u;
+        pass.pClearValues = &clear;
+        vkCmdBeginRenderPass(cmd, &pass, VK_SUBPASS_CONTENTS_INLINE);
+        for (size_t i = 0u; i < views.size(); ++i) {
+            const auto& view = views[i];
+            if (view.rect.Empty() || view.ubo.occlusion[0] <= 0.0f) continue;
+            RecordDraws(cmd, view.rect, view.draws, pose ? ao_instanced_pipeline : ao_pipeline,
+                        pose ? instanced_pipeline_layout : pipeline_layout, sets[i], pose, flags, DrawPass::Scene);
+            RecordDraws(cmd, view.rect, view.env_draws, ao_pipeline, pipeline_layout,
+                        sets[i], nullptr, flags, DrawPass::Scene);
+        }
+        vkCmdEndRenderPass(cmd);
     }
 
     // The id pass over every view, each with its own set; it leaves id_image in SHADER_READ_ONLY_OPTIMAL.
@@ -2681,6 +2911,7 @@ struct PresentRenderer::Impl {
         // The id pass feeds the selection outline and runs only while something is marked.
         const bool outline = !shot.Empty() && Marked(options.instance_flags);
         if (outline) RecordIdPass(cmd, prepared, sets, options.instance_flags, pose);
+        RecordOcclusionPass(cmd, prepared, sets, options.instance_flags, pose);
         const bool see_through = std::any_of(options.instance_flags.begin(), options.instance_flags.end(),
                                              [](uint8_t f) { return (f & kInstanceSeeThrough) != 0; });
 

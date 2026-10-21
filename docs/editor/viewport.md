@@ -49,8 +49,15 @@ Click a pane to make it the active one, outlined in green; the camera keys and t
 | **Contact** | Contact state on the surfaces |
 | **Wireframe** | Triangle edges |
 
-**View → Sun Shadows**, **Distance Fog** and **Ground Grid** adjust the Lit view. The ground grid's
+**View → Sun Shadows**, **Ambient Occlusion**, **Distance Fog** and **Ground Grid** adjust the Lit view. The ground grid's
 *auto* setting draws it only under scenes without a floor.
+
+Ambient occlusion is enabled by default and darkens nearby corners and contact areas in indirect light.
+Use `view.ao {on: false}` to turn it off. It uses visible depth, so geometry outside the view cannot occlude it.
+
+A scene's `environment.hdri` also lights the Lit viewport, supplies reflections and replaces the sky background.
+The viewport honors `yaw_deg` and `intensity`. Diffuse lighting uses a global environment probe;
+local light probes and indirect light bouncing between room surfaces are not included.
 
 ## Overlays
 

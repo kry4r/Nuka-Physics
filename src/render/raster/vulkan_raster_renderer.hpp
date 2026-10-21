@@ -325,6 +325,8 @@ struct RasterOptions {
     // into the scene, and its endless ground grid at z = viewport_grid_height; the offscreen
     // renderer ignores them.
     bool        viewport_sky = false;
+    float       viewport_ao_radius = 0.0f;
+    float       viewport_ao_strength = 1.0f;
     bool        viewport_grid = false;
     float       viewport_grid_height = 0.0f;
 };

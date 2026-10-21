@@ -93,7 +93,8 @@ inline uint64_t PairedMeshFeatureCount(const Model& model) {
         bool paired = false;
         for (uint32_t b = 0u; b < bodies && !paired; ++b) {
             const auto& sb = rows[b];
-            paired = b != a && model.mesh_surface_info[b].vertex_count > 0u &&
+            paired = b != a && !(sa.body_id < 0 && sb.body_id < 0) &&
+                model.mesh_surface_info[b].vertex_count > 0u &&
                 ::nuka::collision::RouteMeshContact(sa.kind, sb.kind, sa.mesh_contact_mode,
                     sb.mesh_contact_mode) == ::nuka::collision::MeshContactRoute::Ogc &&
                 ::nuka::collision::ShapeFilterAdmits(sa.contype, sa.conaffinity, sa.group,

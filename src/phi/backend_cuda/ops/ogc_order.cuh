@@ -1,6 +1,7 @@
 #pragma once
 
-#include <cub/device/device_radix_sort.cuh>
+#include <cub/device/device_segmented_radix_sort.cuh>
+#include <cuda/iterator>
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <limits>
@@ -48,11 +49,20 @@ inline int BucketBits(uint32_t capacity) {
     return bits;
 }
 
-// Keys hold env, an inactive-tail bit, then the bucket.
-inline int SortBits(uint32_t envs, uint32_t capacity) {
-    int bits = BucketBits(capacity) + 1;
-    for (uint32_t value = envs - 1u; value != 0u; value >>= 1u) ++bits;
-    return bits;
+// The final empty segment keeps the declared item extent independent of device contact counts.
+struct SegmentOffset {
+    uint32_t capacity, envs;
+    const uint32_t* counts;
+    bool end;
+    __host__ __device__ uint32_t operator()(uint32_t env) const {
+        return env * capacity + (end && env < envs ? (counts ? counts[env] : capacity) : 0u);
+    }
+};
+
+using Offsets = cuda::transform_iterator<SegmentOffset, cuda::counting_iterator<uint32_t>>;
+
+inline Offsets SegmentOffsets(uint32_t capacity, uint32_t envs, const uint32_t* counts, bool end) {
+    return Offsets(cuda::counting_iterator<uint32_t>(0u), SegmentOffset{capacity, envs, counts, end});
 }
 
 inline uint64_t ScratchBytes(uint32_t capacity, uint32_t envs) {
@@ -63,8 +73,9 @@ inline uint64_t ScratchBytes(uint32_t capacity, uint32_t envs) {
     size_t sort_bytes = 0u;
     cub::DoubleBuffer<uint64_t> keys(nullptr, nullptr);
     cub::DoubleBuffer<uint32_t> order(nullptr, nullptr);
-    const auto status = cub::DeviceRadixSort::SortPairs(nullptr, sort_bytes, keys, order,
-        static_cast<int>(items), 0, SortBits(envs, capacity));
+    const auto status = cub::DeviceSegmentedRadixSort::SortPairs(nullptr, sort_bytes, keys, order,
+        static_cast<int>(items), envs + 1u, SegmentOffsets(capacity, envs, nullptr, false),
+        SegmentOffsets(capacity, envs, nullptr, true), 0, BucketBits(capacity));
     if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
     return CheckedAdd(Layout(static_cast<uint32_t>(items)).temp_offset, sort_bytes);
 }
@@ -139,12 +150,8 @@ static __global__ void SnapshotKernel(OgcDetectParams p, DataView data, int buck
     if (item >= p.env_count * p.slot_capacity) return;
     const uint32_t env = item / p.slot_capacity;
     const uint32_t ordinal = item - env * p.slot_capacity;
-    const uint64_t prefix = uint64_t{env} << (bucket_bits + 1);
+    if (ordinal >= data.ogc_contact_count[env]) return;
     order[item] = item;
-    if (ordinal >= data.ogc_contact_count[env]) {
-        keys[item] = prefix | (uint64_t{1u} << bucket_bits);
-        return;
-    }
     const uint32_t slot = env * p.slot_stride + p.slot_base + ordinal;
     const size_t at = size_t{slot} * nk::kPairDrivenPtsPerSlot;
     Record r;
@@ -181,7 +188,7 @@ static __global__ void SnapshotKernel(OgcDetectParams p, DataView data, int buck
     r.dat[3] = kind != 0u ? data.dat_pair_feature_a[slot] : 0u;
     r.dat[4] = kind != 0u ? data.dat_pair_feature_b[slot] : 0u;
     records[item] = r;
-    keys[item] = prefix | (Bucket(r.pair, r.feature) >> (32 - bucket_bits));
+    keys[item] = Bucket(r.pair, r.feature) >> (32 - bucket_bits);
 }
 
 __device__ inline void WriteRecord(const OgcDetectParams& p, const DataView& data, uint32_t env,
@@ -257,8 +264,10 @@ inline cudaError_t Canonicalize(const OgcDetectParams& p, const DataView& data,
                                                   order.Current(), workspace.records);
     if (const auto status = cudaGetLastError(); status != cudaSuccess) return status;
     size_t temp_bytes = workspace.temp_bytes;
-    const auto status = cub::DeviceRadixSort::SortPairs(workspace.temp, temp_bytes, keys, order,
-        static_cast<int>(items), 0, SortBits(p.env_count, p.slot_capacity), stream);
+    const auto status = cub::DeviceSegmentedRadixSort::SortPairs(workspace.temp, temp_bytes, keys, order,
+        static_cast<int>(items), p.env_count + 1u,
+        SegmentOffsets(p.slot_capacity, p.env_count, data.ogc_contact_count, false),
+        SegmentOffsets(p.slot_capacity, p.env_count, data.ogc_contact_count, true), 0, bucket_bits, stream);
     if (status != cudaSuccess) return status;
     WriteKernel<<<blocks, block, 0u, stream>>>(p, data, keys.Current(), order.Current(), workspace.records);
     return cudaGetLastError();

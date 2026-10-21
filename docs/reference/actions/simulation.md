@@ -166,6 +166,9 @@ Colours the solver's per-vertex residuals over the scene; the heatmap needs the 
 
 Sets the solver's sweep budget per step, live.
 
+New worlds default to 10 sweeps unless a budget is supplied at creation.
+This budget is independent of the robot's number of joints.
+
 **Arguments**
 
 - `n`: int, sweeps per step, at least 1

@@ -308,9 +308,8 @@ struct RenderWorld {
     std::vector<RenderCamera>          cameras;
     std::vector<RenderLight>           lights;
 
-    // Decoded PBR image textures the materials reference by path, and the HDR
-    // environment map (both beauty-only). Empty/disabled by default => flat
-    // materials + procedural sky (byte-identical to a scene authored without them).
+    // Decoded material textures and HDR environment shared by viewport and offline renderers.
+    // Empty textures and a disabled environment use material colors and the procedural sky.
     TextureLibrary                     textures;
     rt::EnvironmentMap                 environment;
 

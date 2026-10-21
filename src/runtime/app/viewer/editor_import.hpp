@@ -20,6 +20,11 @@ enum class AssetKind : uint8_t { Unknown, Scene, Urdf, Mjcf, Usd, Mesh, Image };
 AssetKind AssetKindOf(const std::string& path);
 const char* AssetKindName(AssetKind kind);
 
+// Scene containers preserve their authored coordinates; individual objects rest at the drop height.
+inline bool DefaultGroundPlacement(AssetKind kind) {
+    return kind != AssetKind::Scene && kind != AssetKind::Usd;
+}
+
 struct ImportDiagnostic {
     std::string severity;  // "error" keeps the asset out, "warning" reports a loss
     std::string code;

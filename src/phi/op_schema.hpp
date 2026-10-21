@@ -634,9 +634,6 @@ inline bool BlockDescentTileRoute(uint32_t particles, uint32_t grid_nodes, uint3
     return particles == 0u && grid_nodes == 0u && blocks > 0u && max_dof <= kMaxArticulationDof;
 }
 
-// Outer iterations of the warp tiles when the caller sets none.
-inline constexpr uint32_t kBlockDescentTileIterations = 6u;
-
 uint64_t BlockDescentScratchWords(const BlockDescentSolveParams& params);
 
 // Particle modes select material constraints and ownership; all row-coupled particles share integration.

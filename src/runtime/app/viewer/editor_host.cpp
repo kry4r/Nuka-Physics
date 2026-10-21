@@ -3158,6 +3158,7 @@ render::RasterOptions EditorHost::State::ViewOptions(const CameraController& cam
 void EditorHost::State::LightView(render::RasterOptions& opts) {
     const auto rgb = [](float* dst, float r, float g, float b) { dst[0] = r; dst[1] = g; dst[2] = b; };
     opts.viewport_sky = opts.use_sun_light = true;
+    opts.viewport_ao_radius = ui_state_.ambient_occlusion ? 0.5f : 0.0f;
     rgb(opts.sky_top, 0.33f, 0.46f, 0.66f);
     rgb(opts.sky_bottom, 0.70f, 0.75f, 0.80f);
     rgb(opts.ground_color, 0.13f, 0.13f, 0.125f);
@@ -8078,16 +8079,20 @@ void EditorHost::State::RegisterAssetActions() {
                           return ActionResult::Fail("the mode is auto, add or open");
                       const ImportOptions options = ImportOptionsOf(args);
                       const json::Value* pose = args.Find("pose");
+                      const bool ground = BoolArg(args, "ground", DefaultGroundPlacement(AssetKindOf(path)));
                       if (mode.empty() || mode == "auto") {
                           const ImportAnalysis a = AnalyzeImport(path, options);
-                          if (mode.empty() || !loaded_ || !Importable(a) || !a.diagnostics.empty())
-                              return ShowImport(a, pose != nullptr ? *pose : json::Value());
+                          if (mode.empty() || !loaded_ || !Importable(a) || !a.diagnostics.empty()) {
+                              const ActionResult result = ShowImport(a, pose != nullptr ? *pose : json::Value());
+                              ui_state_.import.ground = ground;
+                              return result;
+                          }
                       }
                       if (mode == "open") {
                           if (borrowed_) return Spawn({path});
                           json::Value resolved = Object({{"path", json::Value::Str(path)},
                                                          {"mode", json::Value::Str(mode)},
-                                                         {"ground", json::Value::Bool(BoolArg(args, "ground", true))},
+                                                         {"ground", json::Value::Bool(ground)},
                                                          {"discard",
                                                           json::Value::Bool(BoolArg(args, "discard", false))}});
                           SetImportOptions(resolved, options);
@@ -8099,7 +8104,7 @@ void EditorHost::State::RegisterAssetActions() {
                           if (!Importable(a)) return ActionResult::Fail(ImportError(a));
                           const std::string file = cache_.File("import.nks");
                           scene::SceneIR scene = *a.scene;
-                          const bool rest = BoolArg(args, "ground", true);
+                          const bool rest = ground;
                           if (rest) RestOnGround(scene);
                           scene.SourcesMut().push_back(SourceOf(a, rest));
                           scene::nks::Save(scene, file);
@@ -8108,7 +8113,7 @@ void EditorHost::State::RegisterAssetActions() {
                       if (!loaded_) return ActionResult::Fail("no document is open to add to");
                       const std::string name = StrArg(args, "name", PathText(Utf8Path(path).stem()));
                       json::Value after = Object({{"path", json::Value::Str(path)}, {"name", json::Value::Str(name)},
-                                                  {"ground", json::Value::Bool(BoolArg(args, "ground", true))}});
+                                                  {"ground", json::Value::Bool(ground)}});
                       SetImportOptions(after, options);
                       if (pose != nullptr && !pose->IsNull()) after.Set("pose", *pose);
                       const ActionResult r = SubmitTxn(EditTxn{"Import " + name, {EditOp{"", "import", json::Value(), after}}});
@@ -8240,6 +8245,7 @@ ActionResult EditorHost::State::ShowImport(const ImportAnalysis& a, const json::
     if (w.path != a.path) {
         std::snprintf(w.name, sizeof(w.name), "%s", analysis.At("name").AsString().c_str());
         w.open_as_new = !loaded_;
+        w.ground = DefaultGroundPlacement(a.kind);
     }
     w.path = a.path;
     w.analysis = analysis;
@@ -8853,6 +8859,12 @@ void EditorHost::State::RegisterViewActions() {
                   [this] { return ui_state_.fog; },
                   [this](const json::Value& args) {
                       ui_state_.fog = BoolArg(args, "on", !ui_state_.fog);
+                      return Ok();
+                  }});
+    actions_.Add({"view.ao", "Ambient Occlusion", "view", "", ShortcutScope::Global, {},
+                  [this] { return ui_state_.ambient_occlusion; },
+                  [this](const json::Value& args) {
+                      ui_state_.ambient_occlusion = BoolArg(args, "on", !ui_state_.ambient_occlusion);
                       return Ok();
                   }});
     // The Lit view's ground grid: mode auto (under scenes without a floor), on or off; a bare call

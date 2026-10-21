@@ -72,6 +72,18 @@ Casts the sun's shadows in the Lit view; `on` sets it, else it toggles.
 
 **Returns:** nothing
 
+## `view.ao`
+
+**Kind:** [view](index.md#kinds)
+
+Applies ambient occlusion to indirect light in the Lit view. Enabled by default.
+
+**Arguments**
+
+- `on`: bool, ambient occlusion on, default: toggles
+
+**Returns:** nothing
+
 ## `view.fog`
 
 **Kind:** [view](index.md#kinds)

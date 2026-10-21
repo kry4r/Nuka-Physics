@@ -621,7 +621,7 @@ bool EditorDocument::ApplyOp(const EditOp& op, EditOp* done, EditOp* inverse, Op
         math::Transform placement;
         if (const json::Value* pose = op.after.Find("pose")) placement = TransformFromJson(*pose);
         const json::Value* ground = op.after.Find("ground");
-        const bool rest = ground == nullptr || ground->AsBool();
+        const bool rest = ground == nullptr ? DefaultGroundPlacement(a.kind) : ground->AsBool();
         out->focus = ComposeAsset(es_->scene, *a.scene, a.kind, op.after.At("name").AsString(), placement, rest,
                                   SourceOf(a, rest));
         out->rebuild = true;

@@ -1,6 +1,7 @@
 #include "runtime/app/viewer/editor_scene.hpp"
 
 #include "render/render_world.hpp"
+#include "render/texture_image.hpp"
 #include "runtime/app/viewer/editor_profile.hpp"
 #include "scene/asset/asset_bytes.hpp"
 #include "scene/format/nks.hpp"
@@ -16,7 +17,7 @@
 namespace nuka::runtime::app::viewer {
 namespace {
 
-// Applies `rewrite` to every material's image map paths, touching only the records it changes.
+// Anchors or relativizes material and environment image paths.
 template <typename Rewrite>
 void RewriteMaps(scene::SceneIR& scene, Rewrite rewrite) {
     for (size_t i = 0; i < scene.Materials().size(); ++i) {
@@ -34,6 +35,8 @@ void RewriteMaps(scene::SceneIR& scene, Rewrite rewrite) {
         rec.metallic_map = std::move(metallic);
         rec.emissive_map = std::move(emissive);
     }
+    const std::string environment = rewrite(scene.Environment().hdri);
+    if (environment != scene.Environment().hdri) scene.EnvironmentMut().hdri = environment;
 }
 
 // Binds the world's current layout: render world, terrain, rest drive targets.
@@ -41,6 +44,10 @@ void BindWorld(EditorScene& es) {
     WorldLayout layout = QueryLayout(es.world);
     render::RenderWorld render_world =
         render::BuildRenderWorld(es.scene.Ecs(), BindScene(es.scene, layout));
+    const auto& environment = es.scene.Environment();
+    if (!environment.hdri.empty())
+        render_world.environment = render::LoadEnvironment(environment.hdri,
+            environment.yaw_deg * (3.14159265358979323846f / 180.0f), environment.intensity);
     es.terrain = QueryTerrain(es.world);
     es.rest_targets.assign(static_cast<size_t>(layout.links_per_env) * layout.env_count, 0.0f);
     if (!es.rest_targets.empty())

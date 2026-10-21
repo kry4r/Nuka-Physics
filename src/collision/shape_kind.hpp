@@ -59,6 +59,9 @@ NUKA_COLLISION_HD inline MeshContactRoute RouteMeshContact(
     const bool mesh_a = kind_a == kShapeConvexHull || kind_a == kShapeSdfMesh;
     const bool mesh_b = kind_b == kShapeConvexHull || kind_b == kShapeSdfMesh;
     if (!mesh_a && !mesh_b) return MeshContactRoute::Analytic;
+    // Rounded primitives query the mesh surface without a tessellated source shape.
+    if (kind_a == kShapeSphere || kind_a == kShapeCapsule ||
+        kind_b == kShapeSphere || kind_b == kShapeCapsule) return MeshContactRoute::Sdf;
     return mesh_a && mesh_b && mode_a == 1u && mode_b == 1u
         ? MeshContactRoute::Sdf : MeshContactRoute::Ogc;
 }

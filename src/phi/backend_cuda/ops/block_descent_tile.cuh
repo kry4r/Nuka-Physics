@@ -385,6 +385,8 @@ __device__ void InitializeTileHead(DataView data, BlockDescentSolveParams p, Blo
     c.Store3(kTileResidual, h, {});
     c.Store3(kTileMove, h, {});
     c.Store3(kTileStep, h, {});
+    c.Store3(kTileRelaxationStep, h, {});
+    c.Value(kTileRelaxationWeight, h) = 0.0f;
 }
 
 // Jacobians on moving blocks and residuals at free velocities, including kinematic sides. Single-coordinate
@@ -628,13 +630,11 @@ __device__ void InitializeTile(ArticulationDeviceState state, DataView data, Blo
     else InitializeWideTileRows<kN>(data, p, s, c);
 }
 
-// The normal bound each head on `block` holds through its solve, and a zero move.
+// Hold the current normal multiplier as the friction radius through the block solve, as LoadLocalTerm.
 __device__ void StartTileBlock(const TileContext& c, uint32_t block) {
     for (uint32_t h = c.lane; h < c.heads; h += kTileLanes) {
         if (c.Incidence(h, block) == kNoTileIncidence) continue;
-        c.Value(kTileNormalBound, h) = nk::augmented::EvaluateScalarImpulse(c.Value(kTileDual, h),
-            c.Value(kTileRho, h), c.Value(kTileResidual, h), c.Value(kTileCompliance, h), c.Value(kTileLower, h),
-            c.Value(kTileUpper, h), c.Response(h)).impulse;
+        c.Value(kTileNormalBound, h) = c.Value(kTileDual, h);
         c.Store3(kTileMove, h, {});
     }
     __syncwarp();
@@ -650,6 +650,13 @@ __device__ void EndTileBlock(const TileContext& c, uint32_t block) {
                                     __fsub_rn(residual.z, move.z)});
     }
     __syncwarp();
+}
+
+// Exact zero responses need no matrix work; every head is reevaluated at each Newton iterate.
+__device__ bool TileResponseContributes(Vec3 f, SymmetricMat3 curvature, Vec3 noise) {
+    return f.x != 0.0f || f.y != 0.0f || f.z != 0.0f || curvature.xx != 0.0f ||
+           curvature.yy != 0.0f || curvature.zz != 0.0f || curvature.yz != 0.0f ||
+           noise.x != 0.0f || noise.y != 0.0f || noise.z != 0.0f;
 }
 
 // Lane i's row of H = M + sum J^T C J and its force g_i = -[M(u - u_free)]_i + sum J_i f at the current
@@ -696,8 +703,9 @@ __device__ bool AssembleTileBlock(const TileContext& c, const TileBlock& b, floa
             unit_value = c.Value(kTileUnitValue + incidence, own);
             axes = t.axes;
         }
+        const bool contributes = incidence != kNoTileIncidence && TileResponseContributes(f, curvature, noise);
         // A row on one coordinate adds to that coordinate's diagonal and force only.
-        for (uint32_t pending = __ballot_sync(~0u, incidence != kNoTileIncidence && unit != ~0u); pending != 0u;
+        for (uint32_t pending = __ballot_sync(~0u, contributes && unit != ~0u); pending != 0u;
              pending &= pending - 1u) {
             const uint32_t source = __ffs(pending) - 1u;
             const uint32_t target = __shfl_sync(~0u, unit, source);
@@ -711,7 +719,7 @@ __device__ bool AssembleTileBlock(const TileContext& c, const TileBlock& b, floa
                 scale += fabsf(v) * nx;
             }
         }
-        for (uint32_t pending = __ballot_sync(~0u, incidence != kNoTileIncidence && unit == ~0u); pending != 0u;
+        for (uint32_t pending = __ballot_sync(~0u, contributes && unit == ~0u); pending != 0u;
              pending &= pending - 1u) {
             const uint32_t source = __ffs(pending) - 1u;
             const bool staged = c.lane < c.width;
@@ -862,7 +870,8 @@ __device__ bool AssembleWideTileBlock(const TileContext& c, const TileBlock& b, 
             unit_value = c.Value(kTileUnitValue + incidence, own);
             axes = t.axes;
         }
-        for (uint32_t pending = __ballot_sync(~0u, incidence != kNoTileIncidence && unit != ~0u); pending != 0u;
+        const bool contributes = incidence != kNoTileIncidence && TileResponseContributes(f, curvature, noise);
+        for (uint32_t pending = __ballot_sync(~0u, contributes && unit != ~0u); pending != 0u;
              pending &= pending - 1u) {
             const uint32_t source = __ffs(pending) - 1u;
             const uint32_t target = __shfl_sync(~0u, unit, source);
@@ -880,7 +889,7 @@ __device__ bool AssembleWideTileBlock(const TileContext& c, const TileBlock& b, 
         }
         // The chunk's Jacobian rows on the block in head order, each with the list position of the other
         // tangent axis's row, and its axis's curvature, coupling to that row, force and noise.
-        const uint32_t count = incidence != kNoTileIncidence && unit == ~0u ? axes : 0u;
+        const uint32_t count = contributes && unit == ~0u ? axes : 0u;
         uint32_t through = count;
         for (uint32_t offset = 1u; offset < kTileLanes; offset <<= 1u) {
             const uint32_t other = __shfl_up_sync(~0u, through, offset);
@@ -1292,7 +1301,6 @@ __device__ void DescendTileBlock(DataView data, BlockDescentSolveParams p, Block
         u[r] = start[r];
     }
     nk::BlockSolveFailure failure = nk::BlockSolveFailure::None;
-    float first_decrement = 0.0f;
     for (uint32_t step = 0u; step < kDenseNewtonSteps; ++step) {
         float force[kSpan], inertia[kSpan], d[kSpan], mass_step[kSpan];
         bool converged = false;
@@ -1326,25 +1334,19 @@ __device__ void DescendTileBlock(DataView data, BlockDescentSolveParams p, Block
             break;
         }
         if (!(total_decrement > 0.0f)) break;
-        if (step == 0u) first_decrement = total_decrement;
-        else if (total_decrement <= static_cast<float>(kDenseDecrementRatio) * first_decrement) break;
         if constexpr (kSpan == 1u) TileRowSteps(c, b.local, d);
         else WideTileRowSteps<kN>(c, b.local, n, d);
         const float alpha = SearchTileLine(c, b.local, inertial_slope, inertial_curvature);
-        float after[kSpan], largest_step = 0.0f, largest_value = 0.0f;
-        bool finite = true;
+        float after[kSpan];
+        bool finite = true, rounded = true;
 #pragma unroll
         for (uint32_t r = 0u; r < kSpan; ++r) {
             after[r] = fmaf(alpha, d[r], u[r]);
             finite &= !coordinate[r] || isfinite(after[r]);
-            const float moved = coordinate[r] ? fabsf(after[r] - u[r]) : 0.0f;
-            const float value =
-                coordinate[r] ? fmaxf(fabsf(after[r]), fmaxf(fabsf(start[r]), fabsf(free[r]))) : 0.0f;
-            largest_step = r == 0u ? moved : fmaxf(largest_step, moved);
-            largest_value = r == 0u ? value : fmaxf(largest_value, value);
+            rounded &= !coordinate[r] || fabsf(after[r] - u[r]) <=
+                kDenseRoundings * FLT_EPSILON * fmaxf(fabsf(after[r]), fabsf(u[r]));
         }
-        largest_step = TileWarpMax(largest_step);
-        largest_value = TileWarpMax(largest_value);
+        rounded = __all_sync(~0u, rounded);
         if (!__all_sync(~0u, finite)) {
             failure = nk::BlockSolveFailure::InvalidCandidate;
             break;
@@ -1360,7 +1362,7 @@ __device__ void DescendTileBlock(DataView data, BlockDescentSolveParams p, Block
                                        fmaf(alpha, row_step.z, move.z)});
         }
         __syncwarp();
-        if (largest_step <= kDenseRoundings * FLT_EPSILON * largest_value) break;
+        if (rounded) break;
     }
     EndTileBlock(c, b.local);
     if (failure != nk::BlockSolveFailure::None && c.lane == 0u) RecordTileFailure(data, p, s, c, b.owner, failure);
@@ -1379,16 +1381,21 @@ __device__ void UpdateTileDuals(DataView data, const TileContext& c, bool veloci
         const uint32_t stride = c.Index(kTileStride, h);
         const float normal = nk::augmented::EvaluateScalarImpulse(t.dual.x, t.rho, t.residual.x, t.compliance,
                                                                   t.lower, t.upper, t.response).impulse;
-        if (velocity) data.lambda[slot] = normal;
         Vec3 dual{normal, 0.0f, 0.0f};
         if (t.axes == 3u) {
             const auto f = nk::augmented::EvaluateTangentImpulse(t.dual, t.rho, t.residual, normal,
                                                                  t.mu_first, t.mu_second);
-            data.lambda[slot + stride] = f.impulse.y;
-            data.lambda[slot + 2u * stride] = f.impulse.z;
             dual.y = f.impulse.y;
             dual.z = f.impulse.z;
+            nk::augmented::ContactRelaxation relaxation{
+                c.Load3(kTileRelaxationStep, h), c.Value(kTileRelaxationWeight, h)};
+            dual = nk::augmented::RelaxContactImpulse(t.dual, dual, &relaxation);
+            c.Store3(kTileRelaxationStep, h, relaxation.step);
+            c.Value(kTileRelaxationWeight, h) = relaxation.weight;
+            data.lambda[slot + stride] = dual.y;
+            data.lambda[slot + 2u * stride] = dual.z;
         }
+        if (velocity) data.lambda[slot] = dual.x;
         c.Store3(kTileDual, h, dual);
     }
     __syncwarp();

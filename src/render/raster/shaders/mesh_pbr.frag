@@ -253,6 +253,9 @@ void main() {
     // ground color by the normal's up-axis (world +Z is up in this scene).
     float hemi = n.z * 0.5 + 0.5;
     vec3  ambient_color = mix(scene.ambient_ground.rgb, scene.ambient.rgb, hemi);
+#ifdef NUKA_VIEW_MODES
+    if (scene.environment.x > 0.5) ambient_color = EnvironmentDiffuse(n);
+#endif
 
     // Diffuse ambient is albedo-tinted (a black body absorbs it) -- this term
     // carries the bright/dark material distinction (white shell vs black plastic),
@@ -274,13 +277,16 @@ void main() {
 #ifdef NUKA_VIEW_MODES
     // Under the viewport sky, diffuse light comes from the hemisphere and the specular from the
     // sky in the reflected direction, blurred toward the irradiance as the surface roughens.
-    if (scene.sky_zenith.w > 0.5) {
+    if (scene.sky_zenith.w > 0.5 || scene.environment.x > 0.5) {
         const vec3 sky_spec = mix(SkyRadiance(reflect(-v, n)), ambient_color, roughness * roughness);
         const vec2 env = EnvBrdf(roughness, n_dot_v);
         ambient = ambient_color * albedo * (1.0 - metallic) + sky_spec * (f0 * env.x + env.y);
     }
 #endif
 
+#ifdef NUKA_VIEW_MODES
+    ambient *= AmbientVisibility(vWorldPos, n);
+#endif
     vec3 color = lo + ambient + emissive;
 
 #ifndef NUKA_VIEW_MODES

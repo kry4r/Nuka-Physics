@@ -53,6 +53,32 @@ def render(world):
     ).copy()
 
 
+def add_rounded_mesh(builder, output):
+    vertices, faces = [], []
+    for x, half_width in ((2.0, 0.3), (3.0, 0.3), (4.0, 0.025)):
+        first = len(vertices) + 1
+        vertices.extend((x + dx, dy, 0.5) for dx, dy in
+                        ((-half_width, -0.3), (half_width, -0.3),
+                         (half_width, 0.3), (-half_width, 0.3)))
+        faces.extend(((first, first + 1, first + 2), (first, first + 2, first + 3)))
+    (output / "supports.obj").write_text(
+        "".join(f"v {x} {y} {z}\n" for x, y, z in vertices)
+        + "".join(f"f {a} {b} {c}\n" for a, b, c in faces))
+    fixture = output / "supports.xml"
+    fixture.write_text('<mujoco><asset><mesh name="supports" file="supports.obj"/></asset>'
+                       '<worldbody><geom name="supports" type="mesh" mesh="supports" '
+                       'nuka:decompose="skip"/></worldbody></mujoco>')
+    positions = ([2.0, 0.0, 0.55], [3.0, 0.0, 0.75], [4.0, 0.0, 0.55])
+    for i, position in enumerate(positions):
+        builder.add_rigid_primitive(
+            nuka.PRIMITIVE_SPHERE if i == 0 else nuka.PRIMITIVE_CAPSULE,
+            dims=[0.05] if i == 0 else [0.05, 0.2], pos=position, mass=1.0,
+            quat=[1, 0, 0, 0] if i < 2 else [2**-0.5, 0, 2**-0.5, 0])
+    with nuka.SceneBuilder.create(str(fixture)) as supports:
+        builder.compose(supports, attach_at="rounded_mesh_")
+    return positions
+
+
 def check_runtime_parameters(world, body):
     fields = (nuka.JOINT_POSITION, nuka.JOINT_VELOCITY, nuka.BASE_POSE, nuka.RIGID_BODY_TRANSFORM)
     addresses = [world.buffer_device_ptr(field) for field in fields]
@@ -110,10 +136,13 @@ def run_pipeline(device, output, dt=1.0 / 240.0, steps=STEPS, execution="eager")
             nuka.PRIMITIVE_SPHERE, dims=[RADIUS], pos=POSITION.tolist(),
             mass=MASS, material="load_body",
         )
+        rounded_positions = add_rounded_mesh(builder, output)
         builder.add_media(
             nuka.MEDIA_CLOTH, nuka.MEDIA_METHOD_VBD,
             cloth_nx=9, cloth_ny=9, cloth_spacing=0.025,
             cloth_origin=[0.1, -0.1, 0.07],
+            vbd_stretch_stiffness=5000.0, vbd_bend_stiffness=5e-5,
+            vbd_poisson=0.3, vbd_particle_mass=0.01,
             vbd_aero_normal=0.6, vbd_aero_tangent=0.04, vbd_aero_max_dv=0.5,
         )
         world = builder.build(
@@ -127,6 +156,8 @@ def run_pipeline(device, output, dt=1.0 / 240.0, steps=STEPS, execution="eager")
     assert world.__enter__() is world
     with world:
         initial = state(world)
+        rounded_bodies = [int(np.flatnonzero(np.all(np.isclose(initial[0][0, :, :3], p), axis=1))[0])
+                          for p in rounded_positions]
         wrench_view = torch.from_dlpack(world.buffer_view(nuka.LINK_CONTACT_WRENCH)).reshape(2, -1, 6)
         wrench_address = world.buffer_device_ptr(nuka.LINK_CONTACT_WRENCH)
         assert wrench_view.data_ptr() == wrench_address
@@ -196,6 +227,9 @@ def run_pipeline(device, output, dt=1.0 / 240.0, steps=STEPS, execution="eager")
         np.testing.assert_allclose(advanced[2][:, body], expected_omega, rtol=0, atol=1e-6)
         frames.append(render(world))
         assert np.any(frames[0] != frames[1])
+        rounded_heights = advanced[0][:, rounded_bodies, 2]
+        np.testing.assert_allclose(rounded_heights, np.broadcast_to([0.55, 0.75, 0.55], rounded_heights.shape),
+                                   rtol=0, atol=0.01)
 
         pending_force = np.repeat(forces[:1], 2, axis=0)
         pending_torque = np.repeat(torques[:1], 2, axis=0)
@@ -261,12 +295,11 @@ def run_pipeline(device, output, dt=1.0 / 240.0, steps=STEPS, execution="eager")
             "position_max_error_m": position_error, "dlpack_alias": True,
             "continuous_position_max_error_m": continuous_error,
             "loads_consumed_once": True, "masked_reset_isolated": True,
+            "rounded_mesh_support_heights": rounded_heights.tolist(),
             "replay_bit_exact": True, "render_reset_bit_exact": True,
             "gyro_max_residual": float(gyro_residual.max()),
             "gyro_max_iterations": int(gyro_iterations.max()),
             "env_status": env_status.tolist(), "gyro_reset_isolated": True,
-            "neighbor_max_count": int(neighbor_count.max()),
-            "neighbor_count": int(neighbor_count.sum()), "neighbors_not_truncated": True,
             "contact_wrench_dlpack_alias": True, "contact_wrench_reset_isolated": True,
             "contact_wrench_sha256": hashlib.sha256(advanced_wrench.tobytes()).hexdigest(),
             "execution": execution_info,

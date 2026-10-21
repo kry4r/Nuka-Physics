@@ -262,12 +262,24 @@ NUKA_OGC_HD inline OgcEdgePair OgcEdgeContact(
     result.owner_edge_a = edge_a;
     result.owner_edge_b = edge_b;
     if (!(result.distance <= reach)) return result;
+    const bool a_interior = ea.opposite0 == ~0u ||
+        (ea.opposite0 < info_a.vertex_count &&
+         (ea.opposite1 == ~0u || ea.opposite1 < info_a.vertex_count) &&
+         OgcEdgeFeasible(pair.b, a0, a1, MeshSurfaceVertex(surface_a, info_a, ea.opposite0),
+             ea.opposite1 == ~0u ? math::Vec3{} : MeshSurfaceVertex(surface_a, info_a, ea.opposite1),
+             ea.opposite1 != ~0u));
+    const bool b_interior = eb.opposite0 == ~0u ||
+        (eb.opposite0 < info_b.vertex_count &&
+         (eb.opposite1 == ~0u || eb.opposite1 < info_b.vertex_count) &&
+         OgcEdgeFeasible(pair.a, b0, b1, MeshSurfaceVertex(surface_b, info_b, eb.opposite0),
+             eb.opposite1 == ~0u ? math::Vec3{} : MeshSurfaceVertex(surface_b, info_b, eb.opposite1),
+             eb.opposite1 != ~0u));
     const bool a_feasible = pair.weight_a > 0.0f && pair.weight_a < 1.0f
-        ? true : OgcWireVertexFeasible(surface_a, info_a, edges_a, incidence_a,
+        ? a_interior : OgcWireVertexFeasible(surface_a, info_a, edges_a, incidence_a,
             edge_info_a, pair.weight_a <= 0.0f ? ea.vertex0 : ea.vertex1,
             pair.b, &result.owner_edge_a);
     const bool b_feasible = pair.weight_b > 0.0f && pair.weight_b < 1.0f
-        ? true : OgcWireVertexFeasible(surface_b, info_b, edges_b, incidence_b,
+        ? b_interior : OgcWireVertexFeasible(surface_b, info_b, edges_b, incidence_b,
             edge_info_b, pair.weight_b <= 0.0f ? eb.vertex0 : eb.vertex1,
             pair.a, &result.owner_edge_b);
     result.feasible = a_feasible && b_feasible &&

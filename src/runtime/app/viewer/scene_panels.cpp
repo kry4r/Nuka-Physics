@@ -2,6 +2,7 @@
 // the collision dialog and the schema groups of the Properties panel.
 
 #include "runtime/app/viewer/imgui_layer.hpp"
+#include "runtime/app/viewer/editor_import.hpp"
 
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -323,7 +324,7 @@ void ImGuiLayer::DrawAssetDrop() {
             if (const ImGuiPayload* drop = ImGui::AcceptDragDropPayload(kAssetPayload, ImGuiDragDropFlags_AcceptNoDrawDefaultRect)) {
                 const std::string path(static_cast<const char*>(drop->Data), static_cast<size_t>(drop->DataSize));
                 json::Value args = Args({{"path", json::Value::Str(path)}, {"mode", json::Value::Str("auto")}});
-                if (ground) args.Set("pose", GroundPose(at));
+                if (ground && DefaultGroundPlacement(AssetKindOf(path))) args.Set("pose", GroundPose(at));
                 Queue("file.import", std::move(args));
             }
             ImGui::EndDragDropTarget();

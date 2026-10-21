@@ -5,8 +5,6 @@
 constexpr uint32_t kDenseNewtonSteps = 16u;
 constexpr uint32_t kDenseLineSearchSteps = 32u;
 constexpr uint32_t kDenseTileRows = 32u;
-// Ends the solve once a Newton decrement falls this far below the first one.
-constexpr double kDenseDecrementRatio = 1.0e-6;
 constexpr double kDenseLineSearchTolerance = 1.0e-6;
 // Gradients and steps within this many float roundings of their terms are converged.
 constexpr float kDenseRoundings = 8.0f;
@@ -550,7 +548,6 @@ __device__ nk::BlockSolveFailure NewtonDenseBlock(const Block& b, DataView data,
     __shared__ double inertia[kMaxDof];
     const uint32_t n = b.dimension;
     nk::BlockSolveFailure failure = nk::BlockSolveFailure::None;
-    double first_decrement = 0.0;
     for (uint32_t step = 0u; step < kDenseNewtonSteps; ++step) {
         bool converged = false;
         bool assembled = false;
@@ -583,21 +580,19 @@ __device__ nk::BlockSolveFailure NewtonDenseBlock(const Block& b, DataView data,
             break;
         }
         if (!(decrement > 0.0)) break;
-        if (step == 0u) first_decrement = decrement;
-        else if (decrement <= kDenseDecrementRatio * first_decrement) break;
         StoreDenseRowSteps(b, data, p, s, working);
         __syncthreads();
         const double alpha = SearchDenseLine(b, data, p, s, working, inertial_slope, inertial_curvature);
-        float largest_step = 0.0f, largest_value = 0.0f;
+        bool rounded = true;
         bool finite = true;
         for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
             const float before = b.velocity[i];
             const float after = static_cast<float>(static_cast<double>(before) + alpha * b.direction[i]);
             finite &= isfinite(after);
-            largest_step = fmaxf(largest_step, fabsf(after - before));
-            largest_value = fmaxf(largest_value, fmaxf(fabsf(after), fmaxf(fabsf(b.Snapshot(i)), fabsf(b.Free(i)))));
+            rounded &= fabsf(after - before) <=
+                kDenseRoundings * FLT_EPSILON * fmaxf(fabsf(after), fabsf(before));
         }
-        MaxDenseBlock2(&largest_step, &largest_value);
+        rounded = __syncthreads_and(rounded) != 0;
         if (__syncthreads_or(!finite)) {
             failure = nk::BlockSolveFailure::InvalidCandidate;
             break;
@@ -614,7 +609,7 @@ __device__ nk::BlockSolveFailure NewtonDenseBlock(const Block& b, DataView data,
                                                         static_cast<float>(move.z + alpha * row_step.z)});
         }
         __syncthreads();
-        if (largest_step <= kDenseRoundings * FLT_EPSILON * largest_value) break;
+        if (rounded) break;
     }
     __syncthreads();
     return failure;

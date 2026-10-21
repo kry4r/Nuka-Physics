@@ -8,6 +8,7 @@
 #include <limits>
 
 #include "collision/primitive_surface.hpp"
+#include "collision/mesh_segment.hpp"
 #include "constraint/contact_manifold.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
@@ -294,8 +295,10 @@ __global__ void FlagPairSampleChunksKernel(const uint32_t* __restrict__ candidat
     const PrimShapeDev sampled = LoadPrimShape(shape_table, bodies[side]);
     const PrimShapeDev target = LoadPrimShape(shape_table, bodies[other]);
     if (!HasCollidableSurface(surfaces, bodies[other], target) ||
-        sampled.kind == collision::kShapeSphere) return;
-    if (target.kind == collision::kShapeSphere &&
+        sampled.kind == collision::kShapeSphere ||
+        (sampled.kind == collision::kShapeCapsule && surfaces.mesh_info &&
+         surfaces.mesh_info[bodies[other]].triangle_count > 0u)) return;
+    if ((target.kind == collision::kShapeSphere || target.kind == collision::kShapeCapsule) &&
         HasCollidableSurface(surfaces, bodies[side], sampled)) return;
     const uint32_t soff = samp_ranges[bodies[side] * 2u];
     const uint32_t scnt = samp_ranges[bodies[side] * 2u + 1u];
@@ -383,29 +386,39 @@ __global__ void PairDrivenSdfKernel(const uint32_t* __restrict__ candidate_pairs
         if (!HasCollidableSurface(surfaces, bodies[other], target)) continue;
         const math::Transform& sxf = poses[side];
         const math::Transform& txf = poses[other];
-        if (shapes[side].kind == collision::kShapeSphere) {
+        const bool capsule = shapes[side].kind == collision::kShapeCapsule && surfaces.mesh_info &&
+            surfaces.mesh_info[bodies[other]].triangle_count > 0u;
+        if (shapes[side].kind == collision::kShapeSphere || capsule) {
             queried = true;
             if (threadIdx.x != 0u) continue;
             const float radius = shapes[side].params[0];
-            const auto surface = QueryCollidableSurface(surfaces, bodies[other], target,
-                SdfInverseTransformPoint(txf, sxf.position), radius + margin);
-            if (!surface.valid) {
-                geometry_status |= kEnvStatusContactGeometryUnavailable;
-                continue;
-            }
-            const float depth = radius + margin - surface.distance;
-            if (depth > 0.0f) {
-                const auto normal = SdfRotate(txf.rotation, surface.normal);
-                const uint32_t feature = surface.triangle != ~0u ? surface.triangle : surface.feature;
-                InsertSampleContact({SdfTransformPoint(txf, surface.point),
-                    side == 0u ? normal : normal * -1.0f, depth,
-                    side == 0u ? 0u : feature, side == 0u ? feature : 0u,
-                    uint64_t(side) * (uint64_t(sample_point_count) + 1u)},
-                    kk, local_contacts, local_count);
+            const math::Vec3 axis = capsule
+                ? SdfRotate(sxf.rotation, {0, 0, shapes[side].params[1]}) : math::Vec3{};
+            const math::Vec3 ends[2] = {SdfInverseTransformPoint(txf, sxf.position - axis),
+                                       SdfInverseTransformPoint(txf, sxf.position + axis)};
+            for (uint32_t point = 0u; point < (capsule ? 3u : 1u); ++point) {
+                const auto surface = point < 2u
+                    ? QueryCollidableSurface(surfaces, bodies[other], target, ends[point], radius + margin)
+                    : collision::QueryMeshSegment(surfaces.mesh, surfaces.mesh_info[bodies[other]],
+                                                   ends[0], ends[1], radius + margin).surface;
+                if (!surface.valid) {
+                    geometry_status |= kEnvStatusContactGeometryUnavailable;
+                    continue;
+                }
+                const float depth = radius + margin - surface.distance;
+                if (depth > 0.0f) {
+                    const auto normal = SdfRotate(txf.rotation, surface.normal);
+                    const uint32_t feature = surface.triangle != ~0u ? surface.triangle : surface.feature;
+                    InsertSampleContact({SdfTransformPoint(txf, surface.point),
+                        side == 0u ? normal : normal * -1.0f, depth,
+                        side == 0u ? point : feature, side == 0u ? feature : point,
+                        uint64_t(side) * (uint64_t(sample_point_count) + 1u) + point},
+                        kk, local_contacts, local_count);
+                }
             }
             continue;
         }
-        if (target.kind == collision::kShapeSphere &&
+        if ((target.kind == collision::kShapeSphere || target.kind == collision::kShapeCapsule) &&
             HasCollidableSurface(surfaces, bodies[side], shapes[side])) continue;
         const uint32_t soff = samp_ranges[bodies[side] * 2u];
         const uint32_t scnt = samp_ranges[bodies[side] * 2u + 1u];

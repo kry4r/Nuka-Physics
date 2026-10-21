@@ -47,6 +47,10 @@ Then it takes the options:
 **Import** runs it. The new node is selected, and the robot or environment appears where the placement
 said.
 
+USD and NKS scene containers preserve their authored coordinates by default, including when dragged
+into the viewport. **Rest on the ground** starts unchecked for these formats; enable it explicitly when
+needed. Robots imported from URDF or MJCF and individual mesh objects keep ground placement enabled.
+
 !!! tip "Analyze without importing"
     `file.import_analyze {path}` returns the same verdict, statistics and diagnostics as the wizard,
     without changing anything; scripts and agents use it to check a file first.

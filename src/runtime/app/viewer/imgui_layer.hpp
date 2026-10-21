@@ -359,6 +359,7 @@ struct ViewerUiState {
     std::vector<ContactPatch> contacts;  // the host's, while show_contacts
     // The Lit view's sun shadows, distance fog and ground grid.
     bool shadows = true;
+    bool ambient_occlusion = true;
     bool fog = false;
     GroundGrid ground_grid = GroundGrid::Auto;
     nuka::render::ViewMode view_mode = nuka::render::ViewMode::Lit;  // the active pane's

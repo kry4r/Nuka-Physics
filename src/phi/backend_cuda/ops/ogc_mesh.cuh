@@ -68,6 +68,7 @@ __device__ bool OgcBodyPairAllowed(const OgcDetectParams& p,
     if (a == b) return false;
     const auto sa = nkops::LoadPrimShape(model.shape_table, a);
     const auto sb = nkops::LoadPrimShape(model.shape_table, b);
+    if (sa.body_id < 0 && sb.body_id < 0) return false;
     if (nkops::RouteMeshContact(sa.kind, sb.kind, model.mesh_contact_mode[a],
                                 model.mesh_contact_mode[b]) != nkops::MeshContactRoute::Ogc)
         return false;

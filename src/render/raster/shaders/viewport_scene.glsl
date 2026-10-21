@@ -17,11 +17,60 @@ layout(set = 0, binding = 0) uniform SceneUbo {
     vec4     sky_ground;       // rgb below the horizon; w the ground grid's height
     vec4     sun;              // xyz toward the sun; w the disc's cosine radius, 0 without a sun
     vec4     sun_color;        // rgb radiance
+    vec4     occlusion;        // radius in metres, strength
+    vec4     environment;      // enabled, yaw, intensity
+    vec4     irradiance[9];
 } scene;
 
 layout(set = 0, binding = 1) uniform sampler2D uShadowMap;
 // Every material image map as one layer, raw texels (albedo still sRGB-encoded).
 layout(set = 0, binding = 2) uniform sampler2DArray uMaps;
+layout(set = 0, binding = 4) uniform sampler2D uSceneDepth;
+layout(set = 0, binding = 5) uniform sampler2D uEnvironment;
+
+vec3 EnvironmentDirection(vec3 direction) {
+    const float c = cos(scene.environment.y), s = sin(scene.environment.y);
+    return vec3(c * direction.x - s * direction.y, s * direction.x + c * direction.y, direction.z);
+}
+
+vec3 EnvironmentDiffuse(vec3 normal) {
+    const vec3 n = EnvironmentDirection(normal);
+    const float basis[9] = float[9](0.2820948, 0.4886025 * n.y, 0.4886025 * n.z, 0.4886025 * n.x,
+        1.0925484 * n.x * n.y, 1.0925484 * n.y * n.z, 0.3153916 * (3.0 * n.z * n.z - 1.0),
+        1.0925484 * n.x * n.z, 0.5462742 * (n.x * n.x - n.y * n.y));
+    vec3 light = vec3(0.0);
+    for (int i = 0; i < 9; ++i) light += scene.irradiance[i].rgb * basis[i];
+    return max(light, vec3(0.0)) * scene.environment.z;
+}
+
+// Reconstruct neighbors from this view's depth prepass; only indirect light is occluded.
+float AmbientVisibility(vec3 position, vec3 normal) {
+    const float radius = scene.occlusion.x;
+    if (radius <= 0.0) return 1.0;
+    const vec4 clip = scene.view_proj * vec4(position, 1.0);
+    const float vertical_scale = length(vec3(scene.view_proj[0][1], scene.view_proj[1][1], scene.view_proj[2][1]));
+    const float pixels = clamp(radius * vertical_scale * scene.viewport.w /
+                               (2.0 * max(clip.w, 0.001)), 1.0, 128.0);
+    const vec2 center = gl_FragCoord.xy;
+    float blocked = 0.0;
+    const float rotation = fract(sin(dot(floor(center), vec2(12.9898, 78.233))) * 43758.5453) * 6.2831853;
+    for (int i = 0; i < 16; ++i) {
+        const float angle = rotation + float(i) * 2.3999632;
+        const vec2 pixel = center + vec2(cos(angle), sin(angle)) * pixels * sqrt((float(i) + 0.5) / 16.0);
+        if (any(lessThan(pixel, scene.viewport.xy)) ||
+            any(greaterThanEqual(pixel, scene.viewport.xy + scene.viewport.zw))) continue;
+        const float depth = texelFetch(uSceneDepth, ivec2(pixel), 0).r;
+        if (depth >= 1.0) continue;
+        const vec2 ndc = (floor(pixel) + 0.5 - scene.viewport.xy) / scene.viewport.zw * 2.0 - 1.0;
+        const vec4 projected = scene.inv_view_proj * vec4(ndc, depth, 1.0);
+        const vec3 delta = projected.xyz / projected.w - position;
+        const float distance = length(delta);
+        if (distance <= 0.001 || distance >= radius) continue;
+        blocked += max(dot(normal, delta / distance) - 0.05, 0.0) *
+                   (1.0 - smoothstep(0.0, radius, distance));
+    }
+    return clamp(1.0 - scene.occlusion.y * blocked * (2.0 / 16.0), 0.0, 1.0);
+}
 
 // Per material, its map layers in uMaps and how they project; the push block's mr.w picks one.
 struct MaterialMaps {
@@ -35,6 +84,11 @@ layout(std430, set = 0, binding = 3) readonly buffer MaterialMapsBlock {
 
 // The sky's radiance along a world direction (+Z up), the sun left out.
 vec3 SkyRadiance(vec3 dir) {
+    if (scene.environment.x > 0.5) {
+        const vec3 d = EnvironmentDirection(dir);
+        const vec2 uv = vec2(atan(d.y, d.x) / 6.2831853 + 0.5, acos(clamp(d.z, -1.0, 1.0)) / 3.1415927);
+        return texture(uEnvironment, uv).rgb * scene.environment.z;
+    }
     if (dir.z >= 0.0) return mix(scene.sky_horizon.rgb, scene.sky_zenith.rgb, sqrt(dir.z));
     return mix(scene.sky_horizon.rgb, scene.sky_ground.rgb, smoothstep(0.0, 0.08, -dir.z));
 }
