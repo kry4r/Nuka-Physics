@@ -48,5 +48,10 @@ std::vector<CollisionPreview> PreviewCollision(const scene::SceneIR& scene, cons
 scene::json::Value PreviewToJson(const std::vector<CollisionPreview>& preview);
 // Writes the colliders into the records; returns how many bodies got one.
 size_t GenerateCollision(scene::SceneIR& scene, const std::vector<std::string>& paths, const CollisionOptions& options);
+// Each colliding triangle mesh on a moving body becomes the convex hull of its own vertices, as MuJoCo
+// collides mesh geoms; one with authored decomposition, SDF contact or reduction stays. Returns how many.
+size_t HullMeshColliders(scene::SceneIR& scene);
+// The colliding triangle meshes on moving bodies that HullMeshColliders would turn into hulls.
+size_t MovingMeshColliders(const scene::SceneIR& scene);
 
 }  // namespace nuka::runtime::app::viewer

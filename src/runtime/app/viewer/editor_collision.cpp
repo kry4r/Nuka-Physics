@@ -328,6 +328,14 @@ std::string SkipReason(const scene::SceneIR& s, scene::BodyId b, const BodyMesh&
     return std::string();
 }
 
+// A colliding triangle mesh on a moving body that names no decomposition, SDF contact or reduction.
+bool Hullable(const scene::SceneIR& s, const scene::CollisionShapeRecord& sh) {
+    return sh.type == scene::ShapeType::TriMesh && !Visual(sh) && sh.body_id != scene::kInvalidBody &&
+           !s.GetBody(sh.body_id).is_static && sh.decompose_mode == scene::DecomposeMode::Auto &&
+           sh.mesh_contact == scene::CollisionShapeRecord::MeshContact::Ogc && sh.mesh_triangle_limit == 0u &&
+           sh.mesh_error_limit == 0.0f;
+}
+
 // The body's convex-hull colliders in world space, at the pose its joints start from.
 std::vector<float> HullPoints(const scene::SceneIR& s, scene::BodyId b) {
     std::vector<float> out;
@@ -553,6 +561,35 @@ size_t GenerateCollision(scene::SceneIR& s, const std::vector<std::string>& path
     }
     ExcludeOverlappingLinks(s, made);
     return made.size();
+}
+
+size_t HullMeshColliders(scene::SceneIR& s) {
+    std::vector<scene::BodyId> made;
+    size_t count = 0u;
+    for (scene::ShapeId i = 0; i < static_cast<scene::ShapeId>(s.ShapeCount()); ++i) {
+        if (!Hullable(s, s.GetShape(i))) continue;
+        scene::CollisionShapeRecord& sh = s.GetShapeMut(i);
+        cooker::ConvexPiece hull = cooker::ComputeConvexHull(
+            sh.mesh_vertices.data(), static_cast<uint32_t>(sh.mesh_vertices.size() / 3u), kHullVertices);
+        // A flat mesh has no hull and keeps its triangles.
+        if (hull.indices.empty()) continue;
+        sh.type = scene::ShapeType::ConvexHull;
+        sh.mesh_vertices = std::move(hull.vertices);
+        sh.mesh_indices = std::move(hull.indices);
+        sh.mesh_normals.clear();
+        sh.mesh_uvs.clear();
+        made.push_back(sh.body_id);
+        ++count;
+    }
+    std::sort(made.begin(), made.end());
+    made.erase(std::unique(made.begin(), made.end()), made.end());
+    ExcludeOverlappingLinks(s, made);
+    return count;
+}
+
+size_t MovingMeshColliders(const scene::SceneIR& s) {
+    return static_cast<size_t>(std::count_if(s.Shapes().begin(), s.Shapes().end(),
+                                             [&](const scene::CollisionShapeRecord& sh) { return Hullable(s, sh); }));
 }
 
 }  // namespace nuka::runtime::app::viewer

@@ -47,21 +47,24 @@ struct ImportAnalysis {
     bool fix_base = false;  // URDF only
     std::vector<std::string> package_paths;  // URDF only
     std::string light_units;  // "isaac", "nits" or "raw"; USD only
+    std::string link_colliders;  // "hull" or "mesh"; URDF and MJCF only
     std::vector<ImportDiagnostic> diagnostics;
     std::optional<scene::SceneIR> scene;  // absent when the file does not load
     ImportStats stats;
 };
 
 // How a URDF reads: its profile, and whether the base is fixed or packages are searched elsewhere; how a
-// USD stage's authored light intensities read (import::UsdLightUnits).
+// USD stage's authored light intensities read (import::UsdLightUnits); whether a URDF or MJCF robot's
+// triangle-mesh colliders on moving links become convex hulls ("hull") or stay meshes ("mesh").
 struct ImportOptions {
     std::string profile = "strict";
     bool fix_base = false;
     std::vector<std::string> package_paths;
     std::string light_units = "isaac";
+    std::string link_colliders = "hull";
 };
-// From an action's or an op's `profile`, `fix_base`, `package_paths` and `light_units` fields; `fallback` is
-// the profile when the fields name none.
+// From an action's or an op's `profile`, `fix_base`, `package_paths`, `light_units` and `link_colliders`
+// fields; `fallback` is the profile when the fields name none.
 ImportOptions ImportOptionsOf(const scene::json::Value& fields, const std::string& fallback = "strict");
 void SetImportOptions(scene::json::Value& fields, const ImportOptions& options);
 

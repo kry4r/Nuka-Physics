@@ -38,6 +38,7 @@ Then it takes the options:
 | **Profile** (URDF) | **Strict** rejects deprecated and ambiguous forms; **Legacy** accepts the forms older exporters write. When Strict refuses a file, **Retry with Legacy** switches. See [URDF import profiles](../import/urdf_profiles.md). |
 | **Base** | **Fix to the world** bolts the robot's root to the world, for arms on a table. |
 | **Packages** (URDF) | Where `package://` mesh paths look: `name=folder` entries or search folders, separated by `;`. ++enter++ checks again. |
+| **Colliders** (URDF, MJCF) | **Convex Hulls** (the default) turns each triangle-mesh collider on a moving link into the convex hull of its mesh, as MuJoCo collides mesh geoms; **Triangle Meshes** keeps the meshes, with a `MESH_COLLIDERS` warning, since contact against them runs far slower. A mesh that names its own decomposition, SDF contact or reduction is kept either way. |
 | **Lights** (USD) | How the stage's light intensities read: **Isaac** (Isaac Sim's units, a 3000 sun is 3), **Nits** (the schema's nits) or **Raw** (as written). |
 | **Destination** | **Add to Scene** adds it to the open document as one undoable step; **Open as New Scene** makes it a document of its own. |
 | **Name** | The new node's name; the file's name by default. |

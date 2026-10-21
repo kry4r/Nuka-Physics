@@ -10,7 +10,7 @@
 
 The files the document's nodes were imported from, with the options each import used.
 
-**Returns:** a list of {node, file, kind, profile, fix\_base, package\_paths, light\_units, ground, exists}
+**Returns:** a list of {node, file, kind, profile, fix\_base, package\_paths, light\_units, link\_colliders, ground, exists}
 
 ## `asset.reimport`
 

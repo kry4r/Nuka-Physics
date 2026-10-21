@@ -783,6 +783,7 @@ Value SaveSource(const SourceRecord& s, const std::filesystem::path& dir) {
     for (const std::string& path : s.package_paths) paths.PushBack(Value::Str(path));
     o.Set("package_paths", std::move(paths));
     o.Set("light_units", Value::Str(s.light_units));
+    o.Set("link_colliders", Value::Str(s.link_colliders));
     o.Set("ground", Value::Bool(s.ground));
     return o;
 }
@@ -2060,6 +2061,7 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             if (const Value* v = sv.Find("package_paths"))
                 for (const Value& path : v->Elements()) rec.package_paths.push_back(path.AsString());
             if (const Value* v = sv.Find("light_units")) rec.light_units = v->AsString();
+            if (const Value* v = sv.Find("link_colliders")) rec.link_colliders = v->AsString();
             if (const Value* v = sv.Find("ground")) rec.ground = v->AsBool();
             scene.SourcesMut().push_back(std::move(rec));
         }

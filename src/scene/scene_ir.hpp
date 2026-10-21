@@ -286,6 +286,7 @@ struct SourceRecord {
     bool fix_base                          = false;
     std::vector<std::string> package_paths;
     std::string light_units;
+    std::string link_colliders;            // "hull" or "mesh"
     bool ground                            = true;
 };
 

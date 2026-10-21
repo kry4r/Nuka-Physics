@@ -293,7 +293,8 @@ args.profile = 'string, how a URDF reads: strict or legacy, default "strict"'
 args.fix_base = "bool, fix the robot's base to the world, default false"
 args.package_paths = "list of strings, folders to search for package:// files, optional"
 args.light_units = "string, how a USD stage's light intensities read: isaac, nits or raw, default \"isaac\""
-returns = "{path, kind, ok, loaded, name, profile, diagnostics: [{severity, code, element, owner, message, line}], stats: {links, joints, colliders, mesh_colliders, visual_meshes, mass, lo, hi}, package_paths}"
+args.link_colliders = "string, a URDF or MJCF robot's triangle-mesh colliders on moving links: hull (their convex hulls, as MuJoCo collides them) or mesh (kept, far slower contact), default \"hull\""
+returns = "{path, kind, ok, loaded, name, profile, link_colliders, diagnostics: [{severity, code, element, owner, message, line}], stats: {links, joints, colliders, mesh_colliders (triangle meshes), visual_meshes, mass, lo, hi}, package_paths}"
 
 ["file.import"]
 summary = 'Imports an asset file (URDF, MJCF, USD, OBJ/STL/GLB meshes, NKS). Without `mode` the import wizard opens on it; "auto" adds a clean asset to the open document at once and opens the wizard otherwise, "add" adds it as one undoable edit, "open" opens it as a new document.'
@@ -307,6 +308,7 @@ args.profile = 'string, how a URDF reads: strict or legacy, default "strict"'
 args.fix_base = "bool, fix the robot's base to the world, default false"
 args.package_paths = "list of strings, folders to search for package:// files, optional"
 args.light_units = "string, how a USD stage's light intensities read: isaac, nits or raw, default \"isaac\""
+args.link_colliders = "string, a URDF or MJCF robot's triangle-mesh colliders on moving links: hull or mesh, default \"hull\""
 args.discard = "bool, with mode open: drop unsaved changes without asking, default false"
 returns = "{focus} after add, {path, title} after open, the analysis while the wizard shows"
 example = '{"path": "C:/assets/go2/go2.urdf", "mode": "add"}'
@@ -314,7 +316,7 @@ example = '{"path": "C:/assets/go2/go2.urdf", "mode": "add"}'
 ["asset.sources"]
 summary = "The files the document's nodes were imported from, with the options each import used."
 kind = "read"
-returns = "a list of {node, file, kind, profile, fix_base, package_paths, light_units, ground, exists}"
+returns = "a list of {node, file, kind, profile, fix_base, package_paths, light_units, link_colliders, ground, exists}"
 
 ["asset.reimport"]
 summary = 'Imports the source of the node at `path` (the selection by default) again in its place, as one edit to undo; the node "" is an asset opened whole, which opens again as a new document.'

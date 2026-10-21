@@ -192,8 +192,9 @@ Reads an asset file (URDF, MJCF, USD, mesh, NKS) without importing it: whether i
 - `fix_base`: bool, fix the robot's base to the world, default false
 - `package_paths`: list of strings, folders to search for package:// files, optional
 - `light_units`: string, how a USD stage's light intensities read: isaac, nits or raw, default "isaac"
+- `link_colliders`: string, a URDF or MJCF robot's triangle-mesh colliders on moving links: hull (their convex hulls, as MuJoCo collides them) or mesh (kept, far slower contact), default "hull"
 
-**Returns:** {path, kind, ok, loaded, name, profile, diagnostics: \[{severity, code, element, owner, message, line}\], stats: {links, joints, colliders, mesh\_colliders, visual\_meshes, mass, lo, hi}, package\_paths}
+**Returns:** {path, kind, ok, loaded, name, profile, link\_colliders, diagnostics: \[{severity, code, element, owner, message, line}\], stats: {links, joints, colliders, mesh\_colliders (triangle meshes), visual\_meshes, mass, lo, hi}, package\_paths}
 
 ## `file.import`
 
@@ -212,6 +213,7 @@ Imports an asset file (URDF, MJCF, USD, OBJ/STL/GLB meshes, NKS). Without `mode`
 - `fix_base`: bool, fix the robot's base to the world, default false
 - `package_paths`: list of strings, folders to search for package:// files, optional
 - `light_units`: string, how a USD stage's light intensities read: isaac, nits or raw, default "isaac"
+- `link_colliders`: string, a URDF or MJCF robot's triangle-mesh colliders on moving links: hull or mesh, default "hull"
 - `discard`: bool, with mode open: drop unsaved changes without asking, default false
 
 **Returns:** {focus} after add, {path, title} after open, the analysis while the wizard shows

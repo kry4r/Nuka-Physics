@@ -23,8 +23,8 @@ This page is generated from assets/editor/actions.toml by tools/skill_actions.py
 - `file.save_as` {path?} [file]: Saves the document to a new file, which becomes its file; without `path` a file dialog asks.
 - `file.package` {path?} [file]: Saves a copy at `path` that carries every image the scene uses in its own .nka, so it opens with no other files; the document keeps its path.
 - `file.export_usd` {path?, node?, light_units?} [file]: Writes the scene, or the Stage node `node` with what hangs from it, as UsdPhysics in the format the path's extension names (.usd, .usda, .usdc, .usdz).
-- `file.import_analyze` {path, profile?, fix_base?, package_paths?, light_units?} [read]: Reads an asset file (URDF, MJCF, USD, mesh, NKS) without importing it: whether it imports, its diagnostics and its size.
-- `file.import` {path?, mode?, name?, pose?, ground?, profile?, fix_base?, package_paths?, light_units?, discard?} [edit]: Imports an asset file (URDF, MJCF, USD, OBJ/STL/GLB meshes, NKS).
+- `file.import_analyze` {path, profile?, fix_base?, package_paths?, light_units?, link_colliders?} [read]: Reads an asset file (URDF, MJCF, USD, mesh, NKS) without importing it: whether it imports, its diagnostics and its size.
+- `file.import` {path?, mode?, name?, pose?, ground?, profile?, fix_base?, package_paths?, light_units?, link_colliders?, discard?} [edit]: Imports an asset file (URDF, MJCF, USD, OBJ/STL/GLB meshes, NKS).
 
 ## Edits and undo
 

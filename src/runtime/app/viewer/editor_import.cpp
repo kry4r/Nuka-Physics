@@ -5,6 +5,7 @@
 #include "import/mjcf_importer.hpp"
 #include "import/urdf_importer.hpp"
 #include "import/usd_importer.hpp"
+#include "runtime/app/viewer/editor_collision.hpp"
 #include "runtime/app/viewer/editor_materials.hpp"
 #include "runtime/app/viewer/editor_profile.hpp"
 #include "scene/format/nks.hpp"
@@ -147,12 +148,11 @@ ImportStats StatsOf(const scene::SceneIR& s) {
     for (const scene::RigidBodyRecord& b : s.Bodies())
         if (!b.is_static) st.mass += b.mass;
     for (const scene::CollisionShapeRecord& sh : s.Shapes()) {
-        const bool mesh = sh.type == scene::ShapeType::TriMesh || sh.type == scene::ShapeType::ConvexHull;
         if (sh.contype == 0u && sh.conaffinity == 0u) {
             if (!sh.mesh_vertices.empty()) ++st.visual_meshes;
         } else {
             ++st.colliders;
-            if (mesh) ++st.mesh_colliders;
+            if (sh.type == scene::ShapeType::TriMesh) ++st.mesh_colliders;
         }
     }
     if (!SceneBounds(s, &st.lo, &st.hi)) st.lo = st.hi = math::Vec3{};
@@ -238,6 +238,7 @@ ImportOptions ImportOptionsOf(const json::Value& fields, const std::string& fall
     if (const json::Value* paths = fields.Find("package_paths"))
         for (const json::Value& p : paths->Elements()) o.package_paths.push_back(p.AsString());
     if (const json::Value* units = fields.Find("light_units")) o.light_units = units->AsString();
+    if (const json::Value* colliders = fields.Find("link_colliders")) o.link_colliders = colliders->AsString();
     return o;
 }
 
@@ -248,6 +249,7 @@ void SetImportOptions(json::Value& fields, const ImportOptions& options) {
     for (const std::string& p : options.package_paths) paths.PushBack(json::Value::Str(p));
     fields.Set("package_paths", std::move(paths));
     fields.Set("light_units", json::Value::Str(options.light_units));
+    fields.Set("link_colliders", json::Value::Str(options.link_colliders));
 }
 
 // Importers throw on files they cannot read; the failure becomes the analysis's one error.
@@ -306,7 +308,15 @@ ImportAnalysis AnalyzeImport(const std::string& path, const ImportOptions& optio
         a.diagnostics.push_back(ImportDiagnostic{"error", "ASSET_LOAD_FAILED", "", "", e.what(), 0});
         a.scene.reset();
     }
+    const bool robot = a.kind == AssetKind::Urdf || a.kind == AssetKind::Mjcf;
+    if (robot) a.link_colliders = options.link_colliders == "mesh" ? "mesh" : "hull";
     if (!a.scene) return a;
+    if (robot && a.link_colliders == "hull") HullMeshColliders(*a.scene);
+    // Contact against a link's triangle mesh costs far more than against its hull.
+    if (const size_t meshes = robot ? MovingMeshColliders(*a.scene) : 0u; meshes != 0u)
+        a.diagnostics.push_back(ImportDiagnostic{
+            "warning", "MESH_COLLIDERS", "collision", "",
+            std::to_string(meshes) + " triangle-mesh colliders on moving links make contact far slower than hulls", 0});
     // The world refuses a sensor mounted on no body; the records still load for a picture.
     for (const scene::SensorDesc& s : a.scene->Sensors())
         if (s.mount == scene::MountFrame::Body && s.joint_id == scene::kInvalidJoint && s.mount_index >= a.scene->RigidBodyCount())
@@ -351,7 +361,7 @@ json::Value AnalysisToJson(const ImportAnalysis& a) {
     json::Value v = json::Value::Object();
     v.Set("path", json::Value::Str(a.path));
     v.Set("kind", json::Value::Str(AssetKindName(a.kind)));
-    SetImportOptions(v, ImportOptions{a.profile, a.fix_base, a.package_paths, a.light_units});
+    SetImportOptions(v, ImportOptions{a.profile, a.fix_base, a.package_paths, a.light_units, a.link_colliders});
     v.Set("ok", json::Value::Bool(Importable(a)));
     v.Set("loaded", json::Value::Bool(a.scene.has_value()));
     v.Set("name", json::Value::Str(Stem(a.path)));
@@ -472,6 +482,7 @@ scene::SourceRecord SourceOf(const ImportAnalysis& analysis, bool ground) {
     s.fix_base = analysis.fix_base;
     s.package_paths = analysis.package_paths;
     s.light_units = analysis.light_units;
+    s.link_colliders = analysis.link_colliders;
     s.ground = ground;
     return s;
 }
@@ -482,6 +493,7 @@ ImportOptions OptionsOf(const scene::SourceRecord& source) {
     o.fix_base = source.fix_base;
     o.package_paths = source.package_paths;
     if (!source.light_units.empty()) o.light_units = source.light_units;
+    if (!source.link_colliders.empty()) o.link_colliders = source.link_colliders;
     return o;
 }
 

@@ -355,6 +355,7 @@ void ImGuiLayer::DrawImportWizard() {
     const std::string profile = a.At("profile").AsString();
     const bool fix_base = a.At("fix_base").AsBool();
     const std::string light_units = a.At("light_units").AsString();
+    const std::string link_colliders = a.At("link_colliders").AsString();
     const bool ok = a.At("ok").AsBool();
     const json::Value& stats = a.At("stats");
     const json::Value& diagnostics = a.At("diagnostics");
@@ -377,10 +378,12 @@ void ImGuiLayer::DrawImportWizard() {
         }
     };
     // Analyzing again under other options keeps the wizard's name and choices.
-    const auto analyze = [&](const std::string& next, bool fix, const std::string& units) {
+    const auto analyze = [&](const std::string& next, bool fix, const std::string& units,
+                             const std::string& colliders) {
         json::Value args = Args({{"path", json::Value::Str(w.path)}, {"profile", json::Value::Str(next)},
                                  {"fix_base", json::Value::Bool(fix)}, {"package_paths", packages()},
-                                 {"light_units", json::Value::Str(units)}});
+                                 {"light_units", json::Value::Str(units)},
+                                 {"link_colliders", json::Value::Str(colliders)}});
         if (!w.pose.IsNull()) args.Set("pose", w.pose);
         Queue("file.import", std::move(args));
     };
@@ -479,7 +482,7 @@ void ImGuiLayer::DrawImportWizard() {
     if (!ok && kind == "urdf" && profile == "strict") {
         ImGui::TextColored(theme::kFgMuted, "%s", Tr("The legacy profile accepts the forms older exporters write."));
         ImGui::SameLine();
-        if (ImGui::SmallButton(Tr("Retry with Legacy"))) analyze("legacy", fix_base, light_units);
+        if (ImGui::SmallButton(Tr("Retry with Legacy"))) analyze("legacy", fix_base, light_units, link_colliders);
     }
     ImGui::Dummy(ImVec2(0.0f, 6.0f * s));
 
@@ -493,20 +496,32 @@ void ImGuiLayer::DrawImportWizard() {
             nui::Segmented profiles({"Strict", "Legacy"}, nui::Ref(&choice));
             profiles.id = "profile";
             profiles.tips = {"Reject deprecated and ambiguous forms", "Accept the forms older exporters write"};
-            profiles.on_change = [&](int v) { analyze(v == 1 ? "legacy" : "strict", fix_base, light_units); };
+            profiles.on_change = [&](int v) {
+                analyze(v == 1 ? "legacy" : "strict", fix_base, light_units, link_colliders);
+            };
             profiles.Draw();
             OptionLabel("Base");
             bool fixed = fix_base;
-            if (ImGui::Checkbox(Tr("Fix to the world"), &fixed)) analyze(profile, fixed, light_units);
+            if (ImGui::Checkbox(Tr("Fix to the world"), &fixed)) analyze(profile, fixed, light_units, link_colliders);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", Tr("Links no joint carries become static"));
             OptionLabel("Packages");
             ImGui::SetNextItemWidth(-FLT_MIN);
             if (ImGui::InputTextWithHint("##packages", Tr("name=folder; search folder"), w.packages, sizeof(w.packages),
                                          ImGuiInputTextFlags_EnterReturnsTrue) ||
                 ImGui::IsItemDeactivatedAfterEdit())
-                analyze(profile, fix_base, light_units);
+                analyze(profile, fix_base, light_units, link_colliders);
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s", Tr("Where package:// mesh paths look; Enter checks again"));
+        }
+        if (kind == "urdf" || kind == "mjcf") {
+            OptionLabel("Colliders");
+            int choice = link_colliders == "mesh" ? 1 : 0;
+            nui::Segmented colliders({"Convex Hulls", "Triangle Meshes"}, nui::Ref(&choice));
+            colliders.id = "link_colliders";
+            colliders.tips = {"Moving links collide as the hulls of their meshes, as MuJoCo does",
+                              "Moving links keep their triangle meshes; contact runs far slower"};
+            colliders.on_change = [&](int v) { analyze(profile, fix_base, light_units, v == 1 ? "mesh" : "hull"); };
+            colliders.Draw();
         }
         if (kind == "usd") {
             OptionLabel("Lights");
@@ -515,7 +530,9 @@ void ImGuiLayer::DrawImportWizard() {
             units.id = "light_units";
             units.tips = {"Authored intensities are Isaac units: its 3000 sun is 3",
                           "Authored intensities are the schema's nits", "Authored intensities are read as written"};
-            units.on_change = [&](int v) { analyze(profile, fix_base, v == 1 ? "nits" : v == 2 ? "raw" : "isaac"); };
+            units.on_change = [&](int v) {
+                analyze(profile, fix_base, v == 1 ? "nits" : v == 2 ? "raw" : "isaac", link_colliders);
+            };
             units.Draw();
         }
         OptionLabel("Destination");
@@ -558,6 +575,7 @@ void ImGuiLayer::DrawImportWizard() {
                                  {"fix_base", json::Value::Bool(fix_base)},
                                  {"package_paths", packages()},
                                  {"light_units", json::Value::Str(light_units)},
+                                 {"link_colliders", json::Value::Str(link_colliders)},
                                  {"name", json::Value::Str(w.name)},
                                  {"ground", json::Value::Bool(w.ground)}});
         if (add && !w.pose.IsNull()) args.Set("pose", w.pose);
@@ -595,6 +613,7 @@ void ImGuiLayer::DrawSourceSection() {
         if (source->fix_base) add(Tr("Fixed base"));
         if (!source->package_paths.empty()) add(Fmt(Tr("%zu package paths"), source->package_paths.size()));
     }
+    if (source->link_colliders == "mesh") add(Tr("Triangle-mesh colliders"));
     if (source->kind == "usd") {
         const char* units = source->light_units == "nits" ? "Nits" : source->light_units == "raw" ? "Raw" : "Isaac";
         add(Fmt(Tr("Lights: %s"), Tr(units)));
