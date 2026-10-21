@@ -13,8 +13,9 @@ The **Teleop** section of the Joints panel reads a device and maps it through a 
 :   Turns teleop on. The badge says **driving**, **idle** or **disconnected**.
 
 **Device**
-:   **Keyboard**, the **Virtual device** (set by scripts and agents), each plugged-in gamepad, and
-    devices from extensions. All report the same gamepad layout: axes `leftx`, `lefty`, `rightx`,
+:   A chip per device, wrapped to the panel, the one driving lit: **Keyboard**, the **Virtual device**
+    (set by scripts and agents), each plugged-in gamepad, and devices from extensions. Hover a chip for
+    its id, kind and owner. All report the same gamepad layout: axes `leftx`, `lefty`, `rightx`,
     `righty`, `lefttrigger`, `righttrigger` and buttons `a`, `b`, `x`, `y`, `back`, `guide`, `start`,
     `leftstick`, `rightstick`, `leftshoulder`, `rightshoulder`, `dpup`, `dpdown`, `dpleft`, `dpright`.
     The panel shows the device's axes as bars and its buttons as chips lit while held.

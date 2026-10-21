@@ -86,13 +86,28 @@ The **Agents** panel (**Window → Agents**) sets what agents may do. Every acti
 | file, process, app | runs | waits for approval | refused |
 
 **Off** lets no program reach the editor. The editor starts in **Full** unless you chose otherwise; the
-choice is kept in the profile.
+choice is kept in the profile. Hover a mode for what it lets agents do.
 
 - **Always allow** runs listed actions without asking, **Never allow** refuses them in every mode. Both
   take action ids, comma separated, with `*` as a wildcard (`file.*`); press ++enter++ to apply.
 - **Disconnect All and Turn Off** drops every agent and sets the mode to Off.
 - Changing the mode, answering requests and disconnecting are yours alone; an agent can't widen its own
   access.
+
+## Building by chat
+
+In **Full** mode an agent builds what you describe straight into the open document, each change a step
+you can undo. With the skill installed and the server added, ask Claude Code in plain words:
+
+```console
+claude "In the Nuka editor, lay an obstacle course in front of the G1: four boxes and three balls 2 to 5 m
+ahead along +x, staggered on both sides of its path. Then make a training task of my own with a goal
+speed of 1.0 m/s, command the G1 forward at 0.5 m/s and start the simulation."
+```
+
+The agent finds the actions it needs (`scene.spawn`, `edit.apply`, `train.new_task`, `train.set`,
+`teleop.use`, `sim.play`), checks its work with `scene_tree` and `screenshot`, and reports back. The
+Agents panel lists every call as it happens.
 
 ## Proposals and approvals
 

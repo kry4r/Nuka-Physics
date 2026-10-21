@@ -30,8 +30,9 @@ pose made initial in the Poses panel ([Robots](robots.md#poses)).
 
 ## Time step
 
-The **Solver** panel's **Time Step** buttons (1 ms, 2 ms, 1/240 s, 5 ms) set the physics step;
-`sim.dt {seconds}` takes any value from 0.0001 to 0.05 s. A change rebuilds the world and keeps its state.
+The **Solver** panel's **Time Step** buttons (1 ms, 2 ms, 4.17 ms, 5 ms) set the physics step; the
+editor shows every step in milliseconds. `sim.dt {seconds}` takes any value from 0.0001 to 0.05 s.
+A change rebuilds the world and keeps its state.
 A loaded policy runs at the step it was trained at, so unload it before changing the step.
 
 The **Sweep Budget** (10, 32, 128, 512) caps the solver's velocity sweeps per step; see

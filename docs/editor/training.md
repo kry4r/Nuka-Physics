@@ -16,6 +16,22 @@ right with the Policy and Camera panels. Its four pages are **Task**, **Runs**, 
 | **Go2 velocity tracking** | `go2_velocity` | Unitree Go2 | 1024 robots, 200 epochs, a save every 25 |
 | **G1 rough-terrain walking** | `g1_rough` | Unitree G1 | 4096 robots, 3000 epochs, a save every 100 |
 
+### A task of your own
+
+The **+** beside the task (**New Task**, `train.new_task {from}`) starts a task of your own on top of the
+one shown: a Python module `my_task.py` in the profile's `extensions/my_task` folder, opened in the
+Script panel, and selected on the Task page. Its groups are the base task's plus a **Goal** group with
+`goal.speed` (m/s) and `goal.turn` (rad/s). Each `Group` in the module is a section of the Task page and
+each `Param` a row in it, so adding one and saving the file adds it to the page. Further tasks are named
+`my_task_2`, `my_task_3` and so on.
+
+```python
+app.actions.run("train.new_task", **{"from": "g1_rough"})
+app.actions.run("train.set", values={"goal.speed": 1.0})
+```
+
+### Settings
+
 Hover the task for the robot it expects (one per environment) and the rate it steps at. The badge says
 **Ready to train**, or counts the problems that keep the scene from training; each problem shows under
 its row, or at the top when it concerns the scene.

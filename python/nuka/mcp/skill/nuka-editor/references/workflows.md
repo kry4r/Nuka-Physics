@@ -101,10 +101,23 @@ Imported environments (rooms, warehouses, terrain) often bring visual meshes onl
 5. `dataset.export {out: "C:/data/run1", frames: 100, channels: ["rgb", "depth", "semantic"]}`, then
    `wait_for {id: "dataset.status", until: {running: false}, timeout_s: 600}`.
 
+## Driving a robot with a walking policy
+
+1. `policy.load {path: "C:/policies/g1_walk.nkml"}` attaches the policy to every robot with the joints its
+   `<name>.contract.json` names (joints, gains, default angles, step). The scene must step at the policy's
+   step: when it does not, the error says so and `sim.dt {seconds}` sets it before loading again.
+2. Start the robot in the policy's stance: `edit.apply` each joint's `initial_position` to the contract's
+   `default` (paths from `robot.joints`), then `sim.reset`.
+3. `teleop.use {on: true, device: "virtual", mode: "command", command_base: [0.5, 0, 0]}` commands
+   [vx m/s, vy m/s, yaw rate rad/s]; `teleop.input {axes: {lefty: -0.6}}` steers on top of it.
+4. `policy.arrows {on: true}` draws the commanded and actual velocity over each robot; `sim.play` runs it and
+   `policy.status` reports what drives the robots.
+
 ## Training a locomotion policy
 
 1. `train.tasks` lists the tasks, `train.config {task: "go2_velocity"}` switches the document to one and
-   reports its configuration and `errors`.
+   reports its configuration and `errors`. `train.new_task {from: "g1_rough"}` makes a task of the user's
+   own on top of one and switches to it; its Goal group (`goal.speed`, `goal.turn`) sets like any other.
 2. `train.set {values: {"run.num_envs": 2048, "run.max_epochs": 500}}`; `train.validate` must be `ok`.
 3. `train.python` must report `ready` (torch, rl_games, a GPU); `train.python {path}` picks another
    Python.

@@ -11,7 +11,8 @@ The Debug panel only shows; it changes nothing.
 
 - **Collider proxies** draws every collider as a see-through wireframe: green for dynamic colliders,
   magenta for static ones.
-- **Contact points** marks each contact in orange. Markers show where contacts are, not their forces.
+- **Contact points** outlines each contact patch in orange, with its points as small dots on the outline.
+  Patches show where bodies touch, not their forces.
 - **Hide all** turns the overlays off.
 
 Under **Last overlay** it counts the proxies and markers drawn, and warns when shapes were skipped,
@@ -32,8 +33,8 @@ you work in other panels; click it to locate the worst element.
 | **Record** | Records each solve's residual, sweeps and energy |
 | **Heatmap** | Colors cloth by its Newton correction, on a log scale shown at the viewport's right edge |
 | **Locate worst** | Frames and marks the worst element of the newest capped solve, or of the newest solve |
-| **Time step** | 1 ms, 2 ms, 1/240 s or 5 ms; rebuilds the world and keeps its state |
-| **Sweep budget** | 10, 32, 128 or 512 velocity sweeps per substep; the solve stops early at its tolerance |
+| **Time step** | 1 ms, 2 ms, 4.17 ms (1/240 s) or 5 ms; rebuilds the world and keeps its state |
+| **Sweep budget** | 10, 32, 128 or 512 velocity sweeps per substep; the solve stops early at its tolerance. A budget set from a script that no preset matches shows as one more, selected choice |
 | **Alert residual** | 1e-4, 1e-3 or 1e-2 m/s: a solve that spends its budget above it counts as capped |
 
 **Telemetry** lists the records kept, the capped solves (all and recent), records dropped, and the
@@ -117,7 +118,7 @@ app.actions.run("rerun.stream", on=True, file="C:/runs/walk.rrd", every=2)
 
 | Section | Shows |
 | --- | --- |
-| Header | The physics step time (amber when it falls behind) and a sparkline of it |
+| Header | The physics step time (amber when it falls behind) and a sparkline of it; while you watch a training run, the run's steps per second over all its environments |
 | **Timing** | Frames per second, frame time with a sparkline, sub-steps per frame, ticks, snapshot age, dropped snapshots, capped batches (frames where the physics fell behind real time, the toolbar's **CAP ×N**), and **HOST COPY** with its reason when publishing falls back from zero-copy |
 | **Model** | Degrees of freedom, links, bodies, the contact cap and the shown environment |
 | **Render** | Draw calls, instances, lit pixels and the GPU |
