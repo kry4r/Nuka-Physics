@@ -6198,17 +6198,20 @@ void EditorHost::State::StepObserve() {
     }
     t.arrows.clear();
     if (o.frames == 0u) return;
-    // Isaac Lab's height of the arrows over a robot's base, their clearance over its top, and the share
-    // of the way the camera closes per frame.
-    constexpr float kArrowLift = 0.5f, kArrowClearance = 0.3f, kFollowShare = 0.1f;
+    // Isaac Lab's height of the arrows over a robot's base, their clearance over a taller robot's top, and
+    // the share of the way the camera closes per frame.
+    constexpr float kArrowLift = 0.5f, kArrowClearance = 0.2f, kFollowShare = 0.1f;
     const uint32_t current = ui_state_.env_index % ui_state_.envs.count;
     t.current = current;
     const auto base = [&](uint32_t e) {
         const float* p = o.frame.bases.data() + size_t{e} * o.articulations * 7u;
         return math::Vec3{p[0], p[1], p[2]};
     };
-    // The arrows clear the middle robot's top over its base at the first frame; with no robot drawn
-    // they keep Isaac Lab's lift.
+    const auto turn = [&](uint32_t e) {
+        const float* p = o.frame.bases.data() + size_t{e} * o.articulations * 7u;
+        return math::Quat{p[3], p[4], p[5], p[6]};
+    };
+    // The arrows clear the middle robot's top over its base at the first frame, never under Isaac Lab's lift.
     if (o.lift == 0.0f) {
         std::vector<float> reach;
         std::vector<math::Transform> links(o.links);
@@ -6220,7 +6223,7 @@ void EditorHost::State::StepObserve() {
         }
         const auto middle = reach.begin() + static_cast<ptrdiff_t>(reach.size() / 2u);
         std::nth_element(reach.begin(), middle, reach.end());
-        o.lift = reach.empty() ? kArrowLift : std::max(*middle, 0.0f) + kArrowClearance;
+        o.lift = reach.empty() ? kArrowLift : std::max(*middle + kArrowClearance, kArrowLift);
     }
     std::vector<EditorSim::Arrow> arrows;
     for (uint32_t e = 0; e < o.envs; ++e) {
@@ -6232,8 +6235,8 @@ void EditorHost::State::StepObserve() {
         std::copy_n(o.frame.command.data() + size_t{e} * 3u, 3, arrow.command);
         std::copy_n(o.frame.velocity.data() + size_t{e} * 3u, 3, arrow.velocity);
         t.arrows.push_back(arrow);
-        arrows.push_back({at, {arrow.command[0], arrow.command[1], 0.0f}, true});
-        arrows.push_back({at, {arrow.velocity[0], arrow.velocity[1], 0.0f}, false});
+        arrows.push_back({at, {arrow.command[0], arrow.command[1], 0.0f}, true, turn(e)});
+        arrows.push_back({at, {arrow.velocity[0], arrow.velocity[1], 0.0f}, false, turn(e)});
     }
     loaded_->sim->SetArrows(arrows);
     if (!t.follow) return;
@@ -10067,8 +10070,9 @@ void EditorHost::State::RecordPolicyNorm(const Snapshot& snap) {
 }
 
 void EditorHost::State::StepPolicyArrows(const Snapshot& snap) {
-    // The newest measurement's share of the shown velocity, and the arrows' clearance over a robot's top.
-    constexpr float kVelocityShare = 0.2f, kArrowClearance = 0.3f;
+    // The newest measurement's share of the shown velocity, Isaac Lab's height of the arrows over a robot's
+    // base, and their clearance over a taller robot's top.
+    constexpr float kVelocityShare = 0.2f, kArrowLift = 0.5f, kArrowClearance = 0.2f;
     // Train Observe draws its own arrows while it runs.
     if (observe_) return;
     PolicyArrows& a = policy_arrows_;
@@ -10079,8 +10083,8 @@ void EditorHost::State::StepPolicyArrows(const Snapshot& snap) {
     const std::vector<uint32_t>& roots = policy_ctrl_->RootLinks();
     const size_t n = roots.size();
     if (a.lift == 0.0f)
-        a.lift = std::max(loaded_->sim->LinkTop(snap.link_poses) - snap.link_poses[roots[0]].position.z, 0.0f) +
-                 kArrowClearance;
+        a.lift = std::max(loaded_->sim->LinkTop(snap.link_poses) - snap.link_poses[roots[0]].position.z +
+                          kArrowClearance, kArrowLift);
     // A rewound timeline starts the measurement over.
     if (a.root.size() != n || snap.sim_time < a.time) {
         a.root.clear();
@@ -10101,8 +10105,8 @@ void EditorHost::State::StepPolicyArrows(const Snapshot& snap) {
         const float c = std::cos(yaw), s = std::sin(yaw);
         a.command[r] = math::Vec3{c * cmd[0] - s * cmd[1], s * cmd[0] + c * cmd[1], 0.0f};
         const math::Vec3 at = pose.position + math::Vec3{0.0f, 0.0f, a.lift};
-        arrows.push_back({at, a.command[r], true});
-        arrows.push_back({at, a.velocity[r], false});
+        arrows.push_back({at, a.command[r], true, pose.rotation});
+        arrows.push_back({at, a.velocity[r], false, pose.rotation});
     }
     if (a.root.empty() || dt > 0.0f) {
         a.root.resize(n);

@@ -117,12 +117,13 @@ public:
         uint32_t env;
         uint32_t instance;
     };
-    // A velocity arrow from `at` along the planar `velocity`, in the command or the measured colour; the
-    // measured one stacks on the command's.
+    // A velocity arrow at `at` along the world `velocity`, in the command or the measured colour; as Isaac
+    // Lab draws it, the velocity's planar part in the robot's `base` frame sets its heading and length.
     struct Arrow {
         math::Vec3 at;
         math::Vec3 velocity;
         bool command;
+        math::Quat base;
     };
 
     EditorSim(WorldLayout layout, render::RenderWorld render_world, const scene::SceneIR& scene);

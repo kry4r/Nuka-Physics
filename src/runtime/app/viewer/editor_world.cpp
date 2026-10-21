@@ -18,16 +18,14 @@ namespace {
 static_assert(sizeof(math::Transform) == 7u * sizeof(float), "pose wire layout");
 static_assert(sizeof(math::Vec3) == 3u * sizeof(float), "velocity wire layout");
 
-// The command arrow's shaft and head widths, head length and thickness in metres; the measured arrow
-// is narrower so the command shows around it where the two agree.
-constexpr float kArrowShaft = 0.08f, kArrowHead = 0.24f, kArrowHeadLength = 0.2f, kArrowThick = 0.05f;
-constexpr float kMeasuredWidth = 0.7f;
-// Metres of arrow per m/s (a walking robot's arrows read in a crowd), the longest arrow and the slowest speed
-// drawn. Lengths snap to a step so the mesh library keeps few; one shorter than kArrowShortest shrinks whole.
-constexpr float kArrowPerSpeed = 1.5f, kArrowMax = 2.0f, kArrowMinSpeed = 0.02f, kArrowStep = 0.02f;
-constexpr float kArrowShortest = 1.5f * kArrowHeadLength;
-// The measured arrow's rise over the command's, a thickness and a hair.
-constexpr float kArrowRise = kArrowThick + 0.01f;
+// Isaac Lab's velocity marker: a 10-sided shaft of radius 0.25 over x in [-0.25, 0.25], a cone of radius 0.5
+// on to x = 0.75, scaled by 0.5 twice (prototype and instance) and along x by three times the planar speed.
+constexpr int kArrowSides = 10;
+constexpr float kArrowScale = 0.5f * 0.5f, kArrowPerSpeed = 3.0f;
+// The measured arrow is a hair thinner so the two do not fight where they agree.
+constexpr float kMeasuredWidth = 0.96f;
+// The slowest and fastest speeds drawn; stretches snap to a step so the mesh library keeps few.
+constexpr float kArrowMinSpeed = 0.02f, kArrowMaxSpeed = 4.0f, kArrowStep = 0.02f;
 // The terrain checker's square and the lift that keeps the surface over a coplanar floor.
 constexpr float kCheckerSquare = 1.0f, kTerrainLift = 0.004f;
 
@@ -55,37 +53,37 @@ const ParticleSurfaceBinding* SurfaceOf(const WorldLayout& layout, uint32_t part
     return nullptr;
 }
 
-// A flat block arrow along +X from the origin, centred on the XY plane: a shaft and a triangular head
-// `thick` from top to bottom, flat-shaded so its edges read from afar.
-render::MeshGeometry ArrowMesh(float length, float shaft, float head, float head_length, float thick) {
-    const float neck = length - head_length;
-    // The outline, counter-clockwise from above.
-    const float outline[7][2] = {{0.0f, -0.5f * shaft}, {neck, -0.5f * shaft}, {neck, -0.5f * head}, {length, 0.0f},
-                                 {neck, 0.5f * head},   {neck, 0.5f * shaft},  {0.0f, 0.5f * shaft}};
+// Isaac Lab's arrow along +X with x scaled by `length` and the radii by `radius`: smooth sides, flat
+// caps facing back, and the cone's apex split per face so each takes its own normal.
+render::MeshGeometry ArrowMesh(float length, float radius) {
+    const float x0 = -0.25f * length, x1 = 0.25f * length, x2 = 0.75f * length;
+    const float shaft = 0.25f * radius, head = 0.5f * radius;
     render::MeshGeometry g;
-    const auto vertex = [&](const float* p, float z, const math::Vec3& n) {
-        g.positions.insert(g.positions.end(), {p[0], p[1], z});
+    const auto vertex = [&](float x, float y, float z, const math::Vec3& n) {
+        g.positions.insert(g.positions.end(), {x, y, z});
         g.normals.insert(g.normals.end(), {n.x, n.y, n.z});
         return g.VertexCount() - 1u;
     };
-    // Top and bottom: the shaft's rectangle (corners 0, 1, 5, 6) and the head's triangle (2, 3, 4).
-    for (const float side : {1.0f, -1.0f}) {
-        uint32_t v[7];
-        for (int k = 0; k < 7; ++k) v[k] = vertex(outline[k], 0.5f * thick * side, {0.0f, 0.0f, side});
-        for (const auto& t : {std::array<uint32_t, 3>{v[0], v[1], v[5]}, std::array<uint32_t, 3>{v[0], v[5], v[6]},
-                              std::array<uint32_t, 3>{v[2], v[3], v[4]}}) {
-            if (side > 0.0f) g.indices.insert(g.indices.end(), {t[0], t[1], t[2]});
-            else g.indices.insert(g.indices.end(), {t[0], t[2], t[1]});
-        }
-    }
-    // The walls: a quad per outline edge, facing out.
-    for (int k = 0; k < 7; ++k) {
-        const float* a = outline[k];
-        const float* b = outline[(k + 1) % 7];
-        const math::Vec3 n = math::Vec3{b[1] - a[1], a[0] - b[0], 0.0f}.Normalized();
-        const uint32_t a0 = vertex(a, -0.5f * thick, n), b0 = vertex(b, -0.5f * thick, n);
-        const uint32_t b1 = vertex(b, 0.5f * thick, n), a1 = vertex(a, 0.5f * thick, n);
-        g.indices.insert(g.indices.end(), {a0, b0, b1, a0, b1, a1});
+    const auto angle = [](float k) { return 6.2831853f * k / static_cast<float>(kArrowSides); };
+    const auto cone = [&](float a) {
+        return math::Vec3{head, (x2 - x1) * std::sin(a), (x2 - x1) * std::cos(a)}.Normalized();
+    };
+    const math::Vec3 back{-1.0f, 0.0f, 0.0f};
+    const uint32_t shaft_cap = vertex(x0, 0.0f, 0.0f, back), head_cap = vertex(x1, 0.0f, 0.0f, back);
+    for (int k = 0; k < kArrowSides; ++k) {
+        const float a = angle(static_cast<float>(k)), b = angle(static_cast<float>(k + 1));
+        const float sa = std::sin(a), ca = std::cos(a), sb = std::sin(b), cb = std::cos(b);
+        const math::Vec3 na{0.0f, sa, ca}, nb{0.0f, sb, cb};
+        const uint32_t a0 = vertex(x0, shaft * sa, shaft * ca, na), a1 = vertex(x1, shaft * sa, shaft * ca, na);
+        const uint32_t b0 = vertex(x0, shaft * sb, shaft * cb, nb), b1 = vertex(x1, shaft * sb, shaft * cb, nb);
+        g.indices.insert(g.indices.end(), {a0, a1, b1, a0, b1, b0});
+        const uint32_t ca0 = vertex(x0, shaft * sa, shaft * ca, back), cb0 = vertex(x0, shaft * sb, shaft * cb, back);
+        g.indices.insert(g.indices.end(), {shaft_cap, ca0, cb0});
+        const uint32_t ha = vertex(x1, head * sa, head * ca, back), hb = vertex(x1, head * sb, head * cb, back);
+        g.indices.insert(g.indices.end(), {head_cap, ha, hb});
+        const uint32_t sa1 = vertex(x1, head * sa, head * ca, cone(a)), sb1 = vertex(x1, head * sb, head * cb, cone(b));
+        const uint32_t tip = vertex(x2, 0.0f, 0.0f, cone(angle(static_cast<float>(k) + 0.5f)));
+        g.indices.insert(g.indices.end(), {sa1, tip, sb1});
     }
     return g;
 }
@@ -441,16 +439,12 @@ EditorSim::EditorSim(WorldLayout layout, render::RenderWorld render_world, const
     ground.roughness = 0.9f;
     terrain_material_ = render_world_.MaterialCount();
     render_world_.materials.push_back(ground);
-    // Arrows: the measured velocity in the shell's info blue and the command in its ok green. Half the colour
-    // glows, so sunlit faces stay saturated and the faces still shade apart.
-    constexpr float kArrowColors[2][3] = {{0.20f, 0.55f, 0.95f}, {0.18f, 0.80f, 0.36f}};
+    // Arrows in Isaac Lab's preview surfaces: the measured velocity pure blue, the command pure green.
+    constexpr float kArrowColors[2][3] = {{0.0f, 0.0f, 1.0f}, {0.0f, 1.0f, 0.0f}};
     for (int k = 0; k < 2; ++k) {
         scene::RenderMaterial arrow;
-        for (int c = 0; c < 3; ++c) {
-            arrow.base_color[c] = 0.45f * kArrowColors[k][c];
-            arrow.emissive[c] = 0.45f * kArrowColors[k][c];
-        }
-        arrow.roughness = 0.7f;
+        for (int c = 0; c < 3; ++c) arrow.base_color[c] = kArrowColors[k][c];
+        arrow.roughness = 0.5f;
         arrow_materials_[k] = render_world_.MaterialCount();
         render_world_.materials.push_back(arrow);
     }
@@ -509,23 +503,20 @@ void EditorSim::SetArrows(const std::vector<Arrow>& arrows) {
     std::vector<render::RenderInstance>& extra = render_world_.extra_instances;
     extra.resize(terrain_shown_ ? 1u : 0u);
     for (const Arrow& a : arrows) {
-        const float speed = std::hypot(a.velocity.x, a.velocity.y);
+        const math::Vec3 local = a.base.Conjugate().Rotate(a.velocity);
+        const float speed = std::min(std::hypot(local.x, local.y), kArrowMaxSpeed);
         if (speed < kArrowMinSpeed) continue;
-        const long steps = std::max(1L, std::lround(std::min(speed * kArrowPerSpeed, kArrowMax) / kArrowStep));
+        const long steps = std::max(1L, std::lround(kArrowScale * kArrowPerSpeed * speed / kArrowStep));
         const float length = static_cast<float>(steps) * kArrowStep;
-        const float shrink = std::min(1.0f, length / kArrowShortest);
-        const float width = shrink * (a.command ? 1.0f : kMeasuredWidth);
+        const float radius = kArrowScale * (a.command ? 1.0f : kMeasuredWidth);
         render::RenderInstance& inst = extra.emplace_back();
         const std::string key =
             (a.command ? "marker:arrow:command:" : "marker:arrow:measured:") + std::to_string(steps);
-        inst.mesh_id = render_world_.meshes.InternPrimitive(key, [&] {
-            return ArrowMesh(length, kArrowShaft * width, kArrowHead * width, kArrowHeadLength * shrink,
-                             kArrowThick * shrink);
-        });
+        inst.mesh_id = render_world_.meshes.InternPrimitive(key, [&] { return ArrowMesh(length, radius); });
         inst.render_material_id = arrow_materials_[a.command ? 1 : 0];
-        inst.world_xform.position = a.at + math::Vec3{0.0f, 0.0f, a.command ? 0.0f : kArrowRise};
+        inst.world_xform.position = a.at;
         inst.world_xform.rotation =
-            math::Quat::FromAxisAngle(math::Vec3::UnitZ(), std::atan2(a.velocity.y, a.velocity.x));
+            a.base * math::Quat::FromAxisAngle(math::Vec3::UnitZ(), std::atan2(local.y, local.x));
     }
 }
 
