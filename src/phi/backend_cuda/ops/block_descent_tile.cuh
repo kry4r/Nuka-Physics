@@ -309,9 +309,9 @@ __device__ float TileSideSpeed(BlockDescentSolveParams p, BlockScratch s, const 
 }
 
 // RowInertialResponse in float: J M^-1 J^T over the row's rigid bodies and articulations, with both sides
-// on one owner summed first; `coupling` is the product of the two owners' shares.
+// on one owner summed first; `coupling` is the product of the two owners' shares, `largest` the larger share.
 __device__ float TileInertialResponse(DataView data, BlockDescentSolveParams p, const NkRow& row, uint32_t slot,
-                                      float* coupling) {
+                                      float* coupling, float* largest) {
     const NkRowSide sides[2] = {row.a, row.b};
     const bool shared = row.a.kind == row.b.kind && row.a.index == row.b.index;
     const size_t at = size_t{slot} * p.max_dof;
@@ -337,6 +337,7 @@ __device__ float TileInertialResponse(DataView data, BlockDescentSolveParams p, 
         shares[i] = contribution;
     }
     *coupling = shares[0] * shares[1];
+    *largest = fmaxf(shares[0], shares[1]);
     return valid && isfinite(response) ? response : nanf("");
 }
 
@@ -350,11 +351,11 @@ __device__ void InitializeTileHead(DataView data, BlockDescentSolveParams p, Blo
     const uint32_t axes = (row.flags & nk::nk_row_flags::kBlockNormal) != 0u ? 3u : 1u;
     const uint32_t owner = TileOwner(s, c, row.a);
     const uint32_t other = TileOwner(s, c, row.b);
-    float coupling = 0.0f;
-    const float response = TileInertialResponse(data, p, row, slot, &coupling);
+    float coupling = 0.0f, largest = 0.0f;
+    const float response = TileInertialResponse(data, p, row, slot, &coupling, &largest);
     const float coupled = coupling > 0.0f
         ? (response + sqrtf(response * response + 12.0f * coupling)) / (6.0f * coupling) : FLT_MAX;
-    float rho = response > 0.0f ? fminf(p.penalty_scale / response, coupled) : 0.0f;
+    float rho = response > 0.0f ? fminf(static_cast<float>(kPenaltyConditionCap) / largest, coupled) : 0.0f;
     if (!(response == 0.0f || (response > 0.0f && rho > 0.0f && rho <= FLT_MAX))) {
         atomicOr(data.env_status + c.env, kEnvStatusSolverFailure);
         VisitOwners(row, PointMasses(data), p, [&](uint32_t failed) {
@@ -384,6 +385,7 @@ __device__ void InitializeTileHead(DataView data, BlockDescentSolveParams p, Blo
     c.Value(kTileResidualScale, h) = scalar.residual_scale;
     c.Store3(kTileDual, h, {data.lambda[slot], axes == 3u ? data.lambda[slot + stride] : 0.0f,
                             axes == 3u ? data.lambda[slot + 2u * stride] : 0.0f});
+    c.Store3(kTileBase, h, c.Load3(kTileDual, h));
     c.Store3(kTileResidual, h, {});
     c.Store3(kTileMove, h, {});
     c.Store3(kTileStep, h, {});
@@ -1380,28 +1382,25 @@ __device__ void DescendTileBlock(DataView data, BlockDescentSolveParams p, Block
 }
 
 // Dual update as DualUpdateKernel at the velocities every block reached in this iteration; position pass
-// impulses stay in the tile. Returns the contact normal, contact tangent and other rows' residuals.
-__device__ float3 UpdateTileDuals(DataView data, const TileContext& c, bool velocity = true) {
-    uint32_t steps[kResidualMomentum] = {0u, 0u, 0u};
+// impulses stay in the tile. Returns the contact normal, contact tangent and other rows' residuals, then the
+// largest multiplier step.
+__device__ float4 UpdateTileDuals(DataView data, const TileContext& c, float beta, bool velocity = true) {
+    uint32_t steps[kResidualClasses] = {0u, 0u, 0u, 0u};
     for (uint32_t h = c.lane; h < c.heads; h += kTileLanes) {
         const TileHead t = LoadTileHead(c, h);
         const uint32_t slot = c.Index(kTileSlot, h);
         const uint32_t stride = c.Index(kTileStride, h);
+        const bool contact = t.axes == 3u;
         const float normal = nk::augmented::EvaluateScalarImpulse(t.dual.x, t.rho, t.residual.x, t.compliance,
                                                                   t.lower, t.upper, t.response).impulse;
-        Vec3 dual{normal, 0.0f, 0.0f};
-        if (t.axes == 3u) {
-            const auto f = nk::augmented::EvaluateTangentImpulse(t.dual, t.rho, t.residual, normal,
-                                                                 t.mu_first, t.mu_second);
-            dual.y = f.impulse.y;
-            dual.z = f.impulse.z;
-        }
-        const float2 step = MultiplierSteps(t.dual, dual, t.response.residual_scale, t.rho, t.mu_first, t.mu_second);
-        if (t.axes != 3u) steps[kResidualJoint] = max(steps[kResidualJoint], ResidualBits(step.x));
-        if (t.axes == 3u) {
-            nk::augmented::ContactRelaxation relaxation{
-                c.Load3(kTileRelaxationStep, h), c.Value(kTileRelaxationWeight, h)};
-            dual = nk::augmented::RelaxContactImpulse(t.dual, dual, &relaxation);
+        nk::augmented::ContactRelaxation relaxation{c.Load3(kTileRelaxationStep, h), c.Value(kTileRelaxationWeight, h)};
+        const Vec3 dual = ProjectRowDual(t.dual, normal, t.rho, t.residual, contact, t.mu_first, t.mu_second,
+                                         &relaxation);
+        const float2 step = MultiplierSteps(t.dual, dual, t.response.residual_scale, t.rho,
+                                            contact ? t.mu_first : 0.0f, contact ? t.mu_second : 0.0f);
+        steps[kResidualMomentum] = max(steps[kResidualMomentum], ResidualBits(fmaxf(step.x, step.y)));
+        if (!contact) steps[kResidualJoint] = max(steps[kResidualJoint], ResidualBits(step.x));
+        if (contact) {
             c.Store3(kTileRelaxationStep, h, relaxation.step);
             c.Value(kTileRelaxationWeight, h) = relaxation.weight;
             data.lambda[slot + stride] = dual.y;
@@ -1415,12 +1414,16 @@ __device__ float3 UpdateTileDuals(DataView data, const TileContext& c, bool velo
                 ResidualBits(fmaxf(step.y, fmaxf(Along(dual.y, v.y), Along(dual.z, v.z)))));
         }
         if (velocity) data.lambda[slot] = dual.x;
-        c.Store3(kTileDual, h, dual);
+        // The blocks descend against the extrapolated multipliers; data.lambda keeps the unextrapolated ones.
+        c.Store3(kTileDual, h, ExtrapolateDual(c.Load3(kTileBase, h), dual, beta, t.lower, t.upper, contact,
+                                               t.mu_first, t.mu_second));
+        c.Store3(kTileBase, h, dual);
     }
     __syncwarp();
     return {__uint_as_float(__reduce_max_sync(~0u, steps[kResidualNormal])),
             __uint_as_float(__reduce_max_sync(~0u, steps[kResidualTangent])),
-            __uint_as_float(__reduce_max_sync(~0u, steps[kResidualJoint]))};
+            __uint_as_float(__reduce_max_sync(~0u, steps[kResidualJoint])),
+            __uint_as_float(__reduce_max_sync(~0u, steps[kResidualMomentum]))};
 }
 
 // Final velocities as the tails of DescendArticulationsKernel and DescendRigidBlocksKernel, then the
@@ -1597,12 +1600,17 @@ __device__ void DescendTile(ArticulationDeviceState state, DataView data, BlockD
     // Lane k holds the residual of class k.
     float residual = 0.0f;
     uint32_t sweeps = 0u;
+    DualMomentum momentum = StartDualMomentum();
+    float step = FLT_MAX;
     while (sweeps < p.iterations) {
         c.iteration = sweeps++;
         c.momentum = 0.0f;
         DescendTileBlocks<kN>(data, p, s, c, false);
         clock.Stamp(kPhaseDense);
-        const float3 rows = UpdateTileDuals(data, c);
+        AdvanceDualMomentum(momentum, step);
+        clock.Stamp(kPhaseMomentum);
+        const float4 rows = UpdateTileDuals(data, c, momentum.beta);
+        step = rows.w;
         clock.Stamp(kPhaseDual);
         residual = c.lane == kResidualNormal ? rows.x : c.lane == kResidualTangent ? rows.y
                  : c.lane == kResidualJoint ? rows.z : c.momentum;
@@ -1621,7 +1629,7 @@ __device__ void DescendTile(ArticulationDeviceState state, DataView data, BlockD
         for (uint32_t iteration = 0u; iteration < positions; ++iteration) {
             c.iteration = sweeps + iteration;
             DescendTileBlocks<kN>(data, p, s, c, true);
-            if (iteration + 1u < positions) UpdateTileDuals(data, c, false);
+            if (iteration + 1u < positions) UpdateTileDuals(data, c, 0.0f, false);
         }
         FinishTilePositions(state, data, p, s, c);
     }

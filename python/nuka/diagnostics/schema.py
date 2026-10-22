@@ -113,7 +113,7 @@ class SolverPhase(IntEnum):
     DENSE = 2
     GRID = 3
     COARSE = 4
-    ACCELERATION = 5
+    MOMENTUM = 5
     DUAL = 6
     CHECK = 7
 

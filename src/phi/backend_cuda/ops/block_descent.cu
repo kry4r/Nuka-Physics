@@ -17,7 +17,6 @@
 #include "nk/readout/telemetry.hpp"
 #include "nk/solve/augmented_row.hpp"
 #include "nk/solve/block_row_schedule.hpp"
-#include "nk/solve/chebyshev_iteration.hpp"
 #include "nk/solve/vertex_block_forms.hpp"
 #include "nk/solve/vertex_block_hierarchy.hpp"
 #include "phi/backend_cuda/launch.cuh"
@@ -51,13 +50,15 @@ constexpr uint32_t kResidualNormal = 0u, kResidualTangent = 1u, kResidualJoint =
                    kResidualClasses = 4u;
 // solver_phase_time slots of a timed solve; kPhaseEnd closes its last phase.
 constexpr uint32_t kPhaseSetup = 0u, kPhaseVertices = 1u, kPhaseDense = 2u, kPhaseGrid = 3u, kPhaseCoarse = 4u,
-                   kPhaseAcceleration = 5u, kPhaseDual = 6u, kPhaseCheck = 7u, kPhaseEnd = kSolverPhaseWords;
+                   kPhaseMomentum = 5u, kPhaseDual = 6u, kPhaseCheck = 7u, kPhaseEnd = kSolverPhaseWords;
 constexpr uint32_t kPointJacobianAxes = 3u;
 constexpr uint32_t kPointJacobianComponents = 3u;
 constexpr uint32_t kPointJacobianWords = kPointJacobianAxes * kPointJacobianComponents;
 // Penalty scale of rows with grid owners: they tie light nodes to each other and to heavier blocks, where a
 // stiffer penalty pins each block to its neighbours' stale velocities and stalls block Gauss-Seidel.
 constexpr double kGridRowPenaltyScale = 1.0;
+// Largest penalty times a row's most compliant owner share, the condition float block solves keep exact enough.
+constexpr double kPenaltyConditionCap = 1.0e2;
 
 struct AugmentedRowState {
     Vec3 residual;
@@ -180,7 +181,7 @@ constexpr uint32_t kTileLanes = 32u;
 constexpr uint32_t kTileWarps = 4u;
 constexpr uint32_t kTileHeadGroup = 8u;
 // Per-head fields interleaved in groups of eight: indices, coefficients, normal bound, residual, dual,
-// move, step and scalar response of the current block solve.
+// move, step and scalar response of the current block solve, the relaxation and the unextrapolated dual.
 constexpr uint32_t kTileSlot = 0u, kTileStride = 1u, kTileAxes = 2u, kTileOwner = 3u, kTileRow = 5u,
                    kTileUnit = 7u, kTileUnitValue = 9u, kTileRho = 11u, kTileCompliance = 12u, kTileLower = 13u,
                    kTileUpper = 14u, kTileMuFirst = 15u, kTileMuSecond = 16u, kTileNormalBound = 17u,
@@ -188,7 +189,8 @@ constexpr uint32_t kTileSlot = 0u, kTileStride = 1u, kTileAxes = 2u, kTileOwner 
                    kTileDualScale = 30u, kTileResidualScale = 31u,
                    kTileRelaxationStep = kTileResidualScale + 1u,
                    kTileRelaxationWeight = kTileRelaxationStep + 3u,
-                   kTileFields = kTileRelaxationWeight + 1u;
+                   kTileBase = kTileRelaxationWeight + 1u,
+                   kTileFields = kTileBase + 3u;
 
 bool DenseTileRoute(const BlockDescentSolveParams& p) {
     return BlockDescentTileRoute(p.total_particle_count, p.total_grid_count,
@@ -215,6 +217,14 @@ __host__ __device__ uint32_t TileJacobianWidth(const BlockDescentSolveParams& p)
 // Warps the tile kernel keeps resident; each stages one environment at a time in its own slot.
 uint32_t TileWarpSlots(const BlockDescentSolveParams& p);
 
+// FISTA momentum of an env's multipliers, restarted when its last multiplier step grew.
+struct DualMomentum {
+    float t;
+    float previous;
+    float beta;
+    uint32_t restarts;
+};
+
 struct BlockScratch {
     uint32_t* counts;
     uint32_t* offsets;
@@ -229,13 +239,10 @@ struct BlockScratch {
     float* penalty;
     Vec3* particle_snapshot;
     Vec3* particle_free;
-    Vec3* particle_previous;
-    Vec3* particle_older;
-    uint32_t* acceleration_disabled;
-    uint32_t* acceleration_iterations;
-    uint32_t* acceleration_accepted;
-    float* acceleration_ratio;
-    double* acceleration_merit;
+    // The sweep path's unextrapolated multipliers, momentum per env and its running sweep's largest multiplier step.
+    float* dual_base;
+    DualMomentum* dual_momentum;
+    uint32_t* dual_step;
     uint32_t* articulation_roots;
     uint32_t* articulation_dimensions;
     float* articulation_free;
@@ -431,17 +438,12 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     s.penalty = reinterpret_cast<float*>(take(rows));
     s.particle_snapshot = reinterpret_cast<Vec3*>(take(3u * p.total_particle_count));
     s.particle_free = reinterpret_cast<Vec3*>(take(3u * p.total_particle_count));
-    s.particle_previous = reinterpret_cast<Vec3*>(take(3u * p.total_particle_count));
-    s.particle_older = reinterpret_cast<Vec3*>(take(3u * p.total_particle_count));
-    // Tiles factor their blocks in shared memory, without the sweeps' search state or acceleration.
+    // Tiles factor their blocks and keep their multipliers' momentum in shared memory, without the sweeps' search state.
     const uint64_t sweep_blocks = tile ? 0u : blocks, sweep_envs = tile ? 0u : p.env_count;
     const uint64_t sweep_dofs = tile ? 0u : dofs, sweep_matrix = tile ? 0u : matrix_words;
-    s.acceleration_disabled = take(sweep_blocks);
-    s.acceleration_iterations = take(sweep_envs);
-    s.acceleration_accepted = take(sweep_envs);
-    s.acceleration_ratio = reinterpret_cast<float*>(take(sweep_envs));
-    at = (at + 1u) & ~uint64_t{1u};
-    s.acceleration_merit = reinterpret_cast<double*>(take(4u * sweep_envs));
+    s.dual_base = reinterpret_cast<float*>(take(tile ? 0u : rows));
+    s.dual_momentum = reinterpret_cast<DualMomentum*>(take(sweep_envs * sizeof(DualMomentum) / sizeof(uint32_t)));
+    s.dual_step = take(sweep_envs);
     s.articulation_roots = take(dofs);
     s.articulation_dimensions = take(p.articulation_count);
     s.articulation_free = reinterpret_cast<float*>(take(dofs));
@@ -630,6 +632,53 @@ __device__ float2 MultiplierSteps(Vec3 dual, Vec3 next, float scale, float rho, 
 // Velocity of a contact axis along its own impulse, which a converged contact keeps from being positive.
 __device__ float Along(float impulse, float velocity) {
     return impulse > 0.0f ? velocity : impulse < 0.0f ? -velocity : 0.0f;
+}
+
+__host__ __device__ inline DualMomentum StartDualMomentum() { return {1.0f, FLT_MAX, 0.0f, 0u}; }
+
+// One FISTA step of an env's momentum from its last largest multiplier step; a grown step restarts it at rest.
+__device__ void AdvanceDualMomentum(DualMomentum& m, float step) {
+    if (step > m.previous) {
+        m.t = 1.0f;
+        ++m.restarts;
+    }
+    m.previous = step;
+    const float t = 0.5f * (1.0f + sqrtf(fmaf(4.0f * m.t, m.t, 1.0f)));
+    m.beta = (m.t - 1.0f) / t;
+    m.t = t;
+}
+
+// A row's next multiplier at its residual: the bound projection `normal`, the friction cone of that normal
+// impulse and, on contacts, the secant relaxation of the step.
+__device__ Vec3 ProjectRowDual(Vec3 dual, float normal, float rho, Vec3 residual, bool contact, float mu_first,
+                               float mu_second, nk::augmented::ContactRelaxation* relaxation) {
+    if (!contact) return {normal, 0.0f, 0.0f};
+    const auto f = nk::augmented::EvaluateTangentImpulse(dual, rho, residual, normal, mu_first, mu_second);
+    return nk::augmented::RelaxContactImpulse(dual, {normal, f.impulse.y, f.impulse.z}, relaxation);
+}
+
+// The Nesterov point beta past `next` away from `base`, projected onto the row's bounds and the friction cone
+// of its normal multiplier.
+__device__ Vec3 ExtrapolateDual(Vec3 base, Vec3 next, float beta, float lower, float upper, bool contact,
+                                float mu_first, float mu_second) {
+    if (beta == 0.0f) return next;
+    Vec3 y{fmaf(beta, next.x - base.x, next.x), fmaf(beta, next.y - base.y, next.y),
+           fmaf(beta, next.z - base.z, next.z)};
+    y.x = fminf(fmaxf(y.x, lower), upper);
+    if (!contact) return {y.x, 0.0f, 0.0f};
+    const float first = mu_first > 0.0f ? y.y / mu_first : 0.0f;
+    const float second = mu_second > 0.0f ? y.z / mu_second : 0.0f;
+    const float slip = hypotf(first, second), radius = fmaxf(y.x, 0.0f);
+    const float scale = slip > radius ? radius / slip : 1.0f;
+    return {y.x, mu_first > 0.0f ? y.y * scale : 0.0f, mu_second > 0.0f ? y.z * scale : 0.0f};
+}
+
+// atomicMax of `bits` into words[env] from every lane of a warp, once per env the lanes hold; a lane without one
+// passes ~0u.
+__device__ void RaiseWarpMax(uint32_t* words, uint32_t env, uint32_t bits) {
+    const uint32_t peers = __match_any_sync(~0u, env);
+    const uint32_t largest = __reduce_max_sync(peers, bits);
+    if (env != ~0u && threadIdx.x % warpSize == __ffs(peers) - 1u) atomicMax(words + env, largest);
 }
 
 // Whether an env's class already exceeds the tolerance this sweep, so its remaining elements cannot stop it.
@@ -1049,10 +1098,10 @@ __device__ double OwnerInertialResponse(const NkRow& row, const DataView& data,
 }
 
 // J M^-1 J^T of a row over its owners; sets `grid` when a grid node owns it and `coupling` to the
-// largest product of one owner's share with the other owners' shares.
+// largest product of one owner's share with the other owners' shares, `largest` to the largest share.
 __device__ double RowInertialResponse(const NkRow& row, const DataView& data,
                                      const BlockDescentSolveParams& p, PointMassView points,
-                                     uint32_t slot, bool* grid, double* coupling) {
+                                     uint32_t slot, bool* grid, double* coupling, double* largest) {
     double response = 0.0;
     bool valid = true;
     VisitOwners(row, points, p, [&](uint32_t owner) {
@@ -1061,10 +1110,12 @@ __device__ double RowInertialResponse(const NkRow& row, const DataView& data,
         response += contribution;
     });
     *coupling = 0.0;
+    *largest = 0.0;
     if (!valid || !isfinite(response)) return nan("");
     VisitOwners(row, points, p, [&](uint32_t owner) {
         const double contribution = OwnerInertialResponse(row, data, p, points, slot, owner, grid);
         *coupling = fmax(*coupling, contribution * (response - contribution));
+        *largest = fmax(*largest, contribution);
     });
     return response;
 }
@@ -1107,15 +1158,14 @@ __global__ void CountIncidenceKernel(DataView data, BlockDescentSolveParams p, B
             }
         }
         bool grid = false;
-        double coupling = 0.0;
-        const double response = RowInertialResponse(row, data, p, points, slot, &grid, &coupling);
+        double coupling = 0.0, largest = 0.0;
+        const double response = RowInertialResponse(row, data, p, points, slot, &grid, &coupling, &largest);
         // Owners a row ties descend against each other's stale velocities at the block Gauss-Seidel factor
         // rho^2 P / (1 + rho W + rho^2 P), P = max w_i (W - w_i); the root below keeps it at most 1/4.
-        const double penalty_scale = grid ? kGridRowPenaltyScale
-            : double(coupling > 0.0 ? p.pair_penalty_scale : p.penalty_scale);
         const double coupled = coupling > 0.0
             ? (response + sqrt(response * response + 12.0 * coupling)) / (6.0 * coupling) : HUGE_VAL;
-        const double penalty = response > 0.0 ? fmin(penalty_scale / response, coupled) : 0.0;
+        const double cap = grid ? kGridRowPenaltyScale / response : kPenaltyConditionCap / largest;
+        const double penalty = response > 0.0 ? fmin(cap, coupled) : 0.0;
         const bool valid_penalty = response == 0.0 ||
             (penalty > 0.0 && penalty <= double(FLT_MAX) && static_cast<float>(penalty) > 0.0f);
         if (!(response >= 0.0 && isfinite(response)) || !valid_penalty) {
@@ -1983,7 +2033,7 @@ __global__ void DescendParticlesKernel(ModelView model, DataView data, BlockDesc
 // the state stored here; grid-only rows read the residuals grid descents keep current instead of recomputing.
 __global__ void DualUpdateKernel(DataView data, BlockDescentSolveParams p, BlockScratch s, bool seed) {
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
-    uint32_t env = ~0u, joint = 0u;
+    uint32_t env = ~0u, joint = 0u, step = 0u;
     for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < *s.active_count;
          item += gridDim.x * blockDim.x) {
         const uint32_t slot = s.active_rows[item];
@@ -1998,161 +2048,77 @@ __global__ void DualUpdateKernel(DataView data, BlockDescentSolveParams p, Block
         if (grid_only)
             current.normal_bound = AugmentedRowBound(s, rows[slot], slot, RowStateScale(data, p, slot), current);
         const LocalTerm t = LoadLocalTerm(data, p, s, slot, ~0u, false, &current);
-        AugmentedRowState next{};
-        next.residual = t.residual;
-        next.dual.x = t.normal_bound;
-        if (t.contact) {
-            const auto f = nk::augmented::EvaluateTangentImpulse(t.dual, t.penalty, t.residual,
-                                                                 t.normal_bound, t.mu_first, t.mu_second);
-            next.dual.y = f.impulse.y;
-            next.dual.z = f.impulse.z;
-        }
+        const uint32_t stride = rows[slot].group_normal_count;
+        const Vec3 next = ProjectRowDual(t.dual, t.normal_bound, t.penalty, t.residual, t.contact, t.mu_first,
+                                         t.mu_second, s.contact_relaxation + slot);
         if (row_env != env && env != ~0u) {
             RaiseResidual(s, env, kResidualJoint, joint);
-            joint = 0u;
+            atomicMax(s.dual_step + env, step);
+            joint = step = 0u;
         }
         env = row_env;
-        // A non-contact row's multiplier step is its residual of this sweep.
-        if (!t.contact)
-            joint = max(joint, ResidualBits(MultiplierSteps(t.dual, next.dual,
-                static_cast<float>(t.response.residual_scale), t.penalty, 0.0f, 0.0f).x));
+        // Every row's multiplier step drives the momentum restart; a non-contact row's is its residual too.
+        const float2 change = MultiplierSteps(t.dual, next, static_cast<float>(t.response.residual_scale),
+            t.penalty, t.contact ? t.mu_first : 0.0f, t.contact ? t.mu_second : 0.0f);
+        if (!t.contact) joint = max(joint, ResidualBits(change.x));
+        step = max(step, ResidualBits(fmaxf(change.x, change.y)));
+        // The primal reads the extrapolated multipliers; the unextrapolated ones stay in dual_base.
+        const Vec3 base{s.dual_base[slot], t.contact ? s.dual_base[slot + stride] : 0.0f,
+                        t.contact ? s.dual_base[slot + 2u * stride] : 0.0f};
+        const Vec3 y = ExtrapolateDual(base, next, s.dual_momentum[row_env].beta, t.lower, t.upper, t.contact,
+                                       t.mu_first, t.mu_second);
+        s.dual_base[slot] = next.x;
+        data.lambda[slot] = y.x;
         if (t.contact) {
-            next.dual = nk::augmented::RelaxContactImpulse(t.dual, next.dual, &s.contact_relaxation[slot]);
-            data.lambda[slot + rows[slot].group_normal_count] = next.dual.y;
-            data.lambda[slot + 2u * rows[slot].group_normal_count] = next.dual.z;
+            s.dual_base[slot + stride] = next.y;
+            s.dual_base[slot + 2u * stride] = next.z;
+            data.lambda[slot + stride] = y.y;
+            data.lambda[slot + 2u * stride] = y.z;
         }
-        data.lambda[slot] = next.dual.x;
         if (seed && (p.total_grid_count == 0u
                 ? ParticleRowFirstColor(s, p.vertex_blocks.colors, slot) != kNoCacheColor : grid_only)) {
-            next.normal_bound = AugmentedRowBound(s, rows[slot], slot, RowStateScale(data, p, slot), next);
-            s.row_state[slot] = next;
+            AugmentedRowState seeded{};
+            seeded.residual = t.residual;
+            seeded.dual = y;
+            seeded.normal_bound = AugmentedRowBound(s, rows[slot], slot, RowStateScale(data, p, slot), seeded);
+            s.row_state[slot] = seeded;
         }
     }
     RaiseWarpResidual(s, env, kResidualJoint, joint);
+    RaiseWarpMax(s.dual_step, env, step);
 }
 
-__global__ void MarkContactBlocksKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
-    const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
-    const auto points = PointMasses(data);
-    for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < *s.active_count;
-         item += gridDim.x * blockDim.x) {
-        const uint32_t slot = s.active_rows[item];
-        const NkRow row = rows[slot];
-        if (!(row.flags & nk::nk_row_flags::kBlockNormal)) continue;
-        const LocalTerm term = LoadLocalTerm(data, p, s, slot, ~0u, false);
-        if (!(term.normal_bound > 0.0f)) continue;
-        VisitOwners(row, points, p, [&](uint32_t owner) { atomicExch(s.acceleration_disabled + owner, 1u); });
-    }
-}
-
-__global__ void PrepareAccelerationKernel(BlockDescentSolveParams p, BlockScratch s) {
-    for (uint32_t env = blockIdx.x * blockDim.x + threadIdx.x; env < p.env_count;
-         env += gridDim.x * blockDim.x)
-        s.acceleration_ratio[env] = nk::solve::ChebyshevIterationRatio(
-            s.acceleration_iterations[env], s.acceleration_ratio[env], p.acceleration_spectral_radius);
-}
-
-__global__ void TrialAccelerationKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
-    for (uint32_t particle = blockIdx.x * blockDim.x + threadIdx.x; particle < p.total_particle_count;
-         particle += gridDim.x * blockDim.x) {
-        const uint32_t env = particle / p.vertex_blocks.particles_per_env;
-        const Vec3 current = data.particle_vel[particle];
-        s.particle_snapshot[particle] = current;
-        const bool owned = particle % p.vertex_blocks.particles_per_env >= p.grid_particles_per_env;
-        const Vec3 next = owned && data.particle_inv_mass[particle] > 0.0f && s.acceleration_disabled[particle] == 0u &&
-                          EnvRunning(data, env)
-            ? nk::solve::ChebyshevExtrapolate(current, s.particle_older[particle], s.acceleration_ratio[env])
-            : current;
-        data.particle_vel[particle] = next;
-    }
-}
-
-__global__ void ParticleMeritKernel(ModelView model, DataView data, BlockDescentSolveParams p,
-                                    BlockScratch s, uint32_t sample) {
-    const uint32_t lane = threadIdx.x % warpSize;
-    const uint32_t first = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
-    const uint32_t stride = gridDim.x * blockDim.x / warpSize;
-    const VertexBlockView b = Vertices(model, data, p);
-    for (uint32_t particle = first; particle < p.total_particle_count; particle += stride) {
-        if (!(data.particle_inv_mass[particle] > 0.0f)) continue;
-        const uint32_t env = particle / b.layout.particles_per_env;
-        const uint32_t local = particle % b.layout.particles_per_env;
-        if (local < p.grid_particles_per_env) continue;
-        const bool elastic = local >= b.layout.begin && local - b.layout.begin < b.layout.vertices;
-        const uint32_t vertex = local - b.layout.begin;
-        const Vec3 u = data.particle_vel[particle];
-        const float inertia = elastic ? b.inertia[b.Slot(env, vertex)]
-            : 1.0f / (data.particle_inv_mass[particle] * p.dt * p.dt);
-        const Vec3 free_rate = elastic ? b.free_rate[b.Slot(env, vertex)] : s.particle_free[particle];
-        Vec3 gradient{}, impulse{};
-        SymmetricMat3 hessian{};
-        if (elastic)
-            GatherVertexBlock(b, data.particle_vel, env, vertex, lane, warpSize, gradient, hessian);
-        for (uint32_t at = s.offsets[particle] + lane; at < s.offsets[particle + 1u]; at += warpSize) {
-            const LocalTerm term = LoadLocalTerm(data, p, s, s.incidence[at], particle, false);
-            impulse += term.jacobian[0] * term.normal_bound;
-            if (term.contact) {
-                const auto tangent = nk::augmented::EvaluateTangent(term.dual, term.penalty, term.residual,
-                    term.normal_bound, term.mu_first, term.mu_second);
-                impulse += term.jacobian[1] * tangent.impulse.y + term.jacobian[2] * tangent.impulse.z;
-            }
-        }
-        gradient = {WarpSum(gradient.x), WarpSum(gradient.y), WarpSum(gradient.z)};
-        impulse = {WarpSum(impulse.x), WarpSum(impulse.y), WarpSum(impulse.z)};
-        if (lane == 0u) {
-            const Vec3 force = -nk::vbd::InertialGradient(u, free_rate, inertia, p.dt) -
-                               gradient + impulse / p.dt;
-            const double merit = (double(force.x) * force.x + double(force.y) * force.y +
-                                  double(force.z) * force.z) / inertia;
-            atomicAdd(s.acceleration_merit + 2u * env + sample, merit);
-        }
-    }
-}
-
-__global__ void RowMeritKernel(DataView data, BlockDescentSolveParams p, BlockScratch s,
-                               uint32_t sample) {
-    for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < *s.active_count;
-         item += gridDim.x * blockDim.x) {
-        const uint32_t slot = s.active_rows[item];
-        const LocalTerm term = LoadLocalTerm(data, p, s, slot, ~0u, false);
-        if (!(term.penalty > 0.0f)) continue;
-        const double normal = double(term.normal_bound) - term.dual.x;
-        double merit = normal * normal / term.penalty;
-        if (term.contact) {
-            const auto tangent = nk::augmented::EvaluateTangent(term.dual, term.penalty, term.residual,
-                term.normal_bound, term.mu_first, term.mu_second);
-            if (term.mu_first > 0.0f) {
-                const double delta = (double(tangent.impulse.y) - term.dual.y) / term.mu_first;
-                merit += delta * delta / term.penalty;
-            }
-            if (term.mu_second > 0.0f) {
-                const double delta = (double(tangent.impulse.z) - term.dual.z) / term.mu_second;
-                merit += delta * delta / term.penalty;
-            }
-        }
-        atomicAdd(s.acceleration_merit + 2u * (slot / p.rows_per_env) + sample, merit);
-    }
-}
-
-__global__ void AcceptAccelerationKernel(BlockDescentSolveParams p, BlockScratch s) {
+// No momentum before the first sweep; the first restart test passes against the largest step.
+__global__ void StartDualMomentumKernel(BlockDescentSolveParams p, BlockScratch s) {
     for (uint32_t env = blockIdx.x * blockDim.x + threadIdx.x; env < p.env_count;
          env += gridDim.x * blockDim.x) {
-        const bool accepted = s.acceleration_ratio[env] == 1.0f ||
-            nk::solve::ChebyshevAccept(s.acceleration_merit[2u * env + 1u], s.acceleration_merit[2u * env]);
-        s.acceleration_accepted[env] = accepted ? 1u : 0u;
-        s.acceleration_iterations[env] = accepted ? s.acceleration_iterations[env] + 1u : 0u;
+        s.dual_momentum[env] = StartDualMomentum();
+        s.dual_step[env] = __float_as_uint(FLT_MAX);
     }
 }
 
-__global__ void CommitAccelerationKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
-    for (uint32_t particle = blockIdx.x * blockDim.x + threadIdx.x; particle < p.total_particle_count;
-         particle += gridDim.x * blockDim.x) {
-        const uint32_t env = particle / p.vertex_blocks.particles_per_env;
-        const bool accepted = s.acceleration_accepted[env] != 0u;
-        const Vec3 next = accepted ? data.particle_vel[particle] : s.particle_snapshot[particle];
-        s.particle_older[particle] = accepted ? s.particle_previous[particle] : next;
-        s.particle_previous[particle] = next;
-        data.particle_vel[particle] = next;
+// A running env's momentum for this sweep's dual update, from the step its last update took.
+__global__ void AdvanceDualMomentumKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
+    for (uint32_t env = blockIdx.x * blockDim.x + threadIdx.x; env < p.env_count;
+         env += gridDim.x * blockDim.x) {
+        if (!EnvRunning(data, env)) continue;
+        AdvanceDualMomentum(s.dual_momentum[env], __uint_as_float(s.dual_step[env]));
+        s.dual_step[env] = 0u;
+    }
+}
+
+// The solve leaves the unextrapolated multipliers to the impulses, the readouts and the next warm start.
+__global__ void RestoreDualBaseKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
+    const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
+    for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < *s.active_count;
+         item += gridDim.x * blockDim.x) {
+        const uint32_t slot = s.active_rows[item];
+        const NkRow& row = rows[slot];
+        if (row.flags & nk::nk_row_flags::kMaterialBlock) continue;
+        data.lambda[slot] = s.dual_base[slot];
+        if (!(row.flags & nk::nk_row_flags::kBlockNormal)) continue;
+        data.lambda[slot + row.group_normal_count] = s.dual_base[slot + row.group_normal_count];
+        data.lambda[slot + 2u * row.group_normal_count] = s.dual_base[slot + 2u * row.group_normal_count];
     }
 }
 
@@ -2444,8 +2410,8 @@ __global__ void FinishSweepKernel(DataView data, BlockDescentSolveParams p, Bloc
     record->sample_count = max(record->sample_count, slot + 1u);
 }
 
-// The solve's part of the substep record: sweeps, acceleration and the deepest active contact row.
-__global__ void TelemetrySolveKernel(DataView data, BlockDescentSolveParams p, BlockScratch s, uint32_t accelerate) {
+// The solve's part of the substep record: sweeps, the largest multiplier momentum and the deepest active contact row.
+__global__ void TelemetrySolveKernel(DataView data, BlockDescentSolveParams p, BlockScratch s, uint32_t momentum) {
     auto* deepest = reinterpret_cast<unsigned long long*>(&TelemetryHeaderOf(data.telemetry)->penetration);
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
     for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < *s.active_count;
@@ -2467,10 +2433,10 @@ __global__ void TelemetrySolveKernel(DataView data, BlockDescentSolveParams p, B
     }
     record->sweep_budget = p.iterations;
     if (converged) record->flags |= nk::kTelemetryConverged;
-    float ratio = 0.0f;
-    for (uint32_t env = 0u; accelerate != 0u && env < p.env_count; ++env)
-        ratio = fmaxf(ratio, s.acceleration_ratio[env]);
-    record->acceleration = ratio;
+    float beta = 0.0f;
+    for (uint32_t env = 0u; momentum != 0u && env < p.env_count; ++env)
+        beta = fmaxf(beta, s.dual_momentum[env].beta);
+    record->acceleration = beta;
 }
 
 // Completes the substep record from the measured solve and the energy ledger, then commits it.
@@ -2673,11 +2639,11 @@ Status MeasureSolve(const ModelView& model, const DataView& data, const BlockDes
 
 // The measured solve, then its part of the telemetry record when telemetry is on.
 Status MeasureAndRecord(const ModelView& model, const DataView& data, const BlockDescentSolveParams& p,
-                        const BlockScratch& s, bool accelerate, cudaStream_t stream) {
+                        const BlockScratch& s, bool momentum, cudaStream_t stream) {
     if (MeasureSolve(model, data, p, s, stream) != Status::Ok) return Status::Failed;
     if (p.telemetry == 0u) return Status::Ok;
     return LaunchWork(TelemetrySolveKernel, std::max(s.rows, 1u), kThreads, stream, data, p, s,
-                      uint32_t{accelerate}) == cudaSuccess ? Status::Ok : Status::Failed;
+                      uint32_t{momentum}) == cudaSuccess ? Status::Ok : Status::Failed;
 }
 
 Status OpRecordTelemetry(const ModelView&, const DataView& data, const void* params, cudaStream_t stream) {
@@ -2813,16 +2779,13 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
                    0u, stream, data, *p, s);
         if (cudaGetLastError() != cudaSuccess) return Status::Failed;
     }
-    const bool accelerate = p->acceleration_spectral_radius > 0.0f &&
-                            p->acceleration_spectral_radius < 1.0f;
-    if (accelerate && (!clear(s.acceleration_disabled, size_t{s.blocks} * sizeof(uint32_t)) ||
-        !clear(s.acceleration_iterations, size_t{p->env_count} * sizeof(uint32_t)) ||
-        !clear(s.acceleration_ratio, size_t{p->env_count} * sizeof(float)) ||
-        (particle_bytes > 0u &&
-         (cudaMemcpyAsync(s.particle_previous, data.particle_vel, particle_bytes,
-                cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
-          cudaMemcpyAsync(s.particle_older, data.particle_vel, particle_bytes,
-                cudaMemcpyDeviceToDevice, stream) != cudaSuccess)))) return Status::Failed;
+    // The multipliers start unextrapolated, without momentum; residuals are measured at the unextrapolated ones.
+    if ((s.rows > 0u && cudaMemcpyAsync(s.dual_base, data.lambda, size_t{s.rows} * sizeof(float),
+            cudaMemcpyDeviceToDevice, stream) != cudaSuccess) ||
+        LaunchWork(StartDualMomentumKernel, p->env_count, kThreads, stream, *p, s) != cudaSuccess)
+        return Status::Failed;
+    DataView measured = data;
+    measured.lambda = s.dual_base;
     if (LaunchWork(InitializeOwnerCacheColorsKernel, s.blocks, kThreads, stream,
             data, *p, s) != cudaSuccess ||
         LaunchWork(InitializeVertexCacheColorsKernel, static_cast<uint32_t>(vertex_color_items),
@@ -2967,23 +2930,9 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
                 LaunchWork(CoarseApplyKernel, p->total_particle_count, kThreads, stream,
                     data, *p, s) != cudaSuccess) return Status::Failed;
         }
-        if (accelerate) {
-            if (!stamp(kPhaseAcceleration, stream)) return Status::Failed;
-            if (cudaMemsetAsync(s.acceleration_merit, 0, size_t{p->env_count} * 2u * sizeof(double),
-                    stream) != cudaSuccess ||
-                LaunchWork(MarkContactBlocksKernel, s.rows, kThreads, stream, data, *p, s) != cudaSuccess ||
-                LaunchWork(PrepareAccelerationKernel, p->env_count, kThreads, stream, *p, s) != cudaSuccess ||
-                LaunchWork(ParticleMeritKernel, p->total_particle_count, kThreads / 32u, stream,
-                    model, data, *p, s, 0u) != cudaSuccess ||
-                LaunchWork(RowMeritKernel, s.rows, kThreads, stream, data, *p, s, 0u) != cudaSuccess ||
-                LaunchWork(TrialAccelerationKernel, p->total_particle_count, kThreads, stream, data, *p, s) != cudaSuccess ||
-                LaunchWork(ParticleMeritKernel, p->total_particle_count, kThreads / 32u, stream,
-                    model, data, *p, s, 1u) != cudaSuccess ||
-                LaunchWork(RowMeritKernel, s.rows, kThreads, stream, data, *p, s, 1u) != cudaSuccess ||
-                LaunchWork(AcceptAccelerationKernel, p->env_count, kThreads, stream, *p, s) != cudaSuccess ||
-                LaunchWork(CommitAccelerationKernel, p->total_particle_count, kThreads, stream, data, *p, s) != cudaSuccess)
-                return Status::Failed;
-        }
+        if (!stamp(kPhaseMomentum, stream) ||
+            LaunchWork(AdvanceDualMomentumKernel, p->env_count, kThreads, stream, data, *p, s) != cudaSuccess)
+            return Status::Failed;
         if (!stamp(kPhaseDual, stream)) return Status::Failed;
         if (p->material_cells_per_env > 0u &&
             LaunchWork(CacheMaterialRowsKernel, s.rows, kThreads / 32u, stream,
@@ -2997,9 +2946,9 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
         if (!stamp(kPhaseCheck, stream)) return Status::Failed;
         // The contact and cloth vertex residuals need the measured contact response.
         if (p->measure_contact_residual != 0u &&
-            (LaunchWork(ContactResidualsKernel, s.rows, kThreads, stream, data, *p, s) != cudaSuccess ||
+            (LaunchWork(ContactResidualsKernel, s.rows, kThreads, stream, measured, *p, s) != cudaSuccess ||
              LaunchWork(VertexResidualsKernel, p->vertex_blocks.dynamic_vertices * p->env_count, kThreads / 32u,
-                 stream, model, data, *p, s) != cudaSuccess))
+                 stream, model, measured, *p, s) != cudaSuccess))
             return Status::Failed;
         LaunchCuda(FinishSweepKernel, dim3(1u), dim3(kThreads), 0u, stream, data, *p, s, loop, graph);
         return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
@@ -3051,14 +3000,15 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
         }
     }
     if (!stamp(kPhaseEnd, stream)) return Status::Failed;
-    if (LaunchWork(GatherImpulseKernel, p->total_particle_count, kThreads / 32u, stream, data, *p, s) != cudaSuccess ||
+    if (LaunchWork(RestoreDualBaseKernel, s.rows, kThreads, stream, data, *p, s) != cudaSuccess ||
+        LaunchWork(GatherImpulseKernel, p->total_particle_count, kThreads / 32u, stream, data, *p, s) != cudaSuccess ||
         LaunchWork(RecordSolveKernel, p->env_count, kThreads, stream,
                    model, data, *p, s) != cudaSuccess) return Status::Failed;
     if (p->base_link_count > 0u && p->joint_limit_rows_per_env >= 2u * p->base_link_count &&
         data.joint_limit_impulse != nullptr &&
         LaunchWork(WriteBlockJointLimitImpulsesKernel, p->base_link_count * p->env_count,
             kThreads, stream, data, *p) != cudaSuccess) return Status::Failed;
-    return MeasureAndRecord(model, data, *p, s, accelerate, stream);
+    return MeasureAndRecord(model, data, *p, s, true, stream);
 }
 
 }  // namespace

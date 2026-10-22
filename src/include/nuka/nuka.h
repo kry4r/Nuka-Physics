@@ -1006,7 +1006,7 @@ typedef struct nuka_telemetry_record_t {
     float contact_residual;
     float max_penetration;      // [m]
     uint32_t penetration_row;   // UINT32_MAX without penetration
-    float acceleration;         // largest Chebyshev ratio, 0 without acceleration
+    float acceleration;         // largest multiplier momentum coefficient (FISTA beta), 0 without momentum
     float energy;               // end kinetic + gravity + elastic energy [J]
     float energy_residual;      // ledger balance residual [J]
     uint32_t worst_kind;        // nuka_telemetry_element_t

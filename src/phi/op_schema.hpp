@@ -595,12 +595,9 @@ struct BlockDescentSolveParams {
     uint32_t joint_limit_rows_per_env = 0u;
     uint64_t incidence_per_env = 0u;
     uint32_t measure_contact_residual = 0u;
-    float penalty_scale = 100.0f;
-    float pair_penalty_scale = 100.0f;
     uint64_t workspace_words = 0u;
     VertexBlockLayout vertex_blocks{};
     uint32_t measure_vertex_audit = 0u;
-    float acceleration_spectral_radius = 0.0f;
     uint32_t mimic_couplings = 0u;
     uint32_t max_independent_dof = kMaxArticulationDof;
     uint32_t material_cells_per_env = 0u;

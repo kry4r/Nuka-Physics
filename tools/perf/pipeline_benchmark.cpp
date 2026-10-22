@@ -1058,8 +1058,7 @@ Json BlockWorkload(nk::World& world, const std::vector<nk::NkRow>& rows, uint32_
     cached_penalty.Set("range_scope", Json::Str("min/max over finite cached values; max_row_id uses the smallest global row ID on ties"));
     cached_penalty.Set("endpoint_kind_scope", Json::Str("unordered pairs of original NkRow side kinds; PointEndpoint is not expanded"));
     result.Set("cached_penalty", std::move(cached_penalty));
-    result.Set("penalty_scale", Json::Float(p.penalty_scale));
-    result.Set("penalty_definition", Json::Str("rho = penalty_scale / full-row inertial response over deduplicated owners, including cross terms between both sides sharing an owner; rho is a solver numerical parameter; physical compliance, friction mu and rhs are unchanged"));
+    result.Set("penalty_definition", Json::Str("rho = min(block Gauss-Seidel root, 1e4 / largest owner share of the row's inertial response); grid rows use 1 / full response; rho is a solver numerical parameter; physical compliance, friction mu and rhs are unchanged"));
     result.Set("material_blocks", Json::Int(material_blocks));
     result.Set("material_cells_per_env", Json::Int(p.material_cells_per_env));
     const bool grid_color_coverage = grid_color_heads_checked == scheduled_count;
@@ -1762,7 +1761,6 @@ Json Run(const Options& options) {
             solve.Set("iterations", Json::Int(params.iterations));
             solve.Set("substep", Json::Int(params.substep_index));
             solve.Set("dt", Json::Float(params.dt));
-            solve.Set("spectral_radius", Json::Float(params.acceleration_spectral_radius));
         } else continue;
         solve_calls.PushBack(std::move(solve));
         ++solve_call_count;
@@ -1773,7 +1771,7 @@ Json Run(const Options& options) {
         config.velocity_iterations_override ? "explicit world override" :
         std::getenv("NUKA_BLOCK_DESCENT_ITERATIONS") != nullptr ? "solver environment" : "solver default"));
     solver.Set("solve_calls", std::move(solve_calls));
-    for (const char* key : {"NUKA_BLOCK_DESCENT_ITERATIONS", "NUKA_BLOCK_DESCENT_SPECTRAL_RADIUS"}) {
+    for (const char* key : {"NUKA_BLOCK_DESCENT_ITERATIONS"}) {
         const char* value = std::getenv(key);
         solver_environment.Set(key, value != nullptr ? Json::Str(value) : Json::Null());
     }

@@ -34,7 +34,7 @@ def relevant_environment(environment):
     prefixes = ("NUKA_", "PHI_", "CUDA_", "NVIDIA_", "NV_", "CUBLAS_", "CUDNN_",
                 "PTXAS_", "LD_", "OMP_", "TBB_", "OPENBLAS_", "GL_", "EGL_", "VK_")
     names = ("PATH", "PYTHONPATH", "DISPLAY", "XDG_RUNTIME_DIR", "CUDA_VISIBLE_DEVICES",
-             "NUKA_BLOCK_DESCENT_ITERATIONS", "NUKA_BLOCK_DESCENT_SPECTRAL_RADIUS")
+             "NUKA_BLOCK_DESCENT_ITERATIONS")
     return {key: environment.get(key) for key in sorted(set(names) | {
         key for key in environment if key.startswith(prefixes)})}
 
@@ -199,8 +199,7 @@ def budget_evidence(configuration, requested, environment):
                solver.get("configured_velocity_iterations") == requested and
                configuration.get("vel_iters") == requested and solver.get("request_explicit") is True)
     recorded = solver.get("environment", {})
-    matches &= all(recorded.get(key) == environment.get(key) for key in
-                   ("NUKA_BLOCK_DESCENT_ITERATIONS", "NUKA_BLOCK_DESCENT_SPECTRAL_RADIUS"))
+    matches &= recorded.get("NUKA_BLOCK_DESCENT_ITERATIONS") == environment.get("NUKA_BLOCK_DESCENT_ITERATIONS")
     expected = requested if solver.get("velocity_iterations_override") is True else None
     if solver.get("mode") == "block_descent" and expected is None:
         value = environment.get("NUKA_BLOCK_DESCENT_ITERATIONS")
