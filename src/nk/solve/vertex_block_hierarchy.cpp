@@ -68,20 +68,23 @@ RestMesh BuildRestMesh(const Model& model) {
         if (a != b && std::isfinite(length) && length >= 0.0)
             defined.emplace_back(std::min(a, b), std::max(a, b), length);
     };
+    auto triangle = [&](const uint32_t* vertex, const float* rest) {
+        // The rest edges are the columns of the inverse of the stored inverse edge matrix.
+        const double a = rest[0], b = rest[1], c = rest[2], d = rest[3];
+        const double det = std::abs(a * d - b * c);
+        if (!(det > 0.0) || !std::isfinite(det)) return;
+        define(vertex[0], vertex[1], std::hypot(d, c) / det);
+        define(vertex[0], vertex[2], std::hypot(b, a) / det);
+        define(vertex[1], vertex[2], std::hypot(b + d, a + c) / det);
+        mesh.triangles.push_back({vertex[0], vertex[1], vertex[2]});
+    };
     for (const VbdElement& e : p.vbd_elements) {
-        if (e.kind == kVbdTriangle) {
-            // The rest edges are the columns of the inverse of the stored inverse edge matrix.
-            const double a = e.rest[0], b = e.rest[1], c = e.rest[2], d = e.rest[3];
-            const double det = std::abs(a * d - b * c);
-            if (!(det > 0.0) || !std::isfinite(det)) continue;
-            define(e.vertex[0], e.vertex[1], std::hypot(d, c) / det);
-            define(e.vertex[0], e.vertex[2], std::hypot(b, a) / det);
-            define(e.vertex[1], e.vertex[2], std::hypot(b + d, a + c) / det);
-            mesh.triangles.push_back({e.vertex[0], e.vertex[1], e.vertex[2]});
-        } else if (e.kind == kVbdSpring) {
-            define(e.vertex[0], e.vertex[1], e.rest[0]);
-        }
+        if (e.kind == kVbdTriangle) triangle(e.vertex, e.rest);
+        else if (e.kind == kVbdSpring) define(e.vertex[0], e.vertex[1], e.rest[0]);
     }
+    // Material-field membranes store the same inverse rest edges.
+    for (const MfElement& e : p.mf_elements)
+        if (e.kind == kMfTriangle) triangle(e.vertex, e.rest);
     // Rod segments that no spring defines take their cooked length.
     for (const VbdElement& e : p.vbd_elements)
         if (e.kind == kVbdRodBend)

@@ -238,7 +238,7 @@ void BuildFieldShellElements(const std::vector<math::Vec3>& rest_positions,
                 far = {x0[0] + along * u[0] - side * height * u[1], x0[1] + along * u[1] + side * height * u[0]};
                 bend.hinges |= 1u << i;
                 bend.vertex[3u + far_count++] = other.v[w];
-                bend.rest[6u + i] = material_faces.empty()
+                bend.rest[10u + i] = material_faces.empty()
                     ? DihedralAngle(rest_positions[tri.v[i0]], rest_positions[tri.v[i1]],
                                     rest_positions[tri.v[i]], rest_positions[other.v[w]])
                     : 0.0f;
@@ -248,7 +248,7 @@ void BuildFieldShellElements(const std::vector<math::Vec3>& rest_positions,
             for (uint32_t k = 0u; k < 3u; ++k) R[i][k] = row[k];
         }
         if (bend.hinges == 0u) continue;
-        // B = R^-1 recovers the curvature from the three turns; M = A B^T P B is the hinge-space stiffness.
+        // B = R^-1 recovers (kxx, kxy, kyy) from the three turns; M = A B^T P B is the hinge-space stiffness.
         const double det = R[0][0] * (R[1][1] * R[2][2] - R[1][2] * R[2][1]) -
                            R[0][1] * (R[1][0] * R[2][2] - R[1][2] * R[2][0]) +
                            R[0][2] * (R[1][0] * R[2][1] - R[1][1] * R[2][0]);
@@ -266,15 +266,25 @@ void BuildFieldShellElements(const std::vector<math::Vec3>& rest_positions,
             for (uint32_t j = 0u; j < 3u; ++j)
                 for (uint32_t a = 0u; a < 3u; ++a)
                     for (uint32_t b = 0u; b < 3u; ++b) M[i][j] += area * B[a][i] * P[a][b] * B[b][j];
+        // A free edge's turn follows the other turns elastically, so B maps only the hinged turns.
         for (uint32_t g = 0u; g < 3u; ++g) {
             if ((bend.hinges >> g) & 1u) continue;
+            for (uint32_t j = 0u; j < 3u; ++j)
+                if (j != g)
+                    for (uint32_t a = 0u; a < 3u; ++a) B[a][j] -= B[a][g] * M[g][j] / M[g][g];
+            for (uint32_t a = 0u; a < 3u; ++a) B[a][g] = 0.0;
             for (uint32_t i = 0u; i < 3u; ++i)
                 for (uint32_t j = 0u; j < 3u; ++j)
                     if (i != g && j != g) M[i][j] -= M[i][g] * M[g][j] / M[g][g];
             for (uint32_t k = 0u; k < 3u; ++k) M[g][k] = M[k][g] = 0.0;
         }
-        const double packed[6] = {M[0][0], M[1][1], M[2][2], M[0][1], M[0][2], M[1][2]};
-        for (uint32_t k = 0u; k < 6u; ++k) bend.rest[k] = static_cast<float>(packed[k]);
+        // Rows (kxx, kyy, 2 kxy) of the Voigt curvature map, then the area.
+        for (uint32_t k = 0u; k < 3u; ++k) {
+            bend.rest[k] = static_cast<float>(B[0][k]);
+            bend.rest[3u + k] = static_cast<float>(B[2][k]);
+            bend.rest[6u + k] = static_cast<float>(2.0 * B[1][k]);
+        }
+        bend.rest[9] = static_cast<float>(area);
         out.push_back(bend);
     }
 }

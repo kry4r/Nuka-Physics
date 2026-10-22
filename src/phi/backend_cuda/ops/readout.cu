@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <limits>
 #include "constraint/coulomb_contact.hpp"
+#include "nk/material/field_response.hpp"
 
 #include "nk/solve/collidable_owner.hpp"
 #include "phi/backend_cuda/launch.cuh"
@@ -492,6 +493,9 @@ __global__ void ResetEnvsKernel(DataView data, ResetEnvsParams p) {
                 data.particle_plastic_F[particle * 9u + component] =
                     data.snapshot_particle_plastic_F[particle * 9u + component];
     }
+    const size_t field_history = size_t{p.field_elements} * nk::kMfHistory;
+    for (uint32_t local = threadIdx.x; local < field_history; local += blockDim.x)
+        data.mf_history[env * field_history + local] = data.snapshot_mf_history[env * field_history + local];
     if (threadIdx.x == 0u) {
         data.contact_count[env] = 0u;
         data.env_status[env] = 0u;
@@ -719,6 +723,11 @@ Status OpSnapshotState(const ModelView& /*model*/, const DataView& data,
         cudaMemcpyAsync(data.snapshot_particle_plastic_F, data.particle_plastic_F,
                         np * 9u * sizeof(float), cudaMemcpyDeviceToDevice, stream) != cudaSuccess)
         return Status::Failed;
+    const size_t field_history = size_t{p->total_field_elements} * nk::kMfHistory;
+    if (field_history > 0u &&
+        cudaMemcpyAsync(data.snapshot_mf_history, data.mf_history, field_history * sizeof(float),
+                        cudaMemcpyDeviceToDevice, stream) != cudaSuccess)
+        return Status::Failed;
     return Status::Ok;
 }
 
@@ -729,7 +738,8 @@ Status OpRestoreState(const ModelView& model, const DataView& data,
     const uint32_t envs = p->env_count;
     if (p->total_link_count % envs || p->articulation_count % envs ||
         p->total_body_count % envs || p->total_particle_count % envs ||
-        p->row_slot_count % envs || p->contact_slot_count % envs) return Status::Failed;
+        p->total_field_elements % envs || p->row_slot_count % envs ||
+        p->contact_slot_count % envs) return Status::Failed;
     ResetEnvsParams reset{};
     reset.energy_substeps = p->energy_substeps;
     reset.count = envs;
@@ -740,6 +750,7 @@ Status OpRestoreState(const ModelView& model, const DataView& data,
     reset.base_link_count = p->total_link_count / envs;
     reset.body_count = p->total_body_count / envs;
     reset.particle_count = p->total_particle_count / envs;
+    reset.field_elements = p->total_field_elements / envs;
     reset.point_endpoints_per_env = p->point_endpoints_per_env;
     reset.point_endpoint_terms_per_env = p->point_endpoint_terms_per_env;
     reset.lambda_stride = p->row_slot_count / envs;

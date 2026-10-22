@@ -118,6 +118,10 @@ constexpr uint32_t kMultilevelSums = 5u;
 constexpr uint32_t kMultilevelRowParts = 256u;
 // Upper triangle of an element Hessian over the moves of up to three vertices relative to vertex 0.
 constexpr uint32_t kMultilevelElementHessian = 45u;
+// A material-field element's Gauss-Newton factor: four strain rows at vertices 1 to 5, then the upper
+// triangle of their stiffness.
+constexpr uint32_t kMultilevelFieldRows = 60u;
+constexpr uint32_t kMultilevelFieldCurvature = kMultilevelFieldRows + 10u;
 // Threads of a restriction block, one coarse node per warp.
 constexpr uint32_t kMultilevelCorrectThreads = 256u;
 // Vertex-block particles one row group may move; a group with more fails its environment.
@@ -138,7 +142,8 @@ __host__ __device__ inline uint64_t MultilevelDenseFactorWords(uint32_t rank) {
 // Blocks per environment of the multilevel plane kernels: up to kMultilevelRowParts blocks striding over
 // the rows, then one vertex or element per thread.
 uint32_t MultilevelItemParts(const BlockDescentSolveParams& p) {
-    const uint64_t items = uint64_t{p.vertex_blocks.vertices} + p.vertex_blocks.elements;
+    const uint64_t items =
+        uint64_t{p.vertex_blocks.vertices} + p.vertex_blocks.elements + p.vertex_blocks.field_elements;
     return static_cast<uint32_t>(std::max<uint64_t>(1u, (items + kThreads - 1u) / kThreads));
 }
 
@@ -314,6 +319,8 @@ struct BlockScratch {
     float* multilevel_dense_inverse;
     float* multilevel_element_hessian;
     Vec3* multilevel_element_gradient;
+    float* multilevel_field_curvature;
+    Vec3* multilevel_field_gradient;
     Vec3* multilevel_row_impulse;
     float* multilevel_row_curvature;
     Vec3* multilevel_row_along;
@@ -542,7 +549,8 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
             uint64_t{std::numeric_limits<int>::max()} ||
         layout.coarse_dense_nodes > layout.coarse_nodes) return 0u;
     const uint64_t element_slots = uint64_t{nk::PackVbdIncidence(1u, 0u)} * layout.elements * p.env_count;
-    if (multilevel && element_slots > uint64_t{std::numeric_limits<uint32_t>::max()} - kThreads + 1u)
+    const uint64_t field_slots = uint64_t{nk::PackMfIncidence(1u, 0u)} * layout.field_elements * p.env_count;
+    if (multilevel && element_slots + field_slots > uint64_t{std::numeric_limits<uint32_t>::max()} - kThreads + 1u)
         return 0u;
     const uint64_t vertex_words = multilevel ? 3u * uint64_t{layout.vertices} * p.env_count : 0u;
     const uint64_t rank = 3u * uint64_t{layout.coarse_dense_nodes};
@@ -570,6 +578,9 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
         ? uint64_t{kMultilevelElementHessian} * layout.elements * p.env_count : 0u));
     s.multilevel_element_gradient = reinterpret_cast<Vec3*>(take(multilevel
         ? 3u * element_slots : 0u));
+    s.multilevel_field_curvature = reinterpret_cast<float*>(take(multilevel
+        ? uint64_t{kMultilevelFieldCurvature} * layout.field_elements * p.env_count : 0u));
+    s.multilevel_field_gradient = reinterpret_cast<Vec3*>(take(multilevel ? 3u * field_slots : 0u));
     s.multilevel_row_impulse = reinterpret_cast<Vec3*>(take(multilevel ? 3u * rows : 0u));
     s.multilevel_row_curvature = reinterpret_cast<float*>(take(multilevel ? 4u * rows : 0u));
     s.multilevel_row_along = reinterpret_cast<Vec3*>(take(multilevel ? 6u * rows : 0u));
@@ -2559,7 +2570,8 @@ cudaError_t LaunchMultilevelCorrection(const ModelView& model, const DataView& d
     cudaError_t status = LaunchWork(MultilevelRowsKernel, s.rows, kThreads / kRowAxisLanes, stream, data, p, s);
     if (status == cudaSuccess)
         status = LaunchWork(MultilevelElementGradientKernel,
-            static_cast<uint32_t>(uint64_t{nk::PackVbdIncidence(1u, 0u)} * l.elements * p.env_count),
+            static_cast<uint32_t>((uint64_t{nk::PackVbdIncidence(1u, 0u)} * l.elements +
+                                   uint64_t{nk::PackMfIncidence(1u, 0u)} * l.field_elements) * p.env_count),
             kThreads, stream, model, data, p, s);
     if (status == cudaSuccess)
         status = LaunchWork(MultilevelForceKernel, vertices, kMultilevelForceTile, stream, model, data, p, s);

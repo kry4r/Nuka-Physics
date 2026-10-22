@@ -39,7 +39,7 @@ __device__ inline float MultilevelMagnitude(float value) {
 }
 
 // One plane-kernel thread's items: the first blocks stride over their chunk of the environment's selected
-// rows by index, the others take one vertex, then element, per thread.
+// rows by index, the others take one vertex, then element, per thread; field elements follow the others.
 template <typename VertexVisit, typename ElementVisit, typename RowVisit>
 __device__ inline void VisitPlaneItems(const BlockScratch& s, const VertexBlockLayout& l, uint32_t env,
                                        uint32_t part, VertexVisit vertex, ElementVisit element,
@@ -48,7 +48,7 @@ __device__ inline void VisitPlaneItems(const BlockScratch& s, const VertexBlockL
     if (part >= row_parts) {
         const uint32_t item = (part - row_parts) * kThreads + threadIdx.x;
         if (item < l.vertices) vertex(item);
-        else if (item - l.vertices < l.elements) element(item - l.vertices);
+        else if (item - l.vertices < l.elements + l.field_elements) element(item - l.vertices);
         return;
     }
     uint32_t begin = 0u, end = 0u;
@@ -306,11 +306,81 @@ __device__ inline float StoreKindHessian(nk::VbdElement e, const nk::vbd::Elemen
     return total;
 }
 
+__device__ inline nk::mf::FieldCurvature FieldCurvatureAt(const VertexBlockView& b, const DataView& data,
+                                                          uint32_t env, uint32_t index) {
+    const nk::MfElement e = b.field_elements[index];
+    return nk::mf::GaussNewtonCurvature(e, b.field_materials[e.material], FieldHistory(b, env, index),
+                                        FieldStepGeometry(b, data.particle_vel, e, env), FieldStart(b, env, index),
+                                        b.dt);
+}
+
+// A field element's strain rows at vertices 1 to 5, vertex 0's being their negated sum, then the stiffness
+// upper triangle; returns the bound of every coupling it gives two coarse nodes.
+__device__ inline float StoreFieldCurvature(const VertexBlockView& b, const DataView& data, const BlockScratch& s,
+                                            uint32_t envs, uint32_t env, uint32_t index) {
+    const nk::mf::FieldCurvature c = FieldCurvatureAt(b, data, env, index);
+    float* out = s.multilevel_field_curvature + size_t{env} * b.layout.field_elements + index;
+    const size_t stride = size_t{envs} * b.layout.field_elements;
+    float reach[4] = {};
+    for (uint32_t a = 0u; a < 4u; ++a)
+        for (uint32_t j = 1u; j < 6u; ++j) {
+            const Vec3 r = c.row[a][j];
+            float* at = out + 3u * (5u * a + j - 1u) * stride;
+            at[0] = r.x;
+            at[stride] = r.y;
+            at[2u * stride] = r.z;
+            reach[a] += fmaxf(fabsf(r.x), fmaxf(fabsf(r.y), fabsf(r.z)));
+        }
+    float total = 0.0f;
+    for (uint32_t a = 0u; a < 4u; ++a)
+        for (uint32_t k = a; k < 4u; ++k) {
+            out[(kMultilevelFieldRows + MultilevelPacked(a, k)) * stride] = c.stiffness[a][k];
+            total += (a == k ? 1.0f : 2.0f) * fabsf(c.stiffness[a][k]) * reach[a] * reach[k];
+        }
+    return total;
+}
+
+// Curvature products of a field element between the correction and the previous step, in rate units.
+__device__ inline void AddFieldForms(const VertexBlockView& b, const DataView& data, const BlockScratch& s,
+                                     uint32_t env, uint32_t index, double (&sums)[kMultilevelSums]) {
+    const nk::MfElement e = b.field_elements[index];
+    Vec3 d[6] = {}, q[6] = {};
+    for (uint32_t j = 0u; j < nk::MfElementVertexCount(e); ++j) {
+        const uint32_t slot = b.Slot(env, e.vertex[j]);
+        d[j] = s.multilevel_direction[slot];
+        q[j] = s.multilevel_previous[slot];
+    }
+    const nk::mf::FieldCurvature c = FieldCurvatureAt(b, data, env, index);
+    float gd[4], gq[4];
+    nk::mf::Vary(c, d, gd);
+    nk::mf::Vary(c, q, gq);
+    const double step = double(b.dt) * b.dt;
+    sums[2] += step * nk::mf::Form(c, gd, gd);
+    sums[3] += step * nk::mf::Form(c, gd, gq);
+    sums[4] += step * nk::mf::Form(c, gq, gq);
+}
+
+// Energy change of a field element as its vertices take the plane step at `scale`, at the committed history.
+template <bool kUnit = false>
+__device__ inline float MultilevelFieldChange(const VertexBlockView& b, const DataView& data, const BlockScratch& s,
+                                              const MultilevelState& state, uint32_t env, uint32_t index,
+                                              float scale) {
+    const nk::MfElement e = b.field_elements[index];
+    Vec3 shift[6] = {};
+    for (uint32_t j = 0u; j < nk::MfElementVertexCount(e); ++j)
+        shift[j] = MultilevelMove<kUnit>(data, s, state, b.Particle(env, e.vertex[j]), b.Slot(env, e.vertex[j]),
+                                         scale) * b.dt;
+    return nk::mf::ElementMovesEnergyChange(e, b.field_materials[e.material], FieldHistory(b, env, index),
+                                            FieldStepGeometry(b, data.particle_vel, e, env),
+                                            FieldStart(b, env, index), b.dt, shift);
+}
+
 // An element's relative Hessian into the multilevel scratch. Relative node weights lie in [-1, 1], so the
 // returned absolute entry sum bounds every coupling the element gives two coarse nodes.
 __device__ inline float StoreElementHessian(const VertexBlockView& b, const DataView& data,
                                             const BlockScratch& s, uint32_t envs, uint32_t env,
                                             uint32_t index) {
+    if (index >= b.layout.elements) return StoreFieldCurvature(b, data, s, envs, env, index - b.layout.elements);
     const nk::VbdElement element = b.elements[index];
     const auto* start = ElementMembraneStart(b, env, index);
     const auto gn = nk::vbd::GaussNewtonCurvature(
@@ -338,6 +408,10 @@ __device__ inline float StoreElementHessian(const VertexBlockView& b, const Data
 __device__ inline void AddElementForms(const VertexBlockView& b, const DataView& data,
                                        const BlockScratch& s, uint32_t env, uint32_t index,
                                        double (&sums)[kMultilevelSums]) {
+    if (index >= b.layout.elements) {
+        AddFieldForms(b, data, s, env, index - b.layout.elements, sums);
+        return;
+    }
     const nk::VbdElement element = b.elements[index];
     const auto* start = ElementMembraneStart(b, env, index);
     Vec3 d[4], q[4];
@@ -367,6 +441,8 @@ template <bool kUnit = false>
 __device__ inline float MultilevelElementChange(const VertexBlockView& b, const DataView& data,
                                                 const BlockScratch& s, const MultilevelState& state,
                                                 uint32_t env, uint32_t index, float scale) {
+    if (index >= b.layout.elements)
+        return MultilevelFieldChange<kUnit>(b, data, s, state, env, index - b.layout.elements, scale);
     const nk::VbdElement element = b.elements[index];
     const auto* start = ElementMembraneStart(b, env, index);
     Vec3 rate[4], move[4], shift[4];
@@ -428,15 +504,30 @@ __global__ void MultilevelRowsKernel(DataView data, BlockDescentSolveParams p, B
 
 // Slots for every local vertex of each element, indexed by its packed incidence.
 constexpr uint32_t kMultilevelElementSlots = nk::PackVbdIncidence(1u, 0u);
+constexpr uint32_t kMultilevelFieldSlots = nk::PackMfIncidence(1u, 0u);
 
-// Element gradients for every incidence at the current rates; the force gathers them in its original
-// lane-strided order, including the complete Rayleigh action.
+// Element gradients for every incidence at the current rates, field incidences after the vertex-block ones;
+// the force gathers them in its original lane-strided order, including the complete Rayleigh action.
 __global__ void MultilevelElementGradientKernel(ModelView model, DataView data,
                                                 BlockDescentSolveParams p, BlockScratch s) {
     const VertexBlockView b = Vertices(model, data, p);
     const uint64_t slots = uint64_t{kMultilevelElementSlots} * b.layout.elements;
-    for (uint64_t item = uint64_t{blockIdx.x} * blockDim.x + threadIdx.x; item < slots * p.env_count;
+    const uint64_t field_slots = uint64_t{kMultilevelFieldSlots} * b.layout.field_elements;
+    for (uint64_t item = uint64_t{blockIdx.x} * blockDim.x + threadIdx.x;
+         item < (slots + field_slots) * p.env_count;
          item += uint64_t{gridDim.x} * blockDim.x) {
+        if (item >= slots * p.env_count) {
+            const uint64_t at = item - slots * p.env_count;
+            const uint32_t env = static_cast<uint32_t>(at / field_slots);
+            const uint32_t packed = static_cast<uint32_t>(at % field_slots);
+            const nk::MfElement element = b.field_elements[nk::MfIncidenceElement(packed)];
+            if (nk::MfIncidenceLocal(packed) >= nk::MfElementVertexCount(element)) continue;
+            Vec3 gradient;
+            SymmetricMat3 curvature;
+            FieldElementBlock(b, data.particle_vel, env, packed, gradient, curvature);
+            s.multilevel_field_gradient[at] = gradient;
+            continue;
+        }
         const uint32_t env = static_cast<uint32_t>(item / slots), packed = static_cast<uint32_t>(item % slots);
         const nk::VbdElement element = b.elements[nk::VbdIncidenceElement(packed)];
         const uint32_t local = nk::VbdIncidenceLocal(packed);
@@ -473,12 +564,14 @@ __global__ void __launch_bounds__(kThreads, 10) MultilevelForceKernel(ModelView 
             if (lane == 0u) moving[local] = dynamic;
             if (!dynamic) continue;
             Vec3 gradient{}, impulse{};
-            const Vec3* terms = s.multilevel_element_gradient +
-                uint64_t{env} * kMultilevelElementSlots * b.layout.elements;
+            const VertexElementList list = ElementsOf(b, vertex);
+            const Vec3* terms = list.field
+                ? s.multilevel_field_gradient + uint64_t{env} * kMultilevelFieldSlots * b.layout.field_elements
+                : s.multilevel_element_gradient + uint64_t{env} * kMultilevelElementSlots * b.layout.elements;
             const uint32_t begin = IncidenceOffset(s.offsets, s.incidence_capacity, particle);
             const uint32_t end = IncidenceOffset(s.offsets, s.incidence_capacity, particle + 1u);
-            for (uint32_t at = b.offsets[vertex] + lane; at < b.offsets[vertex + 1u]; at += warpSize)
-                gradient = gradient + terms[b.incidence[at]];
+            for (uint32_t at = list.begin + lane; at < list.end; at += warpSize)
+                gradient = gradient + terms[list.incidence[at]];
             for (uint32_t at = begin + lane; at < end; at += warpSize) {
                 const Vec3 f = s.multilevel_row_impulse[s.incidence[at]];
                 impulse += LoadPointIncidenceJacobian(s, at, 0u) * f.x + LoadPointIncidenceJacobian(s, at, 1u) * f.y +
@@ -508,27 +601,29 @@ __global__ void __launch_bounds__(kThreads, 10) MultilevelForceKernel(ModelView 
 }
 
 // The node of an element parent slot, selected without indexing so the slots stay in registers.
-__device__ inline uint32_t SlotNode(const uint32_t (&node)[kMultilevelElementNodes], uint32_t slot) {
+template <uint32_t kNodes>
+__device__ inline uint32_t SlotNode(const uint32_t (&node)[kNodes], uint32_t slot) {
     uint32_t value = ~0u;
 #pragma unroll
-    for (uint32_t k = 0u; k < kMultilevelElementNodes; ++k) value = k == slot ? node[k] : value;
+    for (uint32_t k = 0u; k < kNodes; ++k) value = k == slot ? node[k] : value;
     return value;
 }
 
-// A node's weights at element vertices 1 to 3 less its weight at vertex 0, from the parent slots.
-__device__ inline void RelativeWeights(const uint32_t (&node)[kMultilevelElementNodes],
-                                       const float (&weight)[kMultilevelElementNodes], uint32_t target,
-                                       float (&relative)[3]) {
-    float at[4];
+// A node's weights at element vertices past the first less its weight at vertex 0, from the parent slots.
+template <uint32_t kNodes>
+__device__ inline void RelativeWeights(const uint32_t (&node)[kNodes], const float (&weight)[kNodes],
+                                       uint32_t target, float (&relative)[kNodes / nk::kVbdCoarseParents - 1u]) {
+    constexpr uint32_t kVertices = kNodes / nk::kVbdCoarseParents;
+    float at[kVertices];
 #pragma unroll
-    for (uint32_t j = 0u; j < 4u; ++j) {
+    for (uint32_t j = 0u; j < kVertices; ++j) {
         at[j] = 0.0f;
 #pragma unroll
         for (uint32_t k = 0u; k < nk::kVbdCoarseParents; ++k)
             if (node[nk::kVbdCoarseParents * j + k] == target) at[j] = weight[nk::kVbdCoarseParents * j + k];
     }
 #pragma unroll
-    for (uint32_t j = 0u; j < 3u; ++j) relative[j] = at[j + 1u] - at[0];
+    for (uint32_t j = 0u; j + 1u < kVertices; ++j) relative[j] = at[j + 1u] - at[0];
 }
 
 // Coupling block of two nodes through an element's relative Hessian, given their relative weights.
@@ -686,6 +781,102 @@ __device__ inline void AssembleElement(const ModelView& model, const BlockScratc
                 float c[3];
                 RelativeWeights(node, weight, column, c);
                 ElementNodeBlock(h, a, c, block);
+                sink.AddBlock(row, column, block);
+            }
+        }
+    }
+}
+
+// A node's strain rows of a field element: its relative weights on the stored rows of vertices 1 to 5.
+__device__ inline void FieldNodeRows(const float* in, size_t stride, const float (&relative)[5],
+                                     float (&rows)[4][3]) {
+#pragma unroll
+    for (uint32_t a = 0u; a < 4u; ++a)
+#pragma unroll
+        for (uint32_t axis = 0u; axis < 3u; ++axis) {
+            float value = 0.0f;
+#pragma unroll
+            for (uint32_t j = 0u; j < 5u; ++j)
+                value = fmaf(relative[j], in[(3u * (5u * a + j) + axis) * stride], value);
+            rows[a][axis] = value;
+        }
+}
+
+// Coupling block of two nodes through a field element's stiffness, given their strain rows.
+__device__ inline void FieldNodeBlock(const float (&k)[10], const float (&row)[4][3], const float (&column)[4][3],
+                                      float (&block)[3][3]) {
+#pragma unroll
+    for (uint32_t i = 0u; i < 3u; ++i)
+#pragma unroll
+        for (uint32_t m = 0u; m < 3u; ++m) {
+            float value = 0.0f;
+#pragma unroll
+            for (uint32_t a = 0u; a < 4u; ++a)
+#pragma unroll
+                for (uint32_t c = 0u; c < 4u; ++c)
+                    value = fmaf(row[a][i] * column[c][m], k[a <= c ? MultilevelPacked(a, c) : MultilevelPacked(c, a)],
+                                 value);
+            block[i][m] = value;
+        }
+}
+
+// One field element's couplings on every level, as an element's over up to six vertices.
+__device__ inline void AssembleFieldElement(const ModelView& model, const BlockScratch& s, const VertexBlockView& b,
+                                            const OperatorSink& sink, uint32_t envs, uint32_t env, uint32_t index,
+                                            bool dense) {
+    constexpr uint32_t kNodes = 6u * nk::kVbdCoarseParents;
+    const nk::MfElement e = b.field_elements[index];
+    const uint32_t count = nk::MfElementVertexCount(e);
+    bool live[6], any = false;
+#pragma unroll
+    for (uint32_t j = 0u; j < 6u; ++j) {
+        live[j] = j < count && MultilevelDynamic(s, b.Particle(env, e.vertex[j]));
+        any = any || live[j];
+    }
+    if (!any) return;
+    const float* in = s.multilevel_field_curvature + size_t{env} * b.layout.field_elements + index;
+    const size_t stride = size_t{envs} * b.layout.field_elements;
+    float k[10];
+#pragma unroll
+    for (uint32_t i = 0u; i < 10u; ++i) k[i] = in[(kMultilevelFieldRows + i) * stride];
+    for (uint32_t level = 0u; level < b.layout.coarse_levels; ++level) {
+        uint32_t node[kNodes];
+        float weight[kNodes];
+#pragma unroll
+        for (uint32_t j = 0u; j < 6u; ++j) {
+            const size_t at = (size_t{level} * b.layout.vertices + (live[j] ? e.vertex[j] : 0u)) *
+                              nk::kVbdCoarseParents;
+#pragma unroll
+            for (uint32_t m = 0u; m < nk::kVbdCoarseParents; ++m) {
+                node[nk::kVbdCoarseParents * j + m] = live[j] ? model.vbd_coarse_parents[at + m] : ~0u;
+                weight[nk::kVbdCoarseParents * j + m] = live[j] ? model.vbd_coarse_weights[at + m] : 0.0f;
+            }
+        }
+        uint32_t firsts = 0u;
+#pragma unroll
+        for (uint32_t a = 0u; a < kNodes; ++a) {
+            bool first = node[a] != ~0u;
+#pragma unroll
+            for (uint32_t c = 0u; c < a; ++c) first = first && node[c] != node[a];
+            if (first) firsts |= 1u << a;
+        }
+        const bool pairs = dense && level + 1u == b.layout.coarse_levels;
+        for (uint32_t rest = firsts; rest != 0u; rest &= rest - 1u) {
+            const uint32_t row = SlotNode(node, __ffs(rest) - 1u);
+            float relative[5], a[4][3], block[3][3];
+            RelativeWeights(node, weight, row, relative);
+            FieldNodeRows(in, stride, relative, a);
+            if (!pairs) {
+                FieldNodeBlock(k, a, a, block);
+                sink.AddBlock(row, row, block);
+                continue;
+            }
+            for (uint32_t more = rest; more != 0u; more &= more - 1u) {
+                const uint32_t column = SlotNode(node, __ffs(more) - 1u);
+                float c[4][3];
+                RelativeWeights(node, weight, column, relative);
+                FieldNodeRows(in, stride, relative, c);
+                FieldNodeBlock(k, a, c, block);
                 sink.AddBlock(row, column, block);
             }
         }
@@ -875,13 +1066,15 @@ MultilevelAssembleKernel(ModelView model, DataView data, BlockDescentSolveParams
             AssembleVertex(model, s, b, sink, env, item, level, dense && level + 1u == l.coarse_levels);
     } else if (item - l.vertices < l.elements) {
         AssembleElement(model, s, b, sink, p.env_count, env, item - l.vertices, dense);
+    } else if (item - l.vertices - l.elements < l.field_elements) {
+        AssembleFieldElement(model, s, b, sink, p.env_count, env, item - l.vertices - l.elements, dense);
     }
 }
 
 // The fixed-point scale keeps every operator sum of an environment below 2^62.
 __global__ void MultilevelScaleKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
     const VertexBlockLayout& l = p.vertex_blocks;
-    const double terms = double(l.elements) + l.vertices + p.rows_per_env + 1.0;
+    const double terms = double(l.elements) + l.field_elements + l.vertices + p.rows_per_env + 1.0;
     for (uint32_t env = blockIdx.x * blockDim.x + threadIdx.x; env < p.env_count;
          env += gridDim.x * blockDim.x) {
         MultilevelState& state = s.multilevel[env];

@@ -29,12 +29,14 @@ struct VertexBlockView {
     const uint32_t* row_first = nullptr;
     float* solver_audit = nullptr;
     uint32_t* env_status = nullptr;
-    // Material-field elements, materials, incidence of the field vertices and interval-start metrics.
+    // Material-field elements, materials, incidence of the field vertices, interval-start metrics and the
+    // committed history of each element.
     const nk::MfElement* field_elements = nullptr;
     const nk::MfMaterial* field_materials = nullptr;
     const uint32_t* field_offsets = nullptr;
     const uint32_t* field_incidence = nullptr;
     const nk::vbd::MembraneStartState* field_start = nullptr;
+    const float* field_history = nullptr;
     VertexBlockLayout layout{};
     float dt = 0.0f;
 
@@ -53,6 +55,7 @@ __host__ __device__ inline void BindFieldTables(VertexBlockView& b, const ModelV
     b.field_offsets = model.mf_incidence_offsets;
     b.field_incidence = model.mf_incidence;
     b.field_start = data.mf_start_metric;
+    b.field_history = data.mf_history;
 }
 
 // A vertex's element list: its vertex-block elements, or its material-field elements past the first field vertex.
@@ -152,6 +155,10 @@ __device__ inline const nk::vbd::MembraneStartState* FieldStart(const VertexBloc
     return b.field_start != nullptr ? b.field_start + env * b.layout.field_elements + element : nullptr;
 }
 
+__device__ inline const float* FieldHistory(const VertexBlockView& b, uint32_t env, uint32_t element) {
+    return b.field_history + (size_t{env} * b.layout.field_elements + element) * nk::kMfHistory;
+}
+
 __device__ inline nk::mf::FieldGeometry FieldStepGeometry(const VertexBlockView& b, const math::Vec3* velocity,
                                                          const nk::MfElement& element, uint32_t env) {
     return StepGeometry<nk::mf::FieldGeometry>(b, velocity, element.vertex, nk::MfElementVertexCount(element), env);
@@ -199,8 +206,9 @@ __device__ inline void FieldElementBlock(const VertexBlockView& b, const math::V
                                          uint32_t packed, math::Vec3& g, math::SymmetricMat3& h) {
     const uint32_t index = nk::MfIncidenceElement(packed);
     const nk::MfElement element = b.field_elements[index];
-    nk::mf::ElementBlock(element, b.field_materials[element.material], nullptr, nk::MfIncidenceLocal(packed),
-                         FieldStepGeometry(b, velocity, element, env), FieldStart(b, env, index), b.dt, &g, &h);
+    nk::mf::ElementBlock(element, b.field_materials[element.material], FieldHistory(b, env, index),
+                         nk::MfIncidenceLocal(packed), FieldStepGeometry(b, velocity, element, env),
+                         FieldStart(b, env, index), b.dt, &g, &h);
 }
 
 __device__ inline void ListElementBlock(const VertexBlockView& b, const math::Vec3* velocity, uint32_t env,
@@ -296,8 +304,8 @@ __device__ inline VertexElementChangeTerms FieldElementChange(
     const uint32_t local = nk::MfIncidenceLocal(packed);
     nk::mf::FieldGeometry geometry = FieldStepGeometry(b, velocity, element, env);
     geometry.delta[local] = (from - velocity[b.Particle(env, element.vertex[0])]) * b.dt;
-    return {nk::mf::ElementEnergyChange(element, b.field_materials[element.material], nullptr, local, geometry,
-                                        FieldStart(b, env, index), b.dt, move * b.dt),
+    return {nk::mf::ElementEnergyChange(element, b.field_materials[element.material], FieldHistory(b, env, index),
+                                        local, geometry, FieldStart(b, env, index), b.dt, move * b.dt),
             0.0f, 0.0f};
 }
 
@@ -336,8 +344,8 @@ __device__ inline bool FieldElementStateValid(const VertexBlockView& b, const ma
     nk::mf::FieldGeometry geometry = FieldStepGeometry(b, velocity, element, env);
     geometry.delta[nk::MfIncidenceLocal(packed)] = (from - velocity[b.Particle(env, element.vertex[0])]) * b.dt;
     return nk::mf::ElementStateValid(element, geometry, FieldStart(b, env, index)) &&
-           fabs(nk::mf::ElementEnergy(element, b.field_materials[element.material], nullptr, geometry, b.dt)) <=
-               FLT_MAX;
+           fabs(nk::mf::ElementEnergy(element, b.field_materials[element.material], FieldHistory(b, env, index),
+                                      geometry)) <= FLT_MAX;
 }
 
 __device__ inline bool VertexEnergyStateValid(const VertexBlockView& b, const math::Vec3* velocity,

@@ -31,7 +31,7 @@ constexpr uint32_t kThreads = 128u;
 constexpr uint32_t kColumns = nk::kEnergyColumnCount;
 constexpr uint32_t kForceWorkColumn = kColumns;
 constexpr uint32_t kReductionColumns = kColumns + 1u;
-static_assert(kColumns == 31u, "energy field record must match its named columns");
+static_assert(kColumns == 33u, "energy field record must match its named columns");
 
 __device__ uint32_t Column(EnergyColumn value) { return static_cast<uint32_t>(value); }
 __device__ double Dot(Vec3 a, Vec3 b) {
@@ -242,7 +242,10 @@ __device__ KinematicElasticResponse KinematicFieldReaction(const ModelView& m, c
     KinematicElasticResponse total;
     for (uint32_t k = m.mf_incidence_offsets[field_vertex]; k < m.mf_incidence_offsets[field_vertex + 1u]; ++k) {
         const uint32_t incidence = m.mf_incidence[k];
-        const nk::MfElement element = m.mf_elements[nk::MfIncidenceElement(incidence)];
+        const uint32_t index = nk::MfIncidenceElement(incidence);
+        const nk::MfElement element = m.mf_elements[index];
+        const float* history = d.mf_history + (size_t{particle / p.particles_per_env} * p.field_elements + index) *
+            nk::kMfHistory;
         const uint32_t anchor = base + element.vertex[0];
         nk::mf::FieldGeometry geometry;
         for (uint32_t j = 0u; j < nk::MfElementVertexCount(element); ++j) {
@@ -252,7 +255,7 @@ __device__ KinematicElasticResponse KinematicFieldReaction(const ModelView& m, c
         }
         Vec3 gradient;
         math::SymmetricMat3 hessian;
-        nk::mf::ElementBlock(element, m.mf_materials[element.material], nullptr, nk::MfIncidenceLocal(incidence),
+        nk::mf::ElementBlock(element, m.mf_materials[element.material], history, nk::MfIncidenceLocal(incidence),
                              geometry, nullptr, p.dt, &gradient, &hessian);
         total.gradient += gradient;
         total.work += Dot(gradient, d.particle_kinematic_target[particle] - d.energy_particle_start[particle]);
@@ -329,7 +332,8 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
         values[c] += value;
         if (c >= Column(EnergyColumn::DriveWork) && c <= Column(EnergyColumn::ExternalWork))
             values[Column(EnergyColumn::Throughput)] += fabs(value);
-        if (c >= Column(EnergyColumn::FrictionLoss) && c <= Column(EnergyColumn::RayleighLoss))
+        if ((c >= Column(EnergyColumn::FrictionLoss) && c <= Column(EnergyColumn::RayleighLoss)) ||
+            c == Column(EnergyColumn::PlasticLoss) || c == Column(EnergyColumn::ViscousLoss))
             values[Column(EnergyColumn::Throughput)] += value;
     };
     double kinetic = 0.0, gravity = 0.0, elastic = 0.0, position = 0.0;
@@ -476,6 +480,8 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
     for (uint32_t i = threadIdx.x; i < p.field_elements; i += blockDim.x) {
         const nk::MfElement element = m.mf_elements[i];
         const nk::MfMaterial material = m.mf_materials[element.material];
+        const size_t slot = size_t{env} * p.field_elements + i;
+        const float* history = d.mf_history + slot * nk::kMfHistory;
         nk::mf::FieldGeometry x, unprojected;
         const uint32_t anchor = env * p.particles_per_env + p.vbd_begin + element.vertex[0];
         for (uint32_t j = 0u; j < nk::MfElementVertexCount(element); ++j) {
@@ -489,10 +495,15 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
             if (p.stage == EnergyStage::Projected)
                 unprojected.start[j] = ElementPosition(d, p, particle, true);
         }
-        const double energy = nk::mf::ElementEnergy(element, material, nullptr, x, p.dt);
+        const double energy = nk::mf::ElementEnergy(element, material, history, x);
         elastic += energy;
         if (p.stage == EnergyStage::Projected)
-            position += energy - nk::mf::ElementEnergy(element, material, nullptr, unprojected, p.dt);
+            position += energy - nk::mf::ElementEnergy(element, material, history, unprojected);
+        // The step's commit left its plastic and viscous losses after the trial history.
+        if (p.stage == EnergyStage::End) {
+            add(EnergyColumn::PlasticLoss, d.mf_trial[slot * (nk::kMfHistory + 2u) + nk::kMfHistory]);
+            add(EnergyColumn::ViscousLoss, d.mf_trial[slot * (nk::kMfHistory + 2u) + nk::kMfHistory + 1u]);
+        }
     }
     if (p.stage == EnergyStage::Solved) {
         const uint32_t first_friction = p.contact_rows + p.limit_rows;
@@ -570,6 +581,7 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
     for (uint32_t c = Column(EnergyColumn::FrictionLoss); c <= Column(EnergyColumn::RayleighLoss); ++c) {
         losses += sum[c];
     }
+    losses += sum[Column(EnergyColumn::PlasticLoss)] + sum[Column(EnergyColumn::ViscousLoss)];
     const double residual = change - work + losses + get(EnergyColumn::DatKineticLoss) -
                              get(EnergyColumn::PositionPotential);
     output[Column(EnergyColumn::Dt)] = p.dt;

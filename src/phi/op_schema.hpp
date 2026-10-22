@@ -49,6 +49,10 @@ inline constexpr uint32_t kEnvStatusControlFailure = 1u << 10;
 inline constexpr uint32_t kEnvStatusSensorQueueOverflow = 1u << 11;
 inline constexpr uint32_t kEnvStatusDatFailure = 1u << 12;
 inline constexpr uint32_t kEnvStatusSolverFailure = 1u << 13;
+// A material-field law failed and its step's history was not committed; latched until reset.
+inline constexpr uint32_t kEnvStatusMaterialFieldFailure = 1u << 14;
+// A material-field element left its calibrated strain or curvature range; latched until reset.
+inline constexpr uint32_t kEnvStatusMaterialFieldRange = 1u << 15;
 inline constexpr uint32_t kBodyGyroNotConverged      = 1u;
 inline constexpr uint32_t kBodyGyroInvalidInput      = 2u;
 
@@ -881,6 +885,7 @@ struct ResetEnvsParams {
     float    jitter_q;
     uint32_t point_endpoints_per_env = 0u;
     uint32_t point_endpoint_terms_per_env = 0u;
+    uint32_t field_elements = 0u;   // material-field elements per env
 };
 
 struct SnapshotStateParams {
@@ -889,6 +894,7 @@ struct SnapshotStateParams {
     uint32_t articulation_count;
     uint32_t total_body_count;
     uint32_t total_particle_count;
+    uint32_t total_field_elements = 0u;
 };
 
 // Restore all environments with the same state lifecycle as a masked reset.
@@ -904,6 +910,7 @@ struct RestoreStateParams {
     uint32_t total_particle_count;
     uint32_t point_endpoints_per_env = 0u;
     uint32_t point_endpoint_terms_per_env = 0u;
+    uint32_t total_field_elements = 0u;
 };
 
 struct ContactWarmStartParams {

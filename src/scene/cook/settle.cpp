@@ -150,6 +150,7 @@ SettleResult Settle(nk::World& world, const SceneIR& scene, const SceneMap& map,
     snap.articulation_count = world.GetModel().capacities.articulations_per_env * E;
     snap.total_particle_count = world.GetModel().capacities.particles_per_env * E;
     snap.total_body_count = B * E;
+    snap.total_field_elements = world.GetModel().capacities.mf_elements_per_env * E;
     if (world.DispatchOp(phi::NkOp::SnapshotState, &snap) != phi::Status::Ok) {
         return result;  // ok == false.
     }

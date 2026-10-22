@@ -298,6 +298,7 @@ bool World::SeedInitialState() {
     snapshot_params_.articulation_count = cap.articulations_per_env * E;
     snapshot_params_.total_body_count = total_body_count;
     snapshot_params_.total_particle_count = total_particle_count;
+    snapshot_params_.total_field_elements = cap.mf_elements_per_env * E;
     restore_params_.total_link_count = L * E;
     restore_params_.energy_substeps = cap.integration_substeps;
     restore_params_.env_count = E;
@@ -307,6 +308,7 @@ bool World::SeedInitialState() {
     restore_params_.contact_slot_count = cap.max_contacts_per_env * E;
     restore_params_.total_body_count = total_body_count;
     restore_params_.total_particle_count = total_particle_count;
+    restore_params_.total_field_elements = cap.mf_elements_per_env * E;
     reset_params_.count = 0;
     reset_params_.energy_substeps = cap.integration_substeps;
     reset_params_.env_count = E;
@@ -324,6 +326,7 @@ bool World::SeedInitialState() {
     fk_params_.total_link_count = L * E;
     fk_params_.articulations_per_env = cap.articulations_per_env;
     reset_params_.particle_count = cap.particles_per_env;
+    reset_params_.field_elements = cap.mf_elements_per_env;
     reset_params_.point_endpoints_per_env = cap.point_endpoints_per_env;
     reset_params_.point_endpoint_terms_per_env = cap.point_endpoint_terms_per_env;
     restore_params_.point_endpoints_per_env = cap.point_endpoints_per_env;

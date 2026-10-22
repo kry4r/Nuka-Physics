@@ -422,6 +422,10 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::MfIncidenceOffsets, DlpackDtype::kU32, 1, false},  // mf_incidence_offsets
     {FieldId::MfIncidence, DlpackDtype::kU32, 1, false},  // mf_incidence
     {FieldId::MfStartMetric, DlpackDtype::kU8, 2, false},  // mf_start_metric
+    {FieldId::MfHistory, DlpackDtype::kF32, 2, false},  // mf_history
+    {FieldId::SnapshotMfHistory, DlpackDtype::kF32, 2, false},  // snapshot_mf_history
+    {FieldId::MfTrial, DlpackDtype::kF32, 2, false},  // mf_trial
+    {FieldId::MfEnvCommit, DlpackDtype::kU32, 1, false},  // mf_env_commit
 };
 
 } // namespace nuka::nk

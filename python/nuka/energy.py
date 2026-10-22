@@ -39,6 +39,8 @@ class EnergyColumn(IntEnum):
     ROW_PHYSICAL_IMPULSE_WORK = 28
     UNCLASSIFIED_ROW_WORK = 29
     VALID = 30
+    PLASTIC_LOSS = 31
+    VISCOUS_LOSS = 32
 
 
 class EnergyStatus(IntFlag):

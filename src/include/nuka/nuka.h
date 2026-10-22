@@ -901,7 +901,8 @@ typedef enum nuka_energy_column_t {
     NUKA_ENERGY_POSITION_POTENTIAL, NUKA_ENERGY_DAT_KINETIC_LOSS, NUKA_ENERGY_DAT_POTENTIAL,
     NUKA_ENERGY_RESIDUAL, NUKA_ENERGY_THROUGHPUT, NUKA_ENERGY_DT,
     NUKA_ENERGY_ROW_RATE_WORK, NUKA_ENERGY_ROW_PHYSICAL_IMPULSE_WORK,
-    NUKA_ENERGY_UNCLASSIFIED_ROW_WORK, NUKA_ENERGY_VALID, NUKA_ENERGY_COLUMN_COUNT
+    NUKA_ENERGY_UNCLASSIFIED_ROW_WORK, NUKA_ENERGY_VALID, NUKA_ENERGY_PLASTIC_LOSS, NUKA_ENERGY_VISCOUS_LOSS,
+    NUKA_ENERGY_COLUMN_COUNT
 } nuka_energy_column_t;
 
 typedef enum nuka_energy_status_t {
@@ -936,7 +937,11 @@ typedef enum nuka_env_status_t {
     // Invalid or initially intersecting DAT geometry; latched until reset.
     NUKA_ENV_STATUS_DAT_FAILURE = 1u << 12,
     // Invalid or nonfinite block response; latched until reset.
-    NUKA_ENV_STATUS_SOLVER_FAILURE = 1u << 13
+    NUKA_ENV_STATUS_SOLVER_FAILURE = 1u << 13,
+    // A material-field law failed and its step's history was not committed; latched until reset.
+    NUKA_ENV_STATUS_MATERIAL_FIELD_FAILURE = 1u << 14,
+    // A material-field element left its calibrated range; latched until reset.
+    NUKA_ENV_STATUS_MATERIAL_FIELD_RANGE = 1u << 15
 } nuka_env_status_t;
 
 typedef enum nuka_gyro_status_t {

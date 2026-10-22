@@ -233,6 +233,9 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
             return mf_vertices_per_env > 0u ? uint64_t{mf_vertices_per_env} + 1u : 0u;
         if (id == FieldId::MfIncidence) return mf_incidence_per_env;
         if (id == FieldId::MfStartMetric) return CheckedProduct({mf_elements_per_env, env_count});
+        if (id == FieldId::MfHistory || id == FieldId::SnapshotMfHistory || id == FieldId::MfTrial)
+            return CheckedProduct({mf_elements_per_env, env_count});
+        if (id == FieldId::MfEnvCommit) return mf_elements_per_env > 0u ? uint64_t{env_count} : 0u;
         if (id == FieldId::CrbaScratch)
             return CheckedProduct({articulations_per_env, env_count, dofs_per_env, uint64_t{dofs_per_env} + 12u});
         // Symbolic scalar counts require an explicit field-specific extent.

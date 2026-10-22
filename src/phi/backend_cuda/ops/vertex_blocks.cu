@@ -171,6 +171,41 @@ __global__ void ClothHistoryKernel(uint32_t* ready, uint32_t env_count) {
     if (env < env_count) ready[env] = 1u;
 }
 
+// Each field element evaluates its law at the step's final positions; the trial history is followed by
+// the step's area-scaled plastic and viscous losses.
+__global__ void FieldTrialKernel(ModelView model, DataView data, ClothStepParams p) {
+    const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
+    const VertexBlockLayout& l = p.layout;
+    if (item >= l.field_elements * l.env_count) return;
+    const uint32_t env = item / l.field_elements;
+    const nk::MfElement element = model.mf_elements[item % l.field_elements];
+    nk::mf::FieldGeometry g{};
+    for (uint32_t j = 0u; j < nk::MfElementVertexCount(element); ++j)
+        g.start[j] = data.particle_pos[env * l.particles_per_env + l.begin + element.vertex[j]];
+    nk::mf::FieldResponse<float> r{};
+    const nk::MfStatus status = nk::mf::ElementTrial(element, model.mf_materials[element.material],
+                                                     data.mf_history + size_t{item} * nk::kMfHistory, g, p.dt, r);
+    float* trial = data.mf_trial + size_t{item} * (nk::kMfHistory + 2u);
+    for (uint32_t k = 0u; k < nk::kMfHistory; ++k) trial[k] = r.history[k];
+    trial[nk::kMfHistory] = nk::mf::ElementArea(element) * r.plastic;
+    trial[nk::kMfHistory + 1u] = nk::mf::ElementArea(element) * r.viscous;
+    const uint32_t flags = (status != nk::MfStatus::Ok ? kEnvStatusMaterialFieldFailure : 0u) |
+                           (r.beyond_range ? kEnvStatusMaterialFieldRange : 0u);
+    if (flags == 0u) return;
+    atomicOr(data.mf_env_commit + env, flags);
+    atomicOr(data.env_status + env, flags);
+}
+
+// An environment whose field law failed anywhere keeps its whole committed history.
+__global__ void FieldCommitKernel(DataView data, ClothStepParams p) {
+    const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
+    const VertexBlockLayout& l = p.layout;
+    if (item >= l.field_elements * l.env_count) return;
+    if ((data.mf_env_commit[item / l.field_elements] & kEnvStatusMaterialFieldFailure) != 0u) return;
+    const float* trial = data.mf_trial + size_t{item} * (nk::kMfHistory + 2u);
+    for (uint32_t k = 0u; k < nk::kMfHistory; ++k) data.mf_history[size_t{item} * nk::kMfHistory + k] = trial[k];
+}
+
 bool ValidLayout(const ClothStepParams* p) {
     const VertexBlockLayout& l = p->layout;
     const uint64_t max_items = uint64_t{std::numeric_limits<uint32_t>::max()} - (kBlockSize - 1u);
@@ -218,7 +253,7 @@ Status OpClothPredict(const ModelView& model, const DataView& data, const void* 
     return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
 }
 
-Status OpClothFinalize(const ModelView&, const DataView& data, const void* params,
+Status OpClothFinalize(const ModelView& model, const DataView& data, const void* params,
                        cudaStream_t stream) {
     const auto* p = static_cast<const ClothStepParams*>(params);
     if (p == nullptr || !ValidLayout(p)) return Status::InvalidArgument;
@@ -227,13 +262,24 @@ Status OpClothFinalize(const ModelView&, const DataView& data, const void* param
         data.particle_row_impulse == nullptr ||
         data.vbd_history_ready == nullptr ||
         data.vbd_step == nullptr || data.vbd_restart == nullptr ||
-        (p->truncation != 0u && data.dat_particle_beta == nullptr))
+        (p->truncation != 0u && data.dat_particle_beta == nullptr) ||
+        (p->layout.field_elements > 0u && (data.mf_history == nullptr || data.mf_trial == nullptr ||
+                                           data.mf_env_commit == nullptr || model.mf_elements == nullptr ||
+                                           model.mf_materials == nullptr)))
         return Status::InvalidArgument;
     const uint32_t items = p->layout.vertices * p->layout.env_count;
     LaunchCuda(ClothFinalizeKernel, dim3((items + kBlockSize - 1u) / kBlockSize),
                dim3(kBlockSize), 0u, stream, data, *p);
     LaunchCuda(ClothHistoryKernel, dim3((p->layout.env_count + kBlockSize - 1u) / kBlockSize),
                dim3(kBlockSize), 0u, stream, data.vbd_history_ready, p->layout.env_count);
+    const uint32_t field_elements = p->layout.field_elements * p->layout.env_count;
+    if (field_elements > 0u) {
+        if (cudaMemsetAsync(data.mf_env_commit, 0, p->layout.env_count * sizeof(uint32_t), stream) != cudaSuccess)
+            return Status::Failed;
+        const dim3 grid((field_elements + kBlockSize - 1u) / kBlockSize);
+        LaunchCuda(FieldTrialKernel, grid, dim3(kBlockSize), 0u, stream, model, data, *p);
+        LaunchCuda(FieldCommitKernel, grid, dim3(kBlockSize), 0u, stream, data, *p);
+    }
     return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
 }
 
