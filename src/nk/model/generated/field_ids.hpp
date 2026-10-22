@@ -403,6 +403,11 @@ enum class FieldId : uint16_t {
     DatBodyParent,  // dat_body_parent (per:body arena:scratch owner:data)
     DatArticParent,  // dat_artic_parent (per:articulation arena:scratch owner:data)
     Telemetry,  // telemetry (per:scalar arena:scratch owner:data count:telemetry_words flags:[readout])
+    MfElements,  // mf_elements (per:scalar arena:persistent owner:model count:mf_elements_per_env)
+    MfMaterials,  // mf_materials (per:scalar arena:persistent owner:model count:mf_materials)
+    MfIncidenceOffsets,  // mf_incidence_offsets (per:scalar arena:persistent owner:model count:mf_vertices_per_env+1)
+    MfIncidence,  // mf_incidence (per:scalar arena:persistent owner:model count:mf_incidence_per_env)
+    MfStartMetric,  // mf_start_metric (per:scalar arena:scratch owner:data count:mf_elements_per_env*env_count)
     Count
 };
 
@@ -801,6 +806,11 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "dat_body_parent",
     "dat_artic_parent",
     "telemetry",
+    "mf_elements",
+    "mf_materials",
+    "mf_incidence_offsets",
+    "mf_incidence",
+    "mf_start_metric",
 };
 inline constexpr const char* FieldName(FieldId id) {
     return static_cast<int>(id) < kFieldCount ? kFieldNames[static_cast<int>(id)] : "unknown";

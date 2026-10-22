@@ -1790,7 +1790,7 @@ public:
                    uint32_t cable_slab_render_material_id,
                    float mpm_yield_stress, float mpm_hardening_modulus,
                    uint32_t mpm_contact_capacity, float vbd_half_thickness,
-                   float vbd_surface_density) {
+                   float vbd_surface_density, const std::vector<float>& field_material) {
         auto vec3 = [](const std::vector<float>& v, float* out, const char* what) {
             if (v.empty()) return;
             if (v.size() != 3) {
@@ -1859,6 +1859,15 @@ public:
         d.cable_slab_stiffness = cable_slab_stiffness;
         d.cable_slab_render_material_id = cable_slab_render_material_id;
         uint32_t media_id = 0u;
+        if (method == NUKA_MEDIA_METHOD_FIELD) {
+            if (field_material.size() != 16u)
+                throw std::runtime_error("field_material must be 16 floats in nuka_field_material_desc_t order");
+            nuka_field_material_desc_t f{};
+            f.struct_size = sizeof(nuka_field_material_desc_t);
+            std::memcpy(&f.density, field_material.data(), 16u * sizeof(float));
+            check(nuka_scene_add_field_media(h_, &d, &f, &media_id), "nuka_scene_add_field_media");
+            return media_id;
+        }
         const nuka_mpm_plasticity_desc_t plasticity{
             sizeof(nuka_mpm_plasticity_desc_t), mpm_yield_stress, mpm_hardening_modulus};
         const bool has_plasticity = mpm_model_kind == 5.0f ||
@@ -2143,6 +2152,7 @@ NB_MODULE(_nuka_ext, m) {
     m.attr("MEDIA_CABLE") = uint32_t{4};
     m.attr("MEDIA_METHOD_MLSMPM") = uint32_t{2};
     m.attr("MEDIA_METHOD_VBD") = uint32_t{3};
+    m.attr("MEDIA_METHOD_FIELD") = uint32_t{4};
     // SceneBuilder.add_media(cloth_pin=...) pin-set codes (MediaRecord::ClothPin):
     // which cloth node set cooks with inv_mass 0.
     m.attr("CLOTH_PIN_FROM_FREE") = uint32_t{0};
@@ -3627,10 +3637,14 @@ NB_MODULE(_nuka_ext, m) {
              nb::arg("mpm_contact_capacity") = 0u,
              nb::arg("vbd_half_thickness") = 0.0f,
              nb::arg("vbd_surface_density") = 0.0f,
+             nb::arg("field_material") = std::vector<float>{},
              "Add a TAGGED media record. kind is a MEDIA_* code (CLOTH/SOFT_TET/"
-             "FLUID/GRANULAR/CABLE); method a MEDIA_METHOD_* code (MLSMPM/VBD). kind "
+             "FLUID/GRANULAR/CABLE); method a MEDIA_METHOD_* code (MLSMPM/VBD/FIELD). kind "
              "selects the geometry block (cloth_*/tet_*/fluid_*/cable_*); method selects the "
-             "material block (vbd_*/mpm_*). A cable is VBD: cable_start/end + "
+             "material block (vbd_*/mpm_*/field_material). A FIELD cloth takes field_material as 16 "
+             "floats: density, thickness, youngs, poisson, yield_stress, hardening, yield_moment, "
+             "bend_hardening, maxwell_modulus[2], maxwell_time[2], bend_maxwell_modulus[2], "
+             "bend_maxwell_time[2]. A cable is VBD: cable_start/end + "
              "cable_segments links, cable_radius bead size, cable_pin endpoint, optional "
              "cable_slab_* rigid weight welded to the loaded end. Material scalars at 0 take "
              "the cook's own defaults. An illegal (kind x method) pair raises here; an "

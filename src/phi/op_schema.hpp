@@ -534,6 +534,9 @@ struct VertexBlockLayout {
     uint32_t coarse_levels = 0u;
     uint32_t coarse_nodes = 0u;
     uint32_t coarse_dense_nodes = 0u;
+    // Material-field vertices end the range; their elements per env.
+    uint32_t field_vertices = 0u;
+    uint32_t field_elements = 0u;
 };
 
 struct AssembleRowsParams {
@@ -729,6 +732,8 @@ struct ReadoutEnergyLedgerParams {
     uint32_t vbd_begin = 0u;
     uint32_t vbd_vertices = 0u;
     uint32_t vbd_elements = 0u;
+    uint32_t field_vertices = 0u;
+    uint32_t field_elements = 0u;
     uint32_t bodies_per_env = 0u;
     uint32_t links_per_env = 0u;
     uint32_t artics_per_env = 0u;

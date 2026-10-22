@@ -19,6 +19,7 @@
 #include "collision/mesh_surface_types.hpp"
 #include "nk/solve/point_endpoint.hpp"
 #include "nk/solve/vertex_block.hpp"
+#include "nk/solve/field_block.hpp"
 
 namespace nuka::nk {
 // Spatial / matrix element types for the articulation device state
@@ -127,6 +128,10 @@ struct ModelView {
     uint32_t* articulation_tree_depth = nullptr;  // per:articulation arena:persistent owner:model
     uint32_t* link_child_range = nullptr;  // per:link arena:persistent owner:model elem:2
     uint32_t* link_children = nullptr;  // per:link arena:persistent owner:model
+    ::nuka::nk::MfElement* mf_elements = nullptr;  // per:scalar arena:persistent owner:model count:mf_elements_per_env
+    ::nuka::nk::MfMaterial* mf_materials = nullptr;  // per:scalar arena:persistent owner:model count:mf_materials
+    uint32_t* mf_incidence_offsets = nullptr;  // per:scalar arena:persistent owner:model count:mf_vertices_per_env+1
+    uint32_t* mf_incidence = nullptr;  // per:scalar arena:persistent owner:model count:mf_incidence_per_env
 };
 
 // Data-owned, mutable per-World state. Pointers index into the nk::Arena
@@ -431,6 +436,7 @@ struct DataView {
     uint32_t* dat_body_parent = nullptr;  // per:body arena:scratch owner:data
     uint32_t* dat_artic_parent = nullptr;  // per:articulation arena:scratch owner:data
     uint32_t* telemetry = nullptr;  // per:scalar arena:scratch owner:data count:telemetry_words flags:[readout]
+    ::nuka::nk::vbd::MembraneStartState* mf_start_metric = nullptr;  // per:scalar arena:scratch owner:data count:mf_elements_per_env*env_count
 };
 
 } // namespace nuka::phi

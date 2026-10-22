@@ -137,6 +137,10 @@ struct VbdCookInput {
     // Vertex-block elements over input particles [vbd_begin, vbd_begin + vbd_count), indexed by input particle.
     std::vector<nk::VbdElement> vbd_elements;
     uint32_t vbd_begin = 0u, vbd_count = 0u;
+    // Material-field elements over the last field_count vertices of that range, indexed by input particle.
+    std::vector<nk::MfElement>  field_elements;
+    std::vector<nk::MfMaterial> field_materials;
+    uint32_t field_count = 0u;
 };
 
 // Stage a vertex-block soft body into the Model (single-env template;
@@ -204,13 +208,20 @@ void CookMpmVbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
 // MLS-MPM media onto one grid, composing them with CookMpmVbd when both are present.
 // ---------------------------------------------------------------------------
 
-// Whether a medium solves as vertex blocks (cloth and cable); these end the soft slice.
+// Whether a medium solves as vertex blocks (cloth, cable and material-field shells); these end the soft slice.
 bool IsVertexBlockMedium(const MediaRecord& media);
+
+// The vertex-block media in soft-slice order: vertex-block cloth and cable, then material-field shells.
+std::vector<const MediaRecord*> VertexBlockMediaOrder(const std::vector<MediaRecord>& media);
 
 // Build the soft-slice input of a cloth MediaRecord: a baked mesh or a flat (nx x ny)
 // lattice, lumped area masses, and StVK membrane plus hinge vertex blocks from
 // soft::BuildClothVertexBlocks. Empty when the geometry is absent.
 VbdCookInput BuildClothVertexBlockInput(const MediaRecord& media);
+
+// Build the soft-slice input of a material-field cloth: the cloth geometry and pins, lumped masses
+// rho t A / 3, contact half thickness t / 2 and the shell elements of soft::BuildFieldShellElements.
+VbdCookInput BuildFieldVertexBlockInput(const MediaRecord& media);
 
 // Build the soft-slice input of a cable MediaRecord: segments+1 vertex blocks from
 // start to end joined by axial springs and segment bends, the pinned endpoint(s)

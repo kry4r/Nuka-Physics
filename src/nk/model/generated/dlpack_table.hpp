@@ -417,6 +417,11 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::DatBodyParent, DlpackDtype::kU32, 1, false},  // dat_body_parent
     {FieldId::DatArticParent, DlpackDtype::kU32, 1, false},  // dat_artic_parent
     {FieldId::Telemetry, DlpackDtype::kU32, 1, true},  // telemetry
+    {FieldId::MfElements, DlpackDtype::kU8, 2, false},  // mf_elements
+    {FieldId::MfMaterials, DlpackDtype::kU8, 2, false},  // mf_materials
+    {FieldId::MfIncidenceOffsets, DlpackDtype::kU32, 1, false},  // mf_incidence_offsets
+    {FieldId::MfIncidence, DlpackDtype::kU32, 1, false},  // mf_incidence
+    {FieldId::MfStartMetric, DlpackDtype::kU8, 2, false},  // mf_start_metric
 };
 
 } // namespace nuka::nk

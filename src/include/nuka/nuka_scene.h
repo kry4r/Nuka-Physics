@@ -254,7 +254,8 @@ typedef enum nuka_media_kind_t {
 
 typedef enum nuka_media_method_t {
     NUKA_MEDIA_METHOD_MLSMPM = 2,
-    NUKA_MEDIA_METHOD_VBD    = 3   /* Vertex blocks: cloth and cable. */
+    NUKA_MEDIA_METHOD_VBD    = 3,  /* Vertex blocks: cloth and cable. */
+    NUKA_MEDIA_METHOD_FIELD  = 4   /* Material-field shell over cloth geometry. */
 } nuka_media_method_t;
 
 // A TAGGED media record: `kind` + `method` select which geometry block and which
@@ -449,6 +450,31 @@ nuka_result_t nuka_scene_add_media_ex(nuka_scene_handle scene,
 nuka_result_t nuka_scene_add_mpm_fill_ex(nuka_scene_handle scene, uint32_t media_id,
                                        const nuka_mpm_fill_desc_t* desc,
                                        const nuka_mpm_plasticity_desc_t* plasticity);
+
+// Material of a NUKA_MEDIA_METHOD_FIELD cloth (kg/m^3, m, Pa). Zero yield values keep it elastic and
+// zero Maxwell moduli (fractions of the instantaneous stiffness) drop those branches.
+typedef struct nuka_field_material_desc_t {
+    uint32_t struct_size;
+    float density;
+    float thickness;
+    float youngs;
+    float poisson;
+    float yield_stress;
+    float hardening;
+    float yield_moment;       // N m per m of hinge edge
+    float bend_hardening;     // N m per m of hinge edge
+    float maxwell_modulus[2];
+    float maxwell_time[2];    // s
+    float bend_maxwell_modulus[2];
+    float bend_maxwell_time[2];
+} nuka_field_material_desc_t;
+
+// Add a cloth medium solved as a material-field shell: desc->method must be NUKA_MEDIA_METHOD_FIELD,
+// desc supplies the cloth geometry and vbd_friction, `field` the material.
+nuka_result_t nuka_scene_add_field_media(nuka_scene_handle scene,
+                                         const nuka_media_desc_t* desc,
+                                         const nuka_field_material_desc_t* field,
+                                         uint32_t* out_media_id);
 
 // One cloth region: listed vertices take its contact half thickness, friction and particle mass;
 // faces with all three vertices listed take its density and moduli. Later regions win.

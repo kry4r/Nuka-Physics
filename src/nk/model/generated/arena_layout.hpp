@@ -442,6 +442,11 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 1, 1, 4, 0},  // dat_body_parent
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Articulation, 1, 1, 4, 0},  // dat_artic_parent
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // telemetry
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 96, 96, 0},  // mf_elements
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 64, 64, 0},  // mf_materials
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // mf_incidence_offsets
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // mf_incidence
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 36, 36, 0},  // mf_start_metric
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {

@@ -300,6 +300,7 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::ContactRowExtent: v.contact_row_extent = static_cast<uint32_t*>(p); break;
         case FieldId::ContactCacheExtent: v.contact_cache_extent = static_cast<uint32_t*>(p); break;
         case FieldId::VbdMembraneStart: v.vbd_membrane_start = static_cast<vbd::MembraneStartState*>(p); break;
+        case FieldId::MfStartMetric: v.mf_start_metric = static_cast<vbd::MembraneStartState*>(p); break;
         case FieldId::VbdOffset: v.vbd_offset = static_cast<math::Vec3*>(p); break;
         case FieldId::VbdInertia: v.vbd_inertia = static_cast<float*>(p); break;
         case FieldId::ParticleRowImpulse: v.particle_row_impulse = static_cast<math::Vec3*>(p); break;

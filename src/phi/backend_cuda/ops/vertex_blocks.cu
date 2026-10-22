@@ -21,7 +21,8 @@ namespace {
 constexpr uint32_t kBlockSize = 128u;
 
 // BDF2 steps x = xbar + ht v with xbar = (4 x_n - x_{n-1}) / 3 and ht = 2h / 3; without
-// history it is backward Euler. The row variable is the displacement rate u = (x - x_n) / h.
+// history it is backward Euler, as material-field vertices always are. The row variable is the
+// displacement rate u = (x - x_n) / h.
 __device__ inline float EffectiveStep(bool second_order, float dt) {
     return second_order ? (2.0f / 3.0f) * dt : dt;
 }
@@ -53,8 +54,8 @@ __global__ void ClothPredictKernel(DataView data, ClothStepParams p) {
         return;
     }
     // A vertex a row pushed or truncation clipped last step restarts at backward Euler.
-    const bool second_order = p.integrator == 0u && has_history &&
-                              data.vbd_restart[item] == 0u;
+    const bool second_order = p.integrator == 0u && has_history && data.vbd_restart[item] == 0u &&
+                              item % l.vertices < l.vertices - l.field_vertices;
     const float h = p.dt;
     const float ht = EffectiveStep(second_order, h);
     data.vbd_step[item] = ht;
@@ -93,6 +94,19 @@ __global__ void CacheMembraneStartKernel(ModelView model, DataView data, ClothSt
     data.vbd_membrane_start[item] = nk::vbd::MembraneStart(element, geometry);
 }
 
+__global__ void CacheFieldStartKernel(ModelView model, DataView data, ClothStepParams p) {
+    const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
+    const VertexBlockLayout& l = p.layout;
+    if (item >= l.field_elements * l.env_count) return;
+    const uint32_t env = item / l.field_elements;
+    const nk::MfElement element = model.mf_elements[item % l.field_elements];
+    if (element.kind != nk::kMfTriangle) return;
+    nk::vbd::ElementGeometry geometry{};
+    for (uint32_t j = 0u; j < 3u; ++j)
+        geometry.start[j] = data.particle_prev_pos[env * l.particles_per_env + l.begin + element.vertex[j]];
+    data.mf_start_metric[item] = nk::vbd::MembraneStart(nk::mf::RestEdges(element), geometry);
+}
+
 // Rows respond through W = (h^2 A)^-1 at the initial guess; other particles keep 1/m.
 __global__ void ClothResponseKernel(ModelView model, DataView data, ClothStepParams p,
                                     uint32_t particle_count) {
@@ -114,6 +128,7 @@ __global__ void ClothResponseKernel(ModelView model, DataView data, ClothStepPar
         b.start = data.particle_prev_pos;
         b.layout = l;
         b.dt = p.dt;
+        nkops::BindFieldTables(b, model, data);
         math::Vec3 gradient;
         math::SymmetricMat3 hessian;
         nkops::GatherVertexBlock(b, data.particle_vel, env, vertex, 0u, 1u, gradient, hessian);
@@ -162,10 +177,12 @@ bool ValidLayout(const ClothStepParams* p) {
     return p->dt > 0.0f && std::isfinite(p->dt) && p->integrator <= 1u &&
            l.particles_per_env > 0u && l.dynamic_vertices <= l.vertices &&
            uint64_t{l.begin} + l.vertices <= l.particles_per_env &&
-           (l.elements == 0u || l.vertices > 0u) &&
+           (l.elements == 0u || l.vertices > 0u) && l.field_vertices <= l.vertices &&
+           (l.field_elements == 0u || l.field_vertices > 0u) &&
            uint64_t{l.vertices} * l.env_count <= max_items &&
            uint64_t{l.particles_per_env} * l.env_count <= max_items &&
-           uint64_t{l.elements} * l.env_count <= max_items;
+           uint64_t{l.elements} * l.env_count <= max_items &&
+           uint64_t{l.field_elements} * l.env_count <= max_items;
 }
 
 Status OpClothPredict(const ModelView& model, const DataView& data, const void* params,
@@ -179,7 +196,10 @@ Status OpClothPredict(const ModelView& model, const DataView& data, const void* 
         data.vbd_restart == nullptr ||
         data.vbd_history_ready == nullptr || model.vbd_incidence_offsets == nullptr ||
         (p->layout.elements > 0u && (data.vbd_membrane_start == nullptr ||
-            model.vbd_elements == nullptr || model.vbd_incidence == nullptr)))
+            model.vbd_elements == nullptr || model.vbd_incidence == nullptr)) ||
+        (p->layout.field_vertices > 0u && (model.mf_incidence_offsets == nullptr ||
+            (p->layout.field_elements > 0u && (data.mf_start_metric == nullptr || model.mf_elements == nullptr ||
+                                               model.mf_materials == nullptr || model.mf_incidence == nullptr)))))
         return Status::InvalidArgument;
     const uint32_t items = p->layout.vertices * p->layout.env_count;
     LaunchCuda(ClothPredictKernel, dim3((items + kBlockSize - 1u) / kBlockSize),
@@ -187,6 +207,10 @@ Status OpClothPredict(const ModelView& model, const DataView& data, const void* 
     const uint32_t elements = p->layout.elements * p->layout.env_count;
     if (elements > 0u)
         LaunchCuda(CacheMembraneStartKernel, dim3((elements + kBlockSize - 1u) / kBlockSize),
+                   dim3(kBlockSize), 0u, stream, model, data, *p);
+    const uint32_t field_elements = p->layout.field_elements * p->layout.env_count;
+    if (field_elements > 0u)
+        LaunchCuda(CacheFieldStartKernel, dim3((field_elements + kBlockSize - 1u) / kBlockSize),
                    dim3(kBlockSize), 0u, stream, model, data, *p);
     const uint32_t particles = p->layout.particles_per_env * p->layout.env_count;
     LaunchCuda(ClothResponseKernel, dim3((particles + kBlockSize - 1u) / kBlockSize),

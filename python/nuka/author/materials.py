@@ -1,7 +1,8 @@
 """Constitutive materials for the authoring facade.
 
 A material is a parameter bag that also SELECTS the solver method for its medium:
-``Cloth.VBD`` (cloth, vertex blocks), ``Cable.VBD`` (rope, vertex blocks),
+``Cloth.VBD`` (cloth, vertex blocks), ``Cloth.Field`` (cloth, material-field shell),
+``Cable.VBD`` (rope, vertex blocks),
 ``Soft.MPM`` (tet soft body), ``Fluid.MPM`` (fluid), and ``Rigid``
 (a rigid primitive). Each
 maps onto the ``SceneBuilder.add_media`` / ``add_rigid_primitive`` kwargs through a
@@ -58,8 +59,38 @@ class ClothMaterial:
         )
 
 
+@_dc.dataclass(frozen=True)
+class FieldMaterial:
+    """Material-field shell parameters -> the field_material block (16 floats in
+    ``nuka_field_material_desc_t`` order) plus the shared contact friction."""
+
+    MEDIA_KIND = "cloth"
+    MEDIA_METHOD = "field"
+
+    density: float
+    thickness: float
+    youngs: float
+    poisson: float
+    friction: float = 0.6
+    yield_stress: float = 0.0
+    hardening: float = 0.0
+    yield_moment: float = 0.0
+    bend_hardening: float = 0.0
+    maxwell_modulus: Tuple[float, float] = (0.0, 0.0)
+    maxwell_time: Tuple[float, float] = (0.0, 0.0)
+    bend_maxwell_modulus: Tuple[float, float] = (0.0, 0.0)
+    bend_maxwell_time: Tuple[float, float] = (0.0, 0.0)
+
+    def media_material_kwargs(self) -> dict:
+        values = (self.density, self.thickness, self.youngs, self.poisson, self.yield_stress,
+                  self.hardening, self.yield_moment, self.bend_hardening, *self.maxwell_modulus,
+                  *self.maxwell_time, *self.bend_maxwell_modulus, *self.bend_maxwell_time)
+        return dict(vbd_friction=float(self.friction), field_material=[float(v) for v in values])
+
+
 class Cloth:
-    """Cloth constitutive models. ``Cloth.VBD(...)`` builds a vertex-block shell."""
+    """Cloth constitutive models. ``Cloth.VBD(...)`` builds a vertex-block shell,
+    ``Cloth.Field(...)`` a material-field shell."""
 
     @staticmethod
     def VBD(mass: float = 0.01, friction: float = 0.6,
@@ -80,6 +111,29 @@ class Cloth:
             mass = 0.0
         return ClothMaterial(mass, friction, stretch_stiffness, poisson,
                              bend_stiffness, damping, thickness * 0.5, areal_density)
+
+    @staticmethod
+    def Field(density: float = 1.0e3, thickness: float = 5.0e-4, youngs: float = 1.0e6,
+              poisson: float = 0.3, friction: float = 0.6, yield_stress: float = 0.0,
+              hardening: float = 0.0, yield_moment: float = 0.0, bend_hardening: float = 0.0,
+              maxwell_modulus: Tuple[float, float] = (0.0, 0.0),
+              maxwell_time: Tuple[float, float] = (0.0, 0.0),
+              bend_maxwell_modulus: Tuple[float, float] = (0.0, 0.0),
+              bend_maxwell_time: Tuple[float, float] = (0.0, 0.0)) -> FieldMaterial:
+        """Plane-stress membrane (kg/m³, m, Pa) with plate bending D = Y t³ / (12 (1 - ν²)),
+        optional membrane and hinge plasticity and two Maxwell branches each."""
+        if not (density > 0.0 and thickness > 0.0 and youngs > 0.0):
+            raise ValueError("Cloth.Field: density, thickness and youngs must be > 0")
+        if not 0.0 <= poisson < 0.5:
+            raise ValueError("Cloth.Field: poisson must be in [0, 0.5)")
+        rest = (yield_stress, hardening, yield_moment, bend_hardening, *maxwell_modulus,
+                *maxwell_time, *bend_maxwell_modulus, *bend_maxwell_time)
+        if len(rest) != 12 or not all(_math.isfinite(v) and v >= 0.0 for v in rest):
+            raise ValueError("Cloth.Field: plastic and Maxwell parameters must be finite and nonnegative pairs")
+        return FieldMaterial(float(density), float(thickness), float(youngs), float(poisson),
+                             float(friction), float(yield_stress), float(hardening),
+                             float(yield_moment), float(bend_hardening), tuple(maxwell_modulus),
+                             tuple(maxwell_time), tuple(bend_maxwell_modulus), tuple(bend_maxwell_time))
 
 
 @_dc.dataclass(frozen=True)

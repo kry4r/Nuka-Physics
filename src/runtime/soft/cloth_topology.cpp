@@ -1,5 +1,6 @@
 #include "runtime/soft/cloth_topology.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <map>
 #include <stdexcept>
@@ -19,6 +20,42 @@ float DihedralAngle(math::Vec3 x0, math::Vec3 x1, math::Vec3 x2, math::Vec3 x3) 
     if (!(edge_len > 0.0f) || !(m1_len > 0.0f) || !(m2_len > 0.0f)) return 0.0f;
     const math::Vec3 n1 = m1 / m1_len, n2 = m2 / m2_len;
     return std::atan2(n1.Cross(n2).Dot(edge) / edge_len, n1.Dot(n2));
+}
+
+using Point2 = std::array<double, 2>;
+
+double Cross2(Point2 a, Point2 b) { return a[0] * b[1] - a[1] * b[0]; }
+double Dot2(Point2 a, Point2 b) { return a[0] * b[0] + a[1] * b[1]; }
+Point2 Sub2(Point2 a, Point2 b) { return {a[0] - b[0], a[1] - b[1]}; }
+
+// Rest corners of a face in its own plane: the pattern face when given, else the 3D rest triangle.
+std::array<Point2, 3> FaceLayout(const std::vector<math::Vec3>& rest_positions, const ClothTriangle& tri,
+                                 const std::vector<std::array<math::Vec3, 3>>& material_faces, size_t f) {
+    if (!material_faces.empty()) {
+        const auto& face = material_faces[f];
+        return {Point2{0.0, 0.0}, Point2{double(face[1].x) - face[0].x, double(face[1].y) - face[0].y},
+                Point2{double(face[2].x) - face[0].x, double(face[2].y) - face[0].y}};
+    }
+    const math::Vec3 e1 = rest_positions[tri.v[1]] - rest_positions[tri.v[0]];
+    const math::Vec3 e2 = rest_positions[tri.v[2]] - rest_positions[tri.v[0]];
+    const math::Vec3 normal = e1.Cross(e2), t = e1 / e1.Length(), b = normal.Cross(t) / normal.Length();
+    return {Point2{0.0, 0.0}, Point2{e1.Length(), 0.0}, Point2{e2.Dot(t), e2.Dot(b)}};
+}
+
+// Turn of a flat hinge (edge x0 -> x1, near x2, far x3) under the height (kxx x^2 + 2 kxy x y + kyy y^2) / 2,
+// as a row over (kxx, kxy, kyy), through the out-of-plane part of the vertex-block angle gradient.
+std::array<double, 3> TurnResponse(const std::array<Point2, 4>& x) {
+    const Point2 e = Sub2(x[1], x[0]), a = Sub2(x[2], x[0]), b = Sub2(x[3], x[0]);
+    const double length = std::sqrt(Dot2(e, e)), g2 = -length / Cross2(e, a), g3 = -length / Cross2(b, e);
+    const double s1 = Dot2(a, e) / Dot2(e, e), s2 = Dot2(b, e) / Dot2(e, e);
+    const double q[4] = {-(1.0 - s1) * g2 - (1.0 - s2) * g3, -s1 * g2 - s2 * g3, g2, g3};
+    std::array<double, 3> row{};
+    for (uint32_t k = 0u; k < 4u; ++k) {
+        row[0] += 0.5 * q[k] * x[k][0] * x[k][0];
+        row[1] += q[k] * x[k][0] * x[k][1];
+        row[2] += 0.5 * q[k] * x[k][1] * x[k][1];
+    }
+    return row;
 }
 
 }  // namespace
@@ -131,6 +168,114 @@ void BuildClothVertexBlocks(const std::vector<math::Vec3>& rest_positions,
         e.rest[1] = bend * 3.0f * edge_len * edge_len / (areas[fa] + areas[fb]);
         e.damping = 0.5f * (materials[fa].damping + materials[fb].damping);
         out.push_back(e);
+    }
+}
+
+void BuildFieldShellElements(const std::vector<math::Vec3>& rest_positions,
+                             const std::vector<ClothTriangle>& triangles,
+                             const std::vector<std::array<math::Vec3, 3>>& material_faces,
+                             const nk::MfMaterial& material, uint32_t material_index,
+                             std::vector<nk::MfElement>& out) {
+    if (!nk::mf::ValidMaterial(material))
+        throw std::invalid_argument("Material-field shell needs positive density, thickness and modulus");
+    ShellMaterial shell;
+    shell.stretch_stiffness = material.youngs * material.thickness;
+    shell.poisson = material.poisson;
+    std::vector<nk::VbdElement> elements;
+    BuildClothVertexBlocks(rest_positions, triangles, material_faces,
+                           std::vector<ShellMaterial>(triangles.size(), shell), elements);
+    for (const nk::VbdElement& e : elements) {
+        nk::MfElement f;
+        f.material = material_index;
+        f.kind = nk::kMfTriangle;
+        for (uint32_t j = 0u; j < 3u; ++j) f.vertex[j] = e.vertex[j];
+        for (uint32_t j = 0u; j < 5u; ++j) f.rest[j] = e.rest[j];
+        out.push_back(f);
+    }
+    std::vector<std::array<Point2, 3>> layout(triangles.size());
+    std::map<std::pair<uint32_t, uint32_t>, std::vector<std::pair<uint32_t, uint32_t>>> edge_faces;
+    for (size_t f = 0u; f < triangles.size(); ++f) {
+        layout[f] = FaceLayout(rest_positions, triangles[f], material_faces, f);
+        for (uint32_t j = 0u; j < 3u; ++j) {
+            const uint32_t a = triangles[f].v[j], b = triangles[f].v[(j + 1u) % 3u];
+            edge_faces[{std::min(a, b), std::max(a, b)}].push_back({static_cast<uint32_t>(f), j});
+        }
+    }
+    const double D = nk::mf::BendingModulus<double>(material), nu = material.poisson;
+    // Plate rigidity over (kxx, kxy, kyy): D [nu tr^2 + (1 - nu)(kxx^2 + 2 kxy^2 + kyy^2)].
+    const double P[3][3] = {{D, 0.0, nu * D}, {0.0, 2.0 * (1.0 - nu) * D, 0.0}, {nu * D, 0.0, D}};
+    for (size_t f = 0u; f < triangles.size(); ++f) {
+        const ClothTriangle& tri = triangles[f];
+        const std::array<Point2, 3>& c = layout[f];
+        const Point2 centre{(c[0][0] + c[1][0] + c[2][0]) / 3.0, (c[0][1] + c[1][1] + c[2][1]) / 3.0};
+        nk::MfElement bend;
+        bend.kind = nk::kMfBend;
+        bend.material = material_index;
+        for (uint32_t j = 0u; j < 3u; ++j) bend.vertex[j] = tri.v[j];
+        double R[3][3];
+        uint32_t far_count = 0u;
+        for (uint32_t i = 0u; i < 3u; ++i) {
+            const uint32_t i0 = (i + 1u) % 3u, i1 = (i + 2u) % 3u;
+            const auto& faces = edge_faces[{std::min(tri.v[i0], tri.v[i1]), std::max(tri.v[i0], tri.v[i1])}];
+            const Point2 x0 = c[i0], x1 = c[i1], near = c[i];
+            const Point2 edge = Sub2(x1, x0);
+            const double length = std::sqrt(Dot2(edge, edge));
+            const Point2 u{edge[0] / length, edge[1] / length}, r = Sub2(near, x0);
+            // A free edge takes the near corner mirrored across it as its far vertex, then is condensed out.
+            Point2 far{x0[0] + 2.0 * Dot2(r, u) * u[0] - r[0], x0[1] + 2.0 * Dot2(r, u) * u[1] - r[1]};
+            if (faces.size() == 2u) {
+                const auto [g, cg] = faces[0].first == f ? faces[1] : faces[0];
+                const ClothTriangle& other = triangles[g];
+                if (other.v[cg] != tri.v[i1] || other.v[(cg + 1u) % 3u] != tri.v[i0])
+                    throw std::invalid_argument("Cloth faces sharing an edge must be consistently wound");
+                const uint32_t w = (cg + 2u) % 3u;
+                const Point2 to0 = Sub2(layout[g][w], layout[g][(cg + 1u) % 3u]);
+                const Point2 to1 = Sub2(layout[g][w], layout[g][cg]);
+                const double d0 = Dot2(to0, to0), d1 = Dot2(to1, to1);
+                const double along = (d0 - d1 + length * length) / (2.0 * length);
+                const double height = std::sqrt(std::max(d0 - along * along, 0.0));
+                const double side = Cross2(u, r) > 0.0 ? -1.0 : 1.0;
+                far = {x0[0] + along * u[0] - side * height * u[1], x0[1] + along * u[1] + side * height * u[0]};
+                bend.hinges |= 1u << i;
+                bend.vertex[3u + far_count++] = other.v[w];
+                bend.rest[6u + i] = material_faces.empty()
+                    ? DihedralAngle(rest_positions[tri.v[i0]], rest_positions[tri.v[i1]],
+                                    rest_positions[tri.v[i]], rest_positions[other.v[w]])
+                    : 0.0f;
+            }
+            const std::array<double, 3> row =
+                TurnResponse({Sub2(x0, centre), Sub2(x1, centre), Sub2(near, centre), Sub2(far, centre)});
+            for (uint32_t k = 0u; k < 3u; ++k) R[i][k] = row[k];
+        }
+        if (bend.hinges == 0u) continue;
+        // B = R^-1 recovers the curvature from the three turns; M = A B^T P B is the hinge-space stiffness.
+        const double det = R[0][0] * (R[1][1] * R[2][2] - R[1][2] * R[2][1]) -
+                           R[0][1] * (R[1][0] * R[2][2] - R[1][2] * R[2][0]) +
+                           R[0][2] * (R[1][0] * R[2][1] - R[1][1] * R[2][0]);
+        if (!(std::fabs(det) > 0.0) || !std::isfinite(det))
+            throw std::invalid_argument("Material-field bend patch is degenerate");
+        double B[3][3];
+        for (uint32_t a = 0u; a < 3u; ++a)
+            for (uint32_t b = 0u; b < 3u; ++b) {
+                const uint32_t r0 = (b + 1u) % 3u, r1 = (b + 2u) % 3u, c0 = (a + 1u) % 3u, c1 = (a + 2u) % 3u;
+                B[a][b] = (R[r0][c0] * R[r1][c1] - R[r0][c1] * R[r1][c0]) / det;
+            }
+        const double area = 0.5 * std::fabs(Cross2(Sub2(c[1], c[0]), Sub2(c[2], c[0])));
+        double M[3][3] = {};
+        for (uint32_t i = 0u; i < 3u; ++i)
+            for (uint32_t j = 0u; j < 3u; ++j)
+                for (uint32_t a = 0u; a < 3u; ++a)
+                    for (uint32_t b = 0u; b < 3u; ++b) M[i][j] += area * B[a][i] * P[a][b] * B[b][j];
+        for (uint32_t g = 0u; g < 3u; ++g) {
+            if ((bend.hinges >> g) & 1u) continue;
+            for (uint32_t i = 0u; i < 3u; ++i)
+                for (uint32_t j = 0u; j < 3u; ++j)
+                    if (i != g && j != g) M[i][j] -= M[i][g] * M[g][j] / M[g][g];
+            for (uint32_t k = 0u; k < 3u; ++k) M[g][k] = M[k][g] = 0.0;
+        }
+        const double packed[6] = {M[0][0], M[1][1], M[2][2], M[0][1], M[0][2], M[1][2]};
+        for (uint32_t k = 0u; k < 6u; ++k) bend.rest[k] = static_cast<float>(packed[k]);
+        out.push_back(bend);
     }
 }
 

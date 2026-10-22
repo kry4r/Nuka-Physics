@@ -362,6 +362,23 @@ struct MediaVbdMaterial {
     float    aero_drag_max_dv  = 0.0f;
 };
 
+// Material of a material-field shell, mapped 1:1 to nk::MfMaterial: zero yield values keep the
+// response elastic and zero Maxwell moduli drop those branches. Friction comes from the vbd block.
+struct MediaFieldMaterial {
+    float density        = 0.0f;  // kg / m^3
+    float thickness      = 0.0f;  // m
+    float youngs         = 0.0f;  // Pa
+    float poisson        = 0.0f;
+    float yield_stress   = 0.0f;  // Pa
+    float hardening      = 0.0f;  // Pa
+    float yield_moment   = 0.0f;  // N m per m of hinge edge
+    float bend_hardening = 0.0f;  // N m per m of hinge edge
+    float maxwell_modulus[2]{};       // fractions of the instantaneous membrane stiffness
+    float maxwell_time[2]{};          // s
+    float bend_maxwell_modulus[2]{};  // fractions of the instantaneous hinge stiffness
+    float bend_maxwell_time[2]{};     // s
+};
+
 // Constitutive material for an MLS-MPM medium. Mirrors cook::MpmMaterialInput
 // plus the cook::MpmCookInput grid/floor scalars.
 struct MediaMpmMaterial {
@@ -413,8 +430,9 @@ struct MediaRecord {
     // Granular is an MLS-MPM Drucker-Prager sand/gravel bed (box geometry, model_kind 4).
     // Cable is a vertex-block rod, optionally weighted by a spring-lattice slab welded
     // to its loaded end. Cloth and cable solve as vertex blocks (Vbd).
+    // A Field cloth is a material-field shell over the same cloth geometry.
     enum class Kind   : uint8_t { Cloth, SoftTet, Fluid, Granular, Cable };
-    enum class Method : uint8_t { MlsMpm, Vbd };
+    enum class Method : uint8_t { MlsMpm, Vbd, Field };
     Kind   kind   = Kind::Cloth;
     Method method = Method::Vbd;
 
@@ -501,6 +519,7 @@ struct MediaRecord {
 
     MediaVbdMaterial vbd{};
     MediaMpmMaterial  mpm{};
+    MediaFieldMaterial field{};
 
     MediaRenderSkin render_skin{};
     uint32_t        render_material_id = kInvalidMaterial;

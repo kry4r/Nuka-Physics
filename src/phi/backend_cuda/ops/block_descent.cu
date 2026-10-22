@@ -1294,6 +1294,7 @@ __device__ VertexBlockView Vertices(ModelView model, DataView data, BlockDescent
     b.env_status = data.env_status;
     b.layout = p.vertex_blocks;
     b.dt = p.dt;
+    BindFieldTables(b, model, data);
     return b;
 }
 
@@ -1626,7 +1627,9 @@ __global__ void CacheGridRowsKernel(DataView data, BlockDescentSolveParams p, Bl
 constexpr uint32_t kDescendTileVertices = kThreads / 32u;
 constexpr uint32_t kDescendTileElements = 384u;
 constexpr uint32_t kDescendTileRows = 256u;
-constexpr uint32_t kDescendElementKinds = 4u;
+// Vertex-block element kinds, then the two material-field kinds.
+constexpr uint32_t kDescendVertexKinds = 4u;
+constexpr uint32_t kDescendElementKinds = kDescendVertexKinds + 2u;
 constexpr uint32_t kElementSampleWords = 9u;
 constexpr uint32_t kRowSampleWords = 7u;
 constexpr uint32_t kDescendSolveWords = 12u;
@@ -1636,6 +1639,7 @@ struct DescendTileVertex {
     uint32_t active;
     uint32_t descend;
     uint32_t trial;
+    uint32_t field;
     uint32_t particle;
     uint32_t env;
     uint32_t vertex;
@@ -1663,11 +1667,17 @@ __device__ uint32_t DescendTileOwner(const DescendTileVertex* tile, uint32_t k, 
     return j;
 }
 
+__device__ uint32_t TileIncidence(const VertexBlockView& b, const DescendTileVertex& v, uint32_t k) {
+    const uint32_t at = v.element_begin + k - v.element_first;
+    return v.field != 0u ? b.field_incidence[at] : b.incidence[at];
+}
+
 __device__ uint32_t DescendElementKind(const VertexBlockView& b, const DescendTileVertex& v,
                                        uint32_t k) {
-    const uint32_t packed = b.incidence[v.element_begin + k - v.element_first];
+    const uint32_t packed = TileIncidence(b, v, k);
+    if (v.field != 0u) return kDescendVertexKinds + b.field_elements[nk::MfIncidenceElement(packed)].kind;
     const uint32_t kind = b.elements[nk::VbdIncidenceElement(packed)].kind;
-    return kind < kDescendElementKinds ? kind : kDescendElementKinds - 1u;
+    return kind < kDescendVertexKinds ? kind : kDescendVertexKinds - 1u;
 }
 
 __device__ Vec3 TileVec3(const float* value) { return {value[0], value[1], value[2]}; }
@@ -1712,7 +1722,7 @@ __global__ void DescendParticlesKernel(ModelView model, DataView data, BlockDesc
         if (threadIdx.x < kDescendTileVertices) {
             DescendTileVertex& v = tile[threadIdx.x];
             const uint32_t item = tile_index * kDescendTileVertices + threadIdx.x;
-            v.active = v.descend = v.trial = 0u;
+            v.active = v.descend = v.trial = v.field = 0u;
             v.element_count = v.row_count = 0u;
             if (item < items) {
                 const uint32_t env = item / count;
@@ -1726,8 +1736,11 @@ __global__ void DescendParticlesKernel(ModelView model, DataView data, BlockDesc
                     v.env = env;
                     v.vertex = vertex;
                     v.particle = particle;
-                    v.element_begin = elastic ? b.offsets[vertex] : 0u;
-                    v.element_count = elastic ? b.offsets[vertex + 1u] - v.element_begin : 0u;
+                    VertexElementList list{nullptr, 0u, 0u, false};
+                    if (elastic) list = ElementsOf(b, vertex);
+                    v.field = list.field ? 1u : 0u;
+                    v.element_begin = list.begin;
+                    v.element_count = list.end - list.begin;
                     v.row_begin = s.offsets[particle];
                     v.row_count = s.offsets[particle + 1u] - v.row_begin;
                 }
@@ -1775,8 +1788,8 @@ __global__ void DescendParticlesKernel(ModelView model, DataView data, BlockDesc
                 const DescendTileVertex& v = tile[DescendTileOwner(tile, k, false)];
                 Vec3 g;
                 SymmetricMat3 h;
-                VertexElementBlock(b, data.particle_vel, v.env, data.particle_vel[v.particle],
-                                   b.incidence[v.element_begin + k - v.element_first], g, h);
+                ListElementBlock(b, data.particle_vel, v.env, data.particle_vel[v.particle], v.field != 0u,
+                                 TileIncidence(b, v, k), g, h);
                 float* sample = element_samples[k];
                 SetTileVec3(sample, g);
                 sample[3] = h.xx;
@@ -1922,8 +1935,8 @@ __global__ void DescendParticlesKernel(ModelView model, DataView data, BlockDesc
             const Vec3 candidate = VertexTrial(u, direction, 1.0f);
             const Vec3 move = candidate - u;
             if (element) {
-                const VertexElementChangeTerms terms = VertexElementChange(b, data.particle_vel, v.env,
-                    b.incidence[v.element_begin + k - v.element_first], u, move);
+                const VertexElementChangeTerms terms = ListElementChange(b, data.particle_vel, v.env,
+                    v.field != 0u, TileIncidence(b, v, k), u, move);
                 element_samples[k][0] = terms.elastic;
                 element_samples[k][1] = terms.rayleigh;
                 element_samples[k][2] = terms.damping;

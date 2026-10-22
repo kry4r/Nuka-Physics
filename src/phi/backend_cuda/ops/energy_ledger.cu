@@ -216,10 +216,56 @@ __global__ void EnergyKinematicImpulseKernel(DataView d, ReadoutEnergyLedgerPara
 
 struct KinematicElasticResponse { Vec3 gradient{}; double work = 0.0; };
 
+__device__ VertexBlockView LedgerVertices(const ModelView& m, const DataView& d, const ReadoutEnergyLedgerParams& p) {
+    VertexBlockView block;
+    block.elements = m.vbd_elements;
+    block.membrane_start = d.vbd_membrane_start;
+    block.offsets = m.vbd_incidence_offsets;
+    block.incidence = m.vbd_incidence;
+    block.start = d.particle_prev_pos;
+    block.layout.begin = p.vbd_begin;
+    block.layout.vertices = p.vbd_vertices;
+    block.layout.elements = p.vbd_elements;
+    block.layout.field_vertices = p.field_vertices;
+    block.layout.field_elements = p.field_elements;
+    block.layout.particles_per_env = p.particles_per_env;
+    block.layout.env_count = p.env_count;
+    block.dt = p.dt;
+    BindFieldTables(block, m, d);
+    return block;
+}
+
+// Material-field elements push a kinematic vertex through their response at the committed history.
+__device__ KinematicElasticResponse KinematicFieldReaction(const ModelView& m, const DataView& d,
+    const ReadoutEnergyLedgerParams& p, uint32_t particle, uint32_t field_vertex) {
+    const uint32_t base = (particle / p.particles_per_env) * p.particles_per_env + p.vbd_begin;
+    KinematicElasticResponse total;
+    for (uint32_t k = m.mf_incidence_offsets[field_vertex]; k < m.mf_incidence_offsets[field_vertex + 1u]; ++k) {
+        const uint32_t incidence = m.mf_incidence[k];
+        const nk::MfElement element = m.mf_elements[nk::MfIncidenceElement(incidence)];
+        const uint32_t anchor = base + element.vertex[0];
+        nk::mf::FieldGeometry geometry;
+        for (uint32_t j = 0u; j < nk::MfElementVertexCount(element); ++j) {
+            const uint32_t point = base + element.vertex[j];
+            geometry.start[j] = d.particle_prev_pos[point];
+            geometry.delta[j] = (d.particle_vel[point] - d.particle_vel[anchor]) * p.dt;
+        }
+        Vec3 gradient;
+        math::SymmetricMat3 hessian;
+        nk::mf::ElementBlock(element, m.mf_materials[element.material], nullptr, nk::MfIncidenceLocal(incidence),
+                             geometry, nullptr, p.dt, &gradient, &hessian);
+        total.gradient += gradient;
+        total.work += Dot(gradient, d.particle_kinematic_target[particle] - d.energy_particle_start[particle]);
+    }
+    return total;
+}
+
 __device__ KinematicElasticResponse KinematicElasticReaction(const ModelView& m, const DataView& d,
     const ReadoutEnergyLedgerParams& p, uint32_t particle) {
     if (!IsVertex(p, particle)) return {};
     const uint32_t vertex = particle % p.particles_per_env - p.vbd_begin;
+    const uint32_t first_field = p.vbd_vertices - p.field_vertices;
+    if (vertex >= first_field) return KinematicFieldReaction(m, d, p, particle, vertex - first_field);
     const uint32_t base = (particle / p.particles_per_env) * p.particles_per_env + p.vbd_begin;
     KinematicElasticResponse total;
     for (uint32_t k = m.vbd_incidence_offsets[vertex]; k < m.vbd_incidence_offsets[vertex + 1u]; ++k) {
@@ -316,18 +362,7 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
         if (p.stage == EnergyStage::Solved && IsVertex(p, particle)) {
             const uint32_t vertex = local - p.vbd_begin;
             const uint32_t slot = env * p.vbd_vertices + vertex;
-            VertexBlockView block;
-            block.elements = m.vbd_elements;
-            block.membrane_start = d.vbd_membrane_start;
-            block.offsets = m.vbd_incidence_offsets;
-            block.incidence = m.vbd_incidence;
-            block.start = d.particle_prev_pos;
-            block.layout.begin = p.vbd_begin;
-            block.layout.vertices = p.vbd_vertices;
-            block.layout.elements = p.vbd_elements;
-            block.layout.particles_per_env = p.particles_per_env;
-            block.layout.env_count = p.env_count;
-            block.dt = p.dt;
+            const VertexBlockView block = LedgerVertices(m, d, p);
             const Vec3 displacement = d.particle_vel[particle] * p.dt;
             const Vec3 force = VertexBlockForceDouble(block, d.particle_vel, env, vertex,
                 nk::vbd::InertialGradient(d.particle_vel[particle], d.vbd_free_rate[slot], d.vbd_inertia[slot], p.dt),
@@ -437,6 +472,27 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
             add(EnergyColumn::RayleighLoss, double(element.damping) * ParticleStep(d, p, particle) *
                 Dot(applied, average));
         }
+    }
+    for (uint32_t i = threadIdx.x; i < p.field_elements; i += blockDim.x) {
+        const nk::MfElement element = m.mf_elements[i];
+        const nk::MfMaterial material = m.mf_materials[element.material];
+        nk::mf::FieldGeometry x, unprojected;
+        const uint32_t anchor = env * p.particles_per_env + p.vbd_begin + element.vertex[0];
+        for (uint32_t j = 0u; j < nk::MfElementVertexCount(element); ++j) {
+            const uint32_t particle = env * p.particles_per_env + p.vbd_begin + element.vertex[j];
+            if (p.stage == EnergyStage::Solved) {
+                x.start[j] = d.particle_prev_pos[particle];
+                x.delta[j] = (d.particle_vel[particle] - d.particle_vel[anchor]) * p.dt;
+            } else {
+                x.start[j] = d.particle_pos[particle];
+            }
+            if (p.stage == EnergyStage::Projected)
+                unprojected.start[j] = ElementPosition(d, p, particle, true);
+        }
+        const double energy = nk::mf::ElementEnergy(element, material, nullptr, x, p.dt);
+        elastic += energy;
+        if (p.stage == EnergyStage::Projected)
+            position += energy - nk::mf::ElementEnergy(element, material, nullptr, unprojected, p.dt);
     }
     if (p.stage == EnergyStage::Solved) {
         const uint32_t first_friction = p.contact_rows + p.limit_rows;
@@ -573,7 +629,8 @@ __global__ void PhysicsStageMetricsKernel(ModelView m, DataView d, ReadoutEnergy
         const uint32_t vertex = local - p.vbd_begin;
         const uint32_t slot = env * p.vbd_vertices + vertex;
         const bool second_order = p.stage == EnergyStage::Begin
-            ? p.cloth_integrator == 0u && d.vbd_history_ready[env] != 0u && d.vbd_restart[slot] == 0u
+            ? p.cloth_integrator == 0u && d.vbd_history_ready[env] != 0u && d.vbd_restart[slot] == 0u &&
+                  vertex < p.vbd_vertices - p.field_vertices
             : ParticleStep(d, p, particle) < p.dt;
         const Vec3 discrete = second_order ? velocity * 1.5f - d.vbd_history_vel[slot] * 0.5f : velocity;
         vector(C::VbdDiscreteMomentumX, discrete / inverse_mass);
@@ -589,18 +646,7 @@ __global__ void PhysicsStageMetricsKernel(ModelView m, DataView d, ReadoutEnergy
         minimum = fmin(minimum, double(step));
         maximum(C::MaxVbdEffectiveDt, step);
         if (p.stage != EnergyStage::Solved) continue;
-        VertexBlockView block;
-        block.elements = m.vbd_elements;
-        block.membrane_start = d.vbd_membrane_start;
-        block.offsets = m.vbd_incidence_offsets;
-        block.incidence = m.vbd_incidence;
-        block.start = d.particle_prev_pos;
-        block.layout.begin = p.vbd_begin;
-        block.layout.vertices = p.vbd_vertices;
-        block.layout.elements = p.vbd_elements;
-        block.layout.particles_per_env = p.particles_per_env;
-        block.layout.env_count = p.env_count;
-        block.dt = p.dt;
+        const VertexBlockView block = LedgerVertices(m, d, p);
         const Vec3 displacement = d.particle_vel[particle] * p.dt;
         const Vec3 force = VertexBlockForceDouble(block, d.particle_vel, env, vertex,
             nk::vbd::InertialGradient(d.particle_vel[particle], d.vbd_free_rate[slot], d.vbd_inertia[slot], p.dt),

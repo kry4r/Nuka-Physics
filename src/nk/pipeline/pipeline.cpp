@@ -285,6 +285,8 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p.vbd_begin = cap.vbd_particle_begin;
         p.vbd_vertices = cap.vbd_vertices_per_env;
         p.vbd_elements = cap.vbd_elements_per_env;
+        p.field_vertices = cap.mf_vertices_per_env;
+        p.field_elements = cap.mf_elements_per_env;
         p.bodies_per_env = cap.bodies_per_env;
         p.links_per_env = cap.links_per_env;
         p.artics_per_env = has_articulation ? cap.articulations_per_env : 0u;
@@ -400,6 +402,8 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     vertex_blocks.coarse_levels = cap.vbd_coarse_levels;
     vertex_blocks.coarse_nodes = cap.vbd_coarse_nodes;
     vertex_blocks.coarse_dense_nodes = cap.vbd_coarse_dense_nodes;
+    vertex_blocks.field_vertices = cap.mf_vertices_per_env;
+    vertex_blocks.field_elements = cap.mf_elements_per_env;
     p_block_descent_.dt = cfg.dt;
     p_block_descent_.env_count = env_count;
     p_block_descent_.rows_per_env = cap.max_rows_per_env;

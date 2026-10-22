@@ -828,3 +828,10 @@ fields:
   - {name: dat_artic_parent, dtype: u32, per: articulation, arena: scratch, owner: data}
   # Solver telemetry ring (nk::TelemetryHeader + records), allocated while a telemetry mask is set.
   - {name: telemetry, dtype: u32, per: scalar, count: "telemetry_words", arena: scratch, owner: data, flags: [readout]}
+  # Material-field shells close the vertex-block range: membrane and hinge elements, their materials and the
+  # field vertices' incidence (element << 2 | local); the interval-start membrane metric of each triangle.
+  - {name: mf_elements, dtype: mf_element, per: scalar, count: "mf_elements_per_env", arena: persistent, owner: model}
+  - {name: mf_materials, dtype: mf_material, per: scalar, count: "mf_materials", arena: persistent, owner: model}
+  - {name: mf_incidence_offsets, dtype: u32, per: scalar, count: "mf_vertices_per_env+1", arena: persistent, owner: model}
+  - {name: mf_incidence, dtype: u32, per: scalar, count: "mf_incidence_per_env", arena: persistent, owner: model}
+  - {name: mf_start_metric, dtype: vbd_membrane_start, per: scalar, count: "mf_elements_per_env*env_count", arena: scratch, owner: data}

@@ -22,6 +22,7 @@
 #include "math/vec3.hpp"
 #include "nk/contact/contact_profile.hpp"
 #include "nk/material/mpm_material.hpp"
+#include "nk/solve/field_block.hpp"
 #include "nk/solve/vertex_block.hpp"
 #include "sensor/state_types.hpp"
 #include "phi/backend.hpp"   // phi::ModelView, BufferType, Buffer (forward + wrappers)
@@ -97,6 +98,11 @@ struct ModelCapacities {
     uint32_t vbd_coarse_nodes = 0u;
     uint32_t vbd_coarse_children = 0u;
     uint32_t vbd_coarse_dense_nodes = 0u;
+    // Material-field vertices are the last mf_vertices_per_env of the vertex-block range.
+    uint32_t mf_vertices_per_env = 0u;
+    uint32_t mf_elements_per_env = 0u;
+    uint32_t mf_incidence_per_env = 0u;
+    uint32_t mf_materials = 0u;
     uint32_t num_material_buckets = 0;  // physics-material bucket table rows.
     uint32_t obs_width            = 64; // per-env observation export width.
 
@@ -398,6 +404,11 @@ public:
         std::vector<uint32_t>   vbd_coarse_child_offsets;
         std::vector<uint32_t>   vbd_coarse_children;
         std::vector<float>      vbd_coarse_child_weights;
+        // Material-field elements and materials; incidence covers the field vertices from their first.
+        std::vector<MfElement>  mf_elements;
+        std::vector<MfMaterial> mf_materials;
+        std::vector<uint32_t>   mf_incidence_offsets;
+        std::vector<uint32_t>   mf_incidence;
         // Anisotropic air-drag coefficients (lumped 0.5*rho*Cn, 0.5*rho*Ct). Both
         // default 0 -> the drag op is inert (a drag-free world stays byte-identical).
         // Cn >> Ct (normal-dominant) is what destabilizes a flat falling sheet into
@@ -577,6 +588,7 @@ public:
     phi::Status UploadTo(phi::BufferType* bt, phi::ModelView* out_view);
     phi::Status ValidateTopology(std::string* reason = nullptr) const;
     phi::Status ValidateVertexBlocks(std::string* reason = nullptr) const;
+    phi::Status ValidateMaterialField(const std::vector<uint32_t>& color_of, std::string* reason) const;
     phi::Status ValidateVertexBlockLevels(std::string* reason = nullptr) const;
     void BuildAeroAdjacency();
 

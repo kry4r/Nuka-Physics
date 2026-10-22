@@ -36,7 +36,8 @@ from . import surfaces as _surfaces
 _MEDIA_KIND = {"cloth": _nuka.MEDIA_CLOTH, "soft_tet": _nuka.MEDIA_SOFT_TET,
                "fluid": _nuka.MEDIA_FLUID, "granular": _nuka.MEDIA_GRANULAR,
                "cable": _nuka.MEDIA_CABLE}
-_MEDIA_METHOD = {"mlsmpm": _nuka.MEDIA_METHOD_MLSMPM, "vbd": _nuka.MEDIA_METHOD_VBD}
+_MEDIA_METHOD = {"mlsmpm": _nuka.MEDIA_METHOD_MLSMPM, "vbd": _nuka.MEDIA_METHOD_VBD,
+                 "field": _nuka.MEDIA_METHOD_FIELD}
 _PRIMITIVE = {"plane": _nuka.PRIMITIVE_PLANE, "box": _nuka.PRIMITIVE_BOX,
               "sphere": _nuka.PRIMITIVE_SPHERE, "capsule": _nuka.PRIMITIVE_CAPSULE,
               "cylinder": _nuka.PRIMITIVE_CYLINDER}
@@ -236,6 +237,7 @@ class Scene:
         gravity = any(float(g) != 0.0 for g in self.options.gravity)
         thick_grid = any(getattr(e.material, "half_thickness", 0.0) > 0.0 or
                          getattr(e.material, "surface_density", 0.0) > 0.0 or e.morph.regions
+                         or isinstance(e.material, _materials.FieldMaterial)
                          for e in grids)
         if (not scenes or tets or fluids or grans or cables or rigids or appearance or thick_grid
                 or gravity):

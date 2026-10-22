@@ -1,6 +1,7 @@
 #pragma once
 
 #include "math/vec3.hpp"
+#include "nk/solve/field_block.hpp"
 #include "nk/solve/vertex_block.hpp"
 
 #include <array>
@@ -36,6 +37,14 @@ void BuildClothVertexBlocks(const std::vector<math::Vec3>& rest_positions,
                             const std::vector<std::array<math::Vec3, 3>>& material_faces,
                             const std::vector<ShellMaterial>& materials,
                             std::vector<nk::VbdElement>& out);
+
+// Material-field shell elements over the same topology: plane-stress membranes, and per face a bend whose
+// curvature, exact for quadratic deflection, comes from its three hinge turns; free-edge hinges are condensed.
+void BuildFieldShellElements(const std::vector<math::Vec3>& rest_positions,
+                             const std::vector<ClothTriangle>& triangles,
+                             const std::vector<std::array<math::Vec3, 3>>& material_faces,
+                             const nk::MfMaterial& material, uint32_t material_index,
+                             std::vector<nk::MfElement>& out);
 
 // Axial springs between consecutive chain vertices and a bend over each interior vertex.
 void BuildRodVertexBlocks(const std::vector<math::Vec3>& rest_positions,

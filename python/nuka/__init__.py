@@ -74,6 +74,7 @@ from ._nuka_ext import (  # noqa: F401
     MEDIA_CABLE,
     MEDIA_METHOD_MLSMPM,
     MEDIA_METHOD_VBD,
+    MEDIA_METHOD_FIELD,
     # SceneBuilder.add_media(cloth_pin=...) pin-set codes.
     CLOTH_PIN_FROM_FREE,
     CLOTH_PIN_NONE,
@@ -344,6 +345,7 @@ __all__ = [
     "ENV_STATUS_SENSOR_QUEUE_OVERFLOW",
     "MEDIA_METHOD_MLSMPM",
     "MEDIA_METHOD_VBD",
+    "MEDIA_METHOD_FIELD",
     "author",
     "morphs",
     "materials",

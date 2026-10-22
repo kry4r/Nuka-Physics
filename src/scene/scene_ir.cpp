@@ -914,8 +914,11 @@ SystemKindComponent::K SystemKindFromMediaKind(MediaRecord::Kind kind) {
 }
 
 SoftBodyComponent::SimMethod SimMethodFromMediaMethod(MediaRecord::Method method) {
-    return method == MediaRecord::Method::MlsMpm ? SoftBodyComponent::SimMethod::MlsMpm
-                                                 : SoftBodyComponent::SimMethod::Vbd;
+    switch (method) {
+        case MediaRecord::Method::MlsMpm: return SoftBodyComponent::SimMethod::MlsMpm;
+        case MediaRecord::Method::Field:  return SoftBodyComponent::SimMethod::Field;
+        default:                          return SoftBodyComponent::SimMethod::Vbd;
+    }
 }
 
 // Stable node name for an UNNAMED record: derive from the RECORD identity
@@ -1281,6 +1284,9 @@ void SceneIR::ProjectMedia(const MediaRecord& rec) {
         if (rec.method == MediaRecord::Method::MlsMpm) {
             sb.young   = rec.mpm.youngs;
             sb.poisson = rec.mpm.poisson;
+        } else if (rec.method == MediaRecord::Method::Field) {
+            sb.young   = rec.field.youngs;
+            sb.poisson = rec.field.poisson;
         } else {
             sb.young   = rec.vbd.stretch_stiffness;
             sb.poisson = rec.vbd.poisson;

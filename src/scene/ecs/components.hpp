@@ -180,8 +180,8 @@ struct SoftBodyComponent {
     float    young            = 0.0f;
     float    poisson          = 0.0f;
     // Per-medium solver selection: MlsMpm the continuum MPM medium, Vbd the
-    // vertex-block cloth and cable.
-    enum class SimMethod : uint8_t { MlsMpm = 1, Vbd = 2 };
+    // vertex-block cloth and cable, Field the material-field shell.
+    enum class SimMethod : uint8_t { MlsMpm = 1, Vbd = 2, Field = 3 };
     SimMethod sim_method = SimMethod::Vbd;
 };
 

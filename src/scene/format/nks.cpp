@@ -239,12 +239,14 @@ const char* MediaMethodName(MediaRecord::Method m) {
     switch (m) {
         case MediaRecord::Method::MlsMpm: return "mlsmpm";
         case MediaRecord::Method::Vbd:    return "vbd";
+        case MediaRecord::Method::Field:  return "field";
     }
     return "vbd";
 }
 MediaRecord::Method MediaMethodFromName(const std::string& s) {
     if (s == "mlsmpm") return MediaRecord::Method::MlsMpm;
     if (s == "vbd") return MediaRecord::Method::Vbd;
+    if (s == "field") return MediaRecord::Method::Field;
     throw std::runtime_error("nks: unknown media method '" + s + "'");
 }
 
@@ -669,6 +671,29 @@ Value SaveMedia(const MediaRecord& m, MeshSink& sink) {
             regions.PushBack(std::move(ro));
         }
         o.Set("cloth_regions", std::move(regions));
+    }
+    if (m.method == MediaRecord::Method::Field) {
+        const MediaFieldMaterial& mf = m.field;
+        auto pair = [](const float (&v)[2]) {
+            Value a = Value::Array();
+            a.PushBack(Value::Float(v[0]));
+            a.PushBack(Value::Float(v[1]));
+            return a;
+        };
+        Value fo = Value::Object();
+        fo.Set("density", Value::Float(mf.density));
+        fo.Set("thickness", Value::Float(mf.thickness));
+        fo.Set("youngs", Value::Float(mf.youngs));
+        fo.Set("poisson", Value::Float(mf.poisson));
+        fo.Set("yield_stress", Value::Float(mf.yield_stress));
+        fo.Set("hardening", Value::Float(mf.hardening));
+        fo.Set("yield_moment", Value::Float(mf.yield_moment));
+        fo.Set("bend_hardening", Value::Float(mf.bend_hardening));
+        fo.Set("maxwell_modulus", pair(mf.maxwell_modulus));
+        fo.Set("maxwell_time", pair(mf.maxwell_time));
+        fo.Set("bend_maxwell_modulus", pair(mf.bend_maxwell_modulus));
+        fo.Set("bend_maxwell_time", pair(mf.bend_maxwell_time));
+        o.Set("field", std::move(fo));
     }
 
     auto mpm_mat_json = [](const MediaMpmMaterial& mm) {
@@ -1932,6 +1957,25 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                     if (const Value* xp = rv.Find("vbd")) read_vbd(*xp, region.material);
                     rec.cloth_regions.push_back(std::move(region));
                 }
+            if (const Value* fo = mv.Find("field")) {
+                MediaFieldMaterial& mf = rec.field;
+                auto pair = [&](const char* key, float (&out)[2]) {
+                    if (const Value* a = fo->Find(key))
+                        for (size_t i = 0u; i < 2u; ++i) out[i] = FloatAt(*a, i, key);
+                };
+                mf.density = f(*fo, "density", mf.density);
+                mf.thickness = f(*fo, "thickness", mf.thickness);
+                mf.youngs = f(*fo, "youngs", mf.youngs);
+                mf.poisson = f(*fo, "poisson", mf.poisson);
+                mf.yield_stress = f(*fo, "yield_stress", mf.yield_stress);
+                mf.hardening = f(*fo, "hardening", mf.hardening);
+                mf.yield_moment = f(*fo, "yield_moment", mf.yield_moment);
+                mf.bend_hardening = f(*fo, "bend_hardening", mf.bend_hardening);
+                pair("maxwell_modulus", mf.maxwell_modulus);
+                pair("maxwell_time", mf.maxwell_time);
+                pair("bend_maxwell_modulus", mf.bend_maxwell_modulus);
+                pair("bend_maxwell_time", mf.bend_maxwell_time);
+            }
             if (const Value* mp = mv.Find("mpm")) read_mpm(*mp, rec.mpm);
             if (const Value* fills = mv.Find("mpm_fills")) {
                 if (fills->IsArray()) {

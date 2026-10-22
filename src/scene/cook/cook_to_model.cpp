@@ -1667,6 +1667,18 @@ static void StageVertexBlocks(nk::Model& model, const VbdCookInput& in, uint32_t
     }
     cap.vbd_particle_begin = in.vbd_count > 0u ? particle_base + in.vbd_begin : 0u;
     cap.vbd_vertices_per_env = in.vbd_count;
+    mp.mf_elements.clear();
+    const uint32_t field_first = in.vbd_begin + in.vbd_count - in.field_count;
+    for (nk::MfElement element : in.field_elements) {
+        for (uint32_t j = 0u; j < nk::MfElementVertexCount(element); ++j) {
+            if (element.vertex[j] < field_first || element.vertex[j] - in.vbd_begin >= in.vbd_count)
+                throw std::invalid_argument("material-field element leaves its vertex range");
+            element.vertex[j] -= in.vbd_begin;
+        }
+        mp.mf_elements.push_back(element);
+    }
+    mp.mf_materials = in.field_materials;
+    cap.mf_vertices_per_env = in.field_count;
     nk::BuildVertexBlockSchedule(&model);
     nk::BuildVertexBlockHierarchy(&model);
 }
@@ -1904,13 +1916,73 @@ void CookMpmParticles(nk::Model& model, uint32_t env_count,
     GrowContactBudgetForParticles(cap, rigid_base, model.MpmParticlesPerEnv());
 }
 
+namespace {
+
+nk::MfMaterial FieldMaterial(const MediaFieldMaterial& f) {
+    nk::MfMaterial m;
+    m.density = f.density;
+    m.thickness = f.thickness;
+    m.youngs = f.youngs;
+    m.poisson = f.poisson;
+    m.yield_stress = f.yield_stress;
+    m.hardening = f.hardening;
+    m.yield_moment = f.yield_moment;
+    m.bend_hardening = f.bend_hardening;
+    for (int i = 0; i < 2; ++i) {
+        m.maxwell_modulus[i] = f.maxwell_modulus[i];
+        m.maxwell_time[i] = f.maxwell_time[i];
+        m.bend_maxwell_modulus[i] = f.bend_maxwell_modulus[i];
+        m.bend_maxwell_time[i] = f.bend_maxwell_time[i];
+    }
+    return m;
+}
+
+// Pin set of a cloth: none, the perimeter or one grid edge of a lattice, plus listed mesh vertices.
+void PinClothVertices(const MediaRecord& media, std::vector<float>& inv_mass) {
+    if (media.baked.Empty()) {
+        const auto& g = media.cloth_grid;
+        const uint32_t nx = g.nx, ny = g.ny;
+        const auto idx = [nx](uint32_t i, uint32_t j) { return j*nx + i; };
+        // Pin set: None (a free drape), Perimeter (a taut membrane), or one grid
+        // edge (a hung curtain); the FromFree default defers to the legacy flag.
+        using Pin = MediaRecord::ClothPin;
+        Pin pin = g.pin;
+        if (pin == Pin::FromFree) pin = g.free ? Pin::None : Pin::Perimeter;
+        const uint32_t last_i = nx - 1u, last_j = ny - 1u;
+        if (pin == Pin::Perimeter) {
+            for (uint32_t k = 0u; k < nx; ++k) {
+                inv_mass[idx(k, 0u)] = 0.0f;
+                inv_mass[idx(k, last_j)] = 0.0f;
+            }
+            for (uint32_t k = 0u; k < ny; ++k) {
+                inv_mass[idx(0u, k)] = 0.0f;
+                inv_mass[idx(last_i, k)] = 0.0f;
+            }
+        } else if (pin == Pin::EdgeX0 || pin == Pin::EdgeX1) {
+            const uint32_t i = pin == Pin::EdgeX0 ? 0u : last_i;
+            for (uint32_t k = 0u; k < ny; ++k) inv_mass[idx(i, k)] = 0.0f;
+        } else if (pin == Pin::EdgeY0 || pin == Pin::EdgeY1) {
+            const uint32_t j = pin == Pin::EdgeY0 ? 0u : last_j;
+            for (uint32_t k = 0u; k < nx; ++k) inv_mass[idx(k, j)] = 0.0f;
+        }
+    }
+    // Pinned vertices add to a grid's pin set.
+    for (uint32_t vertex : media.cloth_mesh.pinned_vertices) {
+        if (vertex >= inv_mass.size())
+            throw std::invalid_argument("Cloth pinned vertex is out of range");
+        inv_mass[vertex] = 0.0f;
+    }
+}
+
+}  // namespace
+
 void ValidateMedia(const std::vector<MediaRecord>& media) {
     using Kind = MediaRecord::Kind;
     using Method = MediaRecord::Method;
     for (const MediaRecord& m : media) {
         bool legal = false;
         switch (m.kind) {
-            case Kind::Cloth:   legal = m.method == Method::Vbd; break;
+            case Kind::Cloth:   legal = m.method == Method::Vbd || m.method == Method::Field; break;
             case Kind::SoftTet: legal = m.method == Method::MlsMpm; break;
             case Kind::Fluid:   legal = m.method == Method::MlsMpm; break;
             case Kind::Granular: legal = m.method == Method::MlsMpm; break;
@@ -1918,9 +1990,22 @@ void ValidateMedia(const std::vector<MediaRecord>& media) {
         }
         if (!legal) {
             throw std::runtime_error(
-                "ValidateMedia: illegal medium (kind x method) -- cloth and cable solve "
-                "as vertex blocks (vbd), a tet-soft body, a fluid and a granular bed "
-                "with MLS-MPM");
+                "ValidateMedia: illegal medium (kind x method) -- cloth solves as vertex "
+                "blocks (vbd) or a material-field shell (field), cable as vertex blocks, a "
+                "tet-soft body, a fluid and a granular bed with MLS-MPM");
+        }
+        if (m.method == Method::Field) {
+            const MediaFieldMaterial& f = m.field;
+            const float parameters[] = {f.yield_stress, f.hardening, f.yield_moment, f.bend_hardening,
+                                        f.maxwell_modulus[0], f.maxwell_modulus[1], f.maxwell_time[0],
+                                        f.maxwell_time[1], f.bend_maxwell_modulus[0], f.bend_maxwell_modulus[1],
+                                        f.bend_maxwell_time[0], f.bend_maxwell_time[1]};
+            bool nonnegative = true;
+            for (float value : parameters) nonnegative = nonnegative && std::isfinite(value) && value >= 0.0f;
+            if (!nk::mf::ValidMaterial(FieldMaterial(f)) || !nonnegative || !m.cloth_regions.empty())
+                throw std::runtime_error(
+                    "ValidateMedia: a field cloth needs positive density, thickness and youngs, "
+                    "0 <= poisson < 0.5, nonnegative plastic and Maxwell parameters and no cloth regions");
         }
         // model_kind 4 (Drucker-Prager) and Kind::Granular imply each other: no
         // sand-tagged fluid/soft body and no granular bed cooking as another model.
@@ -2207,7 +2292,16 @@ ClothGeometry BuildClothGeometry(const MediaRecord& media) {
 }  // namespace
 
 bool IsVertexBlockMedium(const MediaRecord& media) {
-    return media.method == MediaRecord::Method::Vbd;
+    return media.method == MediaRecord::Method::Vbd || media.method == MediaRecord::Method::Field;
+}
+
+std::vector<const MediaRecord*> VertexBlockMediaOrder(const std::vector<MediaRecord>& media) {
+    std::vector<const MediaRecord*> order;
+    for (const MediaRecord& m : media)
+        if (m.method == MediaRecord::Method::Vbd) order.push_back(&m);
+    for (const MediaRecord& m : media)
+        if (m.method == MediaRecord::Method::Field) order.push_back(&m);
+    return order;
 }
 
 VbdCookInput BuildClothVertexBlockInput(const MediaRecord& media) {
@@ -2288,39 +2382,7 @@ VbdCookInput BuildClothVertexBlockInput(const MediaRecord& media) {
             throw std::invalid_argument("Cloth vertex mass must be finite and positive");
         in.inv_mass.push_back(1.0f / mass);
     }
-    if (media.baked.Empty()) {
-        const auto& g = media.cloth_grid;
-        const uint32_t nx = g.nx, ny = g.ny;
-        const auto idx = [nx](uint32_t i, uint32_t j) { return j*nx + i; };
-        // Pin set: None (a free drape), Perimeter (a taut membrane), or one grid
-        // edge (a hung curtain); the FromFree default defers to the legacy flag.
-        using Pin = MediaRecord::ClothPin;
-        Pin pin = g.pin;
-        if (pin == Pin::FromFree) pin = g.free ? Pin::None : Pin::Perimeter;
-        const uint32_t last_i = nx - 1u, last_j = ny - 1u;
-        if (pin == Pin::Perimeter) {
-            for (uint32_t k = 0u; k < nx; ++k) {
-                in.inv_mass[idx(k, 0u)] = 0.0f;
-                in.inv_mass[idx(k, last_j)] = 0.0f;
-            }
-            for (uint32_t k = 0u; k < ny; ++k) {
-                in.inv_mass[idx(0u, k)] = 0.0f;
-                in.inv_mass[idx(last_i, k)] = 0.0f;
-            }
-        } else if (pin == Pin::EdgeX0 || pin == Pin::EdgeX1) {
-            const uint32_t i = pin == Pin::EdgeX0 ? 0u : last_i;
-            for (uint32_t k = 0u; k < ny; ++k) in.inv_mass[idx(i, k)] = 0.0f;
-        } else if (pin == Pin::EdgeY0 || pin == Pin::EdgeY1) {
-            const uint32_t j = pin == Pin::EdgeY0 ? 0u : last_j;
-            for (uint32_t k = 0u; k < nx; ++k) in.inv_mass[idx(k, j)] = 0.0f;
-        }
-    }
-    // Pinned vertices add to a grid's pin set.
-    for (uint32_t vertex : media.cloth_mesh.pinned_vertices) {
-        if (vertex >= in.inv_mass.size())
-            throw std::invalid_argument("Cloth pinned vertex is out of range");
-        in.inv_mass[vertex] = 0.0f;
-    }
+    PinClothVertices(media, in.inv_mass);
     // Anisotropic aero drag: pass the coeffs through; seed the op with the cloth
     // triangles only when active (all-zero coeffs => no op => byte-identical cook).
     in.aero_drag_normal = media.vbd.aero_drag_normal;
@@ -2332,6 +2394,45 @@ VbdCookInput BuildClothVertexBlockInput(const MediaRecord& media) {
             in.aero_triangles.push_back({t.v[0], t.v[1], t.v[2]});
         }
     }
+    return in;
+}
+
+VbdCookInput BuildFieldVertexBlockInput(const MediaRecord& media) {
+    VbdCookInput in;
+    const auto geometry = BuildClothGeometry(media);
+    const auto& rest = geometry.rest;
+    const auto& tris = geometry.triangles;
+    if (rest.empty()) return in;
+    const nk::MfMaterial material = FieldMaterial(media.field);
+    runtime::soft::BuildFieldShellElements(rest, tris, geometry.material_faces, material, 0u, in.field_elements);
+    in.field_materials.push_back(material);
+    in.vbd_begin = 0u;
+    in.vbd_count = in.field_count = static_cast<uint32_t>(rest.size());
+    in.positions = rest;
+    in.velocities.assign(rest.size(), math::Vec3::Zero());
+    in.half_thickness.assign(rest.size(), 0.5f * material.thickness);
+    in.friction.assign(rest.size(), media.vbd.friction);
+    CookParticleSurface collision_surface;
+    for (const auto& tri : tris)
+        collision_surface.triangles.insert(collision_surface.triangles.end(), {tri.v[0], tri.v[1], tri.v[2]});
+    in.surfaces.push_back(std::move(collision_surface));
+    std::vector<float> masses(rest.size(), 0.0f);
+    const float areal = material.density * material.thickness / 6.0f;
+    for (size_t i = 0u; i < tris.size(); ++i) {
+        const auto& tri = tris[i];
+        const auto face = geometry.material_faces.empty()
+            ? std::array<math::Vec3, 3>{rest[tri.v[0]], rest[tri.v[1]], rest[tri.v[2]]}
+            : geometry.material_faces[i];
+        const float share = (face[1] - face[0]).Cross(face[2] - face[0]).Length() * areal;
+        for (uint32_t vertex : tri.v) masses[vertex] += share;
+    }
+    in.inv_mass.reserve(masses.size());
+    for (float mass : masses) {
+        if (!(mass > 0.0f) || !std::isfinite(1.0f / mass))
+            throw std::invalid_argument("Field cloth vertex mass must be finite and positive");
+        in.inv_mass.push_back(1.0f / mass);
+    }
+    PinClothVertices(media, in.inv_mass);
     return in;
 }
 
@@ -2492,11 +2593,10 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
         }
         base += verts;
     };
-    for (const MediaRecord& m : media) {
-        if (!IsVertexBlockMedium(m)) continue;
+    for (const MediaRecord* m : VertexBlockMediaOrder(media)) {
         const size_t first = surfaces.size();
-        append_soft(m);
-        tag(first, m);
+        append_soft(*m);
+        tag(first, *m);
     }
     return surfaces;
 }
@@ -2812,7 +2912,8 @@ float CrossContactDMin(const std::vector<MediaRecord>& media,
     for (const MediaRecord& m : media) {
         if (any_row_media && m.method == MediaRecord::Method::MlsMpm) continue;
         float sp = 0.0f;
-        if (m.kind == MediaRecord::Kind::Cloth)
+        if (m.method == MediaRecord::Method::Field) sp = m.field.thickness;
+        else if (m.kind == MediaRecord::Kind::Cloth)
             sp = m.vbd.half_thickness > 0.0f ? 2.0f * m.vbd.half_thickness : m.cloth_grid.spacing;
         else if (m.kind == MediaRecord::Kind::SoftTet) sp = m.tet_sphere.cell_len;
         else if (m.kind == MediaRecord::Kind::Cable) sp = 2.0f * m.cable_line.radius;
@@ -2843,20 +2944,32 @@ void AppendSoftMedium(VbdCookInput& dst, const VbdCookInput& src) {
         dst.surfaces.push_back(std::move(surface));
     }
     // The soft slice carries one aero set (per-medium override is the medium's own);
-    // a single soft medium sets it verbatim.
-    dst.aero_drag_normal = src.aero_drag_normal;
-    dst.aero_drag_tangent = src.aero_drag_tangent;
-    dst.aero_drag_max_dv = src.aero_drag_max_dv;
+    // a single soft medium sets it verbatim, and drag-free field shells leave it.
+    if (src.field_count == 0u) {
+        dst.aero_drag_normal = src.aero_drag_normal;
+        dst.aero_drag_tangent = src.aero_drag_tangent;
+        dst.aero_drag_max_dv = src.aero_drag_max_dv;
+    }
     if (src.vbd_count == 0u) return;
+    if (src.field_count == 0u && dst.field_count != 0u)
+        throw std::invalid_argument("material-field media must follow the vertex-block media");
     // Vertex-block media append last, so their ranges join into one.
     if (dst.vbd_count != 0u && dst.vbd_begin + dst.vbd_count != base + src.vbd_begin)
         throw std::invalid_argument("vertex-block media must be contiguous in the soft slice");
     if (dst.vbd_count == 0u) dst.vbd_begin = base + src.vbd_begin;
     dst.vbd_count += src.vbd_count;
+    dst.field_count += src.field_count;
     for (nk::VbdElement element : src.vbd_elements) {
         for (uint32_t j = 0u; j < nk::VbdElementVertexCount(element.kind); ++j) element.vertex[j] += base;
         dst.vbd_elements.push_back(element);
     }
+    const uint32_t material_base = static_cast<uint32_t>(dst.field_materials.size());
+    for (nk::MfElement element : src.field_elements) {
+        for (uint32_t j = 0u; j < nk::MfElementVertexCount(element); ++j) element.vertex[j] += base;
+        element.material += material_base;
+        dst.field_elements.push_back(element);
+    }
+    dst.field_materials.insert(dst.field_materials.end(), src.field_materials.begin(), src.field_materials.end());
 }
 
 }  // namespace
@@ -2875,10 +2988,10 @@ void CookSceneMedia(nk::Model& model, uint32_t env_count,
     // Vertex-block media concatenate into one soft slice; MLS-MPM media compose below.
     VbdCookInput soft;
     bool have_soft = false;
-    for (const MediaRecord& m : media) {
-        if (!IsVertexBlockMedium(m)) continue;
-        AppendSoftMedium(soft, m.kind == MediaRecord::Kind::Cloth ? BuildClothVertexBlockInput(m)
-                                                                  : BuildCableVertexBlockInput(m));
+    for (const MediaRecord* m : VertexBlockMediaOrder(media)) {
+        AppendSoftMedium(soft, m->method == MediaRecord::Method::Field ? BuildFieldVertexBlockInput(*m)
+                               : m->kind == MediaRecord::Kind::Cloth  ? BuildClothVertexBlockInput(*m)
+                                                                      : BuildCableVertexBlockInput(*m));
         have_soft = true;
     }
 

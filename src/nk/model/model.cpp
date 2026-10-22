@@ -227,6 +227,12 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         if (id == FieldId::PointEndpointRanges) return CheckedProduct({point_endpoints_per_env, env_count});
         if (id == FieldId::PointEndpointTerms) return CheckedProduct({point_endpoint_terms_per_env, env_count});
         if (id == FieldId::VbdMembraneStart) return CheckedProduct({vbd_elements_per_env, env_count});
+        if (id == FieldId::MfElements) return mf_elements_per_env;
+        if (id == FieldId::MfMaterials) return mf_materials;
+        if (id == FieldId::MfIncidenceOffsets)
+            return mf_vertices_per_env > 0u ? uint64_t{mf_vertices_per_env} + 1u : 0u;
+        if (id == FieldId::MfIncidence) return mf_incidence_per_env;
+        if (id == FieldId::MfStartMetric) return CheckedProduct({mf_elements_per_env, env_count});
         if (id == FieldId::CrbaScratch)
             return CheckedProduct({articulations_per_env, env_count, dofs_per_env, uint64_t{dofs_per_env} + 12u});
         // Symbolic scalar counts require an explicit field-specific extent.
@@ -915,6 +921,18 @@ void Model::StageModelField(FieldId id, const Segment& seg,
         case FieldId::VbdCoarseChildWeights:
             std::memcpy(dst, particles.vbd_coarse_child_weights.data(), seg.bytes);
             break;
+        case FieldId::MfElements:
+            std::memcpy(dst, particles.mf_elements.data(), seg.bytes);
+            break;
+        case FieldId::MfMaterials:
+            std::memcpy(dst, particles.mf_materials.data(), seg.bytes);
+            break;
+        case FieldId::MfIncidenceOffsets:
+            std::memcpy(dst, particles.mf_incidence_offsets.data(), seg.bytes);
+            break;
+        case FieldId::MfIncidence:
+            std::memcpy(dst, particles.mf_incidence.data(), seg.bytes);
+            break;
         // Cloth aero-drag templates (owner:model). The single-env triangle list is
         // replicated env-major; each triangle's 3 particle indices are shifted by
         // e*particles_per_env (the device particle arrays are env-major).
@@ -1172,6 +1190,10 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::VbdCoarseChildOffsets: v.vbd_coarse_child_offsets = static_cast<uint32_t*>(p); break;
         case FieldId::VbdCoarseChildren:     v.vbd_coarse_children = static_cast<uint32_t*>(p); break;
         case FieldId::VbdCoarseChildWeights: v.vbd_coarse_child_weights = static_cast<float*>(p); break;
+        case FieldId::MfElements:            v.mf_elements = static_cast<MfElement*>(p); break;
+        case FieldId::MfMaterials:           v.mf_materials = static_cast<MfMaterial*>(p); break;
+        case FieldId::MfIncidenceOffsets:    v.mf_incidence_offsets = static_cast<uint32_t*>(p); break;
+        case FieldId::MfIncidence:           v.mf_incidence = static_cast<uint32_t*>(p); break;
         default: break;  // a data-owned field id: not a ModelView member.
     }
 }
@@ -1492,10 +1514,14 @@ phi::Status Model::ValidateVertexBlocks(std::string* reason) const {
     if (vertices == 0u) {
         if (!p.vbd_elements.empty() || !p.vbd_incidence.empty() || !p.vbd_color_vertices.empty() ||
             cap.vbd_colors != 0u || cap.vbd_elements_per_env != 0u || cap.vbd_coarse_levels != 0u ||
-            cap.vbd_coarse_nodes != 0u || cap.vbd_coarse_children != 0u || !p.vbd_coarse_parents.empty())
+            cap.vbd_coarse_nodes != 0u || cap.vbd_coarse_children != 0u || !p.vbd_coarse_parents.empty() ||
+            cap.mf_vertices_per_env != 0u || !p.mf_elements.empty() || !p.mf_materials.empty())
             return reject(Status::InvalidArgument, "vertex-block tables without vertex-block particles");
         return Status::Ok;
     }
+    if (cap.mf_vertices_per_env > vertices)
+        return reject(Status::InvalidArgument, "material-field vertices exceed the vertex-block range");
+    const uint32_t vbd_vertices = vertices - cap.mf_vertices_per_env;
     if (uint64_t{cap.vbd_particle_begin} + vertices > cap.particles_per_env ||
         cap.vbd_particle_begin < p.n_mpm_particles || p.inv_mass.size() != cap.particles_per_env)
         return reject(Status::InvalidArgument, "vertex-block range exceeds its row-coupled particles");
@@ -1512,7 +1538,7 @@ phi::Status Model::ValidateVertexBlocks(std::string* reason) const {
         if (element.kind > kVbdRodBend || !std::isfinite(element.damping) || element.damping < 0.0f)
             return reject(Status::InvalidArgument, "invalid vertex-block element");
         for (uint32_t j = 0u; j < VbdElementVertexCount(element.kind); ++j)
-            if (element.vertex[j] >= vertices)
+            if (element.vertex[j] >= vbd_vertices)
                 return reject(Status::InvalidArgument, "vertex-block element index exceeds its range");
         for (float value : element.rest)
             if (!std::isfinite(value))
@@ -1561,7 +1587,59 @@ phi::Status Model::ValidateVertexBlocks(std::string* reason) const {
                      color_of[element.vertex[j]] == color_of[element.vertex[k]]))
                     return reject(Status::InvalidArgument, "vertex-block element joins one color twice");
     }
+    const Status field = ValidateMaterialField(color_of, reason);
+    if (field != Status::Ok) return field;
     return ValidateVertexBlockLevels(reason);
+}
+
+phi::Status Model::ValidateMaterialField(const std::vector<uint32_t>& color_of, std::string* reason) const {
+    auto reject = [&](const std::string& message) {
+        if (reason) *reason = message;
+        return phi::Status::InvalidArgument;
+    };
+    const auto& cap = capacities;
+    const auto& p = particles;
+    const uint32_t field = cap.mf_vertices_per_env, first = cap.vbd_vertices_per_env - field;
+    if (p.mf_elements.size() != cap.mf_elements_per_env || p.mf_materials.size() != cap.mf_materials ||
+        p.mf_incidence_offsets.size() != (field > 0u ? uint64_t{field} + 1u : 0u) ||
+        p.mf_incidence.size() != cap.mf_incidence_per_env ||
+        (field == 0u && (!p.mf_elements.empty() || !p.mf_materials.empty())) ||
+        (field > 0u && (p.mf_incidence_offsets.front() != 0u ||
+                        p.mf_incidence_offsets.back() != p.mf_incidence.size())))
+        return reject("incomplete material-field tables");
+    if (uint64_t{p.mf_elements.size()} * 8u > std::numeric_limits<uint32_t>::max())
+        return reject("material-field elements exceed incidence packing");
+    for (const MfMaterial& material : p.mf_materials)
+        if (!mf::ValidMaterial(material)) return reject("invalid material-field material");
+    for (const MfElement& element : p.mf_elements) {
+        if (element.kind > kMfBend || element.material >= p.mf_materials.size() ||
+            (element.kind == kMfBend && (element.hinges == 0u || element.hinges > 7u)))
+            return reject("invalid material-field element");
+        const uint32_t count = MfElementVertexCount(element);
+        for (uint32_t j = 0u; j < count; ++j) {
+            if (element.vertex[j] < first || element.vertex[j] >= cap.vbd_vertices_per_env)
+                return reject("material-field element leaves the field vertices");
+            for (uint32_t k = j + 1u; k < count; ++k)
+                if (element.vertex[j] == element.vertex[k] ||
+                    (color_of[element.vertex[j]] != kVbdNoColor &&
+                     color_of[element.vertex[j]] == color_of[element.vertex[k]]))
+                    return reject("material-field element joins one color twice");
+        }
+        for (float value : element.rest)
+            if (!std::isfinite(value)) return reject("material-field rest data must be finite");
+    }
+    for (uint32_t v = 0u; v < field; ++v) {
+        if (p.mf_incidence_offsets[v] > p.mf_incidence_offsets[v + 1u])
+            return reject("material-field incidence offsets must not decrease");
+        for (uint32_t i = p.mf_incidence_offsets[v]; i < p.mf_incidence_offsets[v + 1u]; ++i) {
+            const uint32_t element = MfIncidenceElement(p.mf_incidence[i]);
+            const uint32_t local = MfIncidenceLocal(p.mf_incidence[i]);
+            if (element >= p.mf_elements.size() || local >= MfElementVertexCount(p.mf_elements[element]) ||
+                p.mf_elements[element].vertex[local] != first + v)
+                return reject("material-field incidence disagrees with its element");
+        }
+    }
+    return phi::Status::Ok;
 }
 
 phi::Status Model::ValidateVertexBlockLevels(std::string* reason) const {

@@ -120,6 +120,7 @@ bool MediaFromDesc(const nuka_media_desc_t& d, nscene::MediaRecord* out) {
     switch (d.method) {
         case NUKA_MEDIA_METHOD_MLSMPM: m.method = Method::MlsMpm; break;
         case NUKA_MEDIA_METHOD_VBD:    m.method = Method::Vbd; break;
+        case NUKA_MEDIA_METHOD_FIELD:  m.method = Method::Field; break;
         default: return false;
     }
     // Geometry (one block read per kind).
@@ -434,6 +435,47 @@ nuka_result_t nuka_scene_set_mpm_contact_capacity(nuka_scene_handle scene,
     if (media.method != nscene::MediaRecord::Method::MlsMpm) return NUKA_RESULT_INVALID_ARG;
     media.mpm.contact_capacity = capacity;
     return NUKA_RESULT_OK;
+}
+
+nuka_result_t nuka_scene_add_field_media(nuka_scene_handle scene,
+                                         const nuka_media_desc_t* desc,
+                                         const nuka_field_material_desc_t* field,
+                                         uint32_t* out_media_id) {
+    if (desc == nullptr || field == nullptr || field->struct_size != sizeof(nuka_field_material_desc_t) ||
+        desc->method != NUKA_MEDIA_METHOD_FIELD)
+        return NUKA_RESULT_INVALID_ARG;
+    SceneRecord* sr = SceneTable().Get(scene);
+    if (sr == nullptr || !sr->scene) return NUKA_RESULT_NULL_HANDLE;
+    try {
+        nscene::MediaRecord media;
+        if (!MediaFromDesc(*desc, &media)) return NUKA_RESULT_INVALID_ARG;
+        nscene::MediaFieldMaterial& m = media.field;
+        m.density = field->density;
+        m.thickness = field->thickness;
+        m.youngs = field->youngs;
+        m.poisson = field->poisson;
+        m.yield_stress = field->yield_stress;
+        m.hardening = field->hardening;
+        m.yield_moment = field->yield_moment;
+        m.bend_hardening = field->bend_hardening;
+        for (int i = 0; i < 2; ++i) {
+            m.maxwell_modulus[i] = field->maxwell_modulus[i];
+            m.maxwell_time[i] = field->maxwell_time[i];
+            m.bend_maxwell_modulus[i] = field->bend_maxwell_modulus[i];
+            m.bend_maxwell_time[i] = field->bend_maxwell_time[i];
+        }
+        cook::ValidateMedia(std::vector<nscene::MediaRecord>{media});
+        media.name = "media_" + std::to_string(sr->scene->MediaCount());
+        const nscene::MediaId id = sr->scene->AddMedia(std::move(media));
+        if (out_media_id != nullptr) *out_media_id = id;
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception&) {
+        return NUKA_RESULT_INVALID_ARG;
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
 }
 
 nuka_result_t nuka_scene_add_mpm_fill(nuka_scene_handle scene, uint32_t media_id,
