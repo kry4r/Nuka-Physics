@@ -603,6 +603,15 @@ Value SaveMedia(const MediaRecord& m, MeshSink& sink) {
     Value pins = Value::Array();
     for (uint32_t vertex : m.cloth_mesh.pinned_vertices) pins.PushBack(Value::Int(vertex));
     cm.Set("pinned_vertices", std::move(pins));
+    if (!m.cloth_mesh.seams.empty()) {
+        Value seams = Value::Array();
+        for (const auto& line : m.cloth_mesh.seams) {
+            Value vertices = Value::Array();
+            for (uint32_t vertex : line) vertices.PushBack(Value::Int(vertex));
+            seams.PushBack(std::move(vertices));
+        }
+        cm.Set("seams", std::move(seams));
+    }
     o.Set("cloth_mesh", std::move(cm));
 
     Value cg = Value::Object();
@@ -693,6 +702,8 @@ Value SaveMedia(const MediaRecord& m, MeshSink& sink) {
         fo.Set("maxwell_time", pair(mf.maxwell_time));
         fo.Set("bend_maxwell_modulus", pair(mf.bend_maxwell_modulus));
         fo.Set("bend_maxwell_time", pair(mf.bend_maxwell_time));
+        fo.Set("tear_strength", Value::Float(mf.tear_strength));
+        fo.Set("tear_energy", Value::Float(mf.tear_energy));
         o.Set("field", std::move(fo));
     }
 
@@ -1887,6 +1898,16 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                             throw std::invalid_argument("Cloth pinned vertex is out of range");
                         rec.cloth_mesh.pinned_vertices.push_back(static_cast<uint32_t>(id));
                     }
+                if (const Value* seams = cm->Find("seams"))
+                    for (const Value& line : seams->Elements()) {
+                        std::vector<uint32_t>& vertices = rec.cloth_mesh.seams.emplace_back();
+                        for (const Value& vertex : line.Elements()) {
+                            const auto id = vertex.AsInt();
+                            if (id < 0 || static_cast<uint64_t>(id) > UINT32_MAX)
+                                throw std::invalid_argument("Cloth seam vertex is out of range");
+                            vertices.push_back(static_cast<uint32_t>(id));
+                        }
+                    }
             }
 
             if (const Value* cg = mv.Find("cloth_grid")) {
@@ -1975,6 +1996,8 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                 pair("maxwell_time", mf.maxwell_time);
                 pair("bend_maxwell_modulus", mf.bend_maxwell_modulus);
                 pair("bend_maxwell_time", mf.bend_maxwell_time);
+                mf.tear_strength = f(*fo, "tear_strength", mf.tear_strength);
+                mf.tear_energy = f(*fo, "tear_energy", mf.tear_energy);
             }
             if (const Value* mp = mv.Find("mpm")) read_mpm(*mp, rec.mpm);
             if (const Value* fills = mv.Find("mpm_fills")) {

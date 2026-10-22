@@ -41,6 +41,7 @@ class EnergyColumn(IntEnum):
     VALID = 30
     PLASTIC_LOSS = 31
     VISCOUS_LOSS = 32
+    COHESIVE_LOSS = 33
 
 
 class EnergyStatus(IntFlag):

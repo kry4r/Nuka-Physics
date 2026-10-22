@@ -17,7 +17,8 @@
 namespace nuka::nk {
 
 // Density kg/m^3, thickness m, moduli and yield stress Pa, yield moment N m per m, bend hardening N m,
-// Maxwell moduli as multiples of the elastic stiffness and their relaxation times in s.
+// Maxwell moduli as multiples of the elastic stiffness and their relaxation times in s, and the strength Pa
+// and toughness J/m^2 of declared seams.
 struct MfMaterial {
     float density = 0.0f;
     float thickness = 0.0f;
@@ -31,12 +32,15 @@ struct MfMaterial {
     float maxwell_time[2]{};
     float bend_maxwell_modulus[2]{};
     float bend_maxwell_time[2]{};
+    float tear_strength = 0.0f;
+    float tear_energy = 0.0f;
 };
-static_assert(sizeof(MfMaterial) == 16u * sizeof(float), "MfMaterial packs to 64 bytes");
+static_assert(sizeof(MfMaterial) == 18u * sizeof(float), "MfMaterial packs to 72 bytes");
 
-// Committed history of an element's strain triple: plastic strain, equivalent plastic strain and two Maxwell
-// strains, all in the (11, 22, 2 12) order of the strain.
-inline constexpr uint32_t kMfHistory = 10u;
+// Committed history: the law's plastic, equivalent plastic and two Maxwell strains in (11, 22, 2 12) order, then a
+// bend's seam damage per hinge, which the law carries; a seam keeps the largest separation of each node pair.
+inline constexpr uint32_t kMfHistory = 13u;
+inline constexpr uint32_t kMfHingeDamage = 10u;
 
 enum class MfStatus : uint32_t { Ok, InvalidParameters, LocalNonConvergence, NonFinite };
 
@@ -71,7 +75,8 @@ NUKA_MF_HD inline bool ValidMaterial(const MfMaterial& m) {
     bool valid = math::IsFinite(m.density) && m.density > 0.0f && math::IsFinite(m.thickness) &&
                  m.thickness > 0.0f && math::IsFinite(m.youngs) && m.youngs > 0.0f && m.poisson >= 0.0f &&
                  m.poisson < 0.5f && m.yield_stress >= 0.0f && m.hardening >= 0.0f && m.yield_moment >= 0.0f &&
-                 m.bend_hardening >= 0.0f;
+                 m.bend_hardening >= 0.0f && math::IsFinite(m.tear_strength) && m.tear_strength >= 0.0f &&
+                 math::IsFinite(m.tear_energy) && m.tear_energy >= 0.0f;
     for (uint32_t k = 0u; k < 2u; ++k) {
         valid = valid && m.maxwell_modulus[k] >= 0.0f && (m.maxwell_modulus[k] == 0.0f || m.maxwell_time[k] > 0.0f);
         valid = valid && m.bend_maxwell_modulus[k] >= 0.0f &&
@@ -211,6 +216,7 @@ NUKA_MF_HD inline MfStatus EvaluatePlaneStress(const PlaneStressLaw& law, const 
     Real s[3] = {c[0] * Real(kHalfSqrt2) * (d[0] + d[1]), c[1] * Real(kHalfSqrt2) * (d[0] - d[1]), c[2] * d[2]};
     Real t[6] = {c[0], c[1], c[2], Real(0), Real(0), Real(0)};
     r.history[3] = z[3];
+    for (uint32_t k = kMfHingeDamage; k < kMfHistory; ++k) r.history[k] = z[k];
     const Real kappa = Real(law.yield) + Real(law.hardening) * z[3];
     const Real size = s[0] * s[0] / Real(3) + s[1] * s[1] + Real(2) * s[2] * s[2];
     r.yielded = law.yield > 0.0f && size > Real(2.0 / 3.0) * kappa * kappa;
@@ -277,6 +283,54 @@ NUKA_MF_HD inline MfStatus EvaluatePlaneStress(const PlaneStressLaw& law, const 
     if (!math::IsFinite(r.psi)) return MfStatus::NonFinite;
     out = r;
     return MfStatus::Ok;
+}
+
+// Bilinear traction-separation of a seam per unit area: stiffness up to the strength, then linear softening
+// that has spent the toughness when the separation parts. Damage follows the largest separation reached.
+struct CohesiveLaw {
+    double stiffness;  // Pa/m
+    double strength;   // Pa
+    double toughness;  // J/m^2
+    NUKA_MF_HD double Onset() const { return strength / stiffness; }
+    NUKA_MF_HD double Parting() const { return 2.0 * toughness / strength; }
+};
+
+// Damage D at a largest separation, where (1 - D) K r meets the softening line.
+NUKA_MF_HD inline double SeamDamage(const CohesiveLaw& law, double reached) {
+    const double onset = law.Onset(), parting = law.Parting();
+    if (!(reached > onset)) return 0.0;
+    if (reached >= parting) return 1.0;
+    return parting * (reached - onset) / (reached * (parting - onset));
+}
+
+// Incremental potential, secant stiffness T / r, and the stored energy and loss once the step's
+// separation is committed.
+struct SeamResponse {
+    double psi;
+    double secant;
+    double reached;
+    double stored;
+    double loss;
+};
+
+NUKA_MF_HD inline SeamResponse EvaluateSeam(const CohesiveLaw& law, double reached, double r) {
+    const double onset = law.Onset(), parting = law.Parting(), slope = law.strength / (parting - onset);
+    const double knee = fmax(reached, onset);
+    SeamResponse s{0.0, 0.0, fmax(reached, r), 0.0, 0.0};
+    if (knee >= parting) return s;
+    const double held = (1.0 - SeamDamage(law, knee)) * law.stiffness;
+    auto soften = [&](double x) { return slope * (parting * x - 0.5 * x * x); };
+    if (r <= knee) {
+        s.psi = 0.5 * held * r * r;
+        s.secant = held;
+    } else {
+        const double end = fmin(r, parting);
+        s.psi = 0.5 * held * knee * knee + soften(end) - soften(knee);
+        s.secant = r < parting ? slope * (parting - r) / r : 0.0;
+    }
+    if (s.reached < parting) s.stored = 0.5 * (1.0 - SeamDamage(law, s.reached)) * law.stiffness * r * r;
+    s.loss = s.psi - s.stored;
+    return s;
 }
 
 }  // namespace mf

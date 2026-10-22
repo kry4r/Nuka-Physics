@@ -174,6 +174,7 @@ void BuildClothVertexBlocks(const std::vector<math::Vec3>& rest_positions,
 void BuildFieldShellElements(const std::vector<math::Vec3>& rest_positions,
                              const std::vector<ClothTriangle>& triangles,
                              const std::vector<std::array<math::Vec3, 3>>& material_faces,
+                             const std::vector<uint32_t>& weld,
                              const nk::MfMaterial& material, uint32_t material_index,
                              std::vector<nk::MfElement>& out) {
     if (!nk::mf::ValidMaterial(material))
@@ -193,17 +194,21 @@ void BuildFieldShellElements(const std::vector<math::Vec3>& rest_positions,
         out.push_back(f);
     }
     std::vector<std::array<Point2, 3>> layout(triangles.size());
+    const auto welded = [&](uint32_t v) { return weld.empty() ? v : weld[v]; };
     std::map<std::pair<uint32_t, uint32_t>, std::vector<std::pair<uint32_t, uint32_t>>> edge_faces;
     for (size_t f = 0u; f < triangles.size(); ++f) {
         layout[f] = FaceLayout(rest_positions, triangles[f], material_faces, f);
         for (uint32_t j = 0u; j < 3u; ++j) {
-            const uint32_t a = triangles[f].v[j], b = triangles[f].v[(j + 1u) % 3u];
+            const uint32_t a = welded(triangles[f].v[j]), b = welded(triangles[f].v[(j + 1u) % 3u]);
             edge_faces[{std::min(a, b), std::max(a, b)}].push_back({static_cast<uint32_t>(f), j});
         }
     }
     const double D = nk::mf::BendingModulus<double>(material), nu = material.poisson;
     // Plate rigidity over (kxx, kxy, kyy): D [nu tr^2 + (1 - nu)(kxx^2 + 2 kxy^2 + kyy^2)].
     const double P[3][3] = {{D, 0.0, nu * D}, {0.0, 2.0 * (1.0 - nu) * D, 0.0}, {nu * D, 0.0, D}};
+    // Each cut edge as (face, hinge) on both sides, and each face's bend.
+    std::vector<std::array<uint32_t, 4>> cuts;
+    std::vector<uint32_t> bend_of(triangles.size(), ~0u);
     for (size_t f = 0u; f < triangles.size(); ++f) {
         const ClothTriangle& tri = triangles[f];
         const std::array<Point2, 3>& c = layout[f];
@@ -216,7 +221,8 @@ void BuildFieldShellElements(const std::vector<math::Vec3>& rest_positions,
         uint32_t far_count = 0u;
         for (uint32_t i = 0u; i < 3u; ++i) {
             const uint32_t i0 = (i + 1u) % 3u, i1 = (i + 2u) % 3u;
-            const auto& faces = edge_faces[{std::min(tri.v[i0], tri.v[i1]), std::max(tri.v[i0], tri.v[i1])}];
+            const uint32_t w0 = welded(tri.v[i0]), w1 = welded(tri.v[i1]);
+            const auto& faces = edge_faces[{std::min(w0, w1), std::max(w0, w1)}];
             const Point2 x0 = c[i0], x1 = c[i1], near = c[i];
             const Point2 edge = Sub2(x1, x0);
             const double length = std::sqrt(Dot2(edge, edge));
@@ -226,8 +232,10 @@ void BuildFieldShellElements(const std::vector<math::Vec3>& rest_positions,
             if (faces.size() == 2u) {
                 const auto [g, cg] = faces[0].first == f ? faces[1] : faces[0];
                 const ClothTriangle& other = triangles[g];
-                if (other.v[cg] != tri.v[i1] || other.v[(cg + 1u) % 3u] != tri.v[i0])
+                if (welded(other.v[cg]) != w1 || welded(other.v[(cg + 1u) % 3u]) != w0)
                     throw std::invalid_argument("Cloth faces sharing an edge must be consistently wound");
+                if (f < g && (other.v[cg] != tri.v[i1] || other.v[(cg + 1u) % 3u] != tri.v[i0]))
+                    cuts.push_back({static_cast<uint32_t>(f), i, g, (cg + 2u) % 3u});
                 const uint32_t w = (cg + 2u) % 3u;
                 const Point2 to0 = Sub2(layout[g][w], layout[g][(cg + 1u) % 3u]);
                 const Point2 to1 = Sub2(layout[g][w], layout[g][cg]);
@@ -285,7 +293,36 @@ void BuildFieldShellElements(const std::vector<math::Vec3>& rest_positions,
             bend.rest[6u + k] = static_cast<float>(2.0 * B[1][k]);
         }
         bend.rest[9] = static_cast<float>(area);
+        bend_of[f] = static_cast<uint32_t>(out.size());
         out.push_back(bend);
+    }
+    // A cut edge runs from face a's corner i + 1 to i + 2 and back over face b's corners j + 2 to j + 1; each end
+    // whose copies differ is a node pair of weight L t / 2, held by a cohesive layer 1% as compliant as the face.
+    for (const auto& [fa, i, fb, j] : cuts) {
+        const ClothTriangle &a = triangles[fa], &b = triangles[fb];
+        const uint32_t ends[2][2] = {{a.v[(i + 1u) % 3u], b.v[(j + 2u) % 3u]}, {a.v[(i + 2u) % 3u], b.v[(j + 1u) % 3u]}};
+        nk::MfElement seam;
+        seam.kind = nk::kMfSeam;
+        seam.material = material_index;
+        uint32_t pairs = 0u;
+        for (const auto& end : ends)
+            if (end[0] != end[1]) {
+                seam.vertex[2u * pairs] = end[0];
+                seam.vertex[2u * pairs + 1u] = end[1];
+                ++pairs;
+            }
+        seam.vertex[4] = bend_of[fa];
+        seam.vertex[5] = bend_of[fb];
+        seam.hinges = i | j << 2u | pairs << 4u;
+        const Point2 edge = Sub2(layout[fa][(i + 2u) % 3u], layout[fa][(i + 1u) % 3u]);
+        const double length = std::sqrt(Dot2(edge, edge));
+        seam.rest[0] = static_cast<float>(0.5 * length * material.thickness);
+        seam.rest[1] = static_cast<float>(100.0 * material.youngs / length);
+        const nk::mf::CohesiveLaw law = nk::mf::SeamLaw(seam, material);
+        if (!(material.tear_strength > 0.0f) || !(law.Parting() > law.Onset()))
+            throw std::invalid_argument("Material-field seams need a tear strength and a tear energy above "
+                                        "strength^2 / (2 x seam stiffness)");
+        out.push_back(seam);
     }
 }
 

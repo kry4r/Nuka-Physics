@@ -1934,6 +1934,8 @@ nk::MfMaterial FieldMaterial(const MediaFieldMaterial& f) {
         m.bend_maxwell_modulus[i] = f.bend_maxwell_modulus[i];
         m.bend_maxwell_time[i] = f.bend_maxwell_time[i];
     }
+    m.tear_strength = f.tear_strength;
+    m.tear_energy = f.tear_energy;
     return m;
 }
 
@@ -1999,14 +2001,19 @@ void ValidateMedia(const std::vector<MediaRecord>& media) {
             const float parameters[] = {f.yield_stress, f.hardening, f.yield_moment, f.bend_hardening,
                                         f.maxwell_modulus[0], f.maxwell_modulus[1], f.maxwell_time[0],
                                         f.maxwell_time[1], f.bend_maxwell_modulus[0], f.bend_maxwell_modulus[1],
-                                        f.bend_maxwell_time[0], f.bend_maxwell_time[1]};
+                                        f.bend_maxwell_time[0], f.bend_maxwell_time[1], f.tear_strength,
+                                        f.tear_energy};
             bool nonnegative = true;
             for (float value : parameters) nonnegative = nonnegative && std::isfinite(value) && value >= 0.0f;
-            if (!nk::mf::ValidMaterial(FieldMaterial(f)) || !nonnegative || !m.cloth_regions.empty())
+            if (!nk::mf::ValidMaterial(FieldMaterial(f)) || !nonnegative || !m.cloth_regions.empty() ||
+                (!m.cloth_mesh.seams.empty() && !(f.tear_strength > 0.0f && f.tear_energy > 0.0f)))
                 throw std::runtime_error(
                     "ValidateMedia: a field cloth needs positive density, thickness and youngs, "
-                    "0 <= poisson < 0.5, nonnegative plastic and Maxwell parameters and no cloth regions");
+                    "0 <= poisson < 0.5, nonnegative plastic, Maxwell and tear parameters, a positive tear "
+                    "strength and energy for seams, and no cloth regions");
         }
+        if (m.method != Method::Field && !m.cloth_mesh.seams.empty())
+            throw std::runtime_error("ValidateMedia: cloth seams tear only in a material-field cloth");
         // model_kind 4 (Drucker-Prager) and Kind::Granular imply each other: no
         // sand-tagged fluid/soft body and no granular bed cooking as another model.
         const float mk = m.mpm.model_kind;
@@ -2176,6 +2183,7 @@ struct ClothGeometry {
     std::vector<math::Vec3> rest;
     std::vector<runtime::soft::ClothTriangle> triangles;
     std::vector<std::array<math::Vec3, 3>> material_faces;
+    std::vector<uint32_t> weld;  // the vertex each seam copy was cut from; empty without seams
 };
 
 NkaMesh ReadClothMesh(const AssetRef& ref) {
@@ -2191,7 +2199,7 @@ NkaMesh ReadClothMesh(const AssetRef& ref) {
     return mesh;
 }
 
-ClothGeometry BuildClothGeometry(const MediaRecord& media) {
+ClothGeometry BuildClothSurface(const MediaRecord& media) {
     ClothGeometry out;
     if (!media.baked.Empty()) {
         const NkaMesh mesh = ReadClothMesh(media.baked);
@@ -2286,6 +2294,71 @@ ClothGeometry BuildClothGeometry(const MediaRecord& media) {
             out.triangles.push_back({{idx(i,j), idx(i+1u,j), idx(i+1u,j+1u)}});
             out.triangles.push_back({{idx(i,j), idx(i+1u,j+1u), idx(i,j+1u)}});
         }
+    return out;
+}
+
+// Declared seams cut the surface: the faces around a vertex group across its uncut edges, and each group past
+// the first takes its own copy of the vertex.
+void SplitClothSeams(const std::vector<std::vector<uint32_t>>& lines, ClothGeometry& out) {
+    const uint32_t vertices = static_cast<uint32_t>(out.rest.size());
+    std::set<std::pair<uint32_t, uint32_t>> cut;
+    for (const auto& line : lines) {
+        if (line.size() < 2u) throw std::invalid_argument("Cloth seam needs at least two vertices");
+        for (size_t k = 0u; k + 1u < line.size(); ++k) {
+            if (line[k] >= vertices || line[k + 1u] >= vertices || line[k] == line[k + 1u])
+                throw std::invalid_argument("Cloth seam vertex is out of range");
+            cut.insert({std::min(line[k], line[k + 1u]), std::max(line[k], line[k + 1u])});
+        }
+    }
+    const uint32_t corners = static_cast<uint32_t>(out.triangles.size() * 3u);
+    std::vector<uint32_t> root(corners);
+    for (uint32_t c = 0u; c < corners; ++c) root[c] = c;
+    const auto find = [&](uint32_t c) {
+        while (root[c] != c) c = root[c] = root[root[c]];
+        return c;
+    };
+    // The corner of `vertex` in the face of corner c.
+    const auto at = [&](uint32_t c, uint32_t vertex) {
+        const uint32_t face = c / 3u;
+        return 3u * face + (out.triangles[face].v[0] == vertex ? 0u : out.triangles[face].v[1] == vertex ? 1u : 2u);
+    };
+    std::map<std::pair<uint32_t, uint32_t>, std::vector<uint32_t>> edges;
+    for (uint32_t c = 0u; c < corners; ++c) {
+        const uint32_t a = out.triangles[c / 3u].v[c % 3u], b = out.triangles[c / 3u].v[(c + 1u) % 3u];
+        edges[{std::min(a, b), std::max(a, b)}].push_back(c);
+    }
+    for (const auto& [ends, sides] : edges) {
+        const bool seam = cut.count(ends) != 0u;
+        if (seam && sides.size() != 2u) throw std::invalid_argument("Cloth seams must run along interior edges");
+        if (seam || sides.size() != 2u) continue;
+        for (uint32_t vertex : {ends.first, ends.second})
+            root[find(at(sides[0], vertex))] = find(at(sides[1], vertex));
+    }
+    std::vector<uint32_t> id(corners, ~0u);
+    std::vector<uint8_t> taken(vertices, 0u);
+    out.weld.resize(vertices);
+    for (uint32_t v = 0u; v < vertices; ++v) out.weld[v] = v;
+    for (uint32_t c = 0u; c < corners; ++c) {
+        uint32_t& vertex = out.triangles[c / 3u].v[c % 3u];
+        const uint32_t group = find(c);
+        if (id[group] == ~0u) {
+            if (taken[vertex] != 0u) {
+                id[group] = static_cast<uint32_t>(out.rest.size());
+                const math::Vec3 position = out.rest[vertex];
+                out.rest.push_back(position);
+                out.weld.push_back(vertex);
+            } else {
+                id[group] = vertex;
+                taken[vertex] = 1u;
+            }
+        }
+        vertex = id[group];
+    }
+}
+
+ClothGeometry BuildClothGeometry(const MediaRecord& media) {
+    ClothGeometry out = BuildClothSurface(media);
+    if (!media.cloth_mesh.seams.empty()) SplitClothSeams(media.cloth_mesh.seams, out);
     return out;
 }
 
@@ -2404,7 +2477,8 @@ VbdCookInput BuildFieldVertexBlockInput(const MediaRecord& media) {
     const auto& tris = geometry.triangles;
     if (rest.empty()) return in;
     const nk::MfMaterial material = FieldMaterial(media.field);
-    runtime::soft::BuildFieldShellElements(rest, tris, geometry.material_faces, material, 0u, in.field_elements);
+    runtime::soft::BuildFieldShellElements(rest, tris, geometry.material_faces, geometry.weld, material, 0u,
+                                           in.field_elements);
     in.field_materials.push_back(material);
     in.vbd_begin = 0u;
     in.vbd_count = in.field_count = static_cast<uint32_t>(rest.size());
@@ -2433,6 +2507,8 @@ VbdCookInput BuildFieldVertexBlockInput(const MediaRecord& media) {
         in.inv_mass.push_back(1.0f / mass);
     }
     PinClothVertices(media, in.inv_mass);
+    for (size_t v = 0u; v < geometry.weld.size(); ++v)
+        if (in.inv_mass[geometry.weld[v]] == 0.0f) in.inv_mass[v] = 0.0f;
     return in;
 }
 
@@ -2964,8 +3040,13 @@ void AppendSoftMedium(VbdCookInput& dst, const VbdCookInput& src) {
         dst.vbd_elements.push_back(element);
     }
     const uint32_t material_base = static_cast<uint32_t>(dst.field_materials.size());
+    const uint32_t element_base = static_cast<uint32_t>(dst.field_elements.size());
     for (nk::MfElement element : src.field_elements) {
         for (uint32_t j = 0u; j < nk::MfElementVertexCount(element); ++j) element.vertex[j] += base;
+        if (element.kind == nk::kMfSeam) {
+            element.vertex[4] += element_base;
+            element.vertex[5] += element_base;
+        }
         element.material += material_base;
         dst.field_elements.push_back(element);
     }

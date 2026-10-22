@@ -442,6 +442,8 @@ class Scene:
                 half_thickness=rkw["vbd_half_thickness"], friction=rkw["vbd_friction"],
                 stretch_stiffness=rkw["vbd_stretch_stiffness"], poisson=rkw["vbd_poisson"],
                 bend_stiffness=rkw["vbd_bend_stiffness"], damping=rkw["vbd_damping"])
+        for seam in getattr(morph, "seams", ()):
+            builder.add_cloth_seam(media_id, [int(v) for v in seam])
 
 
 __all__ = ["Scene", "SimOptions", "Environment"]

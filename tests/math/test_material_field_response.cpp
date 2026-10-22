@@ -163,6 +163,37 @@ double YieldMeasure(const double (&s)[3]) {
     const double a = mf::kHalfSqrt2 * (s[0] + s[1]), b = mf::kHalfSqrt2 * (s[0] - s[1]);
     return a * a / 3.0 + b * b + 2.0 * s[2] * s[2];
 }
+
+// A paper seam over a 5 mm edge: cohesive stiffness 100 E / L, strength 2 MPa, toughness 200 J/m^2.
+constexpr float kPaperEdge = 0.005f;
+
+nk::MfMaterial Paper() {
+    nk::MfMaterial m = Sheet();
+    m.youngs = 2.0e8f;
+    m.thickness = 5.0e-4f;
+    m.tear_strength = 2.0e6f;
+    m.tear_energy = 200.0f;
+    return m;
+}
+
+nk::MfElement Seam() {
+    nk::MfElement e;
+    e.kind = nk::kMfSeam;
+    e.hinges = 2u << 4u;
+    for (uint32_t j = 0u; j < 4u; ++j) e.vertex[j] = j;
+    e.rest[0] = 0.5f * kPaperEdge * Paper().thickness;
+    e.rest[1] = 100.0f * Paper().youngs / kPaperEdge;
+    return e;
+}
+
+// Pairs 5 mm apart whose far sides sit `first` and `second` from their near sides.
+mf::FieldGeometry SeamGeometry(Vec3 first, Vec3 second) {
+    mf::FieldGeometry g{};
+    g.start[2] = g.start[3] = Vec3{kPaperEdge, 0.0f, 0.0f};
+    g.delta[1] = first;
+    g.delta[3] = second;
+    return g;
+}
 }  // namespace
 
 TEST(MaterialFieldResponse, StressAndTangentMatchFiniteDifferences) {
@@ -449,5 +480,88 @@ TEST(MaterialFieldKinematics, RotationKeepsStrainEnergyAndRotatesTheGradient) {
             EXPECT_NEAR(actual.y, expected.y, 1.0e-4f * largest);
             EXPECT_NEAR(actual.z, expected.z, 1.0e-4f * largest);
         }
+    }
+}
+
+TEST(MaterialFieldSeam, PartingSpendsTheToughnessAndClosingPullsNothing) {
+    const mf::CohesiveLaw law = mf::SeamLaw(Seam(), Paper());
+    const double onset = law.Onset(), parting = law.Parting();
+    ASSERT_GT(parting, 10.0 * onset);
+    EXPECT_NEAR(mf::EvaluateSeam(law, 0.0, onset).secant * onset, law.strength, 1.0e-9 * law.strength);
+    // Steps that commit their largest separation dissipate G in all and store nothing once parted.
+    double reached = 0.0, loss = 0.0;
+    for (int k = 1; k <= 400; ++k) {
+        const mf::SeamResponse s = mf::EvaluateSeam(law, reached, 1.2 * parting * k / 400.0);
+        EXPECT_GE(s.loss, -1.0e-12 * law.toughness) << "step " << k;
+        loss += s.loss;
+        reached = s.reached;
+    }
+    EXPECT_NEAR(loss, law.toughness, 1.0e-9 * law.toughness);
+    const mf::SeamResponse closed = mf::EvaluateSeam(law, reached, 0.3 * parting);
+    EXPECT_EQ(closed.psi, 0.0);
+    EXPECT_EQ(closed.secant, 0.0);
+    EXPECT_EQ(closed.stored, 0.0);
+}
+
+TEST(MaterialFieldSeam, UnloadingFollowsTheDamagedStiffnessWithoutLoss) {
+    const mf::CohesiveLaw law = mf::SeamLaw(Seam(), Paper());
+    const double onset = law.Onset(), parting = law.Parting(), reached = 0.3 * parting;
+    const double damage = mf::SeamDamage(law, reached);
+    ASSERT_GT(damage, 0.0);
+    ASSERT_LT(damage, 1.0);
+    // The damaged secant meets the softening line at the reached separation.
+    EXPECT_NEAR((1.0 - damage) * law.stiffness * reached, law.strength * (parting - reached) / (parting - onset),
+                1.0e-9 * law.strength);
+    for (const double r : {0.0, 0.2 * reached, reached}) {
+        const mf::SeamResponse s = mf::EvaluateSeam(law, reached, r);
+        EXPECT_NEAR(s.secant, (1.0 - damage) * law.stiffness, 1.0e-9 * law.stiffness);
+        EXPECT_NEAR(s.loss, 0.0, 1.0e-12 * law.toughness);
+        EXPECT_EQ(s.reached, reached);
+    }
+}
+
+TEST(MaterialFieldSeam, PairGradientsFollowTheEnergyChange) {
+    const nk::MfElement seam = Seam();
+    const nk::MfMaterial m = Paper();
+    EXPECT_EQ(nk::MfElementVertexCount(seam), 4u);
+    const float onset = float(mf::SeamLaw(seam, m).Onset());
+    // Pair 0 holds elastically, pair 1 softens; a committed reach makes pair 0 unload.
+    const mf::FieldGeometry g = SeamGeometry(Vec3{0.3f, -0.2f, 0.25f} * onset, Vec3{-12.0f, 30.0f, 20.0f} * onset);
+    float history[nk::kMfHistory]{};
+    history[0] = 4.0f * onset;
+    for (const float* committed : {static_cast<const float*>(nullptr), static_cast<const float*>(history)}) {
+        const Vec3 move = Vec3{1.0f, -0.6f, 0.8f} * (0.01f * onset);
+        for (uint32_t local = 0u; local < 4u; ++local) {
+            Vec3 gradient;
+            SymmetricMat3 hessian;
+            mf::ElementBlock(seam, m, committed, local, g, nullptr, kStep, &gradient, &hessian);
+            ASSERT_GT(gradient.Length(), 0.0f);
+            ASSERT_GT(hessian.xx, 0.0f);
+            const float up = mf::ElementEnergyChange(seam, m, committed, local, g, nullptr, kStep, move);
+            const float down = mf::ElementEnergyChange(seam, m, committed, local, g, nullptr, kStep, move * -1.0f);
+            EXPECT_NEAR(0.5 * (double(up) - double(down)), gradient.Dot(move),
+                        1.0e-3 * gradient.Length() * move.Length()) << "local " << local;
+        }
+        mf::FieldResponse<float> trial{};
+        ASSERT_EQ(mf::ElementTrial(seam, m, committed, g, kStep, trial), nk::MfStatus::Ok);
+        const float softened = (Vec3{-12.0f, 30.0f, 20.0f} * onset).Length();
+        EXPECT_NEAR(trial.history[1], softened, 1.0e-4f * softened);
+        EXPECT_GT(trial.plastic, 0.0f);
+        EXPECT_NEAR(mf::ElementEnergy(seam, m, trial.history, g), seam.rest[0] * trial.stored,
+                    1.0e-4 * seam.rest[0] * trial.stored);
+    }
+}
+
+TEST(MaterialFieldSeam, PartedHingesStopBending) {
+    const Points patch = BentPatch(0.35f);
+    float parted[nk::kMfHistory]{};
+    for (uint32_t i = 0u; i < 3u; ++i) parted[nk::kMfHingeDamage + i] = 1.0f;
+    ASSERT_GT(Energy(Bend(), patch), 0.0);
+    EXPECT_EQ(mf::ElementEnergy(Bend(), Sheet(), parted, Geometry(patch)), 0.0);
+    for (uint32_t local = 0u; local < 6u; ++local) {
+        Vec3 gradient;
+        SymmetricMat3 hessian;
+        mf::ElementBlock(Bend(), Sheet(), parted, local, Geometry(patch), nullptr, kStep, &gradient, &hessian);
+        EXPECT_EQ(gradient.LengthSq(), 0.0f) << "local " << local;
     }
 }

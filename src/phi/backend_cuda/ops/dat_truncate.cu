@@ -93,6 +93,15 @@ __device__ float DatOverlapDepth(const collision::DatPrimitive& a,
     return fmaxf(0.0f, -collision::DatFindSeparator(a, b, -FLT_MAX).gap);
 }
 
+// A seam copy keeps the rest position of the vertex it was split from, so the two count as one.
+__device__ bool DatSameVertex(const DatTruncateParams& p, const ModelView& model,
+                              uint32_t a, uint32_t b) {
+    if (a == b) return true;
+    const math::Vec3 rest_a = model.particle_rest_pos[a % p.particles_per_env];
+    const math::Vec3 rest_b = model.particle_rest_pos[b % p.particles_per_env];
+    return rest_a.x == rest_b.x && rest_a.y == rest_b.y && rest_a.z == rest_b.z;
+}
+
 // DatFindSeparator(a, b).gap > 0. Each axis gap is independent of the others, so any order decides;
 // the face normal of b and the edge pairs come first because they separate most nearby pairs.
 __device__ bool DatSeparated(const collision::DatPrimitive& a, const collision::DatPrimitive& b) {
@@ -431,7 +440,7 @@ __global__ void DatVertexFaceKernel(DatTruncateParams p, ModelView model, DataVi
             for (uint32_t j = 0u; j < 3u; ++j) {
                 candidate->b[j] = env * p.particles_per_env + info.vertex_offset +
                                   view.triangles[at + j];
-                incident |= candidate->b[j] == item;
+                incident |= DatSameVertex(p, model, candidate->b[j], item);
             }
             if (incident) continue;
             candidate->a[0] = item;
@@ -520,8 +529,9 @@ __global__ void DatEdgeEdgeKernel(DatTruncateParams p, ModelView model, DataView
             if (target_edge <= local) continue;
             const auto edge_b = model.particle_surface_edges[target_edge];
             const uint32_t ids_b[2] = {base_b + edge_b.vertex0, base_b + edge_b.vertex1};
-            if (ids_a[0] == ids_b[0] || ids_a[0] == ids_b[1] ||
-                ids_a[1] == ids_b[0] || ids_a[1] == ids_b[1]) continue;
+            if (DatSameVertex(p, model, ids_a[0], ids_b[0]) || DatSameVertex(p, model, ids_a[0], ids_b[1]) ||
+                DatSameVertex(p, model, ids_a[1], ids_b[0]) || DatSameVertex(p, model, ids_a[1], ids_b[1]))
+                continue;
             *candidate = {{ids_a[0], ids_a[1]}, {ids_b[0], ids_b[1], 0u}, env, query};
             return true;
         }
@@ -619,7 +629,8 @@ __global__ void DatInitialEdgeFaceKernel(DatTruncateParams p, ModelView model,
                     bool incident = false;
                     for (uint32_t i = 0u; i < 3u; ++i) {
                         ids_b[i] = base_b + view.triangles[at + i];
-                        incident |= ids_b[i] == ids_a[0] || ids_b[i] == ids_a[1];
+                        incident |= DatSameVertex(p, model, ids_b[i], ids_a[0]) ||
+                                    DatSameVertex(p, model, ids_b[i], ids_a[1]);
                     }
                     if (!incident) {
                         collision::DatPrimitive triangle;

@@ -64,7 +64,7 @@ DTYPE_INFO: dict[str, dict[str, Any]] = {
     "vbd_element": {"cpp": "::nuka::nk::VbdElement", "code": "kU8", "lanes": 64},
     "vbd_membrane_start": {"cpp": "::nuka::nk::vbd::MembraneStartState", "code": "kU8", "lanes": 36},
     "mf_element": {"cpp": "::nuka::nk::MfElement", "code": "kU8", "lanes": 96},
-    "mf_material": {"cpp": "::nuka::nk::MfMaterial", "code": "kU8", "lanes": 64},
+    "mf_material": {"cpp": "::nuka::nk::MfMaterial", "code": "kU8", "lanes": 72},
 }
 
 VALID_PER = {

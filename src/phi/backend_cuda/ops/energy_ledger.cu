@@ -31,7 +31,7 @@ constexpr uint32_t kThreads = 128u;
 constexpr uint32_t kColumns = nk::kEnergyColumnCount;
 constexpr uint32_t kForceWorkColumn = kColumns;
 constexpr uint32_t kReductionColumns = kColumns + 1u;
-static_assert(kColumns == 33u, "energy field record must match its named columns");
+static_assert(kColumns == 34u, "energy field record must match its named columns");
 
 __device__ uint32_t Column(EnergyColumn value) { return static_cast<uint32_t>(value); }
 __device__ double Dot(Vec3 a, Vec3 b) {
@@ -333,7 +333,7 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
         if (c >= Column(EnergyColumn::DriveWork) && c <= Column(EnergyColumn::ExternalWork))
             values[Column(EnergyColumn::Throughput)] += fabs(value);
         if ((c >= Column(EnergyColumn::FrictionLoss) && c <= Column(EnergyColumn::RayleighLoss)) ||
-            c == Column(EnergyColumn::PlasticLoss) || c == Column(EnergyColumn::ViscousLoss))
+            c >= Column(EnergyColumn::PlasticLoss))
             values[Column(EnergyColumn::Throughput)] += value;
     };
     double kinetic = 0.0, gravity = 0.0, elastic = 0.0, position = 0.0;
@@ -499,9 +499,10 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
         elastic += energy;
         if (p.stage == EnergyStage::Projected)
             position += energy - nk::mf::ElementEnergy(element, material, history, unprojected);
-        // The step's commit left its plastic and viscous losses after the trial history.
+        // The step's commit left its plastic, or a seam's cohesive, and viscous losses after the trial history.
         if (p.stage == EnergyStage::End) {
-            add(EnergyColumn::PlasticLoss, d.mf_trial[slot * (nk::kMfHistory + 2u) + nk::kMfHistory]);
+            add(element.kind == nk::kMfSeam ? EnergyColumn::CohesiveLoss : EnergyColumn::PlasticLoss,
+                d.mf_trial[slot * (nk::kMfHistory + 2u) + nk::kMfHistory]);
             add(EnergyColumn::ViscousLoss, d.mf_trial[slot * (nk::kMfHistory + 2u) + nk::kMfHistory + 1u]);
         }
     }
@@ -581,7 +582,8 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
     for (uint32_t c = Column(EnergyColumn::FrictionLoss); c <= Column(EnergyColumn::RayleighLoss); ++c) {
         losses += sum[c];
     }
-    losses += sum[Column(EnergyColumn::PlasticLoss)] + sum[Column(EnergyColumn::ViscousLoss)];
+    losses += sum[Column(EnergyColumn::PlasticLoss)] + sum[Column(EnergyColumn::ViscousLoss)] +
+              sum[Column(EnergyColumn::CohesiveLoss)];
     const double residual = change - work + losses + get(EnergyColumn::DatKineticLoss) -
                              get(EnergyColumn::PositionPotential);
     output[Column(EnergyColumn::Dt)] = p.dt;

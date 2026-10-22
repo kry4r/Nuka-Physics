@@ -781,9 +781,9 @@ fields:
   # acceleration, dual, check.
   - {name: solver_phase_time, dtype: u64, per: env, elem: 8, arena: scratch, owner: data}
   - {name: dat_surface_motion, dtype: f32, per: scalar, count: "particle_surfaces_per_env*env_count", arena: scratch, owner: data}
-  - {name: energy_ledger, dtype: f32, per: scalar, count: "integration_substeps*env_count", elem: 33, arena: scratch, owner: data, flags: [readout]}
+  - {name: energy_ledger, dtype: f32, per: scalar, count: "integration_substeps*env_count", elem: 34, arena: scratch, owner: data, flags: [readout]}
   # The ledger record in double; residuals difference stage energies far larger than their change.
-  - {name: energy_ledger_sum, dtype: f64, per: scalar, count: "integration_substeps*env_count", elem: 33, arena: scratch, owner: data}
+  - {name: energy_ledger_sum, dtype: f64, per: scalar, count: "integration_substeps*env_count", elem: 34, arena: scratch, owner: data}
   - {name: energy_ledger_status, dtype: u32, per: scalar, count: "integration_substeps*env_count", arena: scratch, owner: data, flags: [readout]}
   - {name: physics_stage_metrics, dtype: f32, per: scalar, count: "integration_substeps*env_count", elem: 195, arena: scratch, owner: data, flags: [readout]}
   - {name: contact_audit_counts, dtype: u32, per: scalar, count: "integration_substeps*env_count", elem: 8, arena: scratch, owner: data, flags: [readout]}
@@ -835,9 +835,9 @@ fields:
   - {name: mf_incidence_offsets, dtype: u32, per: scalar, count: "mf_vertices_per_env+1", arena: persistent, owner: model}
   - {name: mf_incidence, dtype: u32, per: scalar, count: "mf_incidence_per_env", arena: persistent, owner: model}
   - {name: mf_start_metric, dtype: vbd_membrane_start, per: scalar, count: "mf_elements_per_env*env_count", arena: scratch, owner: data}
-  # Each element's committed history and its reset twin, the step's trial with its plastic and viscous losses
-  # (history, then losses), and each env's commit failures.
-  - {name: mf_history, dtype: f32, per: scalar, count: "mf_elements_per_env*env_count", arena: persistent, owner: data, elem: 10}
-  - {name: snapshot_mf_history, dtype: f32, per: scalar, count: "mf_elements_per_env*env_count", arena: persistent, owner: data, elem: 10}
-  - {name: mf_trial, dtype: f32, per: scalar, count: "mf_elements_per_env*env_count", arena: scratch, owner: data, elem: 12}
+  # Each element's committed history and its reset twin, the step's trial (history, then its plastic or a seam's
+  # cohesive loss and its viscous loss), and each env's commit failures.
+  - {name: mf_history, dtype: f32, per: scalar, count: "mf_elements_per_env*env_count", arena: persistent, owner: data, elem: 13}
+  - {name: snapshot_mf_history, dtype: f32, per: scalar, count: "mf_elements_per_env*env_count", arena: persistent, owner: data, elem: 13}
+  - {name: mf_trial, dtype: f32, per: scalar, count: "mf_elements_per_env*env_count", arena: scratch, owner: data, elem: 15}
   - {name: mf_env_commit, dtype: u32, per: scalar, count: "env_count", arena: scratch, owner: data}

@@ -368,8 +368,8 @@ enum class FieldId : uint16_t {
     SolverColorCounts,  // solver_color_counts (per:env arena:scratch owner:data elem:6)
     SolverPhaseTime,  // solver_phase_time (per:env arena:scratch owner:data elem:8)
     DatSurfaceMotion,  // dat_surface_motion (per:scalar arena:scratch owner:data count:particle_surfaces_per_env*env_count)
-    EnergyLedger,  // energy_ledger (per:scalar arena:scratch owner:data elem:33 count:integration_substeps*env_count flags:[readout])
-    EnergyLedgerSum,  // energy_ledger_sum (per:scalar arena:scratch owner:data elem:33 count:integration_substeps*env_count)
+    EnergyLedger,  // energy_ledger (per:scalar arena:scratch owner:data elem:34 count:integration_substeps*env_count flags:[readout])
+    EnergyLedgerSum,  // energy_ledger_sum (per:scalar arena:scratch owner:data elem:34 count:integration_substeps*env_count)
     EnergyLedgerStatus,  // energy_ledger_status (per:scalar arena:scratch owner:data count:integration_substeps*env_count flags:[readout])
     PhysicsStageMetrics,  // physics_stage_metrics (per:scalar arena:scratch owner:data elem:195 count:integration_substeps*env_count flags:[readout])
     ContactAuditCounts,  // contact_audit_counts (per:scalar arena:scratch owner:data elem:8 count:integration_substeps*env_count flags:[readout])
@@ -408,9 +408,9 @@ enum class FieldId : uint16_t {
     MfIncidenceOffsets,  // mf_incidence_offsets (per:scalar arena:persistent owner:model count:mf_vertices_per_env+1)
     MfIncidence,  // mf_incidence (per:scalar arena:persistent owner:model count:mf_incidence_per_env)
     MfStartMetric,  // mf_start_metric (per:scalar arena:scratch owner:data count:mf_elements_per_env*env_count)
-    MfHistory,  // mf_history (per:scalar arena:persistent owner:data elem:10 count:mf_elements_per_env*env_count)
-    SnapshotMfHistory,  // snapshot_mf_history (per:scalar arena:persistent owner:data elem:10 count:mf_elements_per_env*env_count)
-    MfTrial,  // mf_trial (per:scalar arena:scratch owner:data elem:12 count:mf_elements_per_env*env_count)
+    MfHistory,  // mf_history (per:scalar arena:persistent owner:data elem:13 count:mf_elements_per_env*env_count)
+    SnapshotMfHistory,  // snapshot_mf_history (per:scalar arena:persistent owner:data elem:13 count:mf_elements_per_env*env_count)
+    MfTrial,  // mf_trial (per:scalar arena:scratch owner:data elem:15 count:mf_elements_per_env*env_count)
     MfEnvCommit,  // mf_env_commit (per:scalar arena:scratch owner:data count:env_count)
     Count
 };

@@ -58,6 +58,7 @@ class Grid:
     spacing: float
     origin: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     regions: Tuple[ClothRegion, ...] = ()
+    seams: Tuple[Tuple[int, ...], ...] = ()
 
     def media_geometry_kwargs(self) -> dict:
         """The cloth geometry block for ``SceneBuilder.add_media`` (used when the

@@ -206,6 +206,26 @@ __global__ void FieldCommitKernel(DataView data, ClothStepParams p) {
     for (uint32_t k = 0u; k < nk::kMfHistory; ++k) data.mf_history[size_t{item} * nk::kMfHistory + k] = trial[k];
 }
 
+// A committed seam's damage, averaged over its pairs, weakens the hinge over it on both sides.
+__global__ void FieldSeamKernel(ModelView model, DataView data, ClothStepParams p) {
+    const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
+    const VertexBlockLayout& l = p.layout;
+    if (item >= l.field_elements * l.env_count) return;
+    const uint32_t env = item / l.field_elements;
+    const nk::MfElement element = model.mf_elements[item % l.field_elements];
+    if (element.kind != nk::kMfSeam || (data.mf_env_commit[env] & kEnvStatusMaterialFieldFailure) != 0u) return;
+    const nk::mf::CohesiveLaw law = nk::mf::SeamLaw(element, model.mf_materials[element.material]);
+    const uint32_t pairs = element.hinges >> 4u;
+    double damage = 0.0;
+    for (uint32_t pair = 0u; pair < pairs; ++pair)
+        damage += nk::mf::SeamDamage(law, data.mf_history[size_t{item} * nk::kMfHistory + pair]);
+    for (uint32_t side = 0u; side < 2u; ++side) {
+        const size_t bend = size_t{env} * l.field_elements + element.vertex[4u + side];
+        data.mf_history[bend * nk::kMfHistory + nk::kMfHingeDamage + ((element.hinges >> (2u * side)) & 3u)] =
+            float(damage / pairs);
+    }
+}
+
 bool ValidLayout(const ClothStepParams* p) {
     const VertexBlockLayout& l = p->layout;
     const uint64_t max_items = uint64_t{std::numeric_limits<uint32_t>::max()} - (kBlockSize - 1u);
@@ -279,6 +299,7 @@ Status OpClothFinalize(const ModelView& model, const DataView& data, const void*
         const dim3 grid((field_elements + kBlockSize - 1u) / kBlockSize);
         LaunchCuda(FieldTrialKernel, grid, dim3(kBlockSize), 0u, stream, model, data, *p);
         LaunchCuda(FieldCommitKernel, grid, dim3(kBlockSize), 0u, stream, data, *p);
+        LaunchCuda(FieldSeamKernel, grid, dim3(kBlockSize), 0u, stream, model, data, *p);
     }
     return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
 }

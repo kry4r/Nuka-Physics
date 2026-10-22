@@ -1615,9 +1615,19 @@ phi::Status Model::ValidateMaterialField(const std::vector<uint32_t>& color_of, 
     for (const MfMaterial& material : p.mf_materials)
         if (!mf::ValidMaterial(material)) return reject("invalid material-field material");
     for (const MfElement& element : p.mf_elements) {
-        if (element.kind > kMfBend || element.material >= p.mf_materials.size() ||
+        if (element.kind > kMfSeam || element.material >= p.mf_materials.size() ||
             (element.kind == kMfBend && (element.hinges == 0u || element.hinges > 7u)))
             return reject("invalid material-field element");
+        if (element.kind == kMfSeam) {
+            const uint32_t pairs = element.hinges >> 4u;
+            bool valid = pairs >= 1u && pairs <= 2u && element.rest[0] > 0.0f && element.rest[1] > 0.0f;
+            for (uint32_t side = 0u; side < 2u && valid; ++side) {
+                const uint32_t bend = element.vertex[4u + side], hinge = (element.hinges >> (2u * side)) & 3u;
+                valid = bend < p.mf_elements.size() && p.mf_elements[bend].kind == kMfBend &&
+                        ((p.mf_elements[bend].hinges >> hinge) & 1u) != 0u;
+            }
+            if (!valid) return reject("invalid material-field seam");
+        }
         const uint32_t count = MfElementVertexCount(element);
         for (uint32_t j = 0u; j < count; ++j) {
             if (element.vertex[j] < first || element.vertex[j] >= cap.vbd_vertices_per_env)

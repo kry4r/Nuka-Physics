@@ -1638,9 +1638,9 @@ __global__ void CacheGridRowsKernel(DataView data, BlockDescentSolveParams p, Bl
 constexpr uint32_t kDescendTileVertices = kThreads / 32u;
 constexpr uint32_t kDescendTileElements = 384u;
 constexpr uint32_t kDescendTileRows = 256u;
-// Vertex-block element kinds, then the two material-field kinds.
+// Vertex-block element kinds, then the three material-field kinds.
 constexpr uint32_t kDescendVertexKinds = 4u;
-constexpr uint32_t kDescendElementKinds = kDescendVertexKinds + 2u;
+constexpr uint32_t kDescendElementKinds = kDescendVertexKinds + 3u;
 constexpr uint32_t kElementSampleWords = 9u;
 constexpr uint32_t kRowSampleWords = 7u;
 constexpr uint32_t kDescendSolveWords = 12u;

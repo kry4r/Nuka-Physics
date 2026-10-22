@@ -464,6 +464,8 @@ nuka_result_t nuka_scene_add_field_media(nuka_scene_handle scene,
             m.bend_maxwell_modulus[i] = field->bend_maxwell_modulus[i];
             m.bend_maxwell_time[i] = field->bend_maxwell_time[i];
         }
+        m.tear_strength = field->tear_strength;
+        m.tear_energy = field->tear_energy;
         cook::ValidateMedia(std::vector<nscene::MediaRecord>{media});
         media.name = "media_" + std::to_string(sr->scene->MediaCount());
         const nscene::MediaId id = sr->scene->AddMedia(std::move(media));
@@ -548,6 +550,30 @@ nuka_result_t nuka_scene_add_cloth_region(nuka_scene_handle scene, uint32_t medi
         region.material.bend_stiffness = desc->bend_stiffness;
         region.material.damping = desc->damping;
         rec.cloth_regions.push_back(std::move(region));
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+nuka_result_t nuka_scene_add_cloth_seam(nuka_scene_handle scene, uint32_t media_id,
+                                        const uint32_t* vertices, uint32_t count) {
+    if (vertices == nullptr || count < 2u) return NUKA_RESULT_INVALID_ARG;
+    SceneRecord* sr = SceneTable().Get(scene);
+    if (sr == nullptr || !sr->scene) return NUKA_RESULT_NULL_HANDLE;
+    if (media_id >= sr->scene->MediaCount()) return NUKA_RESULT_INVALID_ARG;
+    try {
+        nscene::MediaRecord& rec = sr->scene->GetMediaMut(media_id);
+        if (rec.kind != nscene::MediaRecord::Kind::Cloth || rec.method != nscene::MediaRecord::Method::Field)
+            return NUKA_RESULT_INVALID_ARG;
+        std::vector<nscene::MediaRecord> seamed{rec};
+        seamed[0].cloth_mesh.seams.emplace_back(vertices, vertices + count);
+        cook::ValidateMedia(seamed);
+        rec.cloth_mesh.seams = std::move(seamed[0].cloth_mesh.seams);
         return NUKA_RESULT_OK;
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;

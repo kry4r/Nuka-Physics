@@ -826,6 +826,7 @@ __device__ inline void AssembleFieldElement(const ModelView& model, const BlockS
                                             bool dense) {
     constexpr uint32_t kNodes = 6u * nk::kVbdCoarseParents;
     const nk::MfElement e = b.field_elements[index];
+    if (e.kind == nk::kMfSeam) return;
     const uint32_t count = nk::MfElementVertexCount(e);
     bool live[6], any = false;
 #pragma unroll

@@ -40,9 +40,12 @@ void BuildClothVertexBlocks(const std::vector<math::Vec3>& rest_positions,
 
 // Material-field shell elements over the same topology: plane-stress membranes, and per face a bend whose
 // curvature, exact for quadratic deflection, comes from its three hinge turns; free-edge hinges are condensed.
+// `weld` maps seam copies to the vertex they were cut from (empty: none); bends reach across a cut edge, which
+// then takes a seam over the pairs of copies at its ends.
 void BuildFieldShellElements(const std::vector<math::Vec3>& rest_positions,
                              const std::vector<ClothTriangle>& triangles,
                              const std::vector<std::array<math::Vec3, 3>>& material_faces,
+                             const std::vector<uint32_t>& weld,
                              const nk::MfMaterial& material, uint32_t material_index,
                              std::vector<nk::MfElement>& out);
 

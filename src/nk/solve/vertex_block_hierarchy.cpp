@@ -56,7 +56,8 @@ struct RestMesh {
     }
 };
 
-RestMesh BuildRestMesh(const Model& model) {
+// `weld` maps each seam copy to the vertex it was cut from, whose rest metric it shares.
+RestMesh BuildRestMesh(const Model& model, const std::vector<uint32_t>& weld) {
     const auto& p = model.particles;
     const uint32_t n = model.capacities.vbd_vertices_per_env;
     const uint32_t begin = model.capacities.vbd_particle_begin;
@@ -84,7 +85,10 @@ RestMesh BuildRestMesh(const Model& model) {
     }
     // Material-field membranes store the same inverse rest edges.
     for (const MfElement& e : p.mf_elements)
-        if (e.kind == kMfTriangle) triangle(e.vertex, e.rest);
+        if (e.kind == kMfTriangle) {
+            const uint32_t corners[3] = {weld[e.vertex[0]], weld[e.vertex[1]], weld[e.vertex[2]]};
+            triangle(corners, e.rest);
+        }
     // Rod segments that no spring defines take their cooked length.
     for (const VbdElement& e : p.vbd_elements)
         if (e.kind == kVbdRodBend)
@@ -590,7 +594,19 @@ void BuildVertexBlockHierarchy(Model* model) {
     if (n == 0u) return;
     if (uint64_t{cap.vbd_particle_begin} + n > p.initial_pos.size())
         throw std::invalid_argument("vertex-block range exceeds the particle positions");
-    const RestMesh mesh = BuildRestMesh(*model);
+    // Seam copies take their original's coarse parents, so coarse moves never open a seam.
+    std::vector<uint32_t> weld(n);
+    for (uint32_t v = 0u; v < n; ++v) weld[v] = v;
+    for (const MfElement& e : p.mf_elements)
+        if (e.kind == kMfSeam)
+            for (uint32_t pair = 0u; pair < (e.hinges >> 4u); ++pair) {
+                uint32_t a = e.vertex[2u * pair], b = e.vertex[2u * pair + 1u];
+                while (weld[a] != a) a = weld[a];
+                while (weld[b] != b) b = weld[b];
+                weld[std::max(a, b)] = std::min(a, b);
+            }
+    for (uint32_t v = 0u; v < n; ++v) weld[v] = weld[weld[v]];
+    const RestMesh mesh = BuildRestMesh(*model, weld);
     std::vector<double> lengths;
     uint32_t active = 0u;
     for (uint32_t v = 0u; v < n; ++v) {
@@ -629,11 +645,12 @@ void BuildVertexBlockHierarchy(Model* model) {
     for (uint32_t l = 0u; l < level_count; ++l)
         for (uint32_t v = 0u; v < n; ++v)
             for (uint32_t j = 0u; j < kVbdCoarseParents; ++j) {
-                if (levels[l].parent[v][j] == kNone) continue;
+                const uint32_t source = weld[v];
+                if (levels[l].parent[source][j] == kNone) continue;
                 const size_t slot = (size_t{l} * n + v) * kVbdCoarseParents + j;
-                const uint32_t node = p.vbd_coarse_level_nodes[l] + levels[l].parent[v][j];
+                const uint32_t node = p.vbd_coarse_level_nodes[l] + levels[l].parent[source][j];
                 p.vbd_coarse_parents[slot] = node;
-                p.vbd_coarse_weights[slot] = static_cast<float>(levels[l].weight[v][j]);
+                p.vbd_coarse_weights[slot] = static_cast<float>(levels[l].weight[source][j]);
                 ++children[node];
             }
     p.vbd_coarse_child_offsets.assign(nodes + 1u, 0u);

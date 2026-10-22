@@ -61,7 +61,7 @@ class ClothMaterial:
 
 @_dc.dataclass(frozen=True)
 class FieldMaterial:
-    """Material-field shell parameters -> the field_material block (16 floats in
+    """Material-field shell parameters -> the field_material block (18 floats in
     ``nuka_field_material_desc_t`` order) plus the shared contact friction."""
 
     MEDIA_KIND = "cloth"
@@ -80,11 +80,14 @@ class FieldMaterial:
     maxwell_time: Tuple[float, float] = (0.0, 0.0)
     bend_maxwell_modulus: Tuple[float, float] = (0.0, 0.0)
     bend_maxwell_time: Tuple[float, float] = (0.0, 0.0)
+    tear_strength: float = 0.0
+    tear_energy: float = 0.0
 
     def media_material_kwargs(self) -> dict:
         values = (self.density, self.thickness, self.youngs, self.poisson, self.yield_stress,
                   self.hardening, self.yield_moment, self.bend_hardening, *self.maxwell_modulus,
-                  *self.maxwell_time, *self.bend_maxwell_modulus, *self.bend_maxwell_time)
+                  *self.maxwell_time, *self.bend_maxwell_modulus, *self.bend_maxwell_time,
+                  self.tear_strength, self.tear_energy)
         return dict(vbd_friction=float(self.friction), field_material=[float(v) for v in values])
 
 
@@ -119,21 +122,24 @@ class Cloth:
               maxwell_modulus: Tuple[float, float] = (0.0, 0.0),
               maxwell_time: Tuple[float, float] = (0.0, 0.0),
               bend_maxwell_modulus: Tuple[float, float] = (0.0, 0.0),
-              bend_maxwell_time: Tuple[float, float] = (0.0, 0.0)) -> FieldMaterial:
+              bend_maxwell_time: Tuple[float, float] = (0.0, 0.0),
+              tear_strength: float = 0.0, tear_energy: float = 0.0) -> FieldMaterial:
         """Plane-stress membrane (kg/m³, m, Pa) with plate bending D = Y t³ / (12 (1 - ν²)),
-        optional membrane and hinge plasticity and two Maxwell branches each."""
+        optional membrane and hinge plasticity and two Maxwell branches each; seams part at
+        ``tear_strength`` (Pa) after spending ``tear_energy`` (J/m²)."""
         if not (density > 0.0 and thickness > 0.0 and youngs > 0.0):
             raise ValueError("Cloth.Field: density, thickness and youngs must be > 0")
         if not 0.0 <= poisson < 0.5:
             raise ValueError("Cloth.Field: poisson must be in [0, 0.5)")
         rest = (yield_stress, hardening, yield_moment, bend_hardening, *maxwell_modulus,
-                *maxwell_time, *bend_maxwell_modulus, *bend_maxwell_time)
-        if len(rest) != 12 or not all(_math.isfinite(v) and v >= 0.0 for v in rest):
-            raise ValueError("Cloth.Field: plastic and Maxwell parameters must be finite and nonnegative pairs")
+                *maxwell_time, *bend_maxwell_modulus, *bend_maxwell_time, tear_strength, tear_energy)
+        if len(rest) != 14 or not all(_math.isfinite(v) and v >= 0.0 for v in rest):
+            raise ValueError("Cloth.Field: plastic, Maxwell and tear parameters must be finite and nonnegative")
         return FieldMaterial(float(density), float(thickness), float(youngs), float(poisson),
                              float(friction), float(yield_stress), float(hardening),
                              float(yield_moment), float(bend_hardening), tuple(maxwell_modulus),
-                             tuple(maxwell_time), tuple(bend_maxwell_modulus), tuple(bend_maxwell_time))
+                             tuple(maxwell_time), tuple(bend_maxwell_modulus), tuple(bend_maxwell_time),
+                             float(tear_strength), float(tear_energy))
 
 
 @_dc.dataclass(frozen=True)

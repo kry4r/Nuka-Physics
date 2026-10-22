@@ -407,8 +407,8 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 6, 1, 24, 0},  // solver_color_counts
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 8, 1, 64, 0},  // solver_phase_time
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // dat_surface_motion
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 33, 1, 132, 0},  // energy_ledger
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 33, 1, 264, 0},  // energy_ledger_sum
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 34, 1, 136, 0},  // energy_ledger
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 34, 1, 272, 0},  // energy_ledger_sum
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // energy_ledger_status
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 195, 1, 780, 0},  // physics_stage_metrics
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 8, 1, 32, 0},  // contact_audit_counts
@@ -443,13 +443,13 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Articulation, 1, 1, 4, 0},  // dat_artic_parent
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // telemetry
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 96, 96, 0},  // mf_elements
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 64, 64, 0},  // mf_materials
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 72, 72, 0},  // mf_materials
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // mf_incidence_offsets
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // mf_incidence
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 36, 36, 0},  // mf_start_metric
-    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Scalar, 10, 1, 40, 0},  // mf_history
-    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Scalar, 10, 1, 40, 0},  // snapshot_mf_history
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 12, 1, 48, 0},  // mf_trial
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Scalar, 13, 1, 52, 0},  // mf_history
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Scalar, 13, 1, 52, 0},  // snapshot_mf_history
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 15, 1, 60, 0},  // mf_trial
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // mf_env_commit
 };
 

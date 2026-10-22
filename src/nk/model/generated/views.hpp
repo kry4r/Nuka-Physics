@@ -405,8 +405,8 @@ struct DataView {
     uint32_t* solver_color_counts = nullptr;  // per:env arena:scratch owner:data elem:6
     uint64_t* solver_phase_time = nullptr;  // per:env arena:scratch owner:data elem:8
     float* dat_surface_motion = nullptr;  // per:scalar arena:scratch owner:data count:particle_surfaces_per_env*env_count
-    float* energy_ledger = nullptr;  // per:scalar arena:scratch owner:data elem:33 count:integration_substeps*env_count flags:[readout]
-    double* energy_ledger_sum = nullptr;  // per:scalar arena:scratch owner:data elem:33 count:integration_substeps*env_count
+    float* energy_ledger = nullptr;  // per:scalar arena:scratch owner:data elem:34 count:integration_substeps*env_count flags:[readout]
+    double* energy_ledger_sum = nullptr;  // per:scalar arena:scratch owner:data elem:34 count:integration_substeps*env_count
     uint32_t* energy_ledger_status = nullptr;  // per:scalar arena:scratch owner:data count:integration_substeps*env_count flags:[readout]
     float* physics_stage_metrics = nullptr;  // per:scalar arena:scratch owner:data elem:195 count:integration_substeps*env_count flags:[readout]
     uint32_t* contact_audit_counts = nullptr;  // per:scalar arena:scratch owner:data elem:8 count:integration_substeps*env_count flags:[readout]
@@ -437,9 +437,9 @@ struct DataView {
     uint32_t* dat_artic_parent = nullptr;  // per:articulation arena:scratch owner:data
     uint32_t* telemetry = nullptr;  // per:scalar arena:scratch owner:data count:telemetry_words flags:[readout]
     ::nuka::nk::vbd::MembraneStartState* mf_start_metric = nullptr;  // per:scalar arena:scratch owner:data count:mf_elements_per_env*env_count
-    float* mf_history = nullptr;  // per:scalar arena:persistent owner:data elem:10 count:mf_elements_per_env*env_count
-    float* snapshot_mf_history = nullptr;  // per:scalar arena:persistent owner:data elem:10 count:mf_elements_per_env*env_count
-    float* mf_trial = nullptr;  // per:scalar arena:scratch owner:data elem:12 count:mf_elements_per_env*env_count
+    float* mf_history = nullptr;  // per:scalar arena:persistent owner:data elem:13 count:mf_elements_per_env*env_count
+    float* snapshot_mf_history = nullptr;  // per:scalar arena:persistent owner:data elem:13 count:mf_elements_per_env*env_count
+    float* mf_trial = nullptr;  // per:scalar arena:scratch owner:data elem:15 count:mf_elements_per_env*env_count
     uint32_t* mf_env_commit = nullptr;  // per:scalar arena:scratch owner:data count:env_count
 };
 

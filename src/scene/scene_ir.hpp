@@ -377,6 +377,8 @@ struct MediaFieldMaterial {
     float maxwell_time[2]{};          // s
     float bend_maxwell_modulus[2]{};  // fractions of the instantaneous hinge stiffness
     float bend_maxwell_time[2]{};     // s
+    float tear_strength  = 0.0f;  // Pa, the traction at which a seam starts to part
+    float tear_energy    = 0.0f;  // J / m^2 spent parting a seam
 };
 
 // Constitutive material for an MLS-MPM medium. Mirrors cook::MpmMaterialInput
@@ -454,6 +456,7 @@ struct MediaRecord {
         math::Transform local_transform{};
         AssetRef material_mesh;
         std::vector<uint32_t> pinned_vertices;
+        std::vector<std::vector<uint32_t>> seams;  // vertex polylines a material-field cloth may tear along
     };
     struct TetSphere {
         math::Vec3 center{0.0f, 0.0f, 0.0f};

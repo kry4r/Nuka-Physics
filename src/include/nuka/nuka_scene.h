@@ -452,7 +452,8 @@ nuka_result_t nuka_scene_add_mpm_fill_ex(nuka_scene_handle scene, uint32_t media
                                        const nuka_mpm_plasticity_desc_t* plasticity);
 
 // Material of a NUKA_MEDIA_METHOD_FIELD cloth (kg/m^3, m, Pa). Zero yield values keep it elastic and
-// zero Maxwell moduli (fractions of the instantaneous stiffness) drop those branches.
+// zero Maxwell moduli (fractions of the instantaneous stiffness) drop those branches. Seams part at
+// tear_strength (Pa) after spending tear_energy (J/m^2).
 typedef struct nuka_field_material_desc_t {
     uint32_t struct_size;
     float density;
@@ -467,6 +468,8 @@ typedef struct nuka_field_material_desc_t {
     float maxwell_time[2];    // s
     float bend_maxwell_modulus[2];
     float bend_maxwell_time[2];
+    float tear_strength;
+    float tear_energy;
 } nuka_field_material_desc_t;
 
 // Add a cloth medium solved as a material-field shell: desc->method must be NUKA_MEDIA_METHOD_FIELD,
@@ -495,6 +498,11 @@ typedef struct nuka_cloth_region_desc_t {
 // non-cloth medium; vertex range and material checks run at cook.
 nuka_result_t nuka_scene_add_cloth_region(nuka_scene_handle scene, uint32_t media_id,
                                           const nuka_cloth_region_desc_t* desc);
+
+// Append a seam polyline over `count` vertices to the material-field cloth `media_id`: its faces split
+// along it at cook and a cohesive layer holds the two sides until it tears.
+nuka_result_t nuka_scene_add_cloth_seam(nuka_scene_handle scene, uint32_t media_id,
+                                        const uint32_t* vertices, uint32_t count);
 
 // The environment-wide contact pool has no per-node limit; zero uses the cook default.
 nuka_result_t nuka_scene_set_mpm_contact_capacity(nuka_scene_handle scene,

@@ -20,6 +20,9 @@ namespace nuka::nk {
 
 inline constexpr uint32_t kMfTriangle = 0u;
 inline constexpr uint32_t kMfBend = 1u;
+// Node pairs (this side, far side) across a declared edge, then its two bends in vertex[4..5]; `hinges` packs each
+// bend's hinge over the edge in two bits and the pair count from bit 4; rest holds the pair weight L t / 2 and K.
+inline constexpr uint32_t kMfSeam = 2u;
 
 // Triangle: corners, inverse material edges (row-major 2x2) and area. Bend: corners, then the far vertex of
 // each hinge in `hinges` (bit i: the hinge opposite corner i); the hinge-turn to Voigt-curvature map
@@ -34,7 +37,9 @@ struct MfElement {
 static_assert(sizeof(MfElement) == 24u * sizeof(uint32_t), "MfElement packs to 96 bytes");
 
 NUKA_MF_HD constexpr uint32_t MfElementVertexCount(const MfElement& e) {
-    return e.kind == kMfTriangle ? 3u : 3u + (e.hinges & 1u) + ((e.hinges >> 1u) & 1u) + ((e.hinges >> 2u) & 1u);
+    return e.kind == kMfTriangle ? 3u
+         : e.kind == kMfSeam     ? 2u * (e.hinges >> 4u)
+                                 : 3u + (e.hinges & 1u) + ((e.hinges >> 1u) & 1u) + ((e.hinges >> 2u) & 1u);
 }
 
 // A field incidence packs its element with the vertex's slot 0..5 in it.
@@ -82,7 +87,84 @@ NUKA_MF_HD inline vbd::TriangleStrain Strain(const MfElement& e, const vbd::Elem
 }
 
 // Rest area, which scales the element's per-area response.
-NUKA_MF_HD inline float ElementArea(const MfElement& e) { return e.kind == kMfTriangle ? e.rest[4] : e.rest[9]; }
+NUKA_MF_HD inline float ElementArea(const MfElement& e) {
+    return e.kind == kMfTriangle ? e.rest[4] : e.kind == kMfSeam ? e.rest[0] : e.rest[9];
+}
+
+// A hinge over a seam bends with what the seam's damage leaves of it.
+NUKA_MF_HD inline float HingeKeep(const float* history, uint32_t i) {
+    return history != nullptr ? sqrtf(fmaxf(1.0f - history[kMfHingeDamage + i], 0.0f)) : 1.0f;
+}
+
+NUKA_MF_HD inline CohesiveLaw SeamLaw(const MfElement& e, const MfMaterial& m) {
+    return {double(e.rest[1]), double(m.tear_strength), double(m.tear_energy)};
+}
+
+NUKA_MF_HD inline double SeamReached(const float* history, uint32_t pair) {
+    return history != nullptr ? double(history[pair]) : 0.0;
+}
+
+// Separation of node pair `pair` from this side to the far side.
+NUKA_MF_HD inline Vec3 SeamSeparation(const FieldGeometry& g, uint32_t pair) {
+    return g.Relative(2u * pair + 1u) - g.Relative(2u * pair);
+}
+
+// A pair pulls its sides together along their separation; the secant T / r keeps the block positive.
+NUKA_MF_HD inline void SeamBlock(const MfElement& e, const MfMaterial& m, const float* history, uint32_t local,
+                                 const FieldGeometry& g, Vec3* gradient, SymmetricMat3* hessian) {
+    const uint32_t pair = local >> 1u;
+    const Vec3 delta = SeamSeparation(g, pair);
+    const SeamResponse s = EvaluateSeam(SeamLaw(e, m), SeamReached(history, pair), vbd::Norm(delta));
+    const float weight = e.rest[0] * float(s.secant);
+    *gradient = delta * ((local & 1u) != 0u ? weight : -weight);
+    SymmetricMat3 block{};
+    vbd::AddIdentity(block, weight);
+    *hessian = block;
+}
+
+// Energy change of one pair as its separation moves by `step`, exact in product form on the elastic branch.
+NUKA_MF_HD inline float SeamChange(const MfElement& e, const MfMaterial& m, const float* history, uint32_t pair,
+                                   Vec3 delta, Vec3 step) {
+    const CohesiveLaw law = SeamLaw(e, m);
+    const double reached = SeamReached(history, pair), knee = fmax(reached, law.Onset());
+    const Vec3 to = delta + step;
+    const double from_size = vbd::Norm(delta), to_size = vbd::Norm(to);
+    const SeamResponse a = EvaluateSeam(law, reached, from_size);
+    if (from_size <= knee && to_size <= knee) return 0.5f * e.rest[0] * float(a.secant) * step.Dot(delta + to);
+    return e.rest[0] * float(EvaluateSeam(law, reached, to_size).psi - a.psi);
+}
+
+// Stored energy of a seam once its separations are committed, from double coordinates.
+NUKA_MF_HD inline double SeamEnergy(const MfElement& e, const MfMaterial& m, const float* history,
+                                    const FieldGeometry& g) {
+    double energy = 0.0;
+    for (uint32_t pair = 0u; pair < (e.hinges >> 4u); ++pair) {
+        const vbd::Point a = g.Precise(2u * pair), b = g.Precise(2u * pair + 1u);
+        const double dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+        energy += EvaluateSeam(SeamLaw(e, m), SeamReached(history, pair), sqrt(dx * dx + dy * dy + dz * dz)).stored;
+    }
+    return double(e.rest[0]) * energy;
+}
+
+// A seam's trial keeps each pair's largest separation; its cohesive loss takes the plastic slot.
+NUKA_MF_HD inline MfStatus SeamTrial(const MfElement& e, const MfMaterial& m, const float* history,
+                                     const FieldGeometry& g, FieldResponse<float>& out) {
+    FieldResponse<float> r{};
+    double psi = 0.0, stored = 0.0, loss = 0.0;
+    for (uint32_t pair = 0u; pair < (e.hinges >> 4u); ++pair) {
+        const SeamResponse s =
+            EvaluateSeam(SeamLaw(e, m), SeamReached(history, pair), vbd::Norm(SeamSeparation(g, pair)));
+        r.history[pair] = float(s.reached);
+        psi += s.psi;
+        stored += s.stored;
+        loss += s.loss;
+    }
+    r.psi = float(psi);
+    r.stored = float(stored);
+    r.plastic = float(loss);
+    out = r;
+    return MfStatus::Ok;
+}
 
 // Hinge i runs from corner i + 1 to corner i + 2, with corner i on this side and its far vertex beyond.
 NUKA_MF_HD inline uint32_t FarVertex(const MfElement& e, uint32_t i) {
@@ -185,9 +267,10 @@ NUKA_MF_HD inline void BendBlock(const MfElement& e, const MfMaterial& m, const 
         if (!((e.hinges >> i) & 1u)) continue;
         HingePoints(e, g, i, x);
         if (!vbd::HingeAngleGradient(x, dq, &theta)) continue;
-        turn[i] = theta - e.rest[10u + i];
+        const float keep = HingeKeep(history, i);
+        turn[i] = keep * (theta - e.rest[10u + i]);
         const uint32_t slot = HingeSlot(e, i, local);
-        if (slot < 4u) q[i] = dq[slot];
+        if (slot < 4u) q[i] = dq[slot] * keep;
     }
     float kappa[3], moment[3], k[6];
     Curvature(e, turn, kappa);
@@ -209,6 +292,10 @@ NUKA_MF_HD inline void ElementBlock(const MfElement& e, const MfMaterial& m, con
                                     Vec3* gradient, SymmetricMat3* hessian) {
     if (e.kind == kMfTriangle) {
         TriangleBlock(e, m, history, local, Strain(e, g.Corners(), start), h, gradient, hessian);
+        return;
+    }
+    if (e.kind == kMfSeam) {
+        SeamBlock(e, m, history, local, g, gradient, hessian);
         return;
     }
     BendBlock(e, m, history, local, g, h, gradient, hessian);
@@ -237,19 +324,19 @@ NUKA_MF_HD inline float BendEnergyChange(const MfElement& e, const MfMaterial& m
         if (!((e.hinges >> i) & 1u)) continue;
         Vec3 x[4];
         HingePoints(e, g, i, x);
-        const float rest = e.rest[10u + i];
+        const float rest = e.rest[10u + i], keep = HingeKeep(history, i);
         const uint32_t slot = HingeSlot(e, i, local);
         if (slot == 4u) {
             float theta = 0.0f;
-            if (vbd::HingeAngle(x, &theta)) before[i] = after[i] = theta - rest;
+            if (vbd::HingeAngle(x, &theta)) before[i] = after[i] = keep * (theta - rest);
             continue;
         }
         bool had = false, has = false;
         float from = 0.0f, to = 0.0f, turn = 0.0f;
         vbd::HingeAngleChange(x, slot, move, &had, &has, &from, &to, &turn);
-        if (had) before[i] = from - rest;
-        if (has) after[i] = to - rest;
-        if (had && has && to == from + turn) step[i] = turn;
+        if (had) before[i] = keep * (from - rest);
+        if (has) after[i] = keep * (to - rest);
+        if (had && has && to == from + turn) step[i] = keep * turn;
         else exact = false;
     }
     float from[3], to[3], moved[3];
@@ -285,6 +372,8 @@ NUKA_MF_HD inline float ElementEnergyChange(const MfElement& e, const MfMaterial
         return e.rest[4] * (ResponseChange(MembraneLaw(m), history, strain, moved, change, true, h) +
                             ShearModulus<float>(m) * vbd::AreaBarrierChange(t.area_change, area_step));
     }
+    if (e.kind == kMfSeam)
+        return SeamChange(e, m, history, local >> 1u, SeamSeparation(g, local >> 1u), (local & 1u) != 0u ? move : -move);
     return BendEnergyChange(e, m, history, local, g, h, move);
 }
 
@@ -297,13 +386,14 @@ NUKA_MF_HD inline double ElementEnergy(const MfElement& e, const MfMaterial& m, 
         return double(e.rest[4]) * (StoredEnergy(MembraneLaw(m), history, strain) +
                                     ShearModulus<double>(m) * vbd::AreaBarrier(t.area_change));
     }
+    if (e.kind == kMfSeam) return SeamEnergy(e, m, history, g);
     double turn[3] = {0.0, 0.0, 0.0}, kappa[3];
     for (uint32_t i = 0u; i < 3u; ++i) {
         if (!((e.hinges >> i) & 1u)) continue;
         const vbd::Point x[4] = {g.Precise((i + 1u) % 3u), g.Precise((i + 2u) % 3u), g.Precise(i),
                                  g.Precise(FarVertex(e, i))};
         double theta = 0.0;
-        if (vbd::HingeAngle(x, &theta)) turn[i] = theta - double(e.rest[10u + i]);
+        if (vbd::HingeAngle(x, &theta)) turn[i] = double(HingeKeep(history, i)) * (theta - double(e.rest[10u + i]));
     }
     Curvature(e, turn, kappa);
     return double(e.rest[9]) * StoredEnergy(BendLaw(m), history, kappa);
@@ -317,13 +407,14 @@ NUKA_MF_HD inline MfStatus ElementTrial(const MfElement& e, const MfMaterial& m,
         const float strain[3] = {t.g00, t.g11, 2.0f * t.g01};
         return EvaluatePlaneStress(MembraneLaw(m), history, strain, h, out);
     }
+    if (e.kind == kMfSeam) return SeamTrial(e, m, history, g, out);
     float turn[3] = {0.0f, 0.0f, 0.0f}, kappa[3];
     for (uint32_t i = 0u; i < 3u; ++i) {
         if (!((e.hinges >> i) & 1u)) continue;
         Vec3 x[4];
         HingePoints(e, g, i, x);
         float theta = 0.0f;
-        if (vbd::HingeAngle(x, &theta)) turn[i] = theta - e.rest[10u + i];
+        if (vbd::HingeAngle(x, &theta)) turn[i] = HingeKeep(history, i) * (theta - e.rest[10u + i]);
     }
     Curvature(e, turn, kappa);
     return EvaluatePlaneStress(BendLaw(m), history, kappa, h, out);
@@ -336,7 +427,8 @@ NUKA_MF_HD inline bool ElementStateValid(const MfElement& e, const FieldGeometry
 }
 
 // Gauss-Newton factor of an element: generalized strain rows over its vertices and their area-scaled stiffness,
-// the membrane strain and a compressed area for a triangle, the three hinge turns for a bend.
+// the membrane strain and a compressed area for a triangle, the three hinge turns for a bend. A seam's pairs share
+// their coarse moves, which leave it unstrained.
 struct FieldCurvature {
     Vec3 row[4][6];
     float stiffness[4][4];
@@ -346,6 +438,7 @@ NUKA_MF_HD inline FieldCurvature GaussNewtonCurvature(const MfElement& e, const 
                                                      const FieldGeometry& g, const vbd::MembraneStartState* start,
                                                      float h) {
     FieldCurvature c{};
+    if (e.kind == kMfSeam) return c;
     FieldResponse<float> r{};
     float k[6];
     if (e.kind == kMfTriangle) {
@@ -374,10 +467,11 @@ NUKA_MF_HD inline FieldCurvature GaussNewtonCurvature(const MfElement& e, const 
             if (!((e.hinges >> i) & 1u)) continue;
             HingePoints(e, g, i, x);
             if (!vbd::HingeAngleGradient(x, dq, &theta)) continue;
-            turn[i] = theta - e.rest[10u + i];
+            const float keep = HingeKeep(history, i);
+            turn[i] = keep * (theta - e.rest[10u + i]);
             for (uint32_t local = 0u; local < 6u; ++local) {
                 const uint32_t slot = HingeSlot(e, i, local);
-                if (slot < 4u) c.row[i][local] = dq[slot];
+                if (slot < 4u) c.row[i][local] = dq[slot] * keep;
             }
         }
         Curvature(e, turn, kappa);
@@ -432,6 +526,12 @@ NUKA_MF_HD inline float ElementMovesEnergyChange(const MfElement& e, const MfMat
         return e.rest[4] * (ResponseChange(MembraneLaw(m), history, strain, moved, change, true, h) +
                             ShearModulus<float>(m) * vbd::AreaBarrierChange(t.area_change, area_step));
     }
+    if (e.kind == kMfSeam) {
+        float change = 0.0f;
+        for (uint32_t pair = 0u; pair < (e.hinges >> 4u); ++pair)
+            change += SeamChange(e, m, history, pair, SeamSeparation(g, pair), shift[2u * pair + 1u] - shift[2u * pair]);
+        return change;
+    }
     double before[3] = {0.0, 0.0, 0.0}, after[3] = {0.0, 0.0, 0.0};
     for (uint32_t i = 0u; i < 3u; ++i) {
         if (!((e.hinges >> i) & 1u)) continue;
@@ -443,8 +543,9 @@ NUKA_MF_HD inline float ElementMovesEnergyChange(const MfElement& e, const MfMat
                     x[k].z + (double(shift[v[k]].z) - shift[0].z)};
         }
         double theta = 0.0;
-        if (vbd::HingeAngle(x, &theta)) before[i] = theta - double(e.rest[10u + i]);
-        if (vbd::HingeAngle(y, &theta)) after[i] = theta - double(e.rest[10u + i]);
+        const double keep = HingeKeep(history, i);
+        if (vbd::HingeAngle(x, &theta)) before[i] = keep * (theta - double(e.rest[10u + i]));
+        if (vbd::HingeAngle(y, &theta)) after[i] = keep * (theta - double(e.rest[10u + i]));
     }
     double from_turn[3], to_turn[3];
     Curvature(e, before, from_turn);

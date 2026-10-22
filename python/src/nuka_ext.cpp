@@ -1860,11 +1860,11 @@ public:
         d.cable_slab_render_material_id = cable_slab_render_material_id;
         uint32_t media_id = 0u;
         if (method == NUKA_MEDIA_METHOD_FIELD) {
-            if (field_material.size() != 16u)
-                throw std::runtime_error("field_material must be 16 floats in nuka_field_material_desc_t order");
+            if (field_material.size() != 18u)
+                throw std::runtime_error("field_material must be 18 floats in nuka_field_material_desc_t order");
             nuka_field_material_desc_t f{};
             f.struct_size = sizeof(nuka_field_material_desc_t);
-            std::memcpy(&f.density, field_material.data(), 16u * sizeof(float));
+            std::memcpy(&f.density, field_material.data(), 18u * sizeof(float));
             check(nuka_scene_add_field_media(h_, &d, &f, &media_id), "nuka_scene_add_field_media");
             return media_id;
         }
@@ -1933,6 +1933,12 @@ public:
         d.bend_stiffness = bend_stiffness;
         d.damping = damping;
         check(nuka_scene_add_cloth_region(h_, media_id, &d), "nuka_scene_add_cloth_region");
+    }
+
+    // Append a tearable seam polyline to the material-field cloth `media_id`.
+    void add_cloth_seam(uint32_t media_id, const std::vector<uint32_t>& vertices) {
+        check(nuka_scene_add_cloth_seam(h_, media_id, vertices.data(), static_cast<uint32_t>(vertices.size())),
+              "nuka_scene_add_cloth_seam");
     }
 
     // Cook the built scene to a live nk::World on `device` (the SAME cook + record
@@ -3644,10 +3650,10 @@ NB_MODULE(_nuka_ext, m) {
              "Add a TAGGED media record. kind is a MEDIA_* code (CLOTH/SOFT_TET/"
              "FLUID/GRANULAR/CABLE); method a MEDIA_METHOD_* code (MLSMPM/VBD/FIELD). kind "
              "selects the geometry block (cloth_*/tet_*/fluid_*/cable_*); method selects the "
-             "material block (vbd_*/mpm_*/field_material). A FIELD cloth takes field_material as 16 "
+             "material block (vbd_*/mpm_*/field_material). A FIELD cloth takes field_material as 18 "
              "floats: density, thickness, youngs, poisson, yield_stress, hardening, yield_moment, "
              "bend_hardening, maxwell_modulus[2], maxwell_time[2], bend_maxwell_modulus[2], "
-             "bend_maxwell_time[2]. A cable is VBD: cable_start/end + "
+             "bend_maxwell_time[2], tear_strength, tear_energy. A cable is VBD: cable_start/end + "
              "cable_segments links, cable_radius bead size, cable_pin endpoint, optional "
              "cable_slab_* rigid weight welded to the loaded end. Material scalars at 0 take "
              "the cook's own defaults. An illegal (kind x method) pair raises here; an "
@@ -3673,6 +3679,9 @@ NB_MODULE(_nuka_ext, m) {
              "Append a material region to the cloth medium `media_id`: listed vertices take its "
              "contact thickness, friction and particle mass; faces with all three vertices listed "
              "take its density and moduli. Later regions win.")
+        .def("add_cloth_seam", &SceneBuilder::add_cloth_seam, nb::arg("media_id"), nb::arg("vertices"),
+             "Append a seam polyline to the material-field cloth `media_id`: the faces split along it "
+             "and a cohesive layer of the medium's tear_strength and tear_energy holds them until it tears.")
         .def("build", &SceneBuilder::build, nb::arg("device"),
              nb::arg("env_count") = 1u, nb::arg("dt") = 1.0f / 240.0f,
              nb::arg("control_mode") = 0u, nb::arg("determinism") = 0u,
