@@ -259,6 +259,10 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
     {NUKA_FIELD_UCONTACT_COUNT, kStrideU32, kWireDtypeU32, nk::FieldId::UcontactCount},
     {NUKA_FIELD_UCONTACT_POINT, nk::LayoutOf(nk::FieldId::UcontactPoint).elem_size,
         kWireDtypeF32, nk::FieldId::UcontactPoint},
+    {NUKA_FIELD_SOLVER_RESIDUAL, nk::LayoutOf(nk::FieldId::SolverResidual).elem_size,
+        kWireDtypeF32, nk::FieldId::SolverResidual},
+    {NUKA_FIELD_SOLVER_SWEEP_TRACE, nk::LayoutOf(nk::FieldId::SolverSweepTrace).elem_size,
+        kWireDtypeF32, nk::FieldId::SolverSweepTrace},
 };
 
 inline constexpr size_t kDlpackFieldCount =

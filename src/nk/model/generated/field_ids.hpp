@@ -362,7 +362,9 @@ enum class FieldId : uint16_t {
     ContactWarmStartCounts,  // contact_warm_start_counts (per:env arena:scratch owner:data elem:2)
     MeshOgcPairCount,  // mesh_ogc_pair_count (per:env arena:scratch owner:data)
     MeshSdfPairCount,  // mesh_sdf_pair_count (per:env arena:scratch owner:data)
-    VbdVelocitySweepCount,  // vbd_velocity_sweep_count (per:env arena:scratch owner:data)
+    VbdVelocitySweepCount,  // vbd_velocity_sweep_count (per:env arena:scratch owner:data flags:[readout])
+    SolverResidual,  // solver_residual (per:env arena:scratch owner:data elem:4 flags:[readout])
+    SolverSweepTrace,  // solver_sweep_trace (per:scalar arena:scratch owner:data elem:4 count:solver_trace_sweeps*env_count flags:[readout])
     SolverColorCounts,  // solver_color_counts (per:env arena:scratch owner:data elem:6)
     SolverPhaseTime,  // solver_phase_time (per:env arena:scratch owner:data elem:8)
     DatSurfaceMotion,  // dat_surface_motion (per:scalar arena:scratch owner:data count:particle_surfaces_per_env*env_count)
@@ -759,6 +761,8 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "mesh_ogc_pair_count",
     "mesh_sdf_pair_count",
     "vbd_velocity_sweep_count",
+    "solver_residual",
+    "solver_sweep_trace",
     "solver_color_counts",
     "solver_phase_time",
     "dat_surface_motion",

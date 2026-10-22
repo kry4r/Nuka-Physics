@@ -116,6 +116,8 @@ struct TileContext {
     uint32_t capacity;
     uint32_t staged;
     uint32_t width;
+    // The largest block coordinate change of the running sweep, its momentum residual.
+    float momentum;
     float* fields;
     float* jacobian;
     float* mass;
@@ -555,8 +557,6 @@ __device__ void InitializeTile(ArticulationDeviceState state, DataView data, Blo
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
     if (c.lane < kSolverCountWords)
         data.solver_color_counts[c.env * kSolverCountWords + c.lane] = c.lane == 0u ? p.vertex_blocks.colors : 0u;
-    if (c.lane < kSolverPhaseWords) data.solver_phase_time[c.env * kSolverPhaseWords + c.lane] = 0u;
-    if (c.lane == 0u) data.vbd_velocity_sweep_count[c.env] = p.iterations;
     if (p.clear_failure_diagnostics != 0u) {
         for (uint32_t k = c.lane; k < c.bodies + c.articulations; k += kTileLanes) {
             const uint32_t owner = p.total_particle_count + (k < c.bodies
@@ -1368,6 +1368,11 @@ __device__ void DescendTileBlock(DataView data, BlockDescentSolveParams p, Block
     }
     EndTileBlock(c, b.local);
     if (failure != nk::BlockSolveFailure::None && c.lane == 0u) RecordTileFailure(data, p, s, c, b.owner, failure);
+    float moved = failure == nk::BlockSolveFailure::None ? 0.0f : FLT_MAX;
+#pragma unroll
+    for (uint32_t r = 0u; r < kSpan; ++r)
+        if (coordinate[r]) moved = fmaxf(moved, __uint_as_float(ResidualBits(u[r] - start[r])));
+    c.momentum = fmaxf(c.momentum, TileWarpMax(moved));
 #pragma unroll
     for (uint32_t r = 0u; r < kSpan; ++r)
         if (coordinate[r]) b.velocity[c.lane + r * kTileLanes] = u[r];
@@ -1375,8 +1380,9 @@ __device__ void DescendTileBlock(DataView data, BlockDescentSolveParams p, Block
 }
 
 // Dual update as DualUpdateKernel at the velocities every block reached in this iteration; position pass
-// impulses stay in the tile.
-__device__ void UpdateTileDuals(DataView data, const TileContext& c, bool velocity = true) {
+// impulses stay in the tile. Returns the contact normal, contact tangent and other rows' residuals.
+__device__ float3 UpdateTileDuals(DataView data, const TileContext& c, bool velocity = true) {
+    uint32_t steps[kResidualMomentum] = {0u, 0u, 0u};
     for (uint32_t h = c.lane; h < c.heads; h += kTileLanes) {
         const TileHead t = LoadTileHead(c, h);
         const uint32_t slot = c.Index(kTileSlot, h);
@@ -1389,6 +1395,10 @@ __device__ void UpdateTileDuals(DataView data, const TileContext& c, bool veloci
                                                                  t.mu_first, t.mu_second);
             dual.y = f.impulse.y;
             dual.z = f.impulse.z;
+        }
+        const float2 step = MultiplierSteps(t.dual, dual, t.response.residual_scale, t.rho, t.mu_first, t.mu_second);
+        if (t.axes != 3u) steps[kResidualJoint] = max(steps[kResidualJoint], ResidualBits(step.x));
+        if (t.axes == 3u) {
             nk::augmented::ContactRelaxation relaxation{
                 c.Load3(kTileRelaxationStep, h), c.Value(kTileRelaxationWeight, h)};
             dual = nk::augmented::RelaxContactImpulse(t.dual, dual, &relaxation);
@@ -1396,11 +1406,21 @@ __device__ void UpdateTileDuals(DataView data, const TileContext& c, bool veloci
             c.Value(kTileRelaxationWeight, h) = relaxation.weight;
             data.lambda[slot + stride] = dual.y;
             data.lambda[slot + 2u * stride] = dual.z;
+            // Natural velocities without the contact response: a loaded normal must not move, a free one must
+            // not approach; friction must not drive its own axis, and inside the cone the slip is the tangent step.
+            const Vec3 v{-t.residual.x + t.compliance * dual.x, -t.residual.y, -t.residual.z};
+            steps[kResidualNormal] = max(steps[kResidualNormal],
+                                         ResidualBits(dual.x > 0.0f ? fabsf(v.x) : fmaxf(-v.x, 0.0f)));
+            steps[kResidualTangent] = max(steps[kResidualTangent],
+                ResidualBits(fmaxf(step.y, fmaxf(Along(dual.y, v.y), Along(dual.z, v.z)))));
         }
         if (velocity) data.lambda[slot] = dual.x;
         c.Store3(kTileDual, h, dual);
     }
     __syncwarp();
+    return {__uint_as_float(__reduce_max_sync(~0u, steps[kResidualNormal])),
+            __uint_as_float(__reduce_max_sync(~0u, steps[kResidualTangent])),
+            __uint_as_float(__reduce_max_sync(~0u, steps[kResidualJoint]))};
 }
 
 // Final velocities as the tails of DescendArticulationsKernel and DescendRigidBlocksKernel, then the
@@ -1552,25 +1572,62 @@ __device__ void DescendTileBlocks(DataView data, BlockDescentSolveParams p, Bloc
     }
 }
 
-// An environment's velocity iterations, then its split-impulse position pass.
+// Nanoseconds of a timed tile solve per phase; Stamp closes the running phase into `phase`.
+struct TilePhaseClock {
+    bool timed;
+    unsigned long long last;
+    unsigned long long total[kSolverPhaseWords];
+    __device__ explicit TilePhaseClock(bool on) : timed(on), last(on ? GlobalTimer() : 0u), total{} {}
+    __device__ void Stamp(uint32_t phase) {
+        if (!timed) return;
+        const unsigned long long now = GlobalTimer();
+        total[phase] += now - last;
+        last = now;
+    }
+};
+
+// An environment's velocity sweeps until its residuals pass the tolerance or the budget is spent, as the
+// sweep solve ends each env, then its split-impulse position pass.
 template <uint32_t kN>
 __device__ void DescendTile(ArticulationDeviceState state, DataView data, BlockDescentSolveParams p, BlockScratch s,
                             TileContext& c) {
+    TilePhaseClock clock(p.telemetry != 0u);
     InitializeTile<kN>(state, data, p, s, c);
-    for (uint32_t iteration = 0u; iteration < p.iterations; ++iteration) {
-        c.iteration = iteration;
+    clock.Stamp(kPhaseSetup);
+    // Lane k holds the residual of class k.
+    float residual = 0.0f;
+    uint32_t sweeps = 0u;
+    while (sweeps < p.iterations) {
+        c.iteration = sweeps++;
+        c.momentum = 0.0f;
         DescendTileBlocks<kN>(data, p, s, c, false);
-        UpdateTileDuals(data, c);
+        clock.Stamp(kPhaseDense);
+        const float3 rows = UpdateTileDuals(data, c);
+        clock.Stamp(kPhaseDual);
+        residual = c.lane == kResidualNormal ? rows.x : c.lane == kResidualTangent ? rows.y
+                 : c.lane == kResidualJoint ? rows.z : c.momentum;
+        if ((p.telemetry & nk::kTelemetrySweeps) != 0u && sweeps <= p.trace_sweeps && c.lane < kResidualClasses)
+            data.solver_sweep_trace[(size_t{c.env} * p.trace_sweeps + sweeps - 1u) * kResidualClasses + c.lane] =
+                residual;
+        const float largest = fmaxf(fmaxf(rows.x, rows.y), fmaxf(rows.z, c.momentum));
+        clock.Stamp(kPhaseCheck);
+        if (largest < p.velocity_tolerance) break;
     }
+    if (c.lane < kResidualClasses) data.solver_residual[c.env * kResidualClasses + c.lane] = residual;
+    if (c.lane == 0u) data.vbd_velocity_sweep_count[c.env] = sweeps;
     FinishTile<kN>(state, data, p, s, c);
-    if (p.position_iterations == 0u) return;
-    const uint32_t positions = InitializeTilePositions(data, p, s, c);
-    for (uint32_t iteration = 0u; iteration < positions; ++iteration) {
-        c.iteration = p.iterations + iteration;
-        DescendTileBlocks<kN>(data, p, s, c, true);
-        if (iteration + 1u < positions) UpdateTileDuals(data, c, false);
+    if (p.position_iterations != 0u) {
+        const uint32_t positions = InitializeTilePositions(data, p, s, c);
+        for (uint32_t iteration = 0u; iteration < positions; ++iteration) {
+            c.iteration = sweeps + iteration;
+            DescendTileBlocks<kN>(data, p, s, c, true);
+            if (iteration + 1u < positions) UpdateTileDuals(data, c, false);
+        }
+        FinishTilePositions(state, data, p, s, c);
     }
-    FinishTilePositions(state, data, p, s, c);
+    clock.Stamp(kPhaseDense);
+    for (uint32_t phase = c.lane; phase < kSolverPhaseWords; phase += kTileLanes)
+        data.solver_phase_time[c.env * kSolverPhaseWords + phase] = clock.total[phase];
 }
 
 constexpr uint32_t kOrderTileThreads = 1024u;

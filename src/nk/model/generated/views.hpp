@@ -394,7 +394,9 @@ struct DataView {
     uint32_t* contact_warm_start_counts = nullptr;  // per:env arena:scratch owner:data elem:2
     uint32_t* mesh_ogc_pair_count = nullptr;  // per:env arena:scratch owner:data
     uint32_t* mesh_sdf_pair_count = nullptr;  // per:env arena:scratch owner:data
-    uint32_t* vbd_velocity_sweep_count = nullptr;  // per:env arena:scratch owner:data
+    uint32_t* vbd_velocity_sweep_count = nullptr;  // per:env arena:scratch owner:data flags:[readout]
+    float* solver_residual = nullptr;  // per:env arena:scratch owner:data elem:4 flags:[readout]
+    float* solver_sweep_trace = nullptr;  // per:scalar arena:scratch owner:data elem:4 count:solver_trace_sweeps*env_count flags:[readout]
     uint32_t* solver_color_counts = nullptr;  // per:env arena:scratch owner:data elem:6
     uint64_t* solver_phase_time = nullptr;  // per:env arena:scratch owner:data elem:8
     float* dat_surface_motion = nullptr;  // per:scalar arena:scratch owner:data count:particle_surfaces_per_env*env_count

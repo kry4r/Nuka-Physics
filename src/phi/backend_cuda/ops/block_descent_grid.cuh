@@ -118,8 +118,21 @@ __global__ void DescendGridBlocksKernel(
     const size_t stride = size_t{gridDim.x} * blockDim.x / warpSize;
     const uint32_t active_count = s.grid_active_count[color];
     const uint32_t first = s.grid_color_offsets[color];
+    const uint32_t nodes_per_env = p.total_grid_count / p.env_count;
+    // A warp holds its nodes' largest Newton step until their env changes.
+    uint32_t env = ~0u, residual = 0u;
+    const auto raise = [&](uint32_t node_env, float step) {
+        if (node_env != env && env != ~0u) {
+            if (lane == 0u) RaiseResidual(s, env, kResidualMomentum, residual);
+            residual = 0u;
+        }
+        env = node_env;
+        residual = max(residual, ResidualBits(step));
+    };
     for (size_t item = warp; item < active_count; item += stride) {
         const uint32_t node = s.grid_active[first + item];
+        const uint32_t node_env = node / nodes_per_env;
+        if (!EnvRunning(data, node_env)) continue;
         const uint32_t owner = p.total_particle_count + p.total_body_count + p.articulation_count + node;
         const uint32_t begin = s.offsets[owner];
         const uint32_t end = s.offsets[owner + 1u];
@@ -145,6 +158,7 @@ __global__ void DescendGridBlocksKernel(
                    WarpSum(hessian.xy), WarpSum(hessian.xz), WarpSum(hessian.yz)};
         if (!__all_sync(0xffffffffu, rows_finite)) {
             if (lane == 0u) RecordBlockFailure(data, p, s, owner, nk::BlockSolveFailure::InvalidRow);
+            raise(node_env, FLT_MAX);
             continue;
         }
         // Every lane holds the same warp-uniform node solve, in float apart from the inverse's cofactors.
@@ -167,6 +181,7 @@ __global__ void DescendGridBlocksKernel(
             reason = nk::BlockSolveFailure::InvalidDirection;
             valid = Finite(direction) && fabsf(slope) <= FLT_MAX;
         }
+        raise(node_env, valid ? StepSize(direction) : FLT_MAX);
         if (!valid) {
             double dominant_trace = 0.0;
             const uint32_t dominant_row = DominantGridRow(data, p, s, begin, end, lane, &dominant_trace);
@@ -264,4 +279,5 @@ __global__ void DescendGridBlocksKernel(
             s.row_state[slot] = state;
         }
     }
+    if (lane == 0u && env != ~0u) RaiseResidual(s, env, kResidualMomentum, residual);
 }

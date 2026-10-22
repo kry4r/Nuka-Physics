@@ -75,7 +75,8 @@ struct RigidBlock {
 __global__ void DescendRigidBlocksKernel(
     DataView data, BlockDescentSolveParams p, BlockScratch s) {
     const uint32_t body = blockIdx.x;
-    if (body >= p.total_body_count || s.rigid_dimensions[body] == 0u) return;
+    const uint32_t env = body / (p.total_body_count / p.env_count);
+    if (body >= p.total_body_count || s.rigid_dimensions[body] == 0u || !EnvRunning(data, env)) return;
     const uint32_t owner = p.total_particle_count + body;
     const size_t base = size_t{body} * kRigidBlockDof;
     RigidBlock b{};
@@ -94,6 +95,7 @@ __global__ void DescendRigidBlocksKernel(
     const nk::BlockSolveFailure failure = DescendDenseBlock(b, data, p, s);
     if (threadIdx.x != 0u) return;
     if (failure != nk::BlockSolveFailure::None) RecordBlockFailure(data, p, s, owner, failure);
+    RaiseResidual(s, env, kResidualMomentum, DenseBlockResidual(b, failure));
     data.body_linear_velocity[body] = {b.velocity[0], b.velocity[1], b.velocity[2]};
     data.body_angular_velocity[body] = {b.velocity[3], b.velocity[4], b.velocity[5]};
 }

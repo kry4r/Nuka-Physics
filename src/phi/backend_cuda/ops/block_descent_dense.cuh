@@ -626,3 +626,11 @@ __device__ nk::BlockSolveFailure DescendDenseBlock(const Block& b, DataView data
     while (failure == nk::BlockSolveFailure::None && WakeDenseRows(b, data, p, s, &working));
     return failure;
 }
+
+// The largest coordinate change of a block's solve, its momentum residual; a failed solve has the largest.
+template <typename Block>
+__device__ uint32_t DenseBlockResidual(const Block& b, nk::BlockSolveFailure failure) {
+    uint32_t bits = failure == nk::BlockSolveFailure::None ? 0u : ResidualBits(FLT_MAX);
+    for (uint32_t i = 0u; i < b.dimension; ++i) bits = max(bits, ResidualBits(b.velocity[i] - b.Snapshot(i)));
+    return bits;
+}

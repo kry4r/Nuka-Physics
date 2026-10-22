@@ -1650,7 +1650,7 @@ __global__ void MultilevelApplyKernel(DataView data, BlockDescentSolveParams p, 
         const uint32_t particle = env * l.particles_per_env + l.begin + slot % l.vertices;
         const MultilevelState& state = s.multilevel[env];
         Vec3 previous{};
-        if (state.scale > 0.0f && MultilevelDynamic(s, particle)) {
+        if (state.scale > 0.0f && MultilevelDynamic(s, particle) && EnvRunning(data, env)) {
             const Vec3 u = data.particle_vel[particle];
             const Vec3 candidate = state.scale == 1.0f ? MultilevelCandidate<true>(s, state, slot, u, state.scale)
                                                       : MultilevelCandidate(s, state, slot, u, state.scale);

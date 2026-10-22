@@ -9,8 +9,8 @@ import numpy as np
 
 from .._nuka_ext import Field
 from ..energy import EnergyColumn, EnergyLedgerSampler
-from .schema import (AuditCount, AuditMetric, DiagnosticThresholds, Stage, StageColumn,
-                     VbdSolveAuditColumn, stage_units, vbd_solve_audit_units)
+from .schema import (AuditCount, AuditMetric, DiagnosticThresholds, SolverPhase, SolverResidual, Stage,
+                     StageColumn, VbdSolveAuditColumn, stage_units, vbd_solve_audit_units)
 
 
 def sha256(path):
@@ -44,7 +44,7 @@ class DiagnosticSession:
         return PerformanceCapture(device, world, output, metadata)
 
     def __init__(self, world, output, metadata, *, env_count=1, chunk_steps=128,
-                 state_fields=(), thresholds=None):
+                 state_fields=(), thresholds=None, trace_sweeps=False):
         self.world = world
         self.output = Path(output)
         self.output.mkdir(parents=True, exist_ok=False)
@@ -57,6 +57,10 @@ class DiagnosticSession:
         self.steps = 0
         self.state_fields = tuple(state_fields)
         self.thresholds = thresholds or DiagnosticThresholds()
+        # Sweep telemetry keeps each env's residuals per sweep and the solve's phase times.
+        self.trace_sweeps = world.velocity_iterations() if trace_sweeps else 0
+        if self.trace_sweeps:
+            world.set_telemetry_mask(world.telemetry_mask() | 3)
         world.download_field(Field.PHYSICS_STAGE_METRICS)
         world.download_field(Field.CONTACT_AUDIT_COUNTS)
         world.download_field(Field.CONTACT_AUDIT_METRICS)
@@ -73,6 +77,10 @@ class DiagnosticSession:
             "stage_units": [stage_units(c) for c in StageColumn],
             "energy_columns": [c.name for c in EnergyColumn],
             "audit_counts": [c.name for c in AuditCount], "audit_metrics": [c.name for c in AuditMetric],
+            "solver_residual_columns": [c.name for c in SolverResidual],
+            "solver_residual_units": "m/s", "trace_sweeps": self.trace_sweeps,
+            "sweep_budget": world.velocity_iterations(),
+            "solver_phases": [c.name for c in SolverPhase],
             "state_fields": [f.name for f in state_fields],
             "timing_scope": "Host step call wall time; excludes capture and file I/O; not GPU event latency.",
         }
@@ -100,10 +108,15 @@ class DiagnosticSession:
             "dat_failures": read(Field.DAT_FAILURE_COUNT, (self.env_count,)),
             "dat_query_limits": read(Field.DAT_QUERY_LIMIT_COUNT, (self.env_count,)),
             "sweeps": read(Field.VBD_VELOCITY_SWEEP_COUNT, (self.env_count,)),
+            "solver_residual": read(Field.SOLVER_RESIDUAL, (self.env_count, len(SolverResidual))),
             "newton_metrics": read(Field.VBD_SOLVE_METRICS, (self.env_count, 2)),
             "contact_metrics": read(Field.CONTACT_SOLVE_METRICS, (self.env_count, 8)),
             "step_wall_seconds": np.asarray(step_wall_seconds),
         }
+        if self.trace_sweeps:
+            sample["sweep_trace"] = read(Field.SOLVER_SWEEP_TRACE,
+                                         (self.env_count, self.trace_sweeps, len(SolverResidual)))
+            sample["phase_ns"] = read(Field.SOLVER_PHASE_TIME, (self.env_count, len(SolverPhase)))
         for field in self.state_fields if state_fields is None else state_fields:
             sample["state_" + field.name] = np.asarray(self.world.download_field(field)).copy()
         if controls is not None:
@@ -254,6 +267,15 @@ def iter_record_blocks(root, *, states=False):
               "newton_metrics": environments + (2,), "contact_metrics": environments + (8,),
               "step_wall_seconds": (), "policy_step": ()}
     floating = {"energy", "stages", "force_residual_work", "step_wall_seconds"}
+    if "solver_residual_columns" in manifest:
+        if manifest["solver_residual_columns"] != [c.name for c in SolverResidual]:
+            raise ValueError("diagnostic solver residual column order mismatch")
+        shapes["solver_residual"] = environments + (len(SolverResidual),)
+        floating.add("solver_residual")
+        if manifest["trace_sweeps"]:
+            shapes["sweep_trace"] = environments + (manifest["trace_sweeps"], len(SolverResidual))
+            shapes["phase_ns"] = environments + (len(SolverPhase),)
+            floating.add("sweep_trace")
     unsigned = shapes.keys() - floating
     required_states = {"state_" + name for name in state_fields}
     state_shapes, columns, paths = {}, None, set()

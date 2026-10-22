@@ -806,7 +806,8 @@ typedef enum nuka_state_field_t {
     NUKA_FIELD_DAT_BODY_TRUNCATION_ENERGY = 76,
     NUKA_FIELD_MESH_OGC_PAIR_COUNT = 77,
     NUKA_FIELD_MESH_SDF_PAIR_COUNT = 78,
-    // READ: executed velocity sweeps in the colored VBD solve for the latest step.
+    // READ: per environment, velocity sweeps of the latest solve; it stops once SOLVER_RESIDUAL passes the
+    // velocity tolerance or the sweep budget is spent.
     NUKA_FIELD_VBD_VELOCITY_SWEEP_COUNT = 79,
     // READ: per environment, vertex colors, dynamic row colors, chain rows, chain islands, rows of
     // the longest island chain, and articulation Schur rows of the latest colored solve.
@@ -850,8 +851,8 @@ typedef enum nuka_state_field_t {
     // READ: per link, the untruncated joint speed of the last DAT pass and the detection bound.
     NUKA_FIELD_DAT_JOINT_MOTION = 97,
     NUKA_FIELD_DAT_JOINT_RATE = 98,
-    // READ: per environment, eight uint64 nanoseconds of the latest colored solve: warm start,
-    // vertex, color, chain, Schur, hub, stationarity and position phases.
+    // READ: per environment, eight uint64 nanoseconds of the latest solve while telemetry is on: setup,
+    // vertex, dense block, grid, coarse, acceleration, dual update and convergence check phases.
     NUKA_FIELD_SOLVER_PHASE_TIME = 99,
     // READ: per VBD vertex, twenty float32 columns from the last solve call, environment-major.
     NUKA_FIELD_VBD_SOLVE_AUDIT = 100,
@@ -866,7 +867,14 @@ typedef enum nuka_state_field_t {
     // READ: per contact slot, the number of valid UCONTACT_POINT entries, environment-major.
     NUKA_FIELD_UCONTACT_COUNT = 107,
     // READ: per contact slot, four world contact points (xyz each), environment-major.
-    NUKA_FIELD_UCONTACT_POINT = 108
+    NUKA_FIELD_UCONTACT_POINT = 108,
+    // READ: per environment, four float32 final residuals of the latest solve in m/s: contact normal and tangent
+    // natural velocities, other rows' multiplier steps and the block momentum residual. Contact and cloth vertex
+    // residuals are measured under a velocity tolerance, telemetry or contact diagnostics.
+    NUKA_FIELD_SOLVER_RESIDUAL = 109,
+    // READ: per environment and sweep, the four SOLVER_RESIDUAL classes after that sweep; filled while
+    // sweep telemetry is on, for at most the sweep budget set when it was turned on.
+    NUKA_FIELD_SOLVER_SWEEP_TRACE = 110
 } nuka_state_field_t;
 
 typedef enum nuka_vbd_element_kind_t {

@@ -459,6 +459,8 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     const bool telemetry = (readout_demand & kReadoutTelemetry) != 0u;
     p_block_descent_.telemetry = telemetry ? kTelemetrySolve |
         ((readout_demand & kReadoutTelemetrySweeps) != 0u ? kTelemetrySweeps : 0u) : 0u;
+    p_block_descent_.trace_sweeps = (p_block_descent_.telemetry & kTelemetrySweeps) != 0u
+        ? cap.solver_trace_sweeps : 0u;
     p_block_descent_.measure_contact_residual = cfg.measure_contact_residual ||
         p_block_descent_.measure_vertex_audit != 0u ||
         p_block_descent_.velocity_tolerance > 0.0f ||

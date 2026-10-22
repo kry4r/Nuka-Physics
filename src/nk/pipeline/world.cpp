@@ -941,12 +941,14 @@ phi::Status World::BuildDemanded(uint32_t demand, std::unique_ptr<Pipeline>* out
     if (status != phi::Status::Ok) return status;
     // Solve measurements demanded later widen the solver scratch.
     uint64_t solve_words = 0u;
+    uint32_t trace_sweeps = 0u;
     bool measure_response = false;
     for (const phi::OpCall& call : candidate->Calls())
         if (call.op == phi::NkOp::BlockDescentSolve) {
             const auto* solve = static_cast<const phi::BlockDescentSolveParams*>(call.params);
             solve_words = std::max(solve_words, phi::BlockDescentScratchWords(*solve));
             measure_response |= solve->measure_contact_residual != 0u;
+            if ((solve->telemetry & kTelemetrySweeps) != 0u) trace_sweeps = std::max(trace_sweeps, solve->iterations);
         }
     if (measure_response && !cap.contact_response) {
         ModelCapacities demanded = cap;
@@ -957,10 +959,24 @@ phi::Status World::BuildDemanded(uint32_t demand, std::unique_ptr<Pipeline>* out
         if (status != phi::Status::Ok) return status;
         cap.contact_response = true;
     }
-    if (solve_words > cap.block_descent_scratch_words) {
+    // Widened scratch or sweep trace changes the solve parameters, so the pipeline builds again.
+    const bool widen_trace = trace_sweeps > cap.solver_trace_sweeps;
+    const bool widen_scratch = solve_words > cap.block_descent_scratch_words;
+    if (widen_trace) {
+        ModelCapacities demanded = cap;
+        demanded.solver_trace_sweeps = trace_sweeps;
+        status = data_.AllocateField(bt, FieldId::SolverSweepTrace,
+            CheckedProduct({demanded.ElementCount(FieldId::SolverSweepTrace),
+                            uint64_t{LayoutOf(FieldId::SolverSweepTrace).elem_size}}));
+        if (status != phi::Status::Ok) return status;
+        cap.solver_trace_sweeps = trace_sweeps;
+    }
+    if (widen_scratch) {
         status = data_.AllocateField(bt, FieldId::BlockDescentScratch, solve_words * sizeof(uint32_t));
         if (status != phi::Status::Ok) return status;
         cap.block_descent_scratch_words = solve_words;
+    }
+    if (widen_trace || widen_scratch) {
         status = candidate->Build(model_, cfg_, device_, demand, &state_sensors_);
         if (status != phi::Status::Ok) return status;
     }

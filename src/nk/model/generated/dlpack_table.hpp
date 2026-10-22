@@ -376,7 +376,9 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::ContactWarmStartCounts, DlpackDtype::kU32, 2, false},  // contact_warm_start_counts
     {FieldId::MeshOgcPairCount, DlpackDtype::kU32, 1, false},  // mesh_ogc_pair_count
     {FieldId::MeshSdfPairCount, DlpackDtype::kU32, 1, false},  // mesh_sdf_pair_count
-    {FieldId::VbdVelocitySweepCount, DlpackDtype::kU32, 1, false},  // vbd_velocity_sweep_count
+    {FieldId::VbdVelocitySweepCount, DlpackDtype::kU32, 1, true},  // vbd_velocity_sweep_count
+    {FieldId::SolverResidual, DlpackDtype::kF32, 2, true},  // solver_residual
+    {FieldId::SolverSweepTrace, DlpackDtype::kF32, 2, true},  // solver_sweep_trace
     {FieldId::SolverColorCounts, DlpackDtype::kU32, 2, false},  // solver_color_counts
     {FieldId::SolverPhaseTime, DlpackDtype::kU64, 2, false},  // solver_phase_time
     {FieldId::DatSurfaceMotion, DlpackDtype::kF32, 1, false},  // dat_surface_motion

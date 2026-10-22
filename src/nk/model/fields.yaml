@@ -768,10 +768,17 @@ fields:
   - {name: contact_warm_start_counts, dtype: u32, per: env, elem: 2, arena: scratch, owner: data}
   - {name: mesh_ogc_pair_count, dtype: u32, per: env, arena: scratch, owner: data}
   - {name: mesh_sdf_pair_count, dtype: u32, per: env, arena: scratch, owner: data}
-  - {name: vbd_velocity_sweep_count, dtype: u32, per: env, arena: scratch, owner: data}
+  # Velocity sweeps of the last solve per env; zero while the env is still sweeping.
+  - {name: vbd_velocity_sweep_count, dtype: u32, per: env, arena: scratch, owner: data, flags: [readout]}
+  # Final residuals of the last solve per env in m/s: contact normal, contact tangent, other rows, block momentum.
+  # Contact and cloth vertex residuals need the measured contact response.
+  - {name: solver_residual, dtype: f32, per: env, elem: 4, arena: scratch, owner: data, flags: [readout]}
+  # The four residual classes after each sweep of the last solve, for the first solver_trace_sweeps sweeps.
+  - {name: solver_sweep_trace, dtype: f32, per: scalar, count: "solver_trace_sweeps*env_count", elem: 4, arena: scratch, owner: data, flags: [readout]}
   # Vertex colors, row colors, chain rows, chain islands, longest island chain, Schur rows.
   - {name: solver_color_counts, dtype: u32, per: env, elem: 6, arena: scratch, owner: data}
-  # Nanoseconds of the last colored solve per phase, timed by its first block between barriers.
+  # Nanoseconds of the last solve per phase while telemetry is on: setup, vertices, dense, grid, coarse,
+  # acceleration, dual, check.
   - {name: solver_phase_time, dtype: u64, per: env, elem: 8, arena: scratch, owner: data}
   - {name: dat_surface_motion, dtype: f32, per: scalar, count: "particle_surfaces_per_env*env_count", arena: scratch, owner: data}
   - {name: energy_ledger, dtype: f32, per: scalar, count: "integration_substeps*env_count", elem: 31, arena: scratch, owner: data, flags: [readout]}

@@ -366,7 +366,7 @@ __global__ void CoarseApplyKernel(DataView data, BlockDescentSolveParams p, Bloc
         Vec3 free_rate{};
         if (!CoarseParticle(data, p, s, particle, &inertia, &free_rate)) continue;
         const CoarseState& state = s.coarse[particle / per_env];
-        if (!(state.scale > 0.0f)) continue;
+        if (!(state.scale > 0.0f) || !EnvRunning(data, particle / per_env)) continue;
         const Vec3 u = data.particle_vel[particle];
         data.particle_vel[particle] = {nk::vbd::TrialValue(u.x, state.direction[0], state.scale),
                                        nk::vbd::TrialValue(u.y, state.direction[1], state.scale),

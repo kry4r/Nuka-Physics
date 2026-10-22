@@ -613,8 +613,10 @@ struct BlockDescentSolveParams {
     float position_beta = 0.0f;
     float position_slop = 0.0f;
     float position_max_velocity = 0.0f;
-    // Sweeps stop once the vertex equations and contact rows hold to this velocity; zero runs them all.
+    // An env stops sweeping once its largest residual class falls below this velocity or `iterations` run.
     float velocity_tolerance = 0.0f;
+    // Sweeps per env solver_sweep_trace holds when the telemetry samples sweeps; later sweeps go untraced.
+    uint32_t trace_sweeps = 0u;
     // nk::kTelemetry* bits: the solve opens, samples and fills the ring's current record.
     uint32_t telemetry = 0u;
 };

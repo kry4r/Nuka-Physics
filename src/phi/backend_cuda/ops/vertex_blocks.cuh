@@ -303,12 +303,12 @@ __device__ inline void VertexBlockEquationWarp(const VertexBlockView& b, PointMa
     nk::vbd::AddIdentity(hessian, inertia);
 }
 
-// A completed sweep must also satisfy the vertex equations after all neighboring row updates. The ledger sums
-// the force in double, so the momentum defect stays below the tolerance by this warp sum's rounding bound.
-__device__ inline bool VertexBlockStationaryWarp(const VertexBlockView& b, PointMassView points, uint32_t env,
-                                                 uint32_t vertex, uint32_t lane, float tolerance) {
+// The vertex equation's residual after all neighboring row updates: the larger of the Newton correction and
+// the momentum defect in m/s. The defect carries this warp sum's rounding bound, as the ledger sums in double.
+__device__ inline float VertexBlockStationaryResidualWarp(const VertexBlockView& b, PointMassView points,
+                                                          uint32_t env, uint32_t vertex, uint32_t lane) {
     const uint32_t particle = b.Particle(env, vertex);
-    if (!(points.particle_inv_mass[particle] > 0.0f)) return true;
+    if (!(points.particle_inv_mass[particle] > 0.0f)) return 0.0f;
     const uint32_t slot = b.Slot(env, vertex);
     math::Vec3 gradient, magnitude{};
     math::SymmetricMat3 hessian, inverse;
@@ -325,10 +325,9 @@ __device__ inline bool VertexBlockStationaryWarp(const VertexBlockView& b, Point
     nk::vbd::AddIdentity(hessian, inertia);
     if (!(fabsf(force.x) <= FLT_MAX && fabsf(force.y) <= FLT_MAX && fabsf(force.z) <= FLT_MAX)) {
         if (lane == 0u) atomicOr(b.env_status + env, kEnvStatusSolverFailure);
-        return false;
+        return FLT_MAX;
     }
-    if (!(tolerance > 0.0f)) return force.x == 0.0f && force.y == 0.0f && force.z == 0.0f;
-    if (!nk::vbd::Invert(hessian, 1.0e-6f * inertia * inertia * inertia, &inverse)) return false;
+    if (!nk::vbd::Invert(hessian, 1.0e-6f * inertia * inertia * inertia, &inverse)) return FLT_MAX;
     const math::Vec3 correction = inverse.Multiply(force) / b.dt;
     // Each term passes at most ceil(n/32) + 6 roundings here (lane sum, five shuffle levels, assembly); with the
     // ledger's own roundings its readout exceeds this force by at most (ceil(n/32) + 10) u per term magnitude.
@@ -339,9 +338,8 @@ __device__ inline bool VertexBlockStationaryWarp(const VertexBlockView& b, Point
     const math::Vec3 momentum_error = nk::vbd::MomentumResidualVelocity(
         math::Vec3{fabsf(force.x), fabsf(force.y), fabsf(force.z)} + bound, points.particle_inv_mass[particle],
         b.effective_step[slot]);
-    return fabsf(correction.x) <= tolerance && fabsf(correction.y) <= tolerance &&
-           fabsf(correction.z) <= tolerance && fabsf(momentum_error.x) <= tolerance &&
-           fabsf(momentum_error.y) <= tolerance && fabsf(momentum_error.z) <= tolerance;
+    return fmaxf(fmaxf(fabsf(correction.x), fmaxf(fabsf(correction.y), fabsf(correction.z))),
+                 fmaxf(fabsf(momentum_error.x), fmaxf(fabsf(momentum_error.y), fabsf(momentum_error.z))));
 }
 
 // Descend the incremental potential through local curvature, holding accumulated row impulses fixed.

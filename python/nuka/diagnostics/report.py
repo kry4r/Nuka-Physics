@@ -26,6 +26,86 @@ def decision(complete, passed, **details):
     return {"status": "unmeasured" if not complete else "passed" if passed else "failed", **details}
 
 
+def quantiles(values):
+    values = np.asarray(values, dtype=np.float64).ravel()
+    return {"median": float(np.median(values)), "p95": float(np.percentile(values, 95)), "max": float(values.max())}
+
+
+RESIDUAL_LEVELS = (1e-2, 3e-3, 1e-3, 3e-4, 1e-4, 3e-5, 1e-5)
+
+
+def convergence_analysis(values, manifest):
+    """Final solver residuals and sweeps of every recorded solve; with a sweep trace, the residual after each
+    sweep and the solve time and sweeps needed to reach fixed residual levels."""
+    names = manifest["solver_residual_columns"]
+    final, sweeps = values["solver_residual"], values["sweeps"].astype(np.int64)
+    result = {"scope": "Last solve of each recorded step in every environment", "units": manifest["solver_residual_units"],
+              "sweep_budget": manifest["sweep_budget"],
+              "final_residual": {name: quantiles(final[..., k]) for k, name in enumerate(names)},
+              "final_largest": quantiles(final.max(axis=-1)),
+              "sweeps": {"mean": float(sweeps.mean()), **quantiles(sweeps),
+                         "at_budget_fraction": float((sweeps >= manifest["sweep_budget"]).mean())}}
+    if not manifest["trace_sweeps"]:
+        return result
+    trace = values["sweep_trace"].astype(np.float64)
+    count = trace.shape[2]
+    reached = np.arange(1, count + 1) <= sweeps[..., None]
+    worst = np.where(reached, trace.max(axis=-1), np.nan)
+    curve = []
+    for k in range(count):
+        if not reached[..., k].any():
+            break
+        row = {"sweep": k + 1, "solves": int(reached[..., k].sum()), **quantiles(worst[..., k][reached[..., k]])}
+        row.update({name: float(np.median(trace[..., k, c][reached[..., k]])) for c, name in enumerate(names)})
+        curve.append(row)
+    last = np.minimum(sweeps, count) - 1
+    first, final_traced = worst[..., 0], np.take_along_axis(worst, np.maximum(last, 0)[..., None], axis=-1)[..., 0]
+    rated = (last >= 1) & (first > 0) & (final_traced > 0)
+    rates = (final_traced[rated] / first[rated]) ** (1.0 / last[rated])
+    # A solve runs until its slowest env stops; its sweeps share the solve time after setup evenly.
+    phases = values["phase_ns"].astype(np.float64).max(axis=1)
+    setup = phases[:, manifest["solver_phases"].index("SETUP")]
+    per_sweep = (phases.sum(axis=-1) - setup) / np.maximum(sweeps.max(axis=1), 1)
+    levels = []
+    for level in RESIDUAL_LEVELS:
+        below = reached & (np.where(reached, trace.max(axis=-1), np.inf) < level)
+        hit = below.any(axis=-1)
+        index = below.argmax(axis=-1) + 1
+        seconds = (setup[:, None] + index * per_sweep[:, None]) * 1e-9
+        levels.append({"residual": level, "reached_fraction": float(hit.mean()),
+                       "sweeps": quantiles(index[hit]) if hit.any() else None,
+                       "solve_seconds": quantiles(seconds[hit]) if hit.any() else None})
+    result.update(curve=curve, rate_per_sweep=quantiles(rates) if rates.size else None,
+                  solve_phase_seconds={name: float(np.median(phases[:, k]) * 1e-9)
+                                       for k, name in enumerate(manifest["solver_phases"])},
+                  sweep_seconds=quantiles(per_sweep * 1e-9), residual_levels=levels,
+                  timing_scope="Device timer at phase boundaries of the traced solve; a sweep's share is even")
+    return result
+
+
+def convergence_lines(result):
+    lines = ["", "## Solver convergence", "", f"Sweep budget {result['sweep_budget']}; sweeps median "
+             f"{result['sweeps']['median']:.0f}, p95 {result['sweeps']['p95']:.0f}, at budget "
+             f"{result['sweeps']['at_budget_fraction']:.1%}.", "", "| Final residual (m/s) | median | p95 | max |",
+             "|---|---|---|---|"]
+    for name, row in list(result["final_residual"].items()) + [("LARGEST", result["final_largest"])]:
+        lines.append(f"| {name} | {row['median']:.3g} | {row['p95']:.3g} | {row['max']:.3g} |")
+    if "curve" not in result:
+        return lines
+    lines += ["", "| Sweep | solves | median | p95 | max |", "|---|---|---|---|---|"]
+    lines += [f"| {r['sweep']} | {r['solves']} | {r['median']:.3g} | {r['p95']:.3g} | {r['max']:.3g} |"
+              for r in result["curve"]]
+    lines += ["", "| Residual level (m/s) | reached | median sweeps | median solve ms | p95 solve ms |",
+              "|---|---|---|---|---|"]
+    for r in result["residual_levels"]:
+        if r["sweeps"] is None:
+            lines.append(f"| {r['residual']:g} | 0% | - | - | - |")
+        else:
+            lines.append(f"| {r['residual']:g} | {r['reached_fraction']:.1%} | {r['sweeps']['median']:.0f} | "
+                         f"{r['solve_seconds']['median'] * 1e3:.3f} | {r['solve_seconds']['p95'] * 1e3:.3f} |")
+    return lines
+
+
 def vertex_audit_summary(values, env_count):
     values = np.asarray(values)
     if values.dtype != np.float32 or values.size % (env_count * len(V)):
@@ -612,6 +692,10 @@ def make_report(source, output, *, plot=False):
     if vertex_audit is not None:
         report["vertex_solver_audit"] = vertex_audit
         write_json(root / "vertex_solver_audit.json", vertex_audit)
+    convergence = convergence_analysis(values, manifest) if "solver_residual_columns" in manifest else None
+    if convergence is not None:
+        report["solver_convergence"] = convergence
+        write_json(root / "convergence.json", convergence)
     for filename, name in (("particle_state_check.json", "independent_state_readout"),
                            ("elastic_state_check.json", "independent_elastic_readout")):
         state_check = Path(source) / filename
@@ -651,6 +735,10 @@ def make_report(source, output, *, plot=False):
         lines.append("- DAT failures by reason and owner pair: dat_failures.json")
     if vertex_audit is not None:
         lines.append("- Vertex descent and final equation witnesses: vertex_solver_audit.json")
+    if convergence is not None:
+        lines.append("- Solver residuals, convergence curve and residual levels against solve time: convergence.json")
     lines += ["", "Missing coverage, analytic checks or geometry evidence prevents a full acceptance result."]
+    if convergence is not None:
+        lines += convergence_lines(convergence)
     (root / "report.md").write_text("\n".join(lines) + "\n")
     return report

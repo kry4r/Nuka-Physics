@@ -402,6 +402,8 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // mesh_ogc_pair_count
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // mesh_sdf_pair_count
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // vbd_velocity_sweep_count
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 4, 1, 16, 0},  // solver_residual
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 4, 1, 16, 0},  // solver_sweep_trace
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 6, 1, 24, 0},  // solver_color_counts
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 8, 1, 64, 0},  // solver_phase_time
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // dat_surface_motion

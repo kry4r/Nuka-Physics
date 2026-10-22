@@ -37,6 +37,8 @@ namespace nuka::nk {
 struct ModelCapacities {
     uint32_t env_count       = 1;   // number of replicated envs (env-major).
     uint32_t integration_substeps = 1u;
+    // Sweeps per env the solver sweep trace holds; widened when sweep telemetry is demanded.
+    uint32_t solver_trace_sweeps = 0u;
     // Multi-articulation co-residence (K Go2 in ONE env): the number of SEPARATE
     // articulations resident in each env. The forward kernels are grid =
     // articulation_count == articulations_per_env * env_count, each dog keeping

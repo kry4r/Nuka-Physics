@@ -98,6 +98,26 @@ class VbdSolveAuditColumn(IntEnum):
     LAST_PRIMAL_FORCE_Z = 19
 
 
+# Residual classes of a solve in m/s, as SOLVER_RESIDUAL and SOLVER_SWEEP_TRACE order them.
+class SolverResidual(IntEnum):
+    CONTACT_NORMAL = 0
+    CONTACT_TANGENT = 1
+    JOINT = 2
+    MOMENTUM = 3
+
+
+# Phases of SOLVER_PHASE_TIME in nanoseconds.
+class SolverPhase(IntEnum):
+    SETUP = 0
+    VERTICES = 1
+    DENSE = 2
+    GRID = 3
+    COARSE = 4
+    ACCELERATION = 5
+    DUAL = 6
+    CHECK = 7
+
+
 def vbd_solve_audit_units(column):
     c = VbdSolveAuditColumn(column)
     if c <= VbdSolveAuditColumn.FORCE_Z or c >= VbdSolveAuditColumn.LAST_PRIMAL_FORCE_X:

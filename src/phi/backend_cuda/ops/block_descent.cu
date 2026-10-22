@@ -43,9 +43,15 @@ constexpr uint32_t kSolverPhaseWords = 8u;
 constexpr uint32_t kNoCacheColor = ~0u;
 constexpr uint32_t kAllCacheColors = ~0u;
 constexpr uint32_t kRowAxisLanes = 4u;
-// Loop words of a solve: finished sweeps, a flag any measure over the tolerance sets, and whether
-// another sweep runs.
-constexpr uint32_t kSweepCount = 0u, kSweepUnconverged = 1u, kSweepContinue = 2u, kSweepStateWords = 3u;
+// Loop words of a solve: finished sweeps and whether another sweep runs.
+constexpr uint32_t kSweepCount = 0u, kSweepContinue = 1u, kSweepStateWords = 2u;
+// Residual classes of a sweep in velocity units: the contact normal and tangent multiplier steps, the other
+// rows' multiplier steps and the blocks' momentum (Newton) steps.
+constexpr uint32_t kResidualNormal = 0u, kResidualTangent = 1u, kResidualJoint = 2u, kResidualMomentum = 3u,
+                   kResidualClasses = 4u;
+// solver_phase_time slots of a timed solve; kPhaseEnd closes its last phase.
+constexpr uint32_t kPhaseSetup = 0u, kPhaseVertices = 1u, kPhaseDense = 2u, kPhaseGrid = 3u, kPhaseCoarse = 4u,
+                   kPhaseAcceleration = 5u, kPhaseDual = 6u, kPhaseCheck = 7u, kPhaseEnd = kSolverPhaseWords;
 constexpr uint32_t kPointJacobianAxes = 3u;
 constexpr uint32_t kPointJacobianComponents = 3u;
 constexpr uint32_t kPointJacobianWords = kPointJacobianAxes * kPointJacobianComponents;
@@ -266,6 +272,10 @@ struct BlockScratch {
     uint64_t incidence_capacity;
     uint32_t diagnostic_iteration = ~0u;
     uint32_t* sweep_state;
+    // Per env and residual class, the running sweep's largest residual as float bits.
+    uint32_t* env_residual;
+    // A timed solve's last stamp and open phase, then nanoseconds per phase.
+    unsigned long long* phase_clock;
     uint32_t* owner_cache_color;
     uint32_t* row_cache_colors;
     uint32_t* cache_counts;
@@ -480,6 +490,9 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     s.cache_counts = take(s.cache_color_count);
     s.cache_offsets = take(tile ? 0u : cache_colors + 1u);
     s.sweep_state = tile ? nullptr : take(kSweepStateWords);
+    s.env_residual = take(tile ? 0u : uint64_t{p.env_count} * kResidualClasses);
+    at = (at + 1u) & ~uint64_t{1u};
+    s.phase_clock = reinterpret_cast<unsigned long long*>(take(tile ? 0u : 2u * (2u + kSolverPhaseWords)));
     s.cache_rows = s.sorted_incidence;
     s.color_words = static_cast<uint32_t>(color_words);
     s.point_jacobian = reinterpret_cast<float*>(take(point_jacobian_words));
@@ -584,6 +597,60 @@ __device__ uint32_t Owner(const BlockDescentSolveParams& p, uint32_t kind, uint3
     if (kind == kNkSideGrid)
         return p.total_particle_count + p.total_body_count + p.articulation_count + index;
     return ~0u;
+}
+
+// An env sweeps until its residuals pass the tolerance; vbd_velocity_sweep_count then holds its sweeps.
+__device__ bool EnvRunning(const DataView& data, uint32_t env) { return data.vbd_velocity_sweep_count[env] == 0u; }
+
+__device__ float StepSize(Vec3 step) { return fmaxf(fabsf(step.x), fmaxf(fabsf(step.y), fabsf(step.z))); }
+
+// A residual's float bits, ordered as integers since residuals are not negative; a non-finite one is the largest.
+__device__ uint32_t ResidualBits(float value) { return __float_as_uint(value <= FLT_MAX ? fabsf(value) : FLT_MAX); }
+
+__device__ void RaiseResidual(BlockScratch s, uint32_t env, uint32_t kind, uint32_t bits) {
+    atomicMax(s.env_residual + size_t{env} * kResidualClasses + kind, bits);
+}
+
+// RaiseResidual from every lane of a warp, once per env the lanes hold; a lane without one passes ~0u.
+__device__ void RaiseWarpResidual(BlockScratch s, uint32_t env, uint32_t kind, uint32_t bits) {
+    const uint32_t peers = __match_any_sync(~0u, env);
+    const uint32_t largest = __reduce_max_sync(peers, bits);
+    if (env != ~0u && threadIdx.x % warpSize == __ffs(peers) - 1u) RaiseResidual(s, env, kind, largest);
+}
+
+// A row's multiplier steps at its dual update in velocity units: the normal (or scalar) step over its residual
+// scale, the tangent steps over their cone penalties rho mu^2, which is the slip velocity inside the cone.
+__device__ float2 MultiplierSteps(Vec3 dual, Vec3 next, float scale, float rho, float mu_first, float mu_second) {
+    const float normal = scale > 0.0f ? fabsf(next.x - dual.x) / scale : 0.0f;
+    const float first = mu_first > 0.0f && rho > 0.0f ? (next.y - dual.y) / (rho * mu_first * mu_first) : 0.0f;
+    const float second = mu_second > 0.0f && rho > 0.0f ? (next.z - dual.z) / (rho * mu_second * mu_second) : 0.0f;
+    return {normal, hypotf(first, second)};
+}
+
+// Velocity of a contact axis along its own impulse, which a converged contact keeps from being positive.
+__device__ float Along(float impulse, float velocity) {
+    return impulse > 0.0f ? velocity : impulse < 0.0f ? -velocity : 0.0f;
+}
+
+// Whether an env's class already exceeds the tolerance this sweep, so its remaining elements cannot stop it.
+__device__ bool Past(const BlockDescentSolveParams& p, BlockScratch s, uint32_t env, uint32_t kind, uint32_t local) {
+    const volatile uint32_t* words = s.env_residual + size_t{env} * kResidualClasses;
+    return __uint_as_float(max(words[kind], local)) >= p.velocity_tolerance;
+}
+
+// Whether a sweep measures the contact and cloth vertex residuals: every sweep under a tolerance or a sweep
+// trace, else the last one. Without a trace, `prune` lets an env past the tolerance skip the rest.
+__device__ bool MeasuredSweep(const BlockDescentSolveParams& p, BlockScratch s, bool* prune) {
+    const bool trace = (p.telemetry & nk::kTelemetrySweeps) != 0u;
+    const bool last = s.sweep_state[kSweepCount] + 1u >= p.iterations;
+    *prune = p.velocity_tolerance > 0.0f && !trace && !last;
+    return p.velocity_tolerance > 0.0f || trace || last;
+}
+
+__device__ unsigned long long GlobalTimer() {
+    unsigned long long now;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+    return now;
 }
 
 // Stress cells reach lattice-1 nodes i-1..i+1; point rows span two nodes per axis on either lattice.
@@ -1604,7 +1671,7 @@ __global__ void DescendParticlesKernel(ModelView model, DataView data, BlockDesc
                 const uint32_t local = particle % b.layout.particles_per_env;
                 const bool skipped = !elastic && (local < p.grid_particles_per_env ||
                     (local >= b.layout.begin && local - b.layout.begin < b.layout.vertices));
-                if (!skipped && data.particle_inv_mass[particle] > 0.0f) {
+                if (!skipped && data.particle_inv_mass[particle] > 0.0f && EnvRunning(data, env)) {
                     v.active = 1u;
                     v.env = env;
                     v.vertex = vertex;
@@ -1780,6 +1847,21 @@ __global__ void DescendParticlesKernel(ModelView model, DataView data, BlockDesc
             }
         }
         __syncthreads();
+        // Unless the sweep measures the vertex equations themselves, the Newton steps are their residuals.
+        if (threadIdx.x == 0u && p.measure_contact_residual == 0u) {
+            uint32_t env = ~0u, largest = 0u;
+            for (uint32_t j = 0u; j < kDescendTileVertices; ++j) {
+                const DescendTileVertex& v = tile[j];
+                if (v.active == 0u) continue;
+                if (v.env != env && env != ~0u) {
+                    RaiseResidual(s, env, kResidualMomentum, largest);
+                    largest = 0u;
+                }
+                env = v.env;
+                largest = max(largest, ResidualBits(v.descend != 0u ? StepSize(TileVec3(v.direction)) : FLT_MAX));
+            }
+            if (env != ~0u) RaiseResidual(s, env, kResidualMomentum, largest);
+        }
         for (uint32_t q = threadIdx.x; q < dense_total; q += blockDim.x) {
             const bool element = q < dense_element_total;
             const uint32_t k = element ? order[q] : q - dense_element_total;
@@ -1901,9 +1983,12 @@ __global__ void DescendParticlesKernel(ModelView model, DataView data, BlockDesc
 // the state stored here; grid-only rows read the residuals grid descents keep current instead of recomputing.
 __global__ void DualUpdateKernel(DataView data, BlockDescentSolveParams p, BlockScratch s, bool seed) {
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
+    uint32_t env = ~0u, joint = 0u;
     for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < *s.active_count;
          item += gridDim.x * blockDim.x) {
         const uint32_t slot = s.active_rows[item];
+        const uint32_t row_env = slot / p.rows_per_env;
+        if (!EnvRunning(data, row_env)) continue;
         if (rows[slot].flags & nk::nk_row_flags::kMaterialBlock) {
             UpdateMaterialDual(data, p, s, slot);
             continue;
@@ -1921,6 +2006,17 @@ __global__ void DualUpdateKernel(DataView data, BlockDescentSolveParams p, Block
                                                                  t.normal_bound, t.mu_first, t.mu_second);
             next.dual.y = f.impulse.y;
             next.dual.z = f.impulse.z;
+        }
+        if (row_env != env && env != ~0u) {
+            RaiseResidual(s, env, kResidualJoint, joint);
+            joint = 0u;
+        }
+        env = row_env;
+        // A non-contact row's multiplier step is its residual of this sweep.
+        if (!t.contact)
+            joint = max(joint, ResidualBits(MultiplierSteps(t.dual, next.dual,
+                static_cast<float>(t.response.residual_scale), t.penalty, 0.0f, 0.0f).x));
+        if (t.contact) {
             next.dual = nk::augmented::RelaxContactImpulse(t.dual, next.dual, &s.contact_relaxation[slot]);
             data.lambda[slot + rows[slot].group_normal_count] = next.dual.y;
             data.lambda[slot + 2u * rows[slot].group_normal_count] = next.dual.z;
@@ -1932,6 +2028,7 @@ __global__ void DualUpdateKernel(DataView data, BlockDescentSolveParams p, Block
             s.row_state[slot] = next;
         }
     }
+    RaiseWarpResidual(s, env, kResidualJoint, joint);
 }
 
 __global__ void MarkContactBlocksKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
@@ -1962,7 +2059,8 @@ __global__ void TrialAccelerationKernel(DataView data, BlockDescentSolveParams p
         const Vec3 current = data.particle_vel[particle];
         s.particle_snapshot[particle] = current;
         const bool owned = particle % p.vertex_blocks.particles_per_env >= p.grid_particles_per_env;
-        const Vec3 next = owned && data.particle_inv_mass[particle] > 0.0f && s.acceleration_disabled[particle] == 0u
+        const Vec3 next = owned && data.particle_inv_mass[particle] > 0.0f && s.acceleration_disabled[particle] == 0u &&
+                          EnvRunning(data, env)
             ? nk::solve::ChebyshevExtrapolate(current, s.particle_older[particle], s.acceleration_ratio[env])
             : current;
         data.particle_vel[particle] = next;
@@ -2109,27 +2207,79 @@ __global__ void GatherImpulseKernel(DataView data, BlockDescentSolveParams p, Bl
     }
 }
 
+// Every env's color counts, and the phase times of a timed solve.
 __global__ void RecordSolveKernel(ModelView model, DataView data, BlockDescentSolveParams p,
                                   BlockScratch s) {
     for (uint32_t index = blockIdx.x * blockDim.x + threadIdx.x; index < p.env_count;
          index += gridDim.x * blockDim.x) {
-        data.vbd_velocity_sweep_count[index] = s.sweep_state[kSweepCount];
         data.solver_color_counts[index * kSolverCountWords] = p.vertex_blocks.colors;
+        for (uint32_t phase = 0u; p.telemetry != 0u && phase < kSolverPhaseWords; ++phase)
+            data.solver_phase_time[index * kSolverPhaseWords + phase] = s.phase_clock[2u + phase];
     }
 }
 
-// Coulomb residual of a contact row at the current velocities and multipliers; `rate` gets the largest
-// velocity of an axis along its own impulse, which the contact audit bounds by the tolerance.
+// Coulomb residual of a contact row at the current velocities and multipliers; `rates` gets the largest velocity
+// of the normal and of a tangent axis along its own impulse, which the contact audit bounds by the tolerance.
 __device__ constraint::CoulombContactResidual ContactRowResidual(DataView data, BlockDescentSolveParams p,
                                                                  BlockScratch s, uint32_t slot, const NkRow& row,
-                                                                 float* rate = nullptr) {
+                                                                 float2* rates = nullptr) {
     const LocalTerm t = LoadLocalTerm(data, p, s, slot, ~0u, false);
     const Vec3 velocity{-t.residual.x + t.compliance * t.dual.x, -t.residual.y, -t.residual.z};
-    const auto along = [](float impulse, float v) { return impulse > 0.0f ? v : impulse < 0.0f ? -v : 0.0f; };
-    if (rate != nullptr)
-        *rate = fmaxf(along(t.dual.x, velocity.x), fmaxf(along(t.dual.y, velocity.y), along(t.dual.z, velocity.z)));
+    if (rates != nullptr)
+        *rates = {Along(t.dual.x, velocity.x), fmaxf(Along(t.dual.y, velocity.y), Along(t.dual.z, velocity.z))};
     return constraint::EvaluateCoulombContactResidual(
         data.row_contact_response[slot], velocity, t.dual, row.mu, row.friction_secondary);
+}
+
+// The contact classes of a measured sweep: each row's natural velocities and velocities along its impulses.
+__global__ void ContactResidualsKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
+    bool prune = false;
+    if (!MeasuredSweep(p, s, &prune)) return;
+    const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
+    uint32_t env = ~0u, normal = 0u, tangent = 0u;
+    for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < *s.active_count;
+         item += gridDim.x * blockDim.x) {
+        const uint32_t slot = s.active_rows[item];
+        const NkRow row = rows[slot];
+        const uint32_t row_env = slot / p.rows_per_env;
+        if (!(row.flags & nk::nk_row_flags::kBlockNormal) || !EnvRunning(data, row_env)) continue;
+        if (row_env != env && env != ~0u) {
+            RaiseResidual(s, env, kResidualNormal, normal);
+            RaiseResidual(s, env, kResidualTangent, tangent);
+            normal = tangent = 0u;
+        }
+        env = row_env;
+        if (prune && Past(p, s, env, kResidualNormal, normal) && Past(p, s, env, kResidualTangent, tangent)) continue;
+        float2 rates{};
+        const auto residual = ContactRowResidual(data, p, s, slot, row, &rates);
+        normal = max(normal, ResidualBits(residual.valid ? fmaxf(residual.normal_natural_velocity, rates.x) : FLT_MAX));
+        tangent = max(tangent, ResidualBits(residual.valid ? fmaxf(residual.tangent_natural_velocity, rates.y) : FLT_MAX));
+    }
+    RaiseWarpResidual(s, env, kResidualNormal, normal);
+    RaiseWarpResidual(s, env, kResidualTangent, tangent);
+}
+
+// The cloth vertex part of a measured sweep's momentum class, after every row update of the sweep.
+__global__ void VertexResidualsKernel(ModelView model, DataView data, BlockDescentSolveParams p, BlockScratch s) {
+    bool prune = false;
+    if (!MeasuredSweep(p, s, &prune)) return;
+    const uint32_t lane = threadIdx.x % warpSize;
+    const uint32_t first = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
+    const uint32_t stride = gridDim.x * blockDim.x / warpSize;
+    const VertexBlockView b = Vertices(model, data, p);
+    for (uint32_t item = first; item < b.layout.dynamic_vertices * p.env_count; item += stride) {
+        const uint32_t env = item / b.layout.dynamic_vertices;
+        const bool skip = !EnvRunning(data, env) || (prune && Past(p, s, env, kResidualMomentum, 0u));
+        if (__shfl_sync(0xffffffffu, skip ? 1u : 0u, 0) != 0u) continue;
+        const uint32_t vertex = b.color_vertices[item % b.layout.dynamic_vertices];
+        const uint32_t particle = b.Particle(env, vertex);
+        const Vec3 impulse = GatherParticleImpulse(data, s, particle, lane);
+        if (lane == 0u) data.particle_row_impulse[particle] = impulse;
+        __syncwarp();
+        const uint32_t bits = ResidualBits(VertexBlockStationaryResidualWarp(b, PointMasses(data), env, vertex, lane));
+        if (lane == 0u && bits > s.env_residual[size_t{env} * kResidualClasses + kResidualMomentum])
+            RaiseResidual(s, env, kResidualMomentum, bits);
+    }
 }
 
 __global__ void MeasureRowsKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
@@ -2205,56 +2355,12 @@ __global__ void MeasureVerticesKernel(ModelView model, DataView data, BlockDesce
     }
 }
 
-// The solver gate's vertex and contact measures after a sweep; the first one over the tolerance flags
-// the sweep unconverged and ends the check.
-__global__ void UnconvergedVerticesKernel(ModelView model, DataView data, BlockDescentSolveParams p,
-                                          BlockScratch s) {
-    const uint32_t lane = threadIdx.x % warpSize;
-    const uint32_t first = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
-    const uint32_t stride = gridDim.x * blockDim.x / warpSize;
-    const VertexBlockView b = Vertices(model, data, p);
-    volatile uint32_t* unconverged = s.sweep_state + kSweepUnconverged;
-    for (uint32_t item = first; item < b.layout.dynamic_vertices * p.env_count; item += stride) {
-        if (__shfl_sync(0xffffffffu, *unconverged, 0) != 0u) return;
-        const uint32_t env = item / b.layout.dynamic_vertices;
-        const uint32_t vertex = b.color_vertices[item % b.layout.dynamic_vertices];
-        const uint32_t particle = b.Particle(env, vertex);
-        const Vec3 impulse = GatherParticleImpulse(data, s, particle, lane);
-        if (lane == 0u) data.particle_row_impulse[particle] = impulse;
-        __syncwarp();
-        const bool stationary = VertexBlockStationaryWarp(b, PointMasses(data), env, vertex, lane,
-                                                          p.velocity_tolerance);
-        if (!stationary && lane == 0u) *unconverged = 1u;
-    }
-}
-
-__global__ void UnconvergedRowsKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
-    const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
-    volatile uint32_t* unconverged = s.sweep_state + kSweepUnconverged;
-    for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < *s.active_count;
-         item += gridDim.x * blockDim.x) {
-        if (*unconverged != 0u) return;
-        const uint32_t slot = s.active_rows[item];
-        const NkRow row = rows[slot];
-        if (!(row.flags & nk::nk_row_flags::kBlockNormal)) continue;
-        float rate = 0.0f;
-        const auto residual = ContactRowResidual(data, p, s, slot, row, &rate);
-        if (!residual.valid || !(residual.normal_natural_velocity <= p.velocity_tolerance) ||
-            !(residual.tangent_natural_velocity <= p.velocity_tolerance) || !(rate <= p.velocity_tolerance))
-            *unconverged = 1u;
-    }
-}
-
-// Counts the finished sweep and allows another while the budget lasts and a measure exceeds the tolerance.
-__global__ void FinishSweepKernel(BlockDescentSolveParams p, BlockScratch s,
-                                  cudaGraphConditionalHandle loop, bool graph) {
-    const uint32_t done = s.sweep_state[kSweepCount] + 1u;
-    const bool converged = p.velocity_tolerance > 0.0f && s.sweep_state[kSweepUnconverged] == 0u;
-    const uint32_t again = done < p.iterations && !converged ? 1u : 0u;
-    s.sweep_state[kSweepCount] = done;
-    s.sweep_state[kSweepUnconverged] = 0u;
-    s.sweep_state[kSweepContinue] = again;
-    if (graph) cudaGraphSetConditional(loop, again);
+// Closes the open phase of a timed solve at the global timer and opens `phase`; the first stamp only opens.
+__global__ void StampPhaseKernel(BlockScratch s, uint32_t phase, bool first) {
+    const unsigned long long now = GlobalTimer();
+    if (!first) s.phase_clock[2u + s.phase_clock[1]] += now - s.phase_clock[0];
+    s.phase_clock[0] = now;
+    s.phase_clock[1] = phase;
 }
 
 __device__ nk::TelemetryHeader* TelemetryHeaderOf(uint32_t* ring) {
@@ -2286,55 +2392,60 @@ __global__ void OpenTelemetryKernel(DataView data) {
     if (threadIdx.x == 0u) TelemetryHeaderOf(data.telemetry)->penetration = 0u;
 }
 
-// The residual after a sampled sweep: the largest vertex Newton correction and contact natural velocity.
-__global__ void SampleVerticesKernel(ModelView model, DataView data, BlockDescentSolveParams p, BlockScratch s) {
-    const uint32_t slot = SweepSampleSlot(s.sweep_state[kSweepCount] + 1u);
-    if (slot >= nk::kTelemetrySamples) return;
-    auto* sample = reinterpret_cast<unsigned int*>(OpenTelemetryRecord(data.telemetry)->sample_residual + slot);
-    const uint32_t lane = threadIdx.x % warpSize;
-    const uint32_t first = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
-    const uint32_t stride = gridDim.x * blockDim.x / warpSize;
-    const VertexBlockView b = Vertices(model, data, p);
-    for (uint32_t item = first; item < b.layout.dynamic_vertices * p.env_count; item += stride) {
-        const uint32_t env = item / b.layout.dynamic_vertices;
-        const uint32_t vertex = b.color_vertices[item % b.layout.dynamic_vertices];
-        Vec3 u, force;
-        SymmetricMat3 hessian, inverse;
-        VertexBlockEquationWarp(b, PointMasses(data), nullptr, env, vertex, lane, u, force, hessian);
-        const bool valid = Finite(force) && nk::vbd::Invert(hessian, 0.0f, &inverse);
-        const Vec3 correction = inverse.Multiply(force) / p.dt;
-        const float value = valid ? fmaxf(fabsf(correction.x), fmaxf(fabsf(correction.y), fabsf(correction.z)))
-                                  : FLT_MAX;
-        if (lane == 0u) atomicMax(sample, __float_as_uint(value));
+// Ends the sweep of each running env whose residuals pass the tolerance or whose budget is spent, keeping its
+// sweeps and residuals; a while node repeats the sweep as long as an env runs.
+__global__ void FinishSweepKernel(DataView data, BlockDescentSolveParams p, BlockScratch s,
+                                  cudaGraphConditionalHandle loop, bool graph) {
+    __shared__ uint32_t running[kThreads];
+    __shared__ uint32_t largest[kThreads];
+    const uint32_t done = s.sweep_state[kSweepCount] + 1u;
+    const bool trace = (p.telemetry & nk::kTelemetrySweeps) != 0u && done <= p.trace_sweeps;
+    uint32_t count = 0u, worst = 0u;
+    for (uint32_t env = threadIdx.x; env < p.env_count; env += blockDim.x) {
+        if (!EnvRunning(data, env)) continue;
+        uint32_t* words = s.env_residual + size_t{env} * kResidualClasses;
+        uint32_t bits = 0u;
+        for (uint32_t kind = 0u; kind < kResidualClasses; ++kind) {
+            bits = max(bits, words[kind]);
+            if (trace)
+                data.solver_sweep_trace[(size_t{env} * p.trace_sweeps + done - 1u) * kResidualClasses + kind] =
+                    __uint_as_float(words[kind]);
+        }
+        if (__uint_as_float(bits) < p.velocity_tolerance || done >= p.iterations) {
+            data.vbd_velocity_sweep_count[env] = done;
+            for (uint32_t kind = 0u; kind < kResidualClasses; ++kind)
+                data.solver_residual[env * kResidualClasses + kind] = __uint_as_float(words[kind]);
+        } else {
+            ++count;
+        }
+        worst = max(worst, bits);
+        for (uint32_t kind = 0u; kind < kResidualClasses; ++kind) words[kind] = 0u;
     }
-}
-
-__global__ void SampleRowsKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
-    const uint32_t n = s.sweep_state[kSweepCount] + 1u;
-    const uint32_t slot = SweepSampleSlot(n);
-    if (slot >= nk::kTelemetrySamples) return;
+    running[threadIdx.x] = count;
+    largest[threadIdx.x] = worst;
+    __syncthreads();
+    for (uint32_t half = blockDim.x / 2u; half > 0u; half /= 2u) {
+        if (threadIdx.x < half) {
+            running[threadIdx.x] += running[threadIdx.x + half];
+            largest[threadIdx.x] = max(largest[threadIdx.x], largest[threadIdx.x + half]);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x != 0u) return;
+    const uint32_t again = running[0] > 0u ? 1u : 0u;
+    s.sweep_state[kSweepCount] = done;
+    s.sweep_state[kSweepContinue] = again;
+    if (graph) cudaGraphSetConditional(loop, again);
+    const uint32_t slot = SweepSampleSlot(done);
+    if ((p.telemetry & nk::kTelemetrySweeps) == 0u || slot >= nk::kTelemetrySamples) return;
     nk::TelemetryRecord* record = OpenTelemetryRecord(data.telemetry);
-    if (blockIdx.x == 0u && threadIdx.x == 0u) {
-        record->sample_sweep[slot] = n;
-        atomicMax(&record->sample_count, slot + 1u);
-    }
-    auto* sample = reinterpret_cast<unsigned int*>(record->sample_residual + slot);
-    const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
-    for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < *s.active_count;
-         item += gridDim.x * blockDim.x) {
-        const uint32_t row_slot = s.active_rows[item];
-        const NkRow row = rows[row_slot];
-        if (!(row.flags & nk::nk_row_flags::kBlockNormal)) continue;
-        const auto residual = ContactRowResidual(data, p, s, row_slot, row);
-        const float value = residual.valid
-            ? fmaxf(fmaxf(residual.normal_natural_velocity, residual.tangent_natural_velocity), 0.0f) : FLT_MAX;
-        atomicMax(sample, __float_as_uint(value));
-    }
+    record->sample_sweep[slot] = done;
+    record->sample_residual[slot] = __uint_as_float(largest[0]);
+    record->sample_count = max(record->sample_count, slot + 1u);
 }
 
 // The solve's part of the substep record: sweeps, acceleration and the deepest active contact row.
-__global__ void TelemetrySolveKernel(DataView data, BlockDescentSolveParams p, BlockScratch s, uint32_t tile,
-                                     uint32_t accelerate) {
+__global__ void TelemetrySolveKernel(DataView data, BlockDescentSolveParams p, BlockScratch s, uint32_t accelerate) {
     auto* deepest = reinterpret_cast<unsigned long long*>(&TelemetryHeaderOf(data.telemetry)->penetration);
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
     for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < *s.active_count;
@@ -2347,9 +2458,15 @@ __global__ void TelemetrySolveKernel(DataView data, BlockDescentSolveParams p, B
     }
     if (blockIdx.x != 0u || threadIdx.x != 0u) return;
     nk::TelemetryRecord* record = OpenTelemetryRecord(data.telemetry);
-    record->sweeps = tile != 0u ? p.iterations : s.sweep_state[kSweepCount];
+    record->sweeps = 0u;
+    bool converged = true;
+    for (uint32_t env = 0u; env < p.env_count; ++env) {
+        record->sweeps = max(record->sweeps, data.vbd_velocity_sweep_count[env]);
+        for (uint32_t kind = 0u; kind < kResidualClasses; ++kind)
+            converged &= data.solver_residual[env * kResidualClasses + kind] < p.velocity_tolerance;
+    }
     record->sweep_budget = p.iterations;
-    if (record->sweeps < p.iterations) record->flags |= nk::kTelemetryConverged;
+    if (converged) record->flags |= nk::kTelemetryConverged;
     float ratio = 0.0f;
     for (uint32_t env = 0u; accelerate != 0u && env < p.env_count; ++env)
         ratio = fmaxf(ratio, s.acceleration_ratio[env]);
@@ -2556,11 +2673,11 @@ Status MeasureSolve(const ModelView& model, const DataView& data, const BlockDes
 
 // The measured solve, then its part of the telemetry record when telemetry is on.
 Status MeasureAndRecord(const ModelView& model, const DataView& data, const BlockDescentSolveParams& p,
-                        const BlockScratch& s, bool tile, bool accelerate, cudaStream_t stream) {
+                        const BlockScratch& s, bool accelerate, cudaStream_t stream) {
     if (MeasureSolve(model, data, p, s, stream) != Status::Ok) return Status::Failed;
     if (p.telemetry == 0u) return Status::Ok;
     return LaunchWork(TelemetrySolveKernel, std::max(s.rows, 1u), kThreads, stream, data, p, s,
-                      uint32_t{tile}, uint32_t{accelerate}) == cudaSuccess ? Status::Ok : Status::Failed;
+                      uint32_t{accelerate}) == cudaSuccess ? Status::Ok : Status::Failed;
 }
 
 Status OpRecordTelemetry(const ModelView&, const DataView& data, const void* params, cudaStream_t stream) {
@@ -2644,7 +2761,7 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
             return LaunchDenseTiles<decltype(width)::value>(articulation_state, data, *p, s, stream);
         });
         if (launched != cudaSuccess) return Status::Failed;
-        return MeasureAndRecord(model, data, *p, s, true, false, stream);
+        return MeasureAndRecord(model, data, *p, s, false, stream);
     }
     if (p->measure_vertex_audit != 0u && !clear(data.vbd_solve_audit,
             size_t{p->vertex_blocks.vertices} * p->env_count * nk::kVbdSolveAuditColumnCount * sizeof(float)))
@@ -2654,8 +2771,21 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
         !clear(s.contact_relaxation, size_t{s.rows} * sizeof(nk::augmented::ContactRelaxation)) ||
         !clear(s.active_count, sizeof(uint32_t)) ||
         !clear(s.sweep_state, kSweepStateWords * sizeof(uint32_t)) ||
+        !clear(data.vbd_velocity_sweep_count, size_t{p->env_count} * sizeof(uint32_t)) ||
+        !clear(s.env_residual, size_t{p->env_count} * kResidualClasses * sizeof(uint32_t)) ||
         !clear(data.solver_color_counts, size_t{p->env_count} * kSolverCountWords * sizeof(uint32_t)) ||
         !clear(data.solver_phase_time, size_t{p->env_count} * kSolverPhaseWords * sizeof(uint64_t))) return Status::Failed;
+    // A timed solve stamps its phase boundaries; the stamps go into the captured sweeps too.
+    const auto stamp = [&](uint32_t phase, cudaStream_t stream) {
+        if (p->telemetry == 0u) return true;
+        LaunchCuda(StampPhaseKernel, dim3(1u), dim3(1u), 0u, stream, s, phase, false);
+        return cudaGetLastError() == cudaSuccess;
+    };
+    if (p->telemetry != 0u) {
+        if (!clear(s.phase_clock, (2u + kSolverPhaseWords) * sizeof(unsigned long long))) return Status::Failed;
+        LaunchCuda(StampPhaseKernel, dim3(1u), dim3(1u), 0u, stream, s, kPhaseSetup, true);
+        if (cudaGetLastError() != cudaSuccess) return Status::Failed;
+    }
     if (p->clear_failure_diagnostics != 0u &&
         (!clear(s.failure_reasons, size_t{s.blocks} * sizeof(uint32_t)) ||
          !clear(s.failure_equations, size_t{s.blocks} * nk::kBlockSolveFailureEquationColumnCount * sizeof(double)) ||
@@ -2750,6 +2880,7 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
     const bool seed_rows = p->total_grid_count == 0u;
     // One sweep over every block; the first caches every row and builds the multilevel operators.
     const auto sweep = [&](bool first, cudaStream_t stream) {
+        if (!stamp(kPhaseVertices, stream)) return Status::Failed;
         if (grid_bytes > 0u && cudaMemcpyAsync(s.grid_snapshot, data.grid_velocity, grid_bytes,
                 cudaMemcpyDeviceToDevice, stream) != cudaSuccess) return Status::Failed;
         if (articulation_bytes > 0u && cudaMemcpyAsync(s.articulation_snapshot, data.qdot_flat,
@@ -2776,6 +2907,7 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
             if (descent_status != cudaSuccess) return Status::Failed;
         }
         if (p->articulation_count > 0u || p->total_body_count > 0u) {
+            if (!stamp(kPhaseDense, stream)) return Status::Failed;
             if (particle_bytes > 0u && cudaMemcpyAsync(s.particle_snapshot, data.particle_vel,
                     particle_bytes, cudaMemcpyDeviceToDevice, stream) != cudaSuccess) return Status::Failed;
             if (LaunchWork(CacheAugmentedRowsKernel, s.rows, kThreads / kRowAxisLanes, stream,
@@ -2795,6 +2927,7 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
             }
         }
         if (p->total_grid_count > 0u) {
+            if (!stamp(kPhaseGrid, stream)) return Status::Failed;
             if (articulation_bytes > 0u && cudaMemcpyAsync(s.articulation_snapshot, data.qdot_flat,
                     articulation_bytes, cudaMemcpyDeviceToDevice, stream) != cudaSuccess) return Status::Failed;
             if (LaunchWork(PackBlockRigidSnapshotKernel, p->total_body_count, kThreads, stream,
@@ -2812,6 +2945,7 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
                         stream, data, *p, grid_s, color) != cudaSuccess) return Status::Failed;
             }
         }
+        if (!stamp(kPhaseCoarse, stream)) return Status::Failed;
         if (multilevel &&
             LaunchMultilevelCorrection(model, data, *p, s, first, stream) != cudaSuccess)
             return Status::Failed;
@@ -2834,6 +2968,7 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
                     data, *p, s) != cudaSuccess) return Status::Failed;
         }
         if (accelerate) {
+            if (!stamp(kPhaseAcceleration, stream)) return Status::Failed;
             if (cudaMemsetAsync(s.acceleration_merit, 0, size_t{p->env_count} * 2u * sizeof(double),
                     stream) != cudaSuccess ||
                 LaunchWork(MarkContactBlocksKernel, s.rows, kThreads, stream, data, *p, s) != cudaSuccess ||
@@ -2849,6 +2984,7 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
                 LaunchWork(CommitAccelerationKernel, p->total_particle_count, kThreads, stream, data, *p, s) != cudaSuccess)
                 return Status::Failed;
         }
+        if (!stamp(kPhaseDual, stream)) return Status::Failed;
         if (p->material_cells_per_env > 0u &&
             LaunchWork(CacheMaterialRowsKernel, s.rows, kThreads / 32u, stream,
                 data, *p, s, false, kAllCacheColors) != cudaSuccess) return Status::Failed;
@@ -2857,19 +2993,15 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
             return Status::Failed;
         return Status::Ok;
     };
-    const bool check = p->velocity_tolerance > 0.0f;
     const auto finish = [&](cudaStream_t stream, cudaGraphConditionalHandle loop, bool graph) {
-        if (check &&
-            (LaunchWork(UnconvergedRowsKernel, s.rows, kThreads, stream, data, *p, s) != cudaSuccess ||
-             LaunchWork(UnconvergedVerticesKernel, p->vertex_blocks.dynamic_vertices * p->env_count,
-                 kThreads / 32u, stream, model, data, *p, s) != cudaSuccess))
+        if (!stamp(kPhaseCheck, stream)) return Status::Failed;
+        // The contact and cloth vertex residuals need the measured contact response.
+        if (p->measure_contact_residual != 0u &&
+            (LaunchWork(ContactResidualsKernel, s.rows, kThreads, stream, data, *p, s) != cudaSuccess ||
+             LaunchWork(VertexResidualsKernel, p->vertex_blocks.dynamic_vertices * p->env_count, kThreads / 32u,
+                 stream, model, data, *p, s) != cudaSuccess))
             return Status::Failed;
-        if ((p->telemetry & nk::kTelemetrySweeps) != 0u &&
-            (LaunchWork(SampleRowsKernel, std::max(s.rows, 1u), kThreads, stream, data, *p, s) != cudaSuccess ||
-             LaunchWork(SampleVerticesKernel, p->vertex_blocks.dynamic_vertices * p->env_count,
-                 kThreads / 32u, stream, model, data, *p, s) != cudaSuccess))
-            return Status::Failed;
-        LaunchCuda(FinishSweepKernel, dim3(1u), dim3(1u), 0u, stream, *p, s, loop, graph);
+        LaunchCuda(FinishSweepKernel, dim3(1u), dim3(kThreads), 0u, stream, data, *p, s, loop, graph);
         return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
     };
     if (sweep(true, stream) != Status::Ok) return Status::Failed;
@@ -2906,6 +3038,8 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
         if (cudaStreamDestroy(body) != cudaSuccess || !recorded || !ended) return Status::Failed;
     } else {
         if (finish(stream, {}, false) != Status::Ok) return Status::Failed;
+        // Without a tolerance every env runs the whole budget, so the loop needs no readback.
+        const bool check = p->velocity_tolerance > 0.0f;
         for (uint32_t done = 1u; done < p->iterations; ++done) {
             uint32_t again = 1u;
             if (check && (cudaMemcpyAsync(&again, s.sweep_state + kSweepContinue, sizeof(again),
@@ -2916,6 +3050,7 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
                 return Status::Failed;
         }
     }
+    if (!stamp(kPhaseEnd, stream)) return Status::Failed;
     if (LaunchWork(GatherImpulseKernel, p->total_particle_count, kThreads / 32u, stream, data, *p, s) != cudaSuccess ||
         LaunchWork(RecordSolveKernel, p->env_count, kThreads, stream,
                    model, data, *p, s) != cudaSuccess) return Status::Failed;
@@ -2923,7 +3058,7 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
         data.joint_limit_impulse != nullptr &&
         LaunchWork(WriteBlockJointLimitImpulsesKernel, p->base_link_count * p->env_count,
             kThreads, stream, data, *p) != cudaSuccess) return Status::Failed;
-    return MeasureAndRecord(model, data, *p, s, false, accelerate, stream);
+    return MeasureAndRecord(model, data, *p, s, accelerate, stream);
 }
 
 }  // namespace
