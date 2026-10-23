@@ -73,31 +73,6 @@ struct MaterialRowState {
     float pressure_bound;
 };
 
-constexpr uint32_t kCoarseVertexFamily = 0u;
-constexpr uint32_t kCoarseParticleFamily = 1u;
-constexpr uint32_t kNoCoarseFamily = ~0u;
-constexpr uint32_t kCoarseTrials = kVertexStepHalvings + 1u;
-// Force (3) and symmetric curvature (6) of one translation system.
-constexpr uint32_t kCoarseGradientTerms = 9u;
-// Blocks per environment that share its live rows, bounded by its reserved row slots.
-constexpr uint32_t kCoarseRowParts = 64u;
-static_assert(kCoarseTrials >= kCoarseGradientTerms);
-
-struct CoarseState {
-    double slope;
-    float direction[3];
-    float scale;
-};
-static_assert(sizeof(CoarseState) % sizeof(double) == 0u);
-
-uint32_t CoarseParts(const BlockDescentSolveParams& p) {
-    const uint64_t per_env = p.env_count > 0u ? p.total_particle_count / p.env_count : 0u;
-    const uint64_t row_parts = std::min<uint64_t>(kCoarseRowParts,
-        (uint64_t{p.rows_per_env} + kThreads - 1u) / kThreads);
-    const uint64_t parts = std::max((per_env + kThreads - 1u) / kThreads, row_parts);
-    return static_cast<uint32_t>(std::max<uint64_t>(1u, parts));
-}
-
 // One environment's multilevel step: plane coefficients, accepted scale and pending trial, the dense
 // factor flag, the fixed-point exponent with its bound, and the finished blocks of the running kernel.
 struct MultilevelState {
@@ -158,7 +133,7 @@ uint32_t MultilevelCorrectParts(const VertexBlockLayout& l) {
     return std::max<uint32_t>(1u, (l.coarse_nodes + warps - 1u) / warps);
 }
 
-// Live point-row heads, selected in slot order so the coarse sums keep a fixed order.
+// Live point-row heads, selected in slot order so the multilevel sums keep a fixed order.
 struct CoarseRowSelect {
     const NkRow* rows;
     __device__ bool operator()(uint32_t slot) const {
@@ -297,15 +272,12 @@ struct BlockScratch {
     uint32_t color_words;
     float* point_jacobian;
     nk::augmented::ScalarResponse* scalar_response;
-    CoarseState* coarse;
-    double* coarse_partials;
     uint32_t* coarse_rows;
     uint32_t* coarse_row_count;
     uint8_t* coarse_flags;
     uint32_t* coarse_row_offsets;
     void* coarse_select;
     size_t coarse_select_bytes;
-    uint32_t coarse_parts;
     MultilevelState* multilevel;
     double* multilevel_partials;
     unsigned long long* multilevel_operator;
@@ -526,13 +498,6 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     s.articulation_pseudo = reinterpret_cast<float*>(take(positions ? dofs : 0u));
     s.rigid_pseudo = reinterpret_cast<float*>(take(positions ? rigid_dofs : 0u));
     const bool coarse = p.total_particle_count > 0u;
-    s.coarse_parts = CoarseParts(p);
-    if (uint64_t{p.env_count} * s.coarse_parts >= uint64_t{std::numeric_limits<int>::max()}) return 0u;
-    s.coarse =reinterpret_cast<CoarseState*>(take(
-        coarse ? uint64_t{p.env_count} * sizeof(CoarseState) / sizeof(uint32_t) : 0u));
-    s.coarse_partials = reinterpret_cast<double*>(take(coarse
-        ? uint64_t{p.env_count} * s.coarse_parts * kCoarseTrials * (sizeof(double) / sizeof(uint32_t))
-        : 0u));
     s.coarse_rows = take(coarse ? rows : 0u);
     s.coarse_row_count = take(coarse ? 1u : 0u);
     s.coarse_flags = reinterpret_cast<uint8_t*>(take(coarse ? (rows + 3u) / 4u : 0u));
@@ -1535,7 +1500,6 @@ __device__ bool Finite(Vec3 value) {
 #include "phi/backend_cuda/ops/block_descent_rigid.cuh"
 #include "phi/backend_cuda/ops/block_descent_material.cuh"
 #include "phi/backend_cuda/ops/block_descent_grid.cuh"
-#include "phi/backend_cuda/ops/block_descent_coarse.cuh"
 #include "phi/backend_cuda/ops/block_descent_multilevel.cuh"
 #include "phi/backend_cuda/ops/block_descent_tile.cuh"
 
@@ -2937,24 +2901,6 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
         if (multilevel &&
             LaunchMultilevelCorrection(model, data, *p, s, first, stream) != cudaSuccess)
             return Status::Failed;
-        if (p->total_particle_count / p->env_count > p->grid_particles_per_env + layout.vertices) {
-            const dim3 coarse_grid(p->env_count * s.coarse_parts);
-            LaunchCuda(CoarseGradientKernel, coarse_grid, dim3(kThreads * kCoarseHelpers), 0u, stream,
-                       data, *p, s);
-            LaunchCuda(CoarseDirectionKernel, dim3(p->env_count), dim3(kThreads), 0u, stream,
-                       data, *p, s);
-            LaunchCuda(CoarseUnitTrialKernel, coarse_grid, dim3(kThreads * kCoarseHelpers), 0u, stream,
-                       data, *p, s);
-            LaunchCuda(CoarseAcceptKernel, dim3(p->env_count), dim3(kThreads), 0u, stream,
-                       *p, s, false);
-            LaunchCuda(CoarseTrialsKernel, coarse_grid, dim3(kThreads), 0u, stream,
-                       data, *p, s);
-            LaunchCuda(CoarseAcceptKernel, dim3(p->env_count), dim3(kThreads), 0u, stream,
-                       *p, s, true);
-            if (cudaGetLastError() != cudaSuccess ||
-                LaunchWork(CoarseApplyKernel, p->total_particle_count, kThreads, stream,
-                    data, *p, s) != cudaSuccess) return Status::Failed;
-        }
         if (!stamp(kPhaseMomentum, stream) ||
             LaunchWork(AdvanceDualMomentumKernel, p->env_count, kThreads, stream, data, *p, s) != cudaSuccess)
             return Status::Failed;

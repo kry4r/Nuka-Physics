@@ -2,6 +2,61 @@
 // Multilevel Galerkin correction of the vertex blocks: levels restrict the momentum residual through their
 // weights, upper levels take node block steps and the last a dense solve; a plane search takes the step.
 
+__device__ inline double WarpSumDouble(double value) {
+    for (uint32_t offset = warpSize / 2u; offset > 0u; offset /= 2u)
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    return value;
+}
+
+// Fixed-order sums of every value over the first kThreads threads, sharing two barriers; every thread of
+// the block calls it and thread 0 receives the sums.
+template <uint32_t kCount>
+__device__ inline void BlockSumsDouble(double (&values)[kCount], double (&shared)[kCount][kThreads / 32u]) {
+    for (uint32_t k = 0u; k < kCount; ++k) values[k] = WarpSumDouble(values[k]);
+    const uint32_t lane = threadIdx.x % warpSize;
+    const uint32_t warp = threadIdx.x / warpSize;
+    __syncthreads();
+    if (lane == 0u && warp < kThreads / 32u)
+        for (uint32_t k = 0u; k < kCount; ++k) shared[k][warp] = values[k];
+    __syncthreads();
+    if (threadIdx.x != 0u) return;
+    for (uint32_t k = 0u; k < kCount; ++k) {
+        double sum = 0.0;
+        for (uint32_t w = 0u; w < kThreads / 32u; ++w) sum += shared[k][w];
+        values[k] = sum;
+    }
+}
+
+// First selected row at or after `slot`; the selection is in slot order.
+__device__ inline uint32_t CoarseRowLowerBound(const BlockScratch& s, uint32_t count, uint64_t slot) {
+    uint32_t low = 0u, high = count;
+    while (low < high) {
+        const uint32_t middle = low + (high - low) / 2u;
+        if (s.coarse_rows[middle] < slot) low = middle + 1u;
+        else high = middle;
+    }
+    return low;
+}
+
+// Each environment's range in the selected rows, found once per solve.
+__global__ void CoarseRowRangesKernel(BlockDescentSolveParams p, BlockScratch s) {
+    const uint32_t count = *s.coarse_row_count;
+    for (uint32_t env = blockIdx.x * blockDim.x + threadIdx.x; env <= p.env_count;
+         env += gridDim.x * blockDim.x)
+        s.coarse_row_offsets[env] = CoarseRowLowerBound(s, count, uint64_t{env} * p.rows_per_env);
+}
+
+// The environment's selected rows split into equal contiguous chunks over `parts` blocks.
+__device__ inline void CoarseRowChunk(const BlockScratch& s, uint32_t parts, uint32_t env,
+                                      uint32_t part, uint32_t* begin, uint32_t* end) {
+    const uint32_t first = s.coarse_row_offsets[env];
+    const uint32_t last = s.coarse_row_offsets[env + 1u];
+    const uint64_t chunk = (uint64_t{last - first} + parts - 1u) / parts;
+    const uint64_t from = first + part * chunk;
+    *begin = static_cast<uint32_t>(from < last ? from : last);
+    *end = static_cast<uint32_t>(from + chunk < last ? from + chunk : last);
+}
+
 // Nodes one element reaches on a level: the parents of its vertices.
 constexpr uint32_t kMultilevelElementNodes = 4u * nk::kVbdCoarseParents;
 constexpr uint32_t kMultilevelRowNodes = kMultilevelRowPoints * nk::kVbdCoarseParents;
