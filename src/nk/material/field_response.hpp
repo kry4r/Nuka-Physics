@@ -1,7 +1,6 @@
 #pragma once
 // Material-field shell response: one plane-stress law over membrane strain and plate curvature, with J2
-// plasticity and two Maxwell branches, evaluated at fixed committed history free of side effects. The device
-// evaluates Real = float, the host oracles Real = double; the plastic return mapping always runs in double.
+// plasticity and two Maxwell branches at fixed committed history; the device evaluates float, host oracles double.
 
 #include <cmath>
 #include <cstdint>
@@ -148,47 +147,50 @@ NUKA_MF_HD inline Real StoredEnergy(const PlaneStressLaw& law, const float* comm
 inline constexpr double kHalfSqrt2 = 0.70710678118654752440;
 
 // Return-mapping result in the eigenbasis: stress, plastic multiplier and the hardened yield.
+template <class Real>
 struct J2Return {
-    double stress[3];
-    double gamma;
-    double yield;
+    Real stress[3];
+    Real gamma;
+    Real yield;
     bool converged;
 };
 
 // Simo-Taylor plane-stress return: Newton on 1/|S(g)|_P - (1 - 2/3 H g)/(sqrt(2/3) k_n), nearly linear in g,
-// bracketed between zero and the step that would reach the yield at constant hardening.
-NUKA_MF_HD inline J2Return ReturnMap(const double (&trial)[3], const double (&c)[3], double yield, double hardening) {
-    const double p[3] = {1.0 / 3.0, 1.0, 2.0}, root = 0.81649658092772603273;
-    const double slope = 2.0 / 3.0 * hardening;
-    double norm = 0.0, rate = c[0] * p[0];
+// bracketed between zero and the step that would reach the yield at constant hardening, to Real's precision.
+template <class Real>
+NUKA_MF_HD inline J2Return<Real> ReturnMap(const Real (&trial)[3], const Real (&c)[3], Real yield, Real hardening) {
+    constexpr bool wide = sizeof(Real) == sizeof(double);
+    const Real p[3] = {Real(1.0 / 3.0), Real(1), Real(2)}, root = Real(0.81649658092772603273);
+    const Real slope = Real(2.0 / 3.0) * hardening, tolerance = wide ? Real(1e-12) : Real(4e-7);
+    Real norm = Real(0), rate = c[0] * p[0];
     for (uint32_t i = 0u; i < 3u; ++i) {
         norm += p[i] * trial[i] * trial[i];
-        rate = fmin(rate, c[i] * p[i]);
+        rate = std::fmin(rate, c[i] * p[i]);
     }
-    double lo = 0.0, hi = (sqrt(norm) / (root * yield) - 1.0) / rate, gamma = 0.0;
-    if (slope > 0.0) hi = fmin(hi, (1.0 - 1e-9) / slope);
-    J2Return r{};
+    Real lo = Real(0), hi = (std::sqrt(norm) / (root * yield) - Real(1)) / rate, gamma = Real(0);
+    if (slope > Real(0)) hi = std::fmin(hi, (Real(1) - (wide ? Real(1e-9) : Real(1e-6))) / slope);
+    J2Return<Real> r{};
     for (uint32_t it = 0u; it < 8u; ++it) {
-        double size = 0.0, change = 0.0;
+        Real size = Real(0), change = Real(0);
         for (uint32_t i = 0u; i < 3u; ++i) {
-            const double scale = 1.0 + gamma * c[i] * p[i], s = trial[i] / scale;
+            const Real scale = Real(1) + gamma * c[i] * p[i], s = trial[i] / scale;
             r.stress[i] = s;
             size += p[i] * s * s;
             change -= p[i] * p[i] * c[i] * s * s / scale;
         }
-        size = sqrt(size);
-        const double residual = 1.0 / size - (1.0 - slope * gamma) / (root * yield);
-        if (fabs(residual) * size <= 1e-12) {
+        size = std::sqrt(size);
+        const Real residual = Real(1) / size - (Real(1) - slope * gamma) / (root * yield);
+        if (std::fabs(residual) * size <= tolerance) {
             r.converged = true;
             break;
         }
-        if (residual < 0.0) lo = gamma;
+        if (residual < Real(0)) lo = gamma;
         else hi = gamma;
-        const double next = gamma - residual / (-change / (size * size * size) + slope / (root * yield));
-        gamma = next > lo && next < hi ? next : 0.5 * (lo + hi);
+        const Real next = gamma - residual / (-change / (size * size * size) + slope / (root * yield));
+        gamma = next > lo && next < hi ? next : Real(0.5) * (lo + hi);
     }
     r.gamma = gamma;
-    r.yield = yield / (1.0 - slope * gamma);
+    r.yield = yield / (Real(1) - slope * gamma);
     return r;
 }
 
@@ -221,31 +223,29 @@ NUKA_MF_HD inline MfStatus EvaluatePlaneStress(const PlaneStressLaw& law, const 
     const Real size = s[0] * s[0] / Real(3) + s[1] * s[1] + Real(2) * s[2] * s[2];
     r.yielded = law.yield > 0.0f && size > Real(2.0 / 3.0) * kappa * kappa;
     if (r.yielded) {
-        const double trial[3] = {double(s[0]), double(s[1]), double(s[2])};
-        const double cd[3] = {double(c[0]), double(c[1]), double(c[2])}, p[3] = {1.0 / 3.0, 1.0, 2.0};
-        const J2Return j = ReturnMap(trial, cd, double(kappa), double(law.hardening));
+        const Real p[3] = {Real(1.0 / 3.0), Real(1), Real(2)}, hardening = law.hardening;
+        const J2Return<Real> j = ReturnMap(s, c, kappa, hardening);
         if (!j.converged) return MfStatus::LocalNonConvergence;
         // Consistent tangent Xi - n n^T / (n^T P S + beta), Xi = (C^-1 + g P)^-1, n = Xi P S.
-        double xi[3], n[3], den = 4.0 / 9.0 * double(law.hardening) * j.yield * j.yield /
-                                       (1.0 - 2.0 / 3.0 * double(law.hardening) * j.gamma);
+        Real xi[3], n[3], den = Real(4.0 / 9.0) * hardening * j.yield * j.yield /
+                                     (Real(1) - Real(2.0 / 3.0) * hardening * j.gamma);
         for (uint32_t i = 0u; i < 3u; ++i) {
-            xi[i] = cd[i] / (1.0 + j.gamma * cd[i] * p[i]);
+            xi[i] = c[i] / (Real(1) + j.gamma * c[i] * p[i]);
             n[i] = xi[i] * p[i] * j.stress[i];
             den += p[i] * j.stress[i] * n[i];
-            s[i] = Real(j.stress[i]);
+            s[i] = j.stress[i];
         }
-        t[0] = Real(xi[0] - n[0] * n[0] / den);
-        t[1] = Real(xi[1] - n[1] * n[1] / den);
-        t[2] = Real(xi[2] - n[2] * n[2] / den);
-        t[3] = Real(-n[0] * n[1] / den);
-        t[4] = Real(-n[0] * n[2] / den);
-        t[5] = Real(-n[1] * n[2] / den);
-        const Real flow[3] = {Real(j.gamma * p[0] * j.stress[0]), Real(j.gamma * p[1] * j.stress[1]),
-                              Real(j.gamma * p[2] * j.stress[2])};
+        t[0] = xi[0] - n[0] * n[0] / den;
+        t[1] = xi[1] - n[1] * n[1] / den;
+        t[2] = xi[2] - n[2] * n[2] / den;
+        t[3] = -n[0] * n[1] / den;
+        t[4] = -n[0] * n[2] / den;
+        t[5] = -n[1] * n[2] / den;
+        const Real flow[3] = {j.gamma * p[0] * j.stress[0], j.gamma * p[1] * j.stress[1], j.gamma * p[2] * j.stress[2]};
         e[0] -= Real(kHalfSqrt2) * (flow[0] + flow[1]);
         e[1] -= Real(kHalfSqrt2) * (flow[0] - flow[1]);
         e[2] -= flow[2];
-        r.history[3] = z[3] + Real(2.0 / 3.0 * j.gamma * j.yield);
+        r.history[3] = z[3] + Real(2.0 / 3.0) * j.gamma * j.yield;
     }
     for (uint32_t i = 0u; i < 3u; ++i) r.history[i] = E[i] - e[i];
     r.stress[0] = Real(kHalfSqrt2) * (s[0] + s[1]);
@@ -279,7 +279,8 @@ NUKA_MF_HD inline MfStatus EvaluatePlaneStress(const PlaneStressLaw& law, const 
     r.stored = modulus * stored + Real(0.5) * hardening * r.history[3] * r.history[3];
     r.plastic = Real(law.yield) * grown;
     r.viscous = modulus * viscous;
-    r.beyond_range = fmax(fmax(fabs(double(E[0])), fabs(double(E[1]))), 0.5 * fabs(double(E[2]))) > law.range;
+    r.beyond_range =
+        std::fmax(std::fmax(std::fabs(E[0]), std::fabs(E[1])), Real(0.5) * std::fabs(E[2])) > Real(law.range);
     if (!math::IsFinite(r.psi)) return MfStatus::NonFinite;
     out = r;
     return MfStatus::Ok;

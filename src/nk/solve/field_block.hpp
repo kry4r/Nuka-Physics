@@ -9,6 +9,7 @@
 #include "math/vec3.hpp"
 #include "nk/material/field_response.hpp"
 #include "nk/solve/vertex_block.hpp"
+#include "nk/solve/vertex_block_forms.hpp"
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
 #define NUKA_MF_HD __host__ __device__
@@ -500,7 +501,7 @@ NUKA_MF_HD inline float Form(const FieldCurvature& c, const float (&x)[4], const
 }
 
 // Energy change as all vertices move by `shift`: the membrane strain change is formed of products of the moves,
-// and the hinge turns are measured in double before and after.
+// and each hinge turn is one relative rotation, as in the vertex descent.
 NUKA_MF_HD inline float ElementMovesEnergyChange(const MfElement& e, const MfMaterial& m, const float* history,
                                                 const FieldGeometry& g, const vbd::MembraneStartState* start,
                                                 float h, const Vec3 (&shift)[6]) {
@@ -532,31 +533,31 @@ NUKA_MF_HD inline float ElementMovesEnergyChange(const MfElement& e, const MfMat
             change += SeamChange(e, m, history, pair, SeamSeparation(g, pair), shift[2u * pair + 1u] - shift[2u * pair]);
         return change;
     }
-    double before[3] = {0.0, 0.0, 0.0}, after[3] = {0.0, 0.0, 0.0};
+    float before[3] = {0.0f, 0.0f, 0.0f}, after[3] = {0.0f, 0.0f, 0.0f}, step[3] = {0.0f, 0.0f, 0.0f};
+    bool exact = true;
     for (uint32_t i = 0u; i < 3u; ++i) {
         if (!((e.hinges >> i) & 1u)) continue;
-        const uint32_t v[4] = {(i + 1u) % 3u, (i + 2u) % 3u, i, FarVertex(e, i)};
-        vbd::Point x[4], y[4];
-        for (uint32_t k = 0u; k < 4u; ++k) {
-            x[k] = g.Precise(v[k]);
-            y[k] = {x[k].x + (double(shift[v[k]].x) - shift[0].x), x[k].y + (double(shift[v[k]].y) - shift[0].y),
-                    x[k].z + (double(shift[v[k]].z) - shift[0].z)};
-        }
-        double theta = 0.0;
-        const double keep = HingeKeep(history, i);
-        if (vbd::HingeAngle(x, &theta)) before[i] = keep * (theta - double(e.rest[10u + i]));
-        if (vbd::HingeAngle(y, &theta)) after[i] = keep * (theta - double(e.rest[10u + i]));
+        Vec3 x[4];
+        HingePoints(e, g, i, x);
+        const Vec3 move[4] = {shift[(i + 1u) % 3u], shift[(i + 2u) % 3u], shift[i], shift[FarVertex(e, i)]};
+        const float rest = e.rest[10u + i], keep = HingeKeep(history, i);
+        bool had = false, has = false;
+        float from = 0.0f, to = 0.0f, turn = 0.0f;
+        vbd::HingeMovesChange(x, move, &had, &has, &from, &to, &turn);
+        if (had) before[i] = keep * (from - rest);
+        if (has) after[i] = keep * (to - rest);
+        if (had && has && to == from + turn) step[i] = keep * turn;
+        else exact = false;
     }
-    double from_turn[3], to_turn[3];
-    Curvature(e, before, from_turn);
-    Curvature(e, after, to_turn);
-    float from[3], step[3], to[3];
-    for (uint32_t k = 0u; k < 3u; ++k) {
-        from[k] = float(from_turn[k]);
-        step[k] = float(to_turn[k] - from_turn[k]);
-        to[k] = from[k] + step[k];
+    float from[3], to[3], moved[3];
+    Curvature(e, before, from);
+    Curvature(e, step, moved);
+    if (exact) {
+        for (uint32_t r = 0u; r < 3u; ++r) to[r] = from[r] + moved[r];
+    } else {
+        Curvature(e, after, to);
     }
-    return e.rest[9] * ResponseChange(BendLaw(m), history, from, to, step, true, h);
+    return e.rest[9] * ResponseChange(BendLaw(m), history, from, to, moved, exact, h);
 }
 
 }  // namespace mf
