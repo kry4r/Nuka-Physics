@@ -2385,7 +2385,7 @@ __global__ void OpenTelemetryKernel(DataView data) {
 // Ends the sweep of each running env whose residuals pass the tolerance or whose budget is spent, keeping its
 // sweeps and residuals; a while node repeats the sweep as long as an env runs.
 __global__ void FinishSweepKernel(DataView data, BlockDescentSolveParams p, BlockScratch s,
-                                  cudaGraphConditionalHandle loop, bool graph) {
+                                  cudaGraphConditionalHandle loop) {
     __shared__ uint32_t running[kThreads];
     __shared__ uint32_t largest[kThreads];
     const uint32_t done = s.sweep_state[kSweepCount] + 1u;
@@ -2425,7 +2425,7 @@ __global__ void FinishSweepKernel(DataView data, BlockDescentSolveParams p, Bloc
     const uint32_t again = running[0] > 0u ? 1u : 0u;
     s.sweep_state[kSweepCount] = done;
     s.sweep_state[kSweepContinue] = again;
-    if (graph) cudaGraphSetConditional(loop, again);
+    cudaGraphSetConditional(loop, again);
     const uint32_t slot = SweepSampleSlot(done);
     if ((p.telemetry & nk::kTelemetrySweeps) == 0u || slot >= nk::kTelemetrySamples) return;
     nk::TelemetryRecord* record = OpenTelemetryRecord(data.telemetry);
@@ -2967,7 +2967,7 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
             return Status::Failed;
         return Status::Ok;
     };
-    const auto finish = [&](cudaStream_t stream, cudaGraphConditionalHandle loop, bool graph) {
+    const auto finish = [&](cudaStream_t stream, cudaGraphConditionalHandle loop) {
         if (!stamp(kPhaseCheck, stream)) return Status::Failed;
         // The contact and cloth vertex residuals need the measured contact response.
         if (p->measure_contact_residual != 0u &&
@@ -2975,23 +2975,23 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
              LaunchWork(VertexResidualsKernel, p->vertex_blocks.dynamic_vertices * p->env_count, kThreads / 32u,
                  stream, model, measured, *p, s) != cudaSuccess))
             return Status::Failed;
-        LaunchCuda(FinishSweepKernel, dim3(1u), dim3(kThreads), 0u, stream, data, *p, s, loop, graph);
+        LaunchCuda(FinishSweepKernel, dim3(1u), dim3(kThreads), 0u, stream, data, *p, s, loop);
         return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
     };
     if (sweep(true, stream) != Status::Ok) return Status::Failed;
-    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
-    if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess) return Status::Failed;
-    if (capture == cudaStreamCaptureStatusActive) {
-        // A captured solve loops on the device: a while node repeats the sweep that its last kernel allows.
+    // The later sweeps loop on the device: on `captured`, which records into a graph, a while node repeats the
+    // sweep that its last kernel allows.
+    const auto repeat = [&](cudaStream_t captured) {
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
         cudaGraph_t graph = nullptr;
         const cudaGraphNode_t* dependencies = nullptr;
         const cudaGraphEdgeData* edges = nullptr;
         size_t dependency_count = 0u;
         cudaGraphConditionalHandle loop{};
-        if (cudaStreamGetCaptureInfo(stream, &capture, nullptr, &graph) != cudaSuccess ||
+        if (cudaStreamGetCaptureInfo(captured, &capture, nullptr, &graph) != cudaSuccess ||
             cudaGraphConditionalHandleCreate(&loop, graph, 0u, 0u) != cudaSuccess ||
-            finish(stream, loop, true) != Status::Ok ||
-            cudaStreamGetCaptureInfo(stream, &capture, nullptr, &graph, &dependencies, &edges,
+            finish(captured, loop) != Status::Ok ||
+            cudaStreamGetCaptureInfo(captured, &capture, nullptr, &graph, &dependencies, &edges,
                 &dependency_count) != cudaSuccess) return Status::Failed;
         cudaGraphNodeParams node_params{};
         node_params.type = cudaGraphNodeTypeConditional;
@@ -3001,28 +3001,34 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
         cudaGraphNode_t node = nullptr;
         cudaStream_t body = nullptr;
         if (cudaGraphAddNode(&node, graph, dependencies, edges, dependency_count, &node_params) != cudaSuccess ||
-            cudaStreamUpdateCaptureDependencies(stream, &node, nullptr, 1u,
+            cudaStreamUpdateCaptureDependencies(captured, &node, nullptr, 1u,
                 cudaStreamSetCaptureDependencies) != cudaSuccess ||
             cudaStreamCreateWithFlags(&body, cudaStreamNonBlocking) != cudaSuccess) return Status::Failed;
-        cudaGraph_t captured = nullptr;
+        cudaGraph_t sweeps = nullptr;
         const bool recorded = cudaStreamBeginCaptureToGraph(body, node_params.conditional.phGraph_out[0],
                 nullptr, nullptr, 0u, cudaStreamCaptureModeThreadLocal) == cudaSuccess &&
-            sweep(false, body) == Status::Ok && finish(body, loop, true) == Status::Ok;
-        const bool ended = cudaStreamEndCapture(body, &captured) == cudaSuccess;
-        if (cudaStreamDestroy(body) != cudaSuccess || !recorded || !ended) return Status::Failed;
+            sweep(false, body) == Status::Ok && finish(body, loop) == Status::Ok;
+        const bool ended = cudaStreamEndCapture(body, &sweeps) == cudaSuccess;
+        return cudaStreamDestroy(body) == cudaSuccess && recorded && ended ? Status::Ok : Status::Failed;
+    };
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess) return Status::Failed;
+    if (capture == cudaStreamCaptureStatusActive) {
+        if (repeat(stream) != Status::Ok) return Status::Failed;
     } else {
-        if (finish(stream, {}, false) != Status::Ok) return Status::Failed;
-        // Without a tolerance every env runs the whole budget, so the loop needs no readback.
-        const bool check = p->velocity_tolerance > 0.0f;
-        for (uint32_t done = 1u; done < p->iterations; ++done) {
-            uint32_t again = 1u;
-            if (check && (cudaMemcpyAsync(&again, s.sweep_state + kSweepContinue, sizeof(again),
-                    cudaMemcpyDeviceToHost, stream) != cudaSuccess || cudaStreamSynchronize(stream) != cudaSuccess))
-                return Status::Failed;
-            if (again == 0u) break;
-            if (sweep(false, stream) != Status::Ok || finish(stream, {}, false) != Status::Ok)
-                return Status::Failed;
-        }
+        // An eager solve records the loop on a stream of its own and launches it once, not a launch per kernel.
+        cudaStream_t record = nullptr;
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t exec = nullptr;
+        if (cudaStreamCreateWithFlags(&record, cudaStreamNonBlocking) != cudaSuccess) return Status::Failed;
+        const bool recorded = cudaStreamBeginCapture(record, cudaStreamCaptureModeThreadLocal) == cudaSuccess &&
+                              repeat(record) == Status::Ok;
+        const bool ended = cudaStreamEndCapture(record, &graph) == cudaSuccess;
+        const bool launched = recorded && ended && cudaGraphInstantiate(&exec, graph, 0ull) == cudaSuccess &&
+                              cudaGraphLaunch(exec, stream) == cudaSuccess;
+        if ((exec != nullptr && cudaGraphExecDestroy(exec) != cudaSuccess) ||
+            (graph != nullptr && cudaGraphDestroy(graph) != cudaSuccess) ||
+            cudaStreamDestroy(record) != cudaSuccess || !launched) return Status::Failed;
     }
     if (!stamp(kPhaseEnd, stream)) return Status::Failed;
     if (LaunchWork(RestoreDualBaseKernel, s.rows, kThreads, stream, data, *p, s) != cudaSuccess ||
