@@ -200,6 +200,11 @@ struct ElementGeometry {
     }
 };
 
+// Entry `i` of a four-vertex array through selects, so a runtime index keeps the array in registers.
+NUKA_VBD_HD inline Vec3 VertexEntry(const Vec3* v, uint32_t i) {
+    return i == 0u ? v[0] : i == 1u ? v[1] : i == 2u ? v[2] : v[3];
+}
+
 // StVK membrane: F = sum_j x_j b_j^T with b_j the rows of the inverse material edges.
 // The strain keeps the two columns of F, the Green strain G = (F^T F - I) / 2 and J - 1.
 struct TriangleStrain {
@@ -533,7 +538,7 @@ NUKA_VBD_HD inline void HingeBlock(const VbdElement& e, uint32_t local, const Ve
     float theta = 0.0f;
     Vec3 q[4];
     if (!HingeAngleGradient(x, q, &theta)) return;
-    const Vec3 g = q[local];
+    const Vec3 g = VertexEntry(q, local);
     const float stiffness = e.rest[1];
     *gradient = g * (2.0f * stiffness * (theta - e.rest[0]));
     *hessian = Outer(g, 2.0f * stiffness);
@@ -670,15 +675,17 @@ NUKA_VBD_HD inline void ElementRayleighBlock(const VbdElement& e, uint32_t local
         return;
     }
     Vec3 x[4];
-    for (uint32_t j = 0u; j < VbdElementVertexCount(e.kind); ++j) x[j] = start.Relative(j);
+    for (uint32_t j = 0u; j < 4u; ++j)
+        if (j < VbdElementVertexCount(e.kind)) x[j] = start.Relative(j);
     if (e.kind == kVbdHinge) {
         Vec3 q[4];
         if (!HingeAngleGradient(x, q)) return;
         float angle_rate = 0.0f;
         for (uint32_t j = 1u; j < 4u; ++j) angle_rate += q[j].Dot(rate[j] - rate[0]);
         const float coefficient = 2.0f * e.rest[1];
-        *applied = q[local] * (coefficient * angle_rate);
-        *diagonal = Outer(q[local], coefficient);
+        const Vec3 own = VertexEntry(q, local);
+        *applied = own * (coefficient * angle_rate);
+        *diagonal = Outer(own, coefficient);
         return;
     }
     if (e.kind == kVbdSpring) {
@@ -775,8 +782,11 @@ NUKA_VBD_HD inline float ElementEnergyChange(const VbdElement& e, uint32_t local
                (had ? k * (before - rest) * (before - rest) : 0.0f);
     }
     Vec3 x[4], moved[4];
-    for (uint32_t j = 0u; j < VbdElementVertexCount(e.kind); ++j) x[j] = moved[j] = g.Relative(j);
-    moved[local] = x[local] + move;
+    for (uint32_t j = 0u; j < 4u; ++j) {
+        if (j >= VbdElementVertexCount(e.kind)) continue;
+        x[j] = g.Relative(j);
+        moved[j] = j == local ? x[j] + move : x[j];
+    }
     if (e.kind == kVbdSpring) {
         const float before = Norm(x[1] - x[0]), after = Norm(moved[1] - moved[0]);
         return 0.5f * e.rest[1] * (after - before) * (after + before - 2.0f * e.rest[0]);
@@ -807,7 +817,8 @@ NUKA_VBD_HD inline float ElementEnergy(const VbdElement& e, const ElementGeometr
         return float(e.rest[1] * delta * delta);
     }
     Vec3 x[4];
-    for (uint32_t j = 0u; j < VbdElementVertexCount(e.kind); ++j) x[j] = g.Relative(j);
+    for (uint32_t j = 0u; j < 4u; ++j)
+        if (j < VbdElementVertexCount(e.kind)) x[j] = g.Relative(j);
     if (e.kind == kVbdSpring) {
         const float delta = Norm(x[1] - x[0]) - e.rest[0];
         return 0.5f * e.rest[1] * delta * delta;
@@ -825,7 +836,8 @@ NUKA_VBD_HD inline void ElementBlock(const VbdElement& e, uint32_t local, const 
         return;
     }
     Vec3 x[4];
-    for (uint32_t j = 0u; j < VbdElementVertexCount(e.kind); ++j) x[j] = g.Relative(j);
+    for (uint32_t j = 0u; j < 4u; ++j)
+        if (j < VbdElementVertexCount(e.kind)) x[j] = g.Relative(j);
     switch (e.kind) {
         case kVbdHinge: HingeBlock(e, local, x, gradient, hessian); break;
         case kVbdSpring: SpringBlock(e, local, x, gradient, hessian); break;

@@ -1675,8 +1675,9 @@ __device__ Vec3 VertexTrial(Vec3 u, Vec3 direction, float scale) {
 }
 
 template <bool elastic>
-__global__ void DescendParticlesKernel(ModelView model, DataView data, BlockDescentSolveParams p,
-                                       BlockScratch s, uint32_t color) {
+__global__ void __launch_bounds__(kThreads, 3) DescendParticlesKernel(ModelView model, DataView data,
+                                                                      BlockDescentSolveParams p, BlockScratch s,
+                                                                      uint32_t color) {
     __shared__ DescendTileVertex tile[kDescendTileVertices];
     __shared__ uint32_t totals[2];
     __shared__ uint32_t kind_cursor[kDescendElementKinds];

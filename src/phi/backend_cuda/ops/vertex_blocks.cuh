@@ -135,12 +135,21 @@ __device__ inline Geometry StepGeometry(const VertexBlockView& b, const math::Ve
                                         const uint32_t* vertex, uint32_t count, uint32_t env) {
     Geometry geometry;
     const math::Vec3 rate = velocity[b.Particle(env, vertex[0])];
-    for (uint32_t j = 0u; j < count; ++j) {
+    // A loop over every slot, not to `count`, keeps the slots in registers.
+    for (uint32_t j = 0u; j < sizeof(Geometry::start) / sizeof(math::Vec3); ++j) {
+        if (j >= count) continue;
         const uint32_t particle = b.Particle(env, vertex[j]);
         geometry.start[j] = b.start[particle];
         geometry.delta[j] = (velocity[particle] - rate) * b.dt;
     }
     return geometry;
+}
+
+// The displacement of slot `local`, set through selects for the same reason.
+template <class Geometry>
+__device__ inline void SetDelta(Geometry& geometry, uint32_t local, math::Vec3 delta) {
+    for (uint32_t j = 0u; j < sizeof(Geometry::delta) / sizeof(math::Vec3); ++j)
+        if (j == local) geometry.delta[j] = delta;
 }
 
 __device__ inline nk::vbd::ElementGeometry ElementStepGeometry(const VertexBlockView& b,
@@ -172,7 +181,8 @@ __device__ inline void VertexElementRayleigh(const VertexBlockView& b, const mat
                                             const nk::vbd::MembraneStartState* membrane = nullptr) {
     nk::vbd::ElementGeometry start;
     math::Vec3 rates[4];
-    for (uint32_t j = 0u; j < nk::VbdElementVertexCount(element.kind); ++j) {
+    for (uint32_t j = 0u; j < 4u; ++j) {
+        if (j >= nk::VbdElementVertexCount(element.kind)) continue;
         const uint32_t particle = b.Particle(env, element.vertex[j]);
         start.start[j] = b.start[particle];
         rates[j] = j == local ? own : velocity[particle];
@@ -281,7 +291,7 @@ __device__ inline VertexElementChangeTerms VertexElementChange(
         ? b.membrane_start + env * b.layout.elements + element_index : nullptr;
     const uint32_t local = nk::VbdIncidenceLocal(packed);
     nk::vbd::ElementGeometry geometry = ElementStepGeometry(b, velocity, element, env);
-    geometry.delta[local] = (from - velocity[b.Particle(env, element.vertex[0])]) * b.dt;
+    SetDelta(geometry, local, (from - velocity[b.Particle(env, element.vertex[0])]) * b.dt);
     VertexElementChangeTerms terms{
         nk::vbd::ElementEnergyChange(element, local, geometry, move * b.dt, start), 0.0f,
         element.damping};
@@ -303,7 +313,7 @@ __device__ inline VertexElementChangeTerms FieldElementChange(
     const nk::MfElement element = b.field_elements[index];
     const uint32_t local = nk::MfIncidenceLocal(packed);
     nk::mf::FieldGeometry geometry = FieldStepGeometry(b, velocity, element, env);
-    geometry.delta[local] = (from - velocity[b.Particle(env, element.vertex[0])]) * b.dt;
+    SetDelta(geometry, local, (from - velocity[b.Particle(env, element.vertex[0])]) * b.dt);
     return {nk::mf::ElementEnergyChange(element, b.field_materials[element.material], FieldHistory(b, env, index),
                                         local, geometry, FieldStart(b, env, index), b.dt, move * b.dt),
             0.0f, 0.0f};
@@ -342,7 +352,7 @@ __device__ inline bool FieldElementStateValid(const VertexBlockView& b, const ma
     const uint32_t index = nk::MfIncidenceElement(packed);
     const nk::MfElement element = b.field_elements[index];
     nk::mf::FieldGeometry geometry = FieldStepGeometry(b, velocity, element, env);
-    geometry.delta[nk::MfIncidenceLocal(packed)] = (from - velocity[b.Particle(env, element.vertex[0])]) * b.dt;
+    SetDelta(geometry, nk::MfIncidenceLocal(packed), (from - velocity[b.Particle(env, element.vertex[0])]) * b.dt);
     return nk::mf::ElementStateValid(element, geometry, FieldStart(b, env, index)) &&
            fabs(nk::mf::ElementEnergy(element, b.field_materials[element.material], FieldHistory(b, env, index),
                                       geometry)) <= FLT_MAX;
@@ -365,7 +375,7 @@ __device__ inline bool VertexEnergyStateValid(const VertexBlockView& b, const ma
             ? b.membrane_start + env * b.layout.elements + element_index : nullptr;
         const uint32_t local = nk::VbdIncidenceLocal(packed);
         nk::vbd::ElementGeometry geometry = ElementStepGeometry(b, velocity, element, env);
-        geometry.delta[local] = (from - velocity[b.Particle(env, element.vertex[0])]) * b.dt;
+        SetDelta(geometry, local, (from - velocity[b.Particle(env, element.vertex[0])]) * b.dt);
         valid &= fabsf(nk::vbd::ElementEnergy(element, geometry)) <= FLT_MAX;
         if (element.kind == nk::kVbdTriangle) {
             const auto strain = start != nullptr ? nk::vbd::MembraneStrain(element, geometry, *start)
