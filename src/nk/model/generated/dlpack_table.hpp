@@ -388,6 +388,7 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::PhysicsStageMetrics, DlpackDtype::kF32, 2, true},  // physics_stage_metrics
     {FieldId::ContactAuditCounts, DlpackDtype::kU32, 2, true},  // contact_audit_counts
     {FieldId::ContactAuditMetrics, DlpackDtype::kU64, 2, true},  // contact_audit_metrics
+    {FieldId::ReadoutPartials, DlpackDtype::kF64, 2, false},  // readout_partials
     {FieldId::EnergyParticleStart, DlpackDtype::kF32, 2, false},  // energy_particle_start
     {FieldId::EnergyAeroImpulse, DlpackDtype::kF32, 2, false},  // energy_aero_impulse
     {FieldId::EnergyKinematicContactImpulse, DlpackDtype::kF32, 2, false},  // energy_kinematic_contact_impulse

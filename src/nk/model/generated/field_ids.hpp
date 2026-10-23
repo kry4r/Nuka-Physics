@@ -374,6 +374,7 @@ enum class FieldId : uint16_t {
     PhysicsStageMetrics,  // physics_stage_metrics (per:scalar arena:scratch owner:data elem:195 count:integration_substeps*env_count flags:[readout])
     ContactAuditCounts,  // contact_audit_counts (per:scalar arena:scratch owner:data elem:8 count:integration_substeps*env_count flags:[readout])
     ContactAuditMetrics,  // contact_audit_metrics (per:scalar arena:scratch owner:data elem:7 count:integration_substeps*env_count flags:[readout])
+    ReadoutPartials,  // readout_partials (per:scalar arena:scratch owner:data elem:195 count:max(env_count,readout_partial_rows))
     EnergyParticleStart,  // energy_particle_start (per:particle arena:scratch owner:data)
     EnergyAeroImpulse,  // energy_aero_impulse (per:particle arena:scratch owner:data)
     EnergyKinematicContactImpulse,  // energy_kinematic_contact_impulse (per:particle arena:scratch owner:data)
@@ -781,6 +782,7 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "physics_stage_metrics",
     "contact_audit_counts",
     "contact_audit_metrics",
+    "readout_partials",
     "energy_particle_start",
     "energy_aero_impulse",
     "energy_kinematic_contact_impulse",

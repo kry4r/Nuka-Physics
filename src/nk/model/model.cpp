@@ -21,6 +21,7 @@
 #include "nk/solve/vertex_block_hierarchy.hpp"
 #include "nk/contact/contact_identity.hpp"
 #include "nk/material/hencky_j2.hpp"
+#include "nk/readout/energy_ledger.hpp"
 #include "phi/op_schema.hpp"  // phi::kShapeTableRowStride / kSdfHeaderStride (host-safe)
 #include "phi/articulation_contract.hpp"
 
@@ -172,6 +173,7 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
             id == FieldId::VbdForceResidualWork || id == FieldId::PhysicsStageMetrics ||
             id == FieldId::ContactAuditCounts || id == FieldId::ContactAuditMetrics)
             return CheckedProduct({integration_substeps, env_count});
+        if (id == FieldId::ReadoutPartials) return std::max<uint64_t>(env_count, kReadoutPartialRows);
         if (id == FieldId::SolverSweepTrace) return CheckedProduct({solver_trace_sweeps, env_count});
         if (id == FieldId::OgcSourceOffsets)
             return ogc_contacts_per_env > 0u

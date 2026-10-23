@@ -18,6 +18,8 @@ enum class EnergyColumn : uint32_t {
 
 inline constexpr uint32_t kEnergyColumnCount = static_cast<uint32_t>(EnergyColumn::Count);
 inline constexpr uint32_t kEnergyStageCount = static_cast<uint32_t>(EnergyStage::Count);
+// Partial rows the readouts may split their envs over; past this many envs each env takes one row.
+inline constexpr uint32_t kReadoutPartialRows = 512u;
 
 namespace energy_status {
 inline constexpr uint32_t kNonfinite = 1u << 0;

@@ -23,6 +23,7 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::PhysicsStageMetrics: v.physics_stage_metrics = static_cast<float*>(p); break;
         case FieldId::ContactAuditCounts: v.contact_audit_counts = static_cast<uint32_t*>(p); break;
         case FieldId::ContactAuditMetrics: v.contact_audit_metrics = static_cast<uint64_t*>(p); break;
+        case FieldId::ReadoutPartials: v.readout_partials = static_cast<double*>(p); break;
         case FieldId::VbdForceResidualWork: v.vbd_force_residual_work = static_cast<float*>(p); break;
         case FieldId::EnergyParticleStart: v.energy_particle_start = static_cast<math::Vec3*>(p); break;
         case FieldId::EnergyAeroImpulse: v.energy_aero_impulse = static_cast<math::Vec3*>(p); break;

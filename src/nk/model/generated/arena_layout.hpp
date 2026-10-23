@@ -413,6 +413,7 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 195, 1, 780, 0},  // physics_stage_metrics
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 8, 1, 32, 0},  // contact_audit_counts
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 7, 1, 56, 0},  // contact_audit_metrics
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 195, 1, 1560, 0},  // readout_partials
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // energy_particle_start
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // energy_aero_impulse
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // energy_kinematic_contact_impulse

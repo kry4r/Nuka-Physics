@@ -411,6 +411,7 @@ struct DataView {
     float* physics_stage_metrics = nullptr;  // per:scalar arena:scratch owner:data elem:195 count:integration_substeps*env_count flags:[readout]
     uint32_t* contact_audit_counts = nullptr;  // per:scalar arena:scratch owner:data elem:8 count:integration_substeps*env_count flags:[readout]
     uint64_t* contact_audit_metrics = nullptr;  // per:scalar arena:scratch owner:data elem:7 count:integration_substeps*env_count flags:[readout]
+    double* readout_partials = nullptr;  // per:scalar arena:scratch owner:data elem:195 count:max(env_count,readout_partial_rows)
     ::nuka::math::Vec3* energy_particle_start = nullptr;  // per:particle arena:scratch owner:data
     ::nuka::math::Vec3* energy_aero_impulse = nullptr;  // per:particle arena:scratch owner:data
     ::nuka::math::Vec3* energy_kinematic_contact_impulse = nullptr;  // per:particle arena:scratch owner:data

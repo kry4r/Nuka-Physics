@@ -788,6 +788,7 @@ fields:
   - {name: physics_stage_metrics, dtype: f32, per: scalar, count: "integration_substeps*env_count", elem: 195, arena: scratch, owner: data, flags: [readout]}
   - {name: contact_audit_counts, dtype: u32, per: scalar, count: "integration_substeps*env_count", elem: 8, arena: scratch, owner: data, flags: [readout]}
   - {name: contact_audit_metrics, dtype: u64, per: scalar, count: "integration_substeps*env_count", elem: 7, arena: scratch, owner: data, flags: [readout]}
+  - {name: readout_partials, dtype: f64, per: scalar, count: "max(env_count,readout_partial_rows)", elem: 195, arena: scratch, owner: data}
   - {name: energy_particle_start, dtype: vec3, per: particle, arena: scratch, owner: data}
   - {name: energy_aero_impulse, dtype: vec3, per: particle, arena: scratch, owner: data}
   - {name: energy_kinematic_contact_impulse, dtype: vec3, per: particle, arena: scratch, owner: data}

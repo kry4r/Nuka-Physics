@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include "phi/backend_cuda/ops/contact_row_layout.cuh"
 
+#include <algorithm>
 #include <cmath>
 #include <cfloat>
 #include <limits>
@@ -32,6 +33,9 @@ constexpr uint32_t kColumns = nk::kEnergyColumnCount;
 constexpr uint32_t kForceWorkColumn = kColumns;
 constexpr uint32_t kReductionColumns = kColumns + 1u;
 static_assert(kColumns == 34u, "energy field record must match its named columns");
+// A partial row holds one block's column totals, wide enough for the stage metrics.
+constexpr uint32_t kPartialWidth = nk::kPhysicsStageColumnCount;
+static_assert(kReductionColumns <= kPartialWidth);
 
 __device__ uint32_t Column(EnergyColumn value) { return static_cast<uint32_t>(value); }
 __device__ double Dot(Vec3 a, Vec3 b) {
@@ -62,10 +66,66 @@ __device__ Vec3 ParticleVelocity(const DataView& d, const ReadoutEnergyLedgerPar
 }
 
 // Skip cleared contact rows while retaining each thread's row order and noncontact assignments.
-__device__ uint32_t LedgerRow(uint32_t row, uint32_t bound, uint32_t contacts) {
+__device__ uint32_t LedgerRow(uint32_t row, uint32_t bound, uint32_t contacts, uint32_t stride) {
     if (row < contacts && row >= bound)
-        row += ((contacts - row - 1u) / blockDim.x + 1u) * blockDim.x;
+        row += ((contacts - row - 1u) / stride + 1u) * stride;
     return row;
+}
+
+// A readout block's share of its env: the env's blocks stride its item lists together.
+struct ReadoutSlice {
+    uint32_t env;
+    uint32_t first;
+    uint32_t stride;
+};
+
+__device__ ReadoutSlice Slice(uint32_t env_count) {
+    const uint32_t parts = gridDim.x / env_count, part = blockIdx.x % parts;
+    return {blockIdx.x / parts, part * blockDim.x + threadIdx.x, parts * blockDim.x};
+}
+
+struct SumColumns {
+    __device__ double operator()(uint32_t, double a, double b) const { return a + b; }
+};
+
+// Stage metrics combine by column kind; a nonfinite operand poisons the column.
+struct CombineStageMetric {
+    __device__ double operator()(uint32_t c, double a, double b) const {
+        using C = nk::PhysicsStageColumn;
+        if (!isfinite(a) || !isfinite(b)) return double(nanf(""));
+        if (c == static_cast<uint32_t>(C::MinVbdEffectiveDt)) return fmin(a, b);
+        if (c == static_cast<uint32_t>(C::MaxVbdMomentumVelocityError) || c == static_cast<uint32_t>(C::MaxVbdForce) ||
+            c == static_cast<uint32_t>(C::MaxVbdEffectiveDt) || c == static_cast<uint32_t>(C::MaxPassiveRowEnergyGain) ||
+            c == static_cast<uint32_t>(C::MaxAbsoluteVertexResidualWork)) return fmax(a, b);
+        return a + b;
+    }
+};
+
+// Stores the block's column totals in its partial row: warp shuffles, then one thread per column over the warps.
+template <uint32_t columns, class Combine>
+__device__ void StorePartial(const double (&values)[columns], double* partial, Combine combine) {
+    __shared__ double warps[kThreads / 32u][columns];
+    const uint32_t lane = threadIdx.x % 32u, warp = threadIdx.x / 32u;
+    for (uint32_t c = 0u; c < columns; ++c) {
+        double v = values[c];
+        for (uint32_t offset = 16u; offset > 0u; offset /= 2u)
+            v = combine(c, v, __shfl_down_sync(0xffffffffu, v, offset));
+        if (lane == 0u) warps[warp][c] = v;
+    }
+    __syncthreads();
+    for (uint32_t c = threadIdx.x; c < columns; c += blockDim.x) {
+        double v = warps[0][c];
+        for (uint32_t w = 1u; w < kThreads / 32u; ++w) v = combine(c, v, warps[w][c]);
+        partial[c] = v;
+    }
+}
+
+// One column of an env's partial rows, combined in part order.
+template <class Combine>
+__device__ double CombineParts(const double* partials, uint32_t parts, uint32_t c, Combine combine) {
+    double v = partials[c];
+    for (uint32_t part = 1u; part < parts; ++part) v = combine(c, v, partials[size_t{part} * kPartialWidth + c]);
+    return v;
 }
 
 // Read-only FK uses private poses and world velocities; dynamics scratch stays untouched.
@@ -308,24 +368,25 @@ __device__ double KinematicElasticWork(const ModelView& m, const DataView& d,
     return KinematicElasticReaction(m, d, p, particle).work;
 }
 
-__global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerParams p) {
-    const uint32_t env = blockIdx.x;
-    if (env >= p.env_count) return;
-    const size_t record = size_t{env} * p.substeps + p.slot;
-    float* output = d.energy_ledger + record * kColumns;
-    double* sum = d.energy_ledger_sum + record * kColumns;
-    uint32_t* coverage = d.energy_ledger_status + record;
-    if (p.stage == EnergyStage::Begin) {
-        if (threadIdx.x == 0u) {
-            *coverage = p.coverage_status;
-            d.vbd_force_residual_work[record] = 0.0f;
-        }
-        for (uint32_t c = threadIdx.x; c < kColumns; c += blockDim.x) {
-            output[c] = 0.0f;
-            sum[c] = 0.0;
-        }
+// Opens a substep's ledger before its blocks report coverage.
+__global__ void BeginEnergyLedgerKernel(DataView d, ReadoutEnergyLedgerParams p) {
+    const size_t record = size_t{blockIdx.x} * p.substeps + p.slot;
+    if (threadIdx.x == 0u) {
+        d.energy_ledger_status[record] = p.coverage_status;
+        d.vbd_force_residual_work[record] = 0.0f;
     }
-    __syncthreads();
+    for (uint32_t c = threadIdx.x; c < kColumns; c += blockDim.x) {
+        d.energy_ledger[record * kColumns + c] = 0.0f;
+        d.energy_ledger_sum[record * kColumns + c] = 0.0;
+    }
+}
+
+// Each block sums its share of one env into its partial row.
+__global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerParams p) {
+    const ReadoutSlice s = Slice(p.env_count);
+    const uint32_t env = s.env;
+    const size_t record = size_t{env} * p.substeps + p.slot;
+    uint32_t* coverage = d.energy_ledger_status + record;
     double values[kReductionColumns]{};
     const auto add = [&](EnergyColumn column, double value) {
         const uint32_t c = Column(column);
@@ -338,7 +399,7 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
     };
     double kinetic = 0.0, gravity = 0.0, elastic = 0.0, position = 0.0;
     const Vec3 g{p.gravity[0], p.gravity[1], p.gravity[2]};
-    for (uint32_t local = threadIdx.x; local < p.particles_per_env; local += blockDim.x) {
+    for (uint32_t local = s.first; local < p.particles_per_env; local += s.stride) {
         const uint32_t particle = env * p.particles_per_env + local;
         if (p.stage == EnergyStage::Begin) d.energy_particle_start[particle] = d.particle_pos[particle];
         const Vec3 velocity = ParticleVelocity(d, p, particle);
@@ -381,7 +442,7 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
             add(EnergyColumn::AeroWork, Dot(d.energy_aero_impulse[particle],
                 d.particle_pos[particle] - d.energy_particle_start[particle]) / p.dt);
     }
-    for (uint32_t local = threadIdx.x; local < p.bodies_per_env; local += blockDim.x) {
+    for (uint32_t local = s.first; local < p.bodies_per_env; local += s.stride) {
         const uint32_t body = env * p.bodies_per_env + local;
         if (m.body_to_link && m.body_to_link[body] != ~0u) continue;
         if (p.stage == EnergyStage::Begin &&
@@ -404,7 +465,7 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
                 atomicOr(coverage, nk::energy_status::kRigidAngularPositionWork);
         }
     }
-    for (uint32_t local = threadIdx.x; local < p.links_per_env; local += blockDim.x) {
+    for (uint32_t local = s.first; local < p.links_per_env; local += s.stride) {
         const uint32_t link = env * p.links_per_env + local;
         if (p.stage == EnergyStage::Begin) {
             d.energy_link_start_q[link] = d.q[link];
@@ -443,7 +504,7 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
                 d.energy_link_start_qdot[link] * displacement);
         }
     }
-    for (uint32_t i = threadIdx.x; i < p.vbd_elements; i += blockDim.x) {
+    for (uint32_t i = s.first; i < p.vbd_elements; i += s.stride) {
         const auto element = m.vbd_elements[i];
         const uint32_t count = nk::VbdElementVertexCount(element.kind);
         nk::vbd::ElementGeometry x, unprojected, frozen;
@@ -477,7 +538,7 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
                 Dot(applied, average));
         }
     }
-    for (uint32_t i = threadIdx.x; i < p.field_elements; i += blockDim.x) {
+    for (uint32_t i = s.first; i < p.field_elements; i += s.stride) {
         const nk::MfElement element = m.mf_elements[i];
         const nk::MfMaterial material = m.mf_materials[element.material];
         const size_t slot = size_t{env} * p.field_elements + i;
@@ -511,8 +572,8 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
         const uint32_t first_drive = first_friction + p.friction_rows;
         const auto* rows = reinterpret_cast<const NkRow*>(d.urows);
         const uint32_t bound = ContactRowBound(d.contact_row_extent, env, p.contact_rows);
-        for (uint32_t local = LedgerRow(threadIdx.x, bound, p.contact_rows); local < p.rows_per_env;
-             local = LedgerRow(local + blockDim.x, bound, p.contact_rows)) {
+        for (uint32_t local = LedgerRow(s.first, bound, p.contact_rows, s.stride); local < p.rows_per_env;
+             local = LedgerRow(local + s.stride, bound, p.contact_rows, s.stride)) {
             const uint32_t row = env * p.rows_per_env + local;
             const double impulse = d.lambda[row];
             if (impulse == 0.0) continue;
@@ -550,21 +611,24 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
         add(EnergyColumn::EndGravity, gravity);
         add(EnergyColumn::EndElastic, elastic);
     }
-    __shared__ double reduction[kThreads];
-    for (uint32_t c = 0u; c < kReductionColumns; ++c) {
-        reduction[threadIdx.x] = values[c];
-        __syncthreads();
-        for (uint32_t stride = blockDim.x / 2u; stride > 0u; stride /= 2u) {
-            if (threadIdx.x < stride) reduction[threadIdx.x] += reduction[threadIdx.x + stride];
-            __syncthreads();
-        }
-        if (threadIdx.x == 0u) {
-            if (!isfinite(reduction[0])) atomicOr(coverage, nk::energy_status::kNonfinite);
-            if (c == kForceWorkColumn) d.vbd_force_residual_work[record] += float(reduction[0]);
-            else output[c] = float(sum[c] += reduction[0]);
-        }
-        __syncthreads();
+    StorePartial(values, d.readout_partials + size_t{blockIdx.x} * kPartialWidth, SumColumns{});
+}
+
+// Adds an env's partial rows to its ledger in part order; the end stage then closes the balance.
+__global__ void FinishEnergyLedgerKernel(DataView d, ReadoutEnergyLedgerParams p, uint32_t parts) {
+    const uint32_t env = blockIdx.x;
+    const size_t record = size_t{env} * p.substeps + p.slot;
+    float* output = d.energy_ledger + record * kColumns;
+    double* sum = d.energy_ledger_sum + record * kColumns;
+    uint32_t* coverage = d.energy_ledger_status + record;
+    const double* partials = d.readout_partials + size_t{env} * parts * kPartialWidth;
+    for (uint32_t c = threadIdx.x; c < kReductionColumns; c += blockDim.x) {
+        const double total = CombineParts(partials, parts, c, SumColumns{});
+        if (!isfinite(total)) atomicOr(coverage, nk::energy_status::kNonfinite);
+        if (c == kForceWorkColumn) d.vbd_force_residual_work[record] += float(total);
+        else output[c] = float(sum[c] += total);
     }
+    __syncthreads();
     if (p.stage != EnergyStage::End || threadIdx.x != 0u) return;
     const auto get = [&](EnergyColumn column) { return sum[Column(column)]; };
     const auto set = [&](EnergyColumn column, double value) {
@@ -604,8 +668,8 @@ __device__ bool Finite(math::Transform pose) {
 __global__ void PhysicsStageMetricsKernel(ModelView m, DataView d, ReadoutEnergyLedgerParams p) {
     using C = nk::PhysicsStageColumn;
     constexpr uint32_t columns = nk::kPhysicsStageColumnCount;
-    const uint32_t env = blockIdx.x;
-    const size_t record = size_t{env} * p.substeps + p.slot;
+    const ReadoutSlice s = Slice(p.env_count);
+    const uint32_t env = s.env;
     double values[columns]{};
     values[static_cast<uint32_t>(C::MinVbdEffectiveDt)] = DBL_MAX;
     const auto add = [&](C c, double value) { values[static_cast<uint32_t>(c)] += value; };
@@ -626,7 +690,7 @@ __global__ void PhysicsStageMetricsKernel(ModelView m, DataView d, ReadoutEnergy
         add(C::AngularMomentumY, spin.y + double(position.z) * linear[0] - double(position.x) * linear[2]);
         add(C::AngularMomentumZ, spin.z + double(position.x) * linear[1] - double(position.y) * linear[0]);
     };
-    for (uint32_t local = threadIdx.x; local < p.particles_per_env; local += blockDim.x) {
+    for (uint32_t local = s.first; local < p.particles_per_env; local += s.stride) {
         const uint32_t particle = env * p.particles_per_env + local;
         const Vec3 velocity = ParticleVelocity(d, p, particle);
         const Vec3 position = p.stage == EnergyStage::Free || p.stage == EnergyStage::Solved
@@ -675,7 +739,7 @@ __global__ void PhysicsStageMetricsKernel(ModelView m, DataView d, ReadoutEnergy
             ? fmaxf(fabsf(force.x), fmaxf(fabsf(force.y), fabsf(force.z))) : nanf(""));
         maximum(C::MaxAbsoluteVertexResidualWork, fabs(Dot(force, displacement)));
     }
-    for (uint32_t local = threadIdx.x; local < p.bodies_per_env; local += blockDim.x) {
+    for (uint32_t local = s.first; local < p.bodies_per_env; local += s.stride) {
         const uint32_t body = env * p.bodies_per_env + local;
         if (m.body_to_link && m.body_to_link[body] != ~0u) continue;
         const auto pose = ComposeFrame(d.body_pose[body], d.body_inertial_frame[body]);
@@ -692,7 +756,7 @@ __global__ void PhysicsStageMetricsKernel(ModelView m, DataView d, ReadoutEnergy
              inverse.z > 0.0f ? angular.z / inverse.z : 0.0f});
         momentum(1.0 / inverse_mass, pose.position, velocity, spin);
     }
-    for (uint32_t local = threadIdx.x; local < p.links_per_env; local += blockDim.x) {
+    for (uint32_t local = s.first; local < p.links_per_env; local += s.stride) {
         const uint32_t link = env * p.links_per_env + local;
         const auto pose = d.energy_link_pose[link];
         const auto world = d.energy_link_velocity[link];
@@ -717,8 +781,8 @@ __global__ void PhysicsStageMetricsKernel(ModelView m, DataView d, ReadoutEnergy
         const auto* rows = reinterpret_cast<const NkRow*>(d.urows);
         const uint32_t first_drive = p.contact_rows + p.limit_rows + p.friction_rows;
         const uint32_t bound = ContactRowBound(d.contact_row_extent, env, p.contact_rows);
-        for (uint32_t local = LedgerRow(threadIdx.x, bound, p.contact_rows); local < p.rows_per_env;
-             local = LedgerRow(local + blockDim.x, bound, p.contact_rows)) {
+        for (uint32_t local = LedgerRow(s.first, bound, p.contact_rows, s.stride); local < p.rows_per_env;
+             local = LedgerRow(local + s.stride, bound, p.contact_rows, s.stride)) {
             const uint32_t row = env * p.rows_per_env + local;
             const auto r = rows[row];
             if (!(r.flags & nk::nk_row_flags::kActive)) continue;
@@ -733,32 +797,22 @@ __global__ void PhysicsStageMetricsKernel(ModelView m, DataView d, ReadoutEnergy
             }
         }
     }
-    __shared__ double reduction[kThreads];
+    StorePartial(values, d.readout_partials + size_t{blockIdx.x} * kPartialWidth, CombineStageMetric{});
+}
+
+// Combines an env's partial rows of stage metrics in part order.
+__global__ void FinishStageMetricsKernel(DataView d, ReadoutEnergyLedgerParams p, uint32_t parts) {
+    using C = nk::PhysicsStageColumn;
+    constexpr uint32_t columns = nk::kPhysicsStageColumnCount;
+    const size_t record = size_t{blockIdx.x} * p.substeps + p.slot;
+    const double* partials = d.readout_partials + size_t{blockIdx.x} * parts * kPartialWidth;
     float* output = d.physics_stage_metrics +
         (record * nk::kEnergyStageCount + static_cast<uint32_t>(p.stage)) * columns;
-    for (uint32_t c = 0u; c < columns; ++c) {
-        const bool minimum = c == static_cast<uint32_t>(C::MinVbdEffectiveDt);
-        const bool maximum = c == static_cast<uint32_t>(C::MaxVbdMomentumVelocityError) ||
-            c == static_cast<uint32_t>(C::MaxVbdForce) || c == static_cast<uint32_t>(C::MaxVbdEffectiveDt) ||
-            c == static_cast<uint32_t>(C::MaxPassiveRowEnergyGain) ||
-            c == static_cast<uint32_t>(C::MaxAbsoluteVertexResidualWork);
-        reduction[threadIdx.x] = values[c];
-        __syncthreads();
-        for (uint32_t stride = blockDim.x / 2u; stride > 0u; stride /= 2u) {
-            if (threadIdx.x < stride) {
-                const double other = reduction[threadIdx.x + stride];
-                double& held = reduction[threadIdx.x];
-                held = !isfinite(held) || !isfinite(other) ? double(nanf("")) :
-                    minimum ? fmin(held, other) : maximum ? fmax(held, other) : held + other;
-            }
-            __syncthreads();
-        }
-        if (threadIdx.x == 0u) {
-            output[c] = c == static_cast<uint32_t>(C::Dt) ? p.dt :
-                minimum && reduction[0] == DBL_MAX ? 0.0f : float(reduction[0]);
-            if (!isfinite(output[c])) atomicOr(d.energy_ledger_status + record, nk::energy_status::kNonfinite);
-        }
-        __syncthreads();
+    for (uint32_t c = threadIdx.x; c < columns; c += blockDim.x) {
+        const double total = CombineParts(partials, parts, c, CombineStageMetric{});
+        output[c] = c == static_cast<uint32_t>(C::Dt) ? p.dt :
+            c == static_cast<uint32_t>(C::MinVbdEffectiveDt) && total == DBL_MAX ? 0.0f : float(total);
+        if (!isfinite(output[c])) atomicOr(d.energy_ledger_status + record, nk::energy_status::kNonfinite);
     }
 }
 
@@ -858,19 +912,24 @@ __device__ bool AuditBodyParticleGap(const ModelView& m, const DataView& d, cons
     return surface.valid && isfinite(*gap);
 }
 
+// The solved stage opens a substep's contact audit before its blocks count into it.
+__global__ void ClearContactAuditKernel(DataView d, ReadoutEnergyLedgerParams p) {
+    const size_t record = size_t{blockIdx.x} * p.substeps + p.slot;
+    for (uint32_t i = threadIdx.x; i < nk::kContactAuditCountSize; i += blockDim.x)
+        d.contact_audit_counts[record * nk::kContactAuditCountSize + i] = 0u;
+    for (uint32_t i = threadIdx.x; i < nk::kContactAuditMetricCount; i += blockDim.x)
+        d.contact_audit_metrics[record * nk::kContactAuditMetricCount + i] = 0u;
+}
+
 // Impulse laws use the solved state; closest-feature gaps use the committed state.
 __global__ void ContactAuditKernel(ModelView m, DataView d, ReadoutEnergyLedgerParams p, SurfaceQueryView surfaces) {
     using C = nk::ContactAuditCount;
     using M = nk::ContactAuditMetric;
-    const uint32_t env = blockIdx.x;
+    const ReadoutSlice s = Slice(p.env_count);
+    const uint32_t env = s.env;
     const size_t record = size_t{env} * p.substeps + p.slot;
     uint32_t* counts = d.contact_audit_counts + record * nk::kContactAuditCountSize;
     uint64_t* metrics = d.contact_audit_metrics + record * nk::kContactAuditMetricCount;
-    if (p.stage == EnergyStage::Solved) {
-        for (uint32_t i = threadIdx.x; i < nk::kContactAuditCountSize; i += blockDim.x) counts[i] = 0u;
-        for (uint32_t i = threadIdx.x; i < nk::kContactAuditMetricCount; i += blockDim.x) metrics[i] = 0u;
-    }
-    __syncthreads();
     PointMassView points;
     points.ranges = d.point_endpoint_ranges;
     points.terms = d.point_endpoint_terms;
@@ -882,7 +941,7 @@ __global__ void ContactAuditKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
         atomicMax(reinterpret_cast<unsigned long long*>(metrics + static_cast<uint32_t>(column)), packed);
     };
     const uint32_t bound = ContactRowBound(d.contact_row_extent, env, p.contact_rows);
-    for (uint32_t local = threadIdx.x; local < bound; local += blockDim.x) {
+    for (uint32_t local = s.first; local < bound; local += s.stride) {
         const uint32_t slot = env * p.rows_per_env + local;
         const auto normal = rows[slot];
         if (!(normal.flags & nk::nk_row_flags::kActive) ||
@@ -946,14 +1005,25 @@ __global__ void ContactAuditKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
     }
 }
 
+// Blocks per env of the readouts: one per kThreads items of the env's longest list, within the partial rows.
+uint32_t ReadoutParts(const ReadoutEnergyLedgerParams& p) {
+    const uint32_t items = std::max({p.particles_per_env, p.bodies_per_env, p.links_per_env, p.vbd_elements,
+                                     p.field_elements, p.rows_per_env, 1u});
+    return std::min((items + kThreads - 1u) / kThreads, std::max(1u, nk::kReadoutPartialRows / p.env_count));
+}
+
 Status OpReadoutContactAudit(const ModelView& m, const DataView& d, const void* params, cudaStream_t stream) {
     const auto* p = static_cast<const ReadoutEnergyLedgerParams*>(params);
     if (!p || p->slot >= p->substeps || !d.contact_audit_counts || !d.contact_audit_metrics)
         return Status::InvalidArgument;
     const auto surfaces = MakeSurfaceQueryView(m, p->bodies_per_env, p->mesh_geometry,
                                                p->sdf_grid_count, p->sdf_cell_total);
-    if (p->env_count > 0u)
-        LaunchCuda(ContactAuditKernel, dim3(p->env_count), dim3(kThreads), 0u, stream, m, d, *p, surfaces);
+    if (p->env_count > 0u) {
+        if (p->stage == EnergyStage::Solved)
+            LaunchCuda(ClearContactAuditKernel, dim3(p->env_count), dim3(32u), 0u, stream, d, *p);
+        LaunchCuda(ContactAuditKernel, dim3(p->env_count * ReadoutParts(*p)), dim3(kThreads), 0u, stream,
+                   m, d, *p, surfaces);
+    }
     return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
 }
 
@@ -972,9 +1042,15 @@ Status OpReadoutEnergyLedger(const ModelView& m, const DataView& d, const void* 
         if (blocks > std::numeric_limits<uint32_t>::max()) return Status::InvalidArgument;
         LaunchCuda(EnergyKinematicImpulseKernel, dim3(static_cast<uint32_t>(blocks)), dim3(kThreads), 0u, stream, d, *p);
     }
-    if (p->physics_diagnostics)
-        LaunchCuda(PhysicsStageMetricsKernel, dim3(p->env_count), dim3(kThreads), 0u, stream, m, d, *p);
-    LaunchCuda(EnergyLedgerKernel, dim3(p->env_count), dim3(kThreads), 0u, stream, m, d, *p);
+    const uint32_t parts = ReadoutParts(*p);
+    if (p->physics_diagnostics) {
+        LaunchCuda(PhysicsStageMetricsKernel, dim3(p->env_count * parts), dim3(kThreads), 0u, stream, m, d, *p);
+        LaunchCuda(FinishStageMetricsKernel, dim3(p->env_count), dim3(kThreads), 0u, stream, d, *p, parts);
+    }
+    if (p->stage == EnergyStage::Begin)
+        LaunchCuda(BeginEnergyLedgerKernel, dim3(p->env_count), dim3(kThreads), 0u, stream, d, *p);
+    LaunchCuda(EnergyLedgerKernel, dim3(p->env_count * parts), dim3(kThreads), 0u, stream, m, d, *p);
+    LaunchCuda(FinishEnergyLedgerKernel, dim3(p->env_count), dim3(kThreads), 0u, stream, d, *p, parts);
     return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
 }
 
