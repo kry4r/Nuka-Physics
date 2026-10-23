@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iterator>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -327,7 +328,13 @@ void ImGuiLayer::BuildSolver(nui::VStack& root) {
 }
 
 void HeatColor(float residual, float alert, float rgb[3]) {
-    // Deep blue, cyan, green, amber, red.
+    // Deep blue, cyan, green, amber, red; a vertex whose block failed reports FLT_MAX and takes magenta.
+    if (!(residual < std::numeric_limits<float>::max())) {
+        rgb[0] = 0.86f;
+        rgb[1] = 0.22f;
+        rgb[2] = 0.90f;
+        return;
+    }
     constexpr float kStops[5][3] = {{0.06f, 0.10f, 0.32f}, {0.05f, 0.62f, 0.86f}, {0.18f, 0.80f, 0.44f},
                                     {0.96f, 0.62f, 0.04f}, {0.94f, 0.16f, 0.22f}};
     const float t = std::clamp((std::log10(std::max(residual, 1.0e-30f) / alert) + 3.0f) * 0.25f, 0.0f, 1.0f);
@@ -356,7 +363,8 @@ void ImGuiLayer::DrawSolverHud(const ImVec2& vmin, const ImVec2& vmax) {
         // Four decades of log scale up the right edge under the mode menu, the alert at three quarters.
         const float h = std::min(200.0f * s, (vmax.y - vmin.y) * 0.45f), w = 9.0f * s;
         const ImVec2 bar1(vmax.x - 70.0f * s, vmin.y + 74.0f * s + h), bar0(bar1.x - w, bar1.y - h);
-        draw::Chamfer(list, ImVec2(bar0.x - 12.0f * s, bar0.y - 30.0f * s), ImVec2(vmax.x - 14.0f * s, bar1.y + 14.0f * s),
+        const float max_y = bar1.y + px * 0.6f + 6.0f * s;
+        draw::Chamfer(list, ImVec2(bar0.x - 12.0f * s, bar0.y - 30.0f * s), ImVec2(vmax.x - 14.0f * s, max_y + px + 8.0f * s),
                       6.0f * s, U32(theme::Alpha(theme::kBg0, 0.78f)), U32(theme::kLineHi));
         list->AddText(font, px, ImVec2(bar0.x - 4.0f * s, bar0.y - 22.0f * s), U32(theme::kFgMuted), Tr("NEWTON  M/S"));
         constexpr int kSteps = 40;
@@ -377,6 +385,14 @@ void ImGuiLayer::DrawSolverHud(const ImVec2& vmin, const ImVec2& vmax) {
                           U32(at_alert ? theme::kErr : theme::kFgMuted), at_alert ? 2.0f * s : 1.0f * s);
             const std::string label = Fmt("%.0e", static_cast<double>(v.alert) * std::pow(10.0, d - 3));
             list->AddText(font, px, ImVec2(bar1.x + 10.0f * s, y - px * 0.55f), U32(at_alert ? theme::kErr : theme::kFg),
+                          label.c_str());
+        }
+        // The newest solve's largest correction, which the ramp clips above ten times the alert.
+        if (!v.history.empty()) {
+            const float top = v.history.back().vertex_residual;
+            const bool failed = !(top < std::numeric_limits<float>::max());
+            const std::string label = failed ? std::string(Tr("MAX FAILED")) : Fmt("%s %.1e", Tr("MAX"), static_cast<double>(top));
+            list->AddText(font, px, ImVec2(bar0.x - 4.0f * s, max_y), U32(failed || top > 10.0f * v.alert ? theme::kErr : theme::kFgMuted),
                           label.c_str());
         }
     }

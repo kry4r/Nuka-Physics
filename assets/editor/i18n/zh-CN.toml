@@ -470,6 +470,8 @@ tag = "中"
 "Recording is off." = "记录已关闭。"
 "No capped solve kept." = "没有保留的触顶求解。"
 "NEWTON  M/S" = "牛顿修正  M/S"
+"MAX" = "最大"
+"MAX FAILED" = "最大 求解失败"
 
 # timeline
 "Timeline" = "时间线"
