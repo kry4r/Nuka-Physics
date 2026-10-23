@@ -2642,6 +2642,16 @@ Status OpRecordTelemetry(const ModelView&, const DataView& data, const void* par
     return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
 }
 
+// An eager solve's sweep loop, kept on its thread between solves so that a solve neither instantiates a graph
+// nor waits on the destruction of the last one.
+struct SweepLoop {
+    cudaGraphExec_t exec = nullptr;
+    ~SweepLoop() {
+        if (exec != nullptr) (void)cudaGraphExecDestroy(exec);
+    }
+};
+thread_local SweepLoop sweep_loop;
+
 Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
                            const void* params, cudaStream_t stream) {
     const auto* p = static_cast<const BlockDescentSolveParams*>(params);
@@ -2962,18 +2972,27 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
     if (capture == cudaStreamCaptureStatusActive) {
         if (repeat(stream) != Status::Ok) return Status::Failed;
     } else {
-        // An eager solve records the loop on a stream of its own and launches it once, not a launch per kernel.
+        // An eager solve records the loop on a stream of its own and launches it once, not a launch per kernel;
+        // the kept executable takes each recording in place, and a recording of another shape replaces it.
         cudaStream_t record = nullptr;
         cudaGraph_t graph = nullptr;
-        cudaGraphExec_t exec = nullptr;
         if (cudaStreamCreateWithFlags(&record, cudaStreamNonBlocking) != cudaSuccess) return Status::Failed;
         const bool recorded = cudaStreamBeginCapture(record, cudaStreamCaptureModeThreadLocal) == cudaSuccess &&
                               repeat(record) == Status::Ok;
         const bool ended = cudaStreamEndCapture(record, &graph) == cudaSuccess;
-        const bool launched = recorded && ended && cudaGraphInstantiate(&exec, graph, 0ull) == cudaSuccess &&
-                              cudaGraphLaunch(exec, stream) == cudaSuccess;
-        if ((exec != nullptr && cudaGraphExecDestroy(exec) != cudaSuccess) ||
-            (graph != nullptr && cudaGraphDestroy(graph) != cudaSuccess) ||
+        cudaGraphExec_t& exec = sweep_loop.exec;
+        cudaGraphExecUpdateResultInfo update{};
+        bool ready = recorded && ended && exec != nullptr &&
+                     cudaGraphExecUpdate(exec, graph, &update) == cudaSuccess;
+        if (recorded && ended && !ready) {
+            // A refused update leaves its error as the thread's last one.
+            (void)cudaGetLastError();
+            if (exec != nullptr && cudaGraphExecDestroy(exec) != cudaSuccess) return Status::Failed;
+            exec = nullptr;
+            ready = cudaGraphInstantiate(&exec, graph, 0ull) == cudaSuccess;
+        }
+        const bool launched = ready && cudaGraphLaunch(exec, stream) == cudaSuccess;
+        if ((graph != nullptr && cudaGraphDestroy(graph) != cudaSuccess) ||
             cudaStreamDestroy(record) != cudaSuccess || !launched) return Status::Failed;
     }
     if (!stamp(kPhaseEnd, stream)) return Status::Failed;
