@@ -43,7 +43,7 @@ NUKA_COULOMB_HD inline float CoulombTangentSpectralResponse(
 }
 
 NUKA_COULOMB_HD inline math::Vec3 ProjectedCoulombTangentStepWithResponse(
-    const math::SymmetricMat3& response, math::Vec3 residual, math::Vec3 impulse,
+    math::Vec3 residual, math::Vec3 impulse,
     float normal, float mu_first, float mu_second, float largest) {
     const float mu = fmaxf(mu_first, mu_second);
     if (!(normal > 0.0f) || !(mu > 0.0f)) return {normal, 0.0f, 0.0f};
@@ -70,7 +70,7 @@ NUKA_COULOMB_HD inline math::Vec3 ProjectedCoulombTangentStep(
     float normal, float mu_first, float mu_second) {
     const float largest = CoulombTangentSpectralResponse(response, mu_first, mu_second);
     return ProjectedCoulombTangentStepWithResponse(
-        response, residual, impulse, normal, mu_first, mu_second, largest);
+        residual, impulse, normal, mu_first, mu_second, largest);
 }
 
 NUKA_COULOMB_HD inline math::Vec3 ProjectedCoulombStepWithResponse(
@@ -81,7 +81,7 @@ NUKA_COULOMB_HD inline math::Vec3 ProjectedCoulombStepWithResponse(
     residual.y -= response.xy * delta_normal;
     residual.z -= response.xz * delta_normal;
     return ProjectedCoulombTangentStepWithResponse(
-        response, residual, impulse, normal, mu_first, mu_second, tangent_response);
+        residual, impulse, normal, mu_first, mu_second, tangent_response);
 }
 
 // Normal complementarity and tangential maximum dissipation have separate projections.

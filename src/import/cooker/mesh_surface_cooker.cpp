@@ -357,6 +357,35 @@ CookedMeshEdges CookMeshEdges(const float* vertices, uint32_t vertex_count,
     return result;
 }
 
+void AddTwinEdges(CookedMeshEdges& cooked, const float* vertices) {
+    const size_t count = cooked.edges.size();
+    for (size_t i = 0u; i < count; ++i) {
+        collision::MeshEdge twin = cooked.edges[i];
+        if (twin.triangle1 != ~0u) {
+            twin.triangle0 = twin.triangle1;
+            twin.opposite0 = twin.opposite1;
+            twin.triangle1 = twin.opposite1 = ~0u;
+        }
+        cooked.edges.push_back(twin);
+    }
+    const auto vertex = [&](uint32_t i) -> Vec3 {
+        const size_t at = static_cast<size_t>(i) * 3u;
+        return {vertices[at], vertices[at + 1u], vertices[at + 2u]};
+    };
+    std::vector<MeshBvhNode> leaves(cooked.edges.size());
+    for (size_t i = 0u; i < leaves.size(); ++i) {
+        const Vec3 a = vertex(cooked.edges[i].vertex0), b = vertex(cooked.edges[i].vertex1);
+        leaves[i].lower = Min(a, b);
+        leaves[i].upper = Max(a, b);
+    }
+    std::vector<uint32_t> order(leaves.size());
+    std::iota(order.begin(), order.end(), 0u);
+    cooked.nodes.clear();
+    BuildNodes(cooked.nodes, order, leaves, 0u, static_cast<uint32_t>(leaves.size()));
+    cooked.info.edge_count = static_cast<uint32_t>(cooked.edges.size());
+    cooked.info.node_count = static_cast<uint32_t>(cooked.nodes.size());
+}
+
 CookedMeshEdges CookWireEdges(const float* vertices, uint32_t vertex_count,
                               const uint32_t* indices, uint32_t edge_count) {
     if (!vertices || !indices || vertex_count == 0u || edge_count == 0u ||

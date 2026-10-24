@@ -116,12 +116,17 @@ void SetOgcContactCapacity(nk::Model& model, uint32_t capacity);
 struct CookParticleSurface {
     std::vector<uint32_t> triangles;
     std::vector<uint32_t> edges;
+    // One past its last vertex when spare vertices follow those its triangles reach, else 0.
+    uint32_t end = 0u;
+    // A surface that tears doubles its edges, so both sides of a cut edge collide.
+    bool twin_edges = false;
 };
 
 struct VbdCookInput {
     std::vector<math::Vec3>      positions;     // per-particle rest state
     std::vector<math::Vec3>      velocities;    // per-particle initial velocity
     std::vector<float>           inv_mass;      // 1/mass (0 == pinned)
+    std::vector<float>           attachment_stiffness;
     // Cloth aerodynamic-drag surface triangles (3 particle indices / triangle).
     // Empty => no drag (the drag op is inert; the cook stays byte-identical).
     std::vector<std::array<uint32_t, 3>> aero_triangles;
@@ -141,6 +146,8 @@ struct VbdCookInput {
     std::vector<nk::MfElement>  field_elements;
     std::vector<nk::MfMaterial> field_materials;
     uint32_t field_count = 0u;
+    // Free particles [spare_first, + spares) that a fracturing field cloth splits its vertices into.
+    uint32_t spare_first = 0u, spares = 0u;
 };
 
 // Stage a vertex-block soft body into the Model (single-env template;

@@ -603,6 +603,16 @@ Value SaveMedia(const MediaRecord& m, MeshSink& sink) {
     Value pins = Value::Array();
     for (uint32_t vertex : m.cloth_mesh.pinned_vertices) pins.PushBack(Value::Int(vertex));
     cm.Set("pinned_vertices", std::move(pins));
+    if (!m.cloth_mesh.attachments.empty()) {
+        Value attachments = Value::Array();
+        for (const auto& attachment : m.cloth_mesh.attachments) {
+            Value item = Value::Object();
+            item.Set("vertex", Value::Int(attachment.vertex));
+            item.Set("stiffness", Value::Float(attachment.stiffness));
+            attachments.PushBack(std::move(item));
+        }
+        cm.Set("attachments", std::move(attachments));
+    }
     if (!m.cloth_mesh.seams.empty()) {
         Value seams = Value::Array();
         for (const auto& line : m.cloth_mesh.seams) {
@@ -690,6 +700,21 @@ Value SaveMedia(const MediaRecord& m, MeshSink& sink) {
             return a;
         };
         Value fo = Value::Object();
+        Value contract = Value::Object();
+        contract.Set("schema_version", Value::Int(mf.contract.schema));
+        contract.Set("material_version", Value::Int(mf.contract.material));
+        contract.Set("section_version", Value::Int(mf.contract.section));
+        contract.Set("fracture_version", Value::Int(mf.contract.fracture));
+        contract.Set("history_version", Value::Int(mf.contract.history));
+        const bool orthotropic = mf.law == nk::kMfLogStrainOrthotropicLaw;
+        contract.Set("material_law", Value::Str(orthotropic ? "log_strain_orthotropic_hill_maxwell"
+                                                            : "small_strain_plane_stress_j2_maxwell"));
+        const bool effective = mf.section_law == nk::kMfEffectiveSection;
+        contract.Set("section_kind", Value::Str(effective ? "effective_section" : "homogeneous_plate"));
+        const bool mixed = mf.fracture_law == nk::kMfMixedModeCohesive;
+        contract.Set("fracture_law", Value::Str(mixed ? "mixed_mode_midsurface_cohesive" : "legacy_midsurface_cohesive"));
+        contract.Set("synthetic", Value::Bool(true));
+        fo.Set("contract", std::move(contract));
         fo.Set("density", Value::Float(mf.density));
         fo.Set("thickness", Value::Float(mf.thickness));
         fo.Set("youngs", Value::Float(mf.youngs));
@@ -704,6 +729,31 @@ Value SaveMedia(const MediaRecord& m, MeshSink& sink) {
         fo.Set("bend_maxwell_time", pair(mf.bend_maxwell_time));
         fo.Set("tear_strength", Value::Float(mf.tear_strength));
         fo.Set("tear_energy", Value::Float(mf.tear_energy));
+        fo.Set("shear_strength", Value::Float(mf.shear_strength));
+        fo.Set("weibull_reference_area", Value::Float(mf.weibull_reference_area));
+        if (mixed) {
+            fo.Set("shear_tear_energy", Value::Float(mf.shear_tear_energy));
+            fo.Set("mixity_exponent", Value::Float(mf.mixity_exponent));
+        }
+        if (effective) {
+            fo.Set("bend_stiffness", Value::Float(mf.bend_stiffness));
+            fo.Set("curvature_range", Value::Float(mf.curvature_range));
+        }
+        if (mf.weibull_modulus > 0.0f) fo.Set("weibull_modulus", Value::Float(mf.weibull_modulus));
+        if (orthotropic) {
+            fo.Set("youngs_cd", Value::Float(mf.youngs_cd));
+            fo.Set("shear_modulus", Value::Float(mf.shear_modulus));
+            fo.Set("yield_stress_cd", Value::Float(mf.yield_stress_cd));
+            fo.Set("yield_shear", Value::Float(mf.yield_shear));
+            fo.Set("yield_biaxial", Value::Float(mf.yield_biaxial));
+            fo.Set("strain_range", Value::Float(mf.strain_range));
+        }
+        if (mf.grain_ratio > 0.0f || orthotropic) {
+            Value grain = Value::Array();
+            for (float g : mf.grain) grain.PushBack(Value::Float(g));
+            fo.Set("grain", std::move(grain));
+            fo.Set("grain_ratio", Value::Float(mf.grain_ratio));
+        }
         o.Set("field", std::move(fo));
     }
 
@@ -1898,6 +1948,14 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                             throw std::invalid_argument("Cloth pinned vertex is out of range");
                         rec.cloth_mesh.pinned_vertices.push_back(static_cast<uint32_t>(id));
                     }
+                if (const Value* attachments = cm->Find("attachments"))
+                    for (const Value& attachment : attachments->Elements()) {
+                        const auto vertex = attachment.At("vertex").AsInt();
+                        if (vertex < 0 || static_cast<uint64_t>(vertex) > UINT32_MAX)
+                            throw std::invalid_argument("Cloth attachment vertex is out of range");
+                        rec.cloth_mesh.attachments.push_back({static_cast<uint32_t>(vertex),
+                                                             attachment.At("stiffness").AsFloat()});
+                    }
                 if (const Value* seams = cm->Find("seams"))
                     for (const Value& line : seams->Elements()) {
                         std::vector<uint32_t>& vertices = rec.cloth_mesh.seams.emplace_back();
@@ -1980,6 +2038,34 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                 }
             if (const Value* fo = mv.Find("field")) {
                 MediaFieldMaterial& mf = rec.field;
+                if (const Value* contract = fo->Find("contract")) {
+                    const std::string law = contract->At("material_law").AsString();
+                    const std::string fracture = contract->At("fracture_law").AsString();
+                    const std::string section = contract->At("section_kind").AsString();
+                    if ((law != "small_strain_plane_stress_j2_maxwell" && law != "log_strain_orthotropic_hill_maxwell") ||
+                        (section != "homogeneous_plate" && section != "effective_section") ||
+                        (fracture != "legacy_midsurface_cohesive" && fracture != "mixed_mode_midsurface_cohesive") ||
+                        !contract->At("synthetic").AsBool())
+                        throw std::runtime_error("field material: unsupported law, section, fracture or calibration provenance");
+                    mf.law = law == "log_strain_orthotropic_hill_maxwell" ? nk::kMfLogStrainOrthotropicLaw
+                                                                          : nk::kMfSmallStrainLaw;
+                    mf.fracture_law = fracture == "mixed_mode_midsurface_cohesive" ? nk::kMfMixedModeCohesive
+                                                                                   : nk::kMfIsotropicCohesive;
+                    mf.section_law = section == "effective_section" ? nk::kMfEffectiveSection : nk::kMfPlateSection;
+                    const auto version = [&](const char* key) {
+                        const auto& value = contract->At(key);
+                        if (value.type() != Value::Type::Int || value.AsInt() < 0 || value.AsInt() > UINT32_MAX)
+                            throw std::runtime_error(std::string("field material: invalid contract version: ") + key);
+                        return static_cast<uint32_t>(value.AsInt());
+                    };
+                    mf.contract.schema = version("schema_version");
+                    mf.contract.material = version("material_version");
+                    mf.contract.section = version("section_version");
+                    mf.contract.fracture = version("fracture_version");
+                    mf.contract.history = version("history_version");
+                    if (!mf.contract.Supported())
+                        throw std::runtime_error("field material: unsupported contract/law/section/fracture/history version");
+                }
                 auto pair = [&](const char* key, float (&out)[2]) {
                     if (const Value* a = fo->Find(key))
                         for (size_t i = 0u; i < 2u; ++i) out[i] = FloatAt(*a, i, key);
@@ -1998,6 +2084,22 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                 pair("bend_maxwell_time", mf.bend_maxwell_time);
                 mf.tear_strength = f(*fo, "tear_strength", mf.tear_strength);
                 mf.tear_energy = f(*fo, "tear_energy", mf.tear_energy);
+                mf.shear_strength = f(*fo, "shear_strength", mf.shear_strength);
+                mf.weibull_reference_area = f(*fo, "weibull_reference_area", mf.weibull_reference_area);
+                mf.weibull_modulus = f(*fo, "weibull_modulus", mf.weibull_modulus);
+                if (const Value* g = fo->Find("grain"))
+                    for (size_t i = 0u; i < 3u; ++i) mf.grain[i] = FloatAt(*g, i, "grain");
+                mf.grain_ratio = f(*fo, "grain_ratio", mf.grain_ratio);
+                mf.youngs_cd = f(*fo, "youngs_cd", mf.youngs_cd);
+                mf.shear_modulus = f(*fo, "shear_modulus", mf.shear_modulus);
+                mf.yield_stress_cd = f(*fo, "yield_stress_cd", mf.yield_stress_cd);
+                mf.yield_shear = f(*fo, "yield_shear", mf.yield_shear);
+                mf.yield_biaxial = f(*fo, "yield_biaxial", mf.yield_biaxial);
+                mf.strain_range = f(*fo, "strain_range", mf.strain_range);
+                mf.shear_tear_energy = f(*fo, "shear_tear_energy", mf.shear_tear_energy);
+                mf.mixity_exponent = f(*fo, "mixity_exponent", mf.mixity_exponent);
+                mf.bend_stiffness = f(*fo, "bend_stiffness", mf.bend_stiffness);
+                mf.curvature_range = f(*fo, "curvature_range", mf.curvature_range);
             }
             if (const Value* mp = mv.Find("mpm")) read_mpm(*mp, rec.mpm);
             if (const Value* fills = mv.Find("mpm_fills")) {

@@ -14,6 +14,7 @@
 #include "phi/backend_cuda/launch.cuh"
 #include "phi/backend_cuda/launch_grid.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
+#include "phi/backend_cuda/ops/particle_surface.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
 #include "phi/op_schema.hpp"
 
@@ -102,7 +103,7 @@ __global__ void RefitParticleSurfacesKernel(ParticleSurfacesParams p, ModelView 
                 ? data.particle_pos : data.particle_prev_pos;
             const collision::MeshSurfaceView view{
                 reinterpret_cast<const float*>(positions + size_t{env} * p.particles_per_env),
-                model.particle_surface_triangles, model.particle_surface_tree,
+                ParticleSurfaceTriangles(model, data, env, p.triangles_per_env), model.particle_surface_tree,
                 {p.particles_per_env, p.triangles_per_env, p.nodes_per_env}};
             math::Vec3 a, b, c;
             if (!collision::MeshSurfaceTriangle(view, info, node.triangle, a, b, c) ||
@@ -157,7 +158,7 @@ __global__ void RefitParticleSurfacesKernel(ParticleSurfacesParams p, ModelView 
         if (node.triangle == ~0u) {
             node.triangle = kRefitPending;
         } else {
-            const auto edge = model.particle_surface_edges[info.edge_offset + node.triangle];
+            const auto edge = ParticleSurfaceEdges(model, data, env, p.edges_per_env)[info.edge_offset + node.triangle];
             const math::Vec3* positions = p.position_source == 0u
                 ? data.particle_pos : data.particle_prev_pos;
             const math::Vec3 a = positions[size_t{env} * p.particles_per_env +
@@ -167,6 +168,10 @@ __global__ void RefitParticleSurfacesKernel(ParticleSurfacesParams p, ModelView 
             if (!isfinite(a.LengthSq()) || !isfinite(b.LengthSq())) {
                 atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
                 node.escape = 0u;
+            } else if (edge.vertex0 == edge.vertex1) {
+                // A twin whose edge holds together bounds nothing, so no query reaches it.
+                node.lower = {FLT_MAX, FLT_MAX, FLT_MAX};
+                node.upper = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
             } else {
                 node.lower = {fminf(a.x, b.x), fminf(a.y, b.y), fminf(a.z, b.z)};
                 node.upper = {fmaxf(a.x, b.x), fmaxf(a.y, b.y), fmaxf(a.z, b.z)};
@@ -249,25 +254,51 @@ Status OpRefitParticleSurfaces(const ModelView& model, const DataView& data,
                                  *p, model, data) == cudaSuccess ? Status::Ok : Status::Failed;
 }
 
+__device__ inline uint32_t AeroVertex(const AeroDragParams& p, const ModelView& model,
+                                      const DataView& data, uint32_t triangle, uint32_t corner) {
+    const uint32_t source = model.aero_tri_corner_source[triangle];
+    if (data.mf_corner == nullptr || source == ~0u) return model.aero_tri_verts[3u * triangle + corner];
+    const uint32_t env = triangle / p.triangles_per_env;
+    return env * p.particles_per_env + p.field_begin +
+        data.mf_corner[size_t{env} * p.field_elements_per_env * nk::kMfMaxVertices + source + corner];
+}
+
+__device__ inline uint32_t AeroRoot(const AeroDragParams& p, const DataView& data, uint32_t vertex) {
+    return data.particle_root != nullptr
+        ? vertex / p.particles_per_env * p.particles_per_env + data.particle_root[vertex] : vertex;
+}
+
+__device__ inline bool AeroContains(const AeroDragParams& p, const ModelView& model,
+                                    const DataView& data, uint32_t triangle, uint32_t vertex) {
+    for (uint32_t j = 0u; j < 3u; ++j)
+        if (AeroVertex(p, model, data, triangle, j) == vertex) return true;
+    return false;
+}
+
+__device__ inline uint32_t AeroDegree(const AeroDragParams& p, const ModelView& model,
+                                      const DataView& data, uint32_t vertex) {
+    const uint32_t root = AeroRoot(p, data, vertex);
+    const uint32_t offset = model.aero_particle_offset[root];
+    uint32_t count = 0u;
+    for (uint32_t i = 0u; i < model.aero_particle_count[root]; ++i)
+        count += AeroContains(p, model, data, model.aero_incident_tri[offset + i], vertex);
+    return count;
+}
+
 // Faces read one velocity time layer; particles gather impulses in stable triangle order.
-__global__ void ClothAeroImpulseKernel(uint32_t tri_count,
-                                     const uint32_t* __restrict__ tri_verts,
-                                     const float* __restrict__ tri_area,
-                                     const math::Vec3* __restrict__ positions,
-                                     const math::Vec3* __restrict__ velocities,
-                                     const float* __restrict__ inv_masses,
-                                     const uint32_t* __restrict__ incident_counts,
-                                     math::Vec3* __restrict__ impulses,
-                                     float drag_normal, float drag_tangent,
-                                     float max_dv, float dt) {
+__global__ void ClothAeroImpulseKernel(AeroDragParams p, ModelView model, DataView data) {
     const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= tri_count) {
+    if (t >= p.tri_count) {
         return;
     }
+    const auto* positions = data.particle_pos;
+    const auto* velocities = data.particle_vel;
+    const auto* inv_masses = data.particle_inv_mass;
+    auto* impulses = data.aero_tri_impulse;
     impulses[t] = {};
-    const uint32_t ia = tri_verts[t * 3u + 0u];
-    const uint32_t ib = tri_verts[t * 3u + 1u];
-    const uint32_t ic = tri_verts[t * 3u + 2u];
+    const uint32_t ia = AeroVertex(p, model, data, t, 0u);
+    const uint32_t ib = AeroVertex(p, model, data, t, 1u);
+    const uint32_t ic = AeroVertex(p, model, data, t, 2u);
     const math::Vec3 pa = positions[ia], pb = positions[ib], pc = positions[ic];
     const math::Vec3 nrm = Cross(Sub(pb, pa), Sub(pc, pa));  // 2*area*n̂
     const float nlen = Length(nrm);
@@ -278,11 +309,11 @@ __global__ void ClothAeroImpulseKernel(uint32_t tri_count,
     const uint32_t idx[3] = {ia, ib, ic};
     math::Vec3 velocity_sum{};
     float weighted_degree = 0.0f, max_weighted_degree = 0.0f;
-    for (uint32_t p : idx) {
-        const float weight = inv_masses[p];
+    for (uint32_t vertex : idx) {
+        const float weight = inv_masses[vertex];
         if (weight <= 0.0f) continue;
-        velocity_sum = Add(velocity_sum, velocities[p]);
-        const float degree = weight * static_cast<float>(incident_counts[p]);
+        velocity_sum = Add(velocity_sum, velocities[vertex]);
+        const float degree = weight * static_cast<float>(AeroDegree(p, model, data, vertex));
         weighted_degree += degree;
         max_weighted_degree = fmaxf(max_weighted_degree, degree);
     }
@@ -292,36 +323,34 @@ __global__ void ClothAeroImpulseKernel(uint32_t tri_count,
     const math::Vec3 v_n = Scale(nhat, vn);
     const math::Vec3 v_t = Sub(v, v_n);
     const float vt = Length(v_t);
-    const float area = tri_area[t];
+    const float area = model.aero_tri_area[t];
     // F = -(Cn|v_n|v_n + Ct|v_t|v_t) A, opposing the motion in each component.
     const math::Vec3 f = Scale(
-        Add(Scale(v_n, -drag_normal * fabsf(vn)),
-            Scale(v_t, -drag_tangent * vt)), area);
-    const math::Vec3 impulse = Scale(f, dt / 3.0f);
+        Add(Scale(v_n, -p.drag_normal * fabsf(vn)),
+            Scale(v_t, -p.drag_tangent * vt)), area);
+    const math::Vec3 impulse = Scale(f, p.dt / 3.0f);
     const float magnitude_sq = Dot(impulse, impulse);
     if (magnitude_sq <= 0.0f) return;
     // The incidence bound controls the sum over shared vertices, including its kinetic work.
     const float work = fminf(Dot(velocity_sum, impulse), 0.0f);
     float alpha = fminf(1.0f, -work / (weighted_degree * magnitude_sq));
-    if (max_dv > 0.0f)
-        alpha = fminf(alpha, max_dv / (sqrtf(magnitude_sq) * max_weighted_degree));
+    if (p.max_dv > 0.0f)
+        alpha = fminf(alpha, p.max_dv / (sqrtf(magnitude_sq) * max_weighted_degree));
     impulses[t] = Scale(impulse, alpha);
 }
 
-__global__ void ClothAeroGatherKernel(uint32_t particle_count,
-                                    const uint32_t* __restrict__ offsets,
-                                    const uint32_t* __restrict__ counts,
-                                    const uint32_t* __restrict__ incident_tri,
-                                    const math::Vec3* __restrict__ impulses,
-                                    const float* __restrict__ inv_masses,
-                                    math::Vec3* __restrict__ velocities) {
-    const uint32_t p = blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= particle_count || inv_masses[p] <= 0.0f || counts[p] == 0u) return;
+__global__ void ClothAeroGatherKernel(AeroDragParams p, ModelView model, DataView data) {
+    const uint32_t vertex = blockIdx.x * blockDim.x + threadIdx.x;
+    if (vertex >= p.particle_count || data.particle_inv_mass[vertex] <= 0.0f) return;
+    const uint32_t root = AeroRoot(p, data, vertex);
     math::Vec3 impulse{};
-    const uint32_t offset = offsets[p];
-    for (uint32_t i = 0; i < counts[p]; ++i)
-        impulse = Add(impulse, impulses[incident_tri[offset + i]]);
-    velocities[p] = Add(velocities[p], Scale(impulse, inv_masses[p]));
+    const uint32_t offset = model.aero_particle_offset[root];
+    for (uint32_t i = 0; i < model.aero_particle_count[root]; ++i) {
+        const uint32_t triangle = model.aero_incident_tri[offset + i];
+        if (AeroContains(p, model, data, triangle, vertex))
+            impulse = Add(impulse, data.aero_tri_impulse[triangle]);
+    }
+    data.particle_vel[vertex] = Add(data.particle_vel[vertex], Scale(impulse, data.particle_inv_mass[vertex]));
 }
 
 // Prediction saves one step-start position and publishes one common working position.
@@ -414,18 +443,14 @@ Status OpParticleAeroDrag(const ModelView& model, const DataView& data,
         return Status::Ok;  // no aero triangles / drag off: inert.
     }
     const uint32_t blocks = (p->tri_count + kBlockSize - 1u) / kBlockSize;
-    if (p->particle_count == 0u) return Status::InvalidArgument;
+    if (p->particle_count == 0u || p->triangles_per_env == 0u || p->particles_per_env == 0u ||
+        model.aero_tri_corner_source == nullptr) return Status::InvalidArgument;
     LaunchCuda(ClothAeroImpulseKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-               p->tri_count, model.aero_tri_verts, model.aero_tri_area,
-               data.particle_pos, data.particle_vel, data.particle_inv_mass,
-               model.aero_particle_count, data.aero_tri_impulse,
-               p->drag_normal, p->drag_tangent, p->max_dv, p->dt);
+               *p, model, data);
     if (cudaGetLastError() != cudaSuccess) return Status::Failed;
     LaunchCuda(ClothAeroGatherKernel,
                dim3((p->particle_count + kBlockSize - 1u) / kBlockSize),
-               dim3(kBlockSize), 0u, stream, p->particle_count,
-               model.aero_particle_offset, model.aero_particle_count, model.aero_incident_tri,
-               data.aero_tri_impulse, data.particle_inv_mass, data.particle_vel);
+               dim3(kBlockSize), 0u, stream, *p, model, data);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 

@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <utility>
 
@@ -143,7 +144,7 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
     const bool mpm_reaction = mpm_grid_nodes_per_env != 0u && bodies_per_env != 0u;
     if (integration_substeps <= 1u &&
         (id == FieldId::StepLinkImpulse || id == FieldId::StepLinkMoment ||
-         id == FieldId::StepJointLimitImpulse || (id == FieldId::StepEnvStatus && mpm_grid_nodes_per_env == 0u)))
+         id == FieldId::StepJointLimitImpulse))
         return 0u;
     if (!mpm_reaction &&
         (id == FieldId::StepMpmBodyImpulse || id == FieldId::StepMpmBodyMoment)) return 0u;
@@ -169,7 +170,8 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         (id == FieldId::ParticleResponse || id == FieldId::ParticleRowImpulse ||
          id == FieldId::VbdHistoryReady)) return 0u;
     if (lay.per == FieldPer::Scalar) {
-        if (id == FieldId::EnergyLedger || id == FieldId::EnergyLedgerSum || id == FieldId::EnergyLedgerStatus ||
+        if (id == FieldId::SolverExecutedIterations ||
+            id == FieldId::EnergyLedger || id == FieldId::EnergyLedgerSum || id == FieldId::EnergyLedgerStatus ||
             id == FieldId::VbdForceResidualWork || id == FieldId::PhysicsStageMetrics ||
             id == FieldId::ContactAuditCounts || id == FieldId::ContactAuditMetrics)
             return CheckedProduct({integration_substeps, env_count});
@@ -195,7 +197,7 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
             return vbd_coarse_nodes > 0u ? uint64_t{vbd_coarse_nodes} + 1u : 0u;
         if (id == FieldId::VbdCoarseChildren || id == FieldId::VbdCoarseChildWeights)
             return vbd_coarse_children;
-        if (id == FieldId::VbdFreeRate || id == FieldId::VbdFreeVelocity ||
+        if (id == FieldId::VbdFreeRate || id == FieldId::VbdSolveRate || id == FieldId::VbdFreeVelocity ||
             id == FieldId::VbdOffset || id == FieldId::VbdInertia ||
             id == FieldId::VbdHistoryVel ||
             id == FieldId::VbdStep || id == FieldId::VbdRestart || id == FieldId::VbdSolveAudit)
@@ -230,14 +232,34 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         if (id == FieldId::PointEndpointTerms) return CheckedProduct({point_endpoint_terms_per_env, env_count});
         if (id == FieldId::VbdMembraneStart) return CheckedProduct({vbd_elements_per_env, env_count});
         if (id == FieldId::MfElements) return mf_elements_per_env;
+        if (id == FieldId::MfFacePartner) return mf_spares_per_env > 0u ? mf_elements_per_env : 0u;
+        if (id == FieldId::MfStress || id == FieldId::MfCrackLoad)
+            return mf_spares_per_env > 0u ? CheckedProduct({mf_elements_per_env, env_count}) : 0u;
         if (id == FieldId::MfMaterials) return mf_materials;
         if (id == FieldId::MfIncidenceOffsets)
             return mf_vertices_per_env > 0u ? uint64_t{mf_vertices_per_env} + 1u : 0u;
         if (id == FieldId::MfIncidence) return mf_incidence_per_env;
         if (id == FieldId::MfStartMetric) return CheckedProduct({mf_elements_per_env, env_count});
-        if (id == FieldId::MfHistory || id == FieldId::SnapshotMfHistory || id == FieldId::MfTrial)
-            return CheckedProduct({mf_elements_per_env, env_count});
+        if (id == FieldId::MfHistory || id == FieldId::SnapshotMfHistory)
+            return CheckedProduct({mf_state_scalars_per_env, env_count});
+        if (id == FieldId::MfTrial) return CheckedProduct({mf_trial_scalars_per_env, env_count});
         if (id == FieldId::MfEnvCommit) return mf_elements_per_env > 0u ? uint64_t{env_count} : 0u;
+        if (id == FieldId::MfIncidenceAnchor) return mf_spares_per_env > 0u ? mf_incidence_per_env : 0u;
+        if (id == FieldId::MfColor) return mf_spares_per_env > 0u ? mf_vertices_per_env : 0u;
+        if (id == FieldId::MfCorner || id == FieldId::SnapshotMfCorner || id == FieldId::MfTraction ||
+            id == FieldId::MfCracks || id == FieldId::MfOpened)
+            return mf_spares_per_env > 0u ? CheckedProduct({mf_elements_per_env, env_count}) : 0u;
+        if (id == FieldId::SnapshotParticleInvMass || id == FieldId::ParticleRoot ||
+            id == FieldId::SnapshotParticleRoot)
+            return mf_spares_per_env > 0u ? CheckedProduct({particles_per_env, env_count}) : 0u;
+        if (id == FieldId::MfCrackCount || id == FieldId::MfOpenedCount || id == FieldId::MfTopology)
+            return mf_spares_per_env > 0u ? uint64_t{env_count} : 0u;
+        if (id == FieldId::ParticleSurfaceCornerSource)
+            return mf_spares_per_env > 0u ? uint64_t{particle_surface_triangles} * 3u : 0u;
+        if (id == FieldId::ParticleSurfaceCorners || id == FieldId::SnapshotParticleSurfaceCorners)
+            return mf_spares_per_env > 0u ? CheckedProduct({particle_surface_triangles, 3u, env_count}) : 0u;
+        if (id == FieldId::ParticleSurfaceLiveEdges || id == FieldId::SnapshotParticleSurfaceLiveEdges)
+            return mf_spares_per_env > 0u ? CheckedProduct({particle_surface_edges_per_env, env_count}) : 0u;
         if (id == FieldId::CrbaScratch)
             return CheckedProduct({articulations_per_env, env_count, dofs_per_env, uint64_t{dofs_per_env} + 12u});
         // Symbolic scalar counts require an explicit field-specific extent.
@@ -929,6 +951,9 @@ void Model::StageModelField(FieldId id, const Segment& seg,
         case FieldId::MfElements:
             std::memcpy(dst, particles.mf_elements.data(), seg.bytes);
             break;
+        case FieldId::MfFacePartner:
+            std::memcpy(dst, particles.mf_face_partner.data(), seg.bytes);
+            break;
         case FieldId::MfMaterials:
             std::memcpy(dst, particles.mf_materials.data(), seg.bytes);
             break;
@@ -937,6 +962,15 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             break;
         case FieldId::MfIncidence:
             std::memcpy(dst, particles.mf_incidence.data(), seg.bytes);
+            break;
+        case FieldId::MfIncidenceAnchor:
+            std::memcpy(dst, particles.mf_incidence_anchor.data(), seg.bytes);
+            break;
+        case FieldId::MfColor:
+            std::memcpy(dst, particles.mf_color.data(), seg.bytes);
+            break;
+        case FieldId::ParticleSurfaceCornerSource:
+            std::memcpy(dst, particles.surface_corner_source.data(), seg.bytes);
             break;
         // Cloth aero-drag templates (owner:model). The single-env triangle list is
         // replicated env-major; each triangle's 3 particle indices are shifted by
@@ -960,6 +994,10 @@ void Model::StageModelField(FieldId id, const Segment& seg,
         case FieldId::AeroTriArea:
             StampPerLink(dst, particles.aero_tri_area,
                          capacities.aero_tris_per_env, E, sizeof(float));
+            break;
+        case FieldId::AeroTriCornerSource:
+            StampPerLink(dst, particles.aero_tri_corner_source,
+                         capacities.aero_tris_per_env, E, sizeof(uint32_t));
             break;
         case FieldId::AeroParticleOffset: {
             auto* p = reinterpret_cast<uint32_t*>(dst);
@@ -1181,6 +1219,7 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::DofToComponent:        v.dof_to_component = static_cast<uint32_t*>(p); break;
         case FieldId::AeroTriVerts:          v.aero_tri_verts = static_cast<uint32_t*>(p); break;
         case FieldId::AeroTriArea:           v.aero_tri_area = static_cast<float*>(p); break;
+        case FieldId::AeroTriCornerSource:   v.aero_tri_corner_source = static_cast<uint32_t*>(p); break;
         case FieldId::AeroParticleOffset:    v.aero_particle_offset = static_cast<uint32_t*>(p); break;
         case FieldId::AeroParticleCount:     v.aero_particle_count = static_cast<uint32_t*>(p); break;
         case FieldId::AeroIncidentTri:       v.aero_incident_tri = static_cast<uint32_t*>(p); break;
@@ -1196,9 +1235,15 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::VbdCoarseChildren:     v.vbd_coarse_children = static_cast<uint32_t*>(p); break;
         case FieldId::VbdCoarseChildWeights: v.vbd_coarse_child_weights = static_cast<float*>(p); break;
         case FieldId::MfElements:            v.mf_elements = static_cast<MfElement*>(p); break;
+        case FieldId::MfFacePartner:         v.mf_face_partner = static_cast<uint32_t*>(p); break;
         case FieldId::MfMaterials:           v.mf_materials = static_cast<MfMaterial*>(p); break;
         case FieldId::MfIncidenceOffsets:    v.mf_incidence_offsets = static_cast<uint32_t*>(p); break;
         case FieldId::MfIncidence:           v.mf_incidence = static_cast<uint32_t*>(p); break;
+        case FieldId::MfIncidenceAnchor:     v.mf_incidence_anchor = static_cast<uint32_t*>(p); break;
+        case FieldId::MfColor:               v.mf_color = static_cast<uint32_t*>(p); break;
+        case FieldId::ParticleSurfaceCornerSource:
+            v.particle_surface_corner_source = static_cast<uint32_t*>(p);
+            break;
         default: break;  // a data-owned field id: not a ModelView member.
     }
 }
@@ -1570,8 +1615,10 @@ phi::Status Model::ValidateVertexBlocks(std::string* reason) const {
     }
     if (next != p.vbd_color_vertices.size())
         return reject(Status::InvalidArgument, "vertex-block colors must tile their vertex list");
+    // Free fracture spares wait in their colors without mass.
+    const auto spare = [&](uint32_t v) { return v - cap.mf_spare_first < cap.mf_spares_per_env; };
     for (uint32_t v : p.vbd_color_vertices) {
-        if (v >= vertices || listed[v] != 0u || !(p.inv_mass[cap.vbd_particle_begin + v] > 0.0f))
+        if (v >= vertices || listed[v] != 0u || !(p.inv_mass[cap.vbd_particle_begin + v] > 0.0f || spare(v)))
             return reject(Status::InvalidArgument, "vertex-block colors must list each dynamic vertex once");
         listed[v] = 1u;
     }
@@ -1610,19 +1657,39 @@ phi::Status Model::ValidateMaterialField(const std::vector<uint32_t>& color_of, 
         p.mf_incidence.size() != cap.mf_incidence_per_env ||
         (field == 0u && (!p.mf_elements.empty() || !p.mf_materials.empty())) ||
         (field > 0u && (p.mf_incidence_offsets.front() != 0u ||
-                        p.mf_incidence_offsets.back() != p.mf_incidence.size())))
+                        p.mf_incidence_offsets.back() != p.mf_incidence.size())) ||
+        (cap.mf_spares_per_env > 0u &&
+         (cap.mf_spare_first < first || uint64_t{cap.mf_spare_first} + cap.mf_spares_per_env > first + field ||
+          p.mf_incidence_anchor.size() != p.mf_incidence.size() || p.mf_color.size() != field ||
+          p.mf_face_partner.size() != p.mf_elements.size() ||
+          p.surface_corner_source.size() != p.surface_triangles.size())))
         return reject("incomplete material-field tables");
-    if (uint64_t{p.mf_elements.size()} * 8u > std::numeric_limits<uint32_t>::max())
+    if (uint64_t{p.mf_elements.size()} * (1u << kMfIncidenceLocalBits) > std::numeric_limits<uint32_t>::max())
         return reject("material-field elements exceed incidence packing");
+    for (size_t i = 0u; i < p.mf_face_partner.size(); ++i) {
+        const uint32_t partner = p.mf_face_partner[i];
+        if (partner == ~0u) continue;
+        if (partner >= p.mf_elements.size() || p.mf_face_partner[partner] != i ||
+            p.mf_elements[i].kind + p.mf_elements[partner].kind != kMfTriangle + kMfBend)
+            return reject("invalid material face and bend pairing");
+    }
     for (const MfMaterial& material : p.mf_materials)
         if (!mf::ValidMaterial(material)) return reject("invalid material-field material");
+    uint64_t state_end = 0u, trial_end = 0u;
     for (const MfElement& element : p.mf_elements) {
-        if (element.kind > kMfSeam || element.material >= p.mf_materials.size() ||
+        if (element.material >= p.mf_materials.size() || element.state_version != kMfStateVersion ||
+            element.state_count != MfElementStateCount(element, p.mf_materials[element.material]) ||
+            element.state_offset != state_end || element.trial_offset != trial_end)
+            return reject("invalid material-field state layout");
+        state_end += element.state_count;
+        trial_end += element.state_count + kMfTrialLosses;
+        if (element.kind > kMfSeam ||
             (element.kind == kMfBend && (element.hinges == 0u || element.hinges > 7u)))
             return reject("invalid material-field element");
         if (element.kind == kMfSeam) {
             const uint32_t pairs = element.hinges >> 4u;
-            bool valid = pairs >= 1u && pairs <= 2u && element.rest[0] > 0.0f && element.rest[1] > 0.0f;
+            bool valid = pairs >= 1u && pairs <= 2u && element.rest[0] > 0.0f && element.rest[1] > 0.0f &&
+                         element.rest[2] > 0.0f && element.rest[3] > 0.0f;
             for (uint32_t side = 0u; side < 2u && valid; ++side) {
                 const uint32_t bend = element.vertex[4u + side], hinge = (element.hinges >> (2u * side)) & 3u;
                 valid = bend < p.mf_elements.size() && p.mf_elements[bend].kind == kMfBend &&
@@ -1630,19 +1697,32 @@ phi::Status Model::ValidateMaterialField(const std::vector<uint32_t>& color_of, 
             }
             if (!valid) return reject("invalid material-field seam");
         }
+        if (element.kind == kMfTriangle)
+            for (uint32_t j = 3u; j < 6u; ++j)
+                if (element.vertex[j] != ~0u && (element.vertex[j] >= p.mf_elements.size() ||
+                                                 p.mf_elements[element.vertex[j]].kind != kMfSeam))
+                    return reject("invalid material-field triangle seam");
         const uint32_t count = MfElementVertexCount(element);
         for (uint32_t j = 0u; j < count; ++j) {
             if (element.vertex[j] < first || element.vertex[j] >= cap.vbd_vertices_per_env)
                 return reject("material-field element leaves the field vertices");
-            for (uint32_t k = j + 1u; k < count; ++k)
+            // Joined face corners and seam pairs can alias the same physical vertex.
+            for (uint32_t k = j + 1u; k < count; ++k) {
+                if (element.vertex[j] == element.vertex[k] && (element.kind == kMfBend ||
+                    (element.kind == kMfSeam && k == (j | 1u)))) continue;
                 if (element.vertex[j] == element.vertex[k] ||
                     (color_of[element.vertex[j]] != kVbdNoColor &&
                      color_of[element.vertex[j]] == color_of[element.vertex[k]]))
                     return reject("material-field element joins one color twice");
+            }
         }
         for (float value : element.rest)
             if (!std::isfinite(value)) return reject("material-field rest data must be finite");
+        for (float value : element.curvature_dual)
+            if (!std::isfinite(value)) return reject("material-field curvature dual must be finite");
     }
+    if (state_end != cap.mf_state_scalars_per_env || trial_end != cap.mf_trial_scalars_per_env)
+        return reject("material-field state capacity disagrees with its layout");
     for (uint32_t v = 0u; v < field; ++v) {
         if (p.mf_incidence_offsets[v] > p.mf_incidence_offsets[v + 1u])
             return reject("material-field incidence offsets must not decrease");
@@ -1732,7 +1812,23 @@ void Model::BuildAeroAdjacency() {
     p.aero_particle_offset.clear();
     p.aero_particle_count.clear();
     p.aero_incident_tri.clear();
+    p.aero_tri_corner_source.assign(capacities.aero_tris_per_env, ~0u);
     if (capacities.aero_tris_per_env == 0u) return;
+    std::map<std::array<uint32_t, 3>, uint32_t> field_faces;
+    for (uint32_t i = 0u; i < p.mf_elements.size(); ++i) {
+        const MfElement& e = p.mf_elements[i];
+        if (e.kind != kMfTriangle) continue;
+        std::array<uint32_t, 3> vertices{e.vertex[0], e.vertex[1], e.vertex[2]};
+        for (uint32_t& vertex : vertices) vertex += capacities.vbd_particle_begin;
+        std::sort(vertices.begin(), vertices.end());
+        field_faces[vertices] = kMfMaxVertices * i;
+    }
+    for (uint32_t i = 0u; i < capacities.aero_tris_per_env; ++i) {
+        std::array<uint32_t, 3> vertices{p.aero_tri_verts[3u * i], p.aero_tri_verts[3u * i + 1u], p.aero_tri_verts[3u * i + 2u]};
+        std::sort(vertices.begin(), vertices.end());
+        const auto face = field_faces.find(vertices);
+        if (face != field_faces.end()) p.aero_tri_corner_source[i] = face->second;
+    }
     p.aero_particle_count.assign(capacities.particles_per_env, 0u);
     p.aero_particle_offset.resize(capacities.particles_per_env);
     for (uint32_t vertex : p.aero_tri_verts) ++p.aero_particle_count[vertex];

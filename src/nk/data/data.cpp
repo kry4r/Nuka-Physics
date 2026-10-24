@@ -26,6 +26,7 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::ReadoutPartials: v.readout_partials = static_cast<double*>(p); break;
         case FieldId::VbdForceResidualWork: v.vbd_force_residual_work = static_cast<float*>(p); break;
         case FieldId::EnergyParticleStart: v.energy_particle_start = static_cast<math::Vec3*>(p); break;
+        case FieldId::EnergyParticleStartVelocity: v.energy_particle_start_velocity = static_cast<math::Vec3*>(p); break;
         case FieldId::EnergyAeroImpulse: v.energy_aero_impulse = static_cast<math::Vec3*>(p); break;
         case FieldId::EnergyKinematicContactImpulse: v.energy_kinematic_contact_impulse = static_cast<math::Vec3*>(p); break;
         case FieldId::EnergyLinkStartQ: v.energy_link_start_q = static_cast<float*>(p); break;
@@ -195,7 +196,18 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::ParticleVel:         v.particle_vel = static_cast<math::Vec3*>(p); break;
         case FieldId::ParticleInvMass:     v.particle_inv_mass = static_cast<float*>(p); break;
         case FieldId::ParticleKinematicTarget: v.particle_kinematic_target = static_cast<math::Vec3*>(p); break;
+        case FieldId::ParticleAttachmentStiffness: v.particle_attachment_stiffness = static_cast<float*>(p); break;
+        case FieldId::MfStress: v.mf_stress = static_cast<math::Vec3*>(p); break;
+        case FieldId::MfCrackLoad: v.mf_crack_load = static_cast<float*>(p); break;
+        case FieldId::ParticleAttachmentPreviousStiffness: v.particle_attachment_previous_stiffness = static_cast<float*>(p); break;
+        case FieldId::ParticleAttachmentPreviousTarget: v.particle_attachment_previous_target = static_cast<math::Vec3*>(p); break;
+        case FieldId::SnapshotParticleAttachmentStiffness: v.snapshot_particle_attachment_stiffness = static_cast<float*>(p); break;
+        case FieldId::SnapshotParticleAttachmentPreviousStiffness: v.snapshot_particle_attachment_previous_stiffness = static_cast<float*>(p); break;
+        case FieldId::SnapshotParticleAttachmentPreviousTarget: v.snapshot_particle_attachment_previous_target = static_cast<math::Vec3*>(p); break;
+        case FieldId::SnapshotParticleKinematicTarget: v.snapshot_particle_kinematic_target = static_cast<math::Vec3*>(p); break;
         case FieldId::OgcContactCount: v.ogc_contact_count = static_cast<uint32_t*>(p); break;
+        case FieldId::OgcContactDemand: v.ogc_contact_demand = static_cast<uint32_t*>(p); break;
+        case FieldId::MfRangeElement: v.mf_range_element = static_cast<uint32_t*>(p); break;
         case FieldId::MeshOgcPairCount: v.mesh_ogc_pair_count = static_cast<uint32_t*>(p); break;
         case FieldId::MeshSdfPairCount: v.mesh_sdf_pair_count = static_cast<uint32_t*>(p); break;
         case FieldId::OgcSourceOffsets: v.ogc_source_offsets = static_cast<uint64_t*>(p); break;
@@ -297,6 +309,7 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::ParticleProjectionDelta: v.particle_projection_delta = static_cast<math::Vec3*>(p); break;
         case FieldId::ParticleResponse: v.particle_response = static_cast<math::SymmetricMat3*>(p); break;
         case FieldId::VbdFreeRate: v.vbd_free_rate = static_cast<math::Vec3*>(p); break;
+        case FieldId::VbdSolveRate: v.vbd_solve_rate = static_cast<math::Vec3*>(p); break;
         case FieldId::VbdFreeVelocity: v.vbd_free_velocity = static_cast<math::Vec3*>(p); break;
         case FieldId::ContactRowExtent: v.contact_row_extent = static_cast<uint32_t*>(p); break;
         case FieldId::ContactCacheExtent: v.contact_cache_extent = static_cast<uint32_t*>(p); break;
@@ -306,6 +319,27 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::SnapshotMfHistory: v.snapshot_mf_history = static_cast<float*>(p); break;
         case FieldId::MfTrial: v.mf_trial = static_cast<float*>(p); break;
         case FieldId::MfEnvCommit: v.mf_env_commit = static_cast<uint32_t*>(p); break;
+        case FieldId::MfCorner: v.mf_corner = static_cast<uint32_t*>(p); break;
+        case FieldId::SnapshotMfCorner: v.snapshot_mf_corner = static_cast<uint32_t*>(p); break;
+        case FieldId::ParticleRoot: v.particle_root = static_cast<uint32_t*>(p); break;
+        case FieldId::SnapshotParticleRoot: v.snapshot_particle_root = static_cast<uint32_t*>(p); break;
+        case FieldId::SnapshotParticleInvMass: v.snapshot_particle_inv_mass = static_cast<float*>(p); break;
+        case FieldId::MfTraction: v.mf_traction = static_cast<float*>(p); break;
+        case FieldId::MfCracks: v.mf_cracks = static_cast<uint32_t*>(p); break;
+        case FieldId::MfCrackCount: v.mf_crack_count = static_cast<uint32_t*>(p); break;
+        case FieldId::MfOpened: v.mf_opened = static_cast<uint32_t*>(p); break;
+        case FieldId::MfOpenedCount: v.mf_opened_count = static_cast<uint32_t*>(p); break;
+        case FieldId::MfTopology: v.mf_topology = static_cast<uint32_t*>(p); break;
+        case FieldId::ParticleSurfaceCorners: v.particle_surface_corners = static_cast<uint32_t*>(p); break;
+        case FieldId::SnapshotParticleSurfaceCorners:
+            v.snapshot_particle_surface_corners = static_cast<uint32_t*>(p);
+            break;
+        case FieldId::ParticleSurfaceLiveEdges:
+            v.particle_surface_live_edges = static_cast<collision::MeshEdge*>(p);
+            break;
+        case FieldId::SnapshotParticleSurfaceLiveEdges:
+            v.snapshot_particle_surface_live_edges = static_cast<collision::MeshEdge*>(p);
+            break;
         case FieldId::VbdOffset: v.vbd_offset = static_cast<math::Vec3*>(p); break;
         case FieldId::VbdInertia: v.vbd_inertia = static_cast<float*>(p); break;
         case FieldId::ParticleRowImpulse: v.particle_row_impulse = static_cast<math::Vec3*>(p); break;
@@ -335,6 +369,7 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::PairSortScratch:     v.pair_sort_scratch = static_cast<uint8_t*>(p); break;
         case FieldId::RngState:            v.rng_state = static_cast<uint64_t*>(p); break;
         case FieldId::EnvStatus:           v.env_status = static_cast<uint32_t*>(p); break;
+        case FieldId::SolverExecutedIterations: v.solver_executed_iterations = static_cast<uint32_t*>(p); break;
         case FieldId::ObsBuffer:           v.obs_buffer = static_cast<float*>(p); break;
         case FieldId::EnvTerrainType:      v.env_terrain_type = static_cast<uint32_t*>(p); break;
         case FieldId::EnvTerrainDifficulty: v.env_terrain_difficulty = static_cast<float*>(p); break;
@@ -358,6 +393,7 @@ phi::Status Data::Allocate(phi::BufferType* bt, const ModelCapacities& caps,
     if (s != phi::Status::Ok) {
         return s;
     }
+    buffer_type_ = bt;
     if (out_view != nullptr) {
         FillView(out_view);
     }
@@ -403,9 +439,11 @@ void* Data::Ptr(FieldId id) const {
 
 phi::Status Data::UploadFieldStatus(FieldId id, const void* src, uint64_t bytes, uint64_t byte_offset) const {
     const FieldBuffer* own = OwnBuffer(id);
-    if (own == nullptr) return arena_.UploadFieldStatus(id, src, bytes, byte_offset);
-    if (byte_offset > own->bytes || bytes > own->bytes - byte_offset) return phi::Status::InvalidArgument;
-    return phi::BufferUpload(own->buffer.get(), src, byte_offset, bytes);
+    if (own && (byte_offset > own->bytes || bytes > own->bytes - byte_offset)) return phi::Status::InvalidArgument;
+    const auto status = own ? phi::BufferUpload(own->buffer.get(), src, byte_offset, bytes)
+                            : arena_.UploadFieldStatus(id, src, bytes, byte_offset);
+    if (status == phi::Status::Ok && bytes > 0u) ++mutation_version_;
+    return status;
 }
 
 phi::Status Data::DownloadFieldStatus(FieldId id, void* dst, uint64_t bytes, uint64_t byte_offset) const {
@@ -454,19 +492,54 @@ bool Data::UploadPersistent(const std::vector<uint8_t>& bytes) const {
         return false;
     }
     if (phi::BufferUpload(buffer, bytes.data(), 0, bytes.size()) != phi::Status::Ok) return false;
-    for (const auto& segment : arena_.Segments()) {
-        if (segment.field != FieldId::ContactSolveMetrics && segment.field != FieldId::ContactSolveCounts &&
-            segment.field != FieldId::ContactSolveWorstTerms &&
-            segment.field != FieldId::ContactRowExtent && segment.field != FieldId::ContactCacheExtent)
-            continue;
-        if (phi::BufferMemset(arena_.ScratchBuffer(), 0, segment.offset, segment.bytes) != phi::Status::Ok)
-            return false;
-    }
-    return true;
+    ++mutation_version_;
+    return InvalidateScratch() == phi::Status::Ok;
 }
 
 bool Data::Snapshot() {
     return DownloadPersistent(&snapshot_persistent_);
+}
+
+phi::Status Data::CaptureTransaction() {
+    std::vector<phi::BufferSnapshot::Region> regions{{arena_.PersistentBuffer(), PersistentByteSize()}};
+    for (const auto& field : own_)
+        if (kFieldLayout[static_cast<uint32_t>(field.field)].arena == FieldArena::Persistent)
+            regions.push_back({field.buffer.get(), static_cast<size_t>(field.bytes)});
+    return transaction_.Capture(buffer_type_, regions);
+}
+
+phi::Status Data::InvalidateScratch() const {
+    for (const auto& segment : arena_.Segments()) {
+        if (segment.arena != static_cast<uint8_t>(FieldArena::Scratch)) continue;
+        const auto status = phi::BufferMemset(arena_.ScratchBuffer(), 0u, segment.offset, segment.bytes);
+        if (status != phi::Status::Ok) return status;
+    }
+    for (const auto& field : own_) {
+        if (kFieldLayout[static_cast<uint32_t>(field.field)].arena != FieldArena::Scratch) continue;
+        const auto status = phi::BufferMemset(field.buffer.get(), 0u, 0u, field.bytes);
+        if (status != phi::Status::Ok) return status;
+    }
+    return phi::Status::Ok;
+}
+
+phi::Status Data::ClearScratchField(FieldId id) const {
+    if (kFieldLayout[static_cast<uint32_t>(id)].arena != FieldArena::Scratch) return phi::Status::InvalidArgument;
+    if (const FieldBuffer* own = OwnBuffer(id)) return phi::BufferMemset(own->buffer.get(), 0u, 0u, own->bytes);
+    for (const auto& segment : arena_.Segments())
+        if (segment.field == id) return phi::BufferMemset(arena_.ScratchBuffer(), 0u, segment.offset, segment.bytes);
+    return phi::Status::InvalidArgument;
+}
+
+phi::Status Data::UploadScratchField(FieldId id, const void* src, uint64_t bytes) const {
+    if (kFieldLayout[static_cast<uint32_t>(id)].arena != FieldArena::Scratch) return phi::Status::InvalidArgument;
+    const FieldBuffer* own = OwnBuffer(id);
+    if (own && bytes > own->bytes) return phi::Status::InvalidArgument;
+    return own ? phi::BufferUpload(own->buffer.get(), src, 0u, bytes) : arena_.UploadFieldStatus(id, src, bytes, 0u);
+}
+
+phi::Status Data::RollbackTransaction() {
+    const auto status = transaction_.Restore();
+    return status == phi::Status::Ok ? InvalidateScratch() : status;
 }
 
 bool Data::Restore() {

@@ -453,7 +453,22 @@ nuka_result_t nuka_scene_add_mpm_fill_ex(nuka_scene_handle scene, uint32_t media
 
 // Material of a NUKA_MEDIA_METHOD_FIELD cloth (kg/m^3, m, Pa). Zero yield values keep it elastic and
 // zero Maxwell moduli (fractions of the instantaneous stiffness) drop those branches. Seams part at
-// tear_strength (Pa) after spending tear_energy (J/m^2).
+// tear_strength (Pa) after spending tear_energy (J/m^2); a positive weibull_modulus lets any edge crack
+// at a Weibull-scattered tear_strength. A positive grain_ratio (>= 1) makes a crack across grain, the
+// paper's machine direction, that many times stronger than one along it.
+// NUKA_FIELD_LAW_LOG_STRAIN_ORTHOTROPIC (material version 2) reads youngs and poisson along the grain, which
+// must be nonzero, and the appended cross-grain, shear and Hill yield parameters; law 0 is the small-strain law.
+// NUKA_FIELD_FRACTURE_MIXED_MODE (fracture version 2) parts seams in opening at tear_strength and tear_energy and
+// in sliding at shear_strength and shear_tear_energy, with toughness G_I + (G_S - G_I) b^mixity_exponent at sliding
+// energy share b; fracture law 0 is the isotropic cohesive.
+// NUKA_FIELD_SECTION_EFFECTIVE (section version 2) bends with its own bend_stiffness (zero: the plate value) and
+// declares the curvature_range its moment law holds for; section law 0 is the homogeneous plate.
+#define NUKA_FIELD_LAW_SMALL_STRAIN 1u
+#define NUKA_FIELD_LAW_LOG_STRAIN_ORTHOTROPIC 2u
+#define NUKA_FIELD_FRACTURE_ISOTROPIC 1u
+#define NUKA_FIELD_FRACTURE_MIXED_MODE 2u
+#define NUKA_FIELD_SECTION_PLATE 1u
+#define NUKA_FIELD_SECTION_EFFECTIVE 2u
 typedef struct nuka_field_material_desc_t {
     uint32_t struct_size;
     float density;
@@ -470,7 +485,41 @@ typedef struct nuka_field_material_desc_t {
     float bend_maxwell_time[2];
     float tear_strength;
     float tear_energy;
+    float weibull_modulus;
+    float grain[3];
+    float grain_ratio;
+    float shear_strength;          // Pa at a crack tip; zero uses tear_strength.
+    float weibull_reference_area;  // m^2 of the strength specimen; zero disables weakest-link area scaling.
+    uint32_t law;
+    float youngs_cd;        // Pa across the grain
+    float shear_modulus;    // Pa, in-plane
+    float yield_stress_cd;  // Pa across the grain; zero uses yield_stress
+    float yield_shear;      // Pa; zero uses yield_stress / sqrt(3)
+    float yield_biaxial;    // Pa, equibiaxial; zero uses yield_stress
+    float strain_range;     // largest principal log strain the law holds for
+    uint32_t fracture_law;
+    float shear_tear_energy;  // J/m^2 parting a seam by sliding; zero uses tear_energy
+    float mixity_exponent;    // zero uses 1
+    uint32_t section_law;
+    float bend_stiffness;   // N m along the grain; zero uses the plate value
+    float curvature_range;  // 1/m, largest principal curvature the section holds for
 } nuka_field_material_desc_t;
+
+typedef struct nuka_field_contract_desc_t {
+    uint32_t struct_size;
+    uint32_t schema_version;
+    uint32_t material_version;
+    uint32_t section_version;
+    uint32_t fracture_version;
+    uint32_t history_version;
+} nuka_field_contract_desc_t;
+
+// Current material-history schema; newly authored media record it and registered older versions still load.
+#define NUKA_FIELD_HISTORY_VERSION 2u
+
+nuka_result_t nuka_scene_add_field_media_v1(nuka_scene_handle scene,
+    const nuka_media_desc_t* desc, const nuka_field_material_desc_t* field,
+    const nuka_field_contract_desc_t* contract, uint32_t* out_media_id);
 
 // Add a cloth medium solved as a material-field shell: desc->method must be NUKA_MEDIA_METHOD_FIELD,
 // desc supplies the cloth geometry and vbd_friction, `field` the material.
@@ -503,6 +552,11 @@ nuka_result_t nuka_scene_add_cloth_region(nuka_scene_handle scene, uint32_t medi
 // along it at cook and a cohesive layer holds the two sides until it tears.
 nuka_result_t nuka_scene_add_cloth_seam(nuka_scene_handle scene, uint32_t media_id,
                                         const uint32_t* vertices, uint32_t count);
+
+// Add stiffness in N/m to one dynamic cloth vertex; its target initially equals its cooked position.
+// Drive it through PARTICLE_KINEMATIC_TARGET; vertex range, pinning and material checks run at cook.
+nuka_result_t nuka_scene_add_cloth_attachment(nuka_scene_handle scene, uint32_t media_id,
+                                              uint32_t vertex, float stiffness);
 
 // The environment-wide contact pool has no per-node limit; zero uses the cook default.
 nuka_result_t nuka_scene_set_mpm_contact_capacity(nuka_scene_handle scene,

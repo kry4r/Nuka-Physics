@@ -95,7 +95,7 @@ constexpr uint32_t kMultilevelRowParts = 256u;
 constexpr uint32_t kMultilevelElementHessian = 45u;
 // A material-field element's Gauss-Newton factor: four strain rows at vertices 1 to 5, then the upper
 // triangle of their stiffness.
-constexpr uint32_t kMultilevelFieldRows = 60u;
+constexpr uint32_t kMultilevelFieldRows = 4u * (nk::kMfMaxVertices - 1u) * 3u;
 constexpr uint32_t kMultilevelFieldCurvature = kMultilevelFieldRows + 10u;
 // Threads of a restriction block, one coarse node per warp.
 constexpr uint32_t kMultilevelCorrectThreads = 256u;
@@ -282,6 +282,7 @@ struct BlockScratch {
     double* multilevel_partials;
     unsigned long long* multilevel_operator;
     Vec3* multilevel_force;
+    Vec3* multilevel_root_force;
     Vec3* multilevel_direction;
     Vec3* multilevel_previous;
     Vec3* multilevel_correction;
@@ -529,6 +530,7 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
         ? uint64_t{p.env_count} * MultilevelOperatorEntries(layout) * (sizeof(uint64_t) / sizeof(uint32_t))
         : 0u));
     s.multilevel_force = reinterpret_cast<Vec3*>(take(vertex_words));
+    s.multilevel_root_force = layout.spares > 0u ? reinterpret_cast<Vec3*>(take(vertex_words)) : nullptr;
     s.multilevel_direction = reinterpret_cast<Vec3*>(take(vertex_words));
     s.multilevel_previous = reinterpret_cast<Vec3*>(take(vertex_words));
     s.multilevel_correction = reinterpret_cast<Vec3*>(take(
@@ -1031,10 +1033,11 @@ __global__ void CachePointIncidenceJacobiansKernel(
     }
 }
 
-// One owner's share of a row's J M^-1 J^T; sets `grid` when a grid node is the owner.
-__device__ double OwnerInertialResponse(const NkRow& row, const DataView& data,
-                                        const BlockDescentSolveParams& p, PointMassView points,
-                                        uint32_t slot, uint32_t owner, bool* grid) {
+// One owner's share of a row's J A^-1 J^T, A the owner's block matrix: a cloth vertex adds its elastic curvature at the
+// initial guess to its inertia, so a penalty stays in scale with the block it stiffens. Sets `grid` for a grid owner.
+__device__ double OwnerBlockResponse(const NkRow& row, const DataView& data,
+                                     const BlockDescentSolveParams& p, PointMassView points,
+                                     uint32_t slot, uint32_t owner, bool* grid) {
     if (owner < p.total_particle_count ||
         owner >= p.total_particle_count + p.total_body_count + p.articulation_count) {
         const uint32_t kind = owner < p.total_particle_count ? kNkSideParticle : kNkSideGrid;
@@ -1042,6 +1045,7 @@ __device__ double OwnerInertialResponse(const NkRow& row, const DataView& data,
             : owner - p.total_particle_count - p.total_body_count - p.articulation_count;
         *grid |= kind == kNkSideGrid;
         const Vec3 jacobian = PointJacobian(row, points, kind, index);
+        if (points.Shaped(kind)) return double(points.Quad(kind, index, jacobian, jacobian));
         const double norm = double(jacobian.x) * jacobian.x + double(jacobian.y) * jacobian.y +
                             double(jacobian.z) * jacobian.z;
         return double(InertialPointResponse(PointMassView::Contribution{kind, index, {}}, data, p, points)) * norm;
@@ -1073,15 +1077,15 @@ __device__ double OwnerInertialResponse(const NkRow& row, const DataView& data,
     return MassCoupling<double>(factor, p.max_dof, J, J, extra, extra);
 }
 
-// J M^-1 J^T of a row over its owners; sets `grid` when a grid node owns it and `coupling` to the
+// J A^-1 J^T of a row over its owners; sets `grid` when a grid node owns it and `coupling` to the
 // largest product of one owner's share with the other owners' shares, `largest` to the largest share.
-__device__ double RowInertialResponse(const NkRow& row, const DataView& data,
-                                     const BlockDescentSolveParams& p, PointMassView points,
-                                     uint32_t slot, bool* grid, double* coupling, double* largest) {
+__device__ double RowBlockResponse(const NkRow& row, const DataView& data,
+                                  const BlockDescentSolveParams& p, PointMassView points,
+                                  uint32_t slot, bool* grid, double* coupling, double* largest) {
     double response = 0.0;
     bool valid = true;
     VisitOwners(row, points, p, [&](uint32_t owner) {
-        const double contribution = OwnerInertialResponse(row, data, p, points, slot, owner, grid);
+        const double contribution = OwnerBlockResponse(row, data, p, points, slot, owner, grid);
         valid &= contribution >= 0.0 && isfinite(contribution);
         response += contribution;
     });
@@ -1089,7 +1093,7 @@ __device__ double RowInertialResponse(const NkRow& row, const DataView& data,
     *largest = 0.0;
     if (!valid || !isfinite(response)) return nan("");
     VisitOwners(row, points, p, [&](uint32_t owner) {
-        const double contribution = OwnerInertialResponse(row, data, p, points, slot, owner, grid);
+        const double contribution = OwnerBlockResponse(row, data, p, points, slot, owner, grid);
         *coupling = fmax(*coupling, contribution * (response - contribution));
         *largest = fmax(*largest, contribution);
     });
@@ -1135,7 +1139,7 @@ __global__ void CountIncidenceKernel(DataView data, BlockDescentSolveParams p, B
         }
         bool grid = false;
         double coupling = 0.0, largest = 0.0;
-        const double response = RowInertialResponse(row, data, p, points, slot, &grid, &coupling, &largest);
+        const double response = RowBlockResponse(row, data, p, points, slot, &grid, &coupling, &largest);
         // Owners a row ties descend against each other's stale velocities at the block Gauss-Seidel factor
         // rho^2 P / (1 + rho W + rho^2 P), P = max w_i (W - w_i); the root below keeps it at most 1/4.
         const double coupled = coupling > 0.0
@@ -1263,7 +1267,7 @@ __device__ VertexBlockView Vertices(ModelView model, DataView data, BlockDescent
     b.color_vertices = model.vbd_color_vertices;
     b.color_segments = model.vbd_color_segments;
     b.start = data.particle_prev_pos;
-    b.free_rate = data.vbd_free_rate;
+    b.free_rate = data.vbd_solve_rate;
     b.inertia = data.vbd_inertia;
     b.effective_step = data.vbd_step;
     b.solver_audit = p.measure_vertex_audit != 0u ? data.vbd_solve_audit : nullptr;
@@ -1647,6 +1651,11 @@ __device__ uint32_t TileIncidence(const VertexBlockView& b, const DescendTileVer
     return v.field != 0u ? b.field_incidence[at] : b.incidence[at];
 }
 
+// Whether a tile vertex still holds an incidence of its list, as VertexElementList::Holds.
+__device__ bool TileHolds(const VertexBlockView& b, const DescendTileVertex& v, uint32_t packed) {
+    return ElementsOf(b, v.env, v.vertex).Holds(packed);
+}
+
 __device__ uint32_t DescendElementKind(const VertexBlockView& b, const DescendTileVertex& v,
                                        uint32_t k) {
     const uint32_t packed = TileIncidence(b, v, k);
@@ -1713,7 +1722,7 @@ __global__ void __launch_bounds__(kThreads, 3) DescendParticlesKernel(ModelView 
                     v.vertex = vertex;
                     v.particle = particle;
                     VertexElementList list{nullptr, 0u, 0u, false};
-                    if (elastic) list = ElementsOf(b, vertex);
+                    if (elastic) list = ElementsOf(b, env, vertex);
                     v.field = list.field ? 1u : 0u;
                     v.element_begin = list.begin;
                     v.element_count = list.end - list.begin;
@@ -1762,10 +1771,12 @@ __global__ void __launch_bounds__(kThreads, 3) DescendParticlesKernel(ModelView 
             if (q < dense_element_total) {
                 const uint32_t k = order[q];
                 const DescendTileVertex& v = tile[DescendTileOwner(tile, k, false)];
-                Vec3 g;
-                SymmetricMat3 h;
-                ListElementBlock(b, data.particle_vel, v.env, data.particle_vel[v.particle], v.field != 0u,
-                                 TileIncidence(b, v, k), g, h);
+                const uint32_t packed = TileIncidence(b, v, k);
+                Vec3 g{};
+                SymmetricMat3 h{};
+                if (TileHolds(b, v, packed))
+                    ListElementBlock(b, data.particle_vel, v.env, data.particle_vel[v.particle], v.field != 0u,
+                                     packed, g, h);
                 float* sample = element_samples[k];
                 SetTileVec3(sample, g);
                 sample[3] = h.xx;
@@ -1911,8 +1922,10 @@ __global__ void __launch_bounds__(kThreads, 3) DescendParticlesKernel(ModelView 
             const Vec3 candidate = VertexTrial(u, direction, 1.0f);
             const Vec3 move = candidate - u;
             if (element) {
-                const VertexElementChangeTerms terms = ListElementChange(b, data.particle_vel, v.env,
-                    v.field != 0u, TileIncidence(b, v, k), u, move);
+                const uint32_t packed = TileIncidence(b, v, k);
+                const VertexElementChangeTerms terms = TileHolds(b, v, packed)
+                    ? ListElementChange(b, data.particle_vel, v.env, v.field != 0u, packed, u, move)
+                    : VertexElementChangeTerms{0.0f, 0.0f, 0.0f};
                 element_samples[k][0] = terms.elastic;
                 element_samples[k][1] = terms.rayleigh;
                 element_samples[k][2] = terms.damping;
@@ -2028,8 +2041,15 @@ __global__ void DualUpdateKernel(DataView data, BlockDescentSolveParams p, Block
         const uint32_t slot = s.active_rows[item];
         const uint32_t row_env = slot / p.rows_per_env;
         if (!EnvRunning(data, row_env)) continue;
+        if (row_env != env && env != ~0u) {
+            RaiseResidual(s, env, kResidualJoint, joint);
+            atomicMax(s.dual_step + env, step);
+            joint = step = 0u;
+        }
+        env = row_env;
+        // A material cell's step is its stress rows' residual; it takes no momentum, so no restart either.
         if (rows[slot].flags & nk::nk_row_flags::kMaterialBlock) {
-            UpdateMaterialDual(data, p, s, slot);
+            joint = max(joint, ResidualBits(UpdateMaterialDual(data, p, s, slot)));
             continue;
         }
         const bool grid_only = p.total_grid_count != 0u && GridOnlyRow(s, p.vertex_blocks.colors, slot);
@@ -2040,12 +2060,6 @@ __global__ void DualUpdateKernel(DataView data, BlockDescentSolveParams p, Block
         const uint32_t stride = rows[slot].group_normal_count;
         const Vec3 next = ProjectRowDual(t.dual, t.normal_bound, t.penalty, t.residual, t.contact, t.mu_first,
                                          t.mu_second, s.contact_relaxation + slot);
-        if (row_env != env && env != ~0u) {
-            RaiseResidual(s, env, kResidualJoint, joint);
-            atomicMax(s.dual_step + env, step);
-            joint = step = 0u;
-        }
-        env = row_env;
         // Every row's multiplier step drives the momentum restart; a non-contact row's is its residual too.
         const float2 change = MultiplierSteps(t.dual, next, static_cast<float>(t.response.residual_scale),
             t.penalty, t.contact ? t.mu_first : 0.0f, t.contact ? t.mu_second : 0.0f);
@@ -2214,6 +2228,21 @@ __global__ void ContactResidualsKernel(DataView data, BlockDescentSolveParams p,
     RaiseWarpResidual(s, env, kResidualTangent, tangent);
 }
 
+// The common steps of one color's split vertices, after every vertex block of the sweep has descended.
+__global__ void DescendCopiesKernel(ModelView model, DataView data, BlockDescentSolveParams p, BlockScratch s,
+                                    uint32_t color) {
+    const uint32_t lane = threadIdx.x % warpSize;
+    const uint32_t first = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
+    const uint32_t stride = gridDim.x * blockDim.x / warpSize;
+    const VertexBlockView b = Vertices(model, data, p);
+    const uint32_t begin = b.color_segments[2u * color], count = b.color_segments[2u * color + 1u];
+    for (uint32_t item = first; item < count * p.env_count; item += stride) {
+        const uint32_t env = item / count;
+        if (!EnvRunning(data, env)) continue;
+        SolveCopiesWarp(b, PointMasses(data), s.offsets, env, b.color_vertices[begin + item % count], lane);
+    }
+}
+
 // The cloth vertex part of a measured sweep's momentum class, after every row update of the sweep.
 __global__ void VertexResidualsKernel(ModelView model, DataView data, BlockDescentSolveParams p, BlockScratch s) {
     bool prune = false;
@@ -2292,6 +2321,8 @@ __global__ void MeasureVerticesKernel(ModelView model, DataView data, BlockDesce
     for (uint32_t item = first; item < b.layout.dynamic_vertices * p.env_count; item += stride) {
         const uint32_t env = item / b.layout.dynamic_vertices;
         const uint32_t vertex = b.color_vertices[item % b.layout.dynamic_vertices];
+        // A free fracture spare has no mass and no equation yet.
+        if (!(data.particle_inv_mass[b.Particle(env, vertex)] > 0.0f)) continue;
         Vec3 u, force;
         SymmetricMat3 hessian, inverse;
         VertexBlockEquationWarp(b, PointMasses(data), nullptr, env, vertex, lane, u, force, hessian);
@@ -2368,6 +2399,8 @@ __global__ void FinishSweepKernel(DataView data, BlockDescentSolveParams p, Bloc
         }
         if (__uint_as_float(bits) < p.velocity_tolerance || done >= p.iterations) {
             data.vbd_velocity_sweep_count[env] = done;
+            if (data.solver_executed_iterations != nullptr)
+                data.solver_executed_iterations[size_t{p.substep_index} * p.env_count + env] = done;
             for (uint32_t kind = 0u; kind < kResidualClasses; ++kind)
                 data.solver_residual[env * kResidualClasses + kind] = __uint_as_float(words[kind]);
         } else {
@@ -2540,6 +2573,8 @@ cudaError_t LaunchMultilevelCorrection(const ModelView& model, const DataView& d
             kThreads, stream, model, data, p, s);
     if (status == cudaSuccess)
         status = LaunchWork(MultilevelForceKernel, vertices, kMultilevelForceTile, stream, model, data, p, s);
+    if (status == cudaSuccess && l.spares > 0u)
+        status = LaunchWork(MultilevelRootForceKernel, vertices, kThreads, stream, model, data, p, s);
     if (status == cudaSuccess && assemble) {
         status = cudaMemsetAsync(s.multilevel_operator, 0, size_t{p.env_count} *
                                  MultilevelOperatorEntries(l) * sizeof(unsigned long long), stream);
@@ -2675,7 +2710,7 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
         model.vbd_coarse_parents == nullptr || model.vbd_coarse_weights == nullptr ||
         model.vbd_coarse_child_offsets == nullptr || model.vbd_coarse_children == nullptr ||
         model.vbd_coarse_child_weights == nullptr || data.vbd_inertia == nullptr ||
-        data.vbd_free_rate == nullptr))
+        data.vbd_solve_rate == nullptr))
         return Status::InvalidArgument;
     if (p->total_grid_count > 0u) {
         if (p->total_grid_count % p->env_count != 0u || data.grid_inv_mass == nullptr ||
@@ -2869,6 +2904,9 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
                              model, data, *p, particle_s, color);
             if (descent_status != cudaSuccess) return Status::Failed;
         }
+        for (uint32_t color = 0u; p->vertex_blocks.spares > 0u && color < p->vertex_blocks.colors; ++color)
+            if (LaunchWork(DescendCopiesKernel, p->vertex_blocks.dynamic_vertices * p->env_count, kThreads / 32u,
+                    stream, model, data, *p, s, color) != cudaSuccess) return Status::Failed;
         if (p->articulation_count > 0u || p->total_body_count > 0u) {
             if (!stamp(kPhaseDense, stream)) return Status::Failed;
             if (particle_bytes > 0u && cudaMemcpyAsync(s.particle_snapshot, data.particle_vel,

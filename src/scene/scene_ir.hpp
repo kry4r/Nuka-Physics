@@ -20,6 +20,7 @@
 // ---------------------------------------------------------------------------
 
 #include "scene/asset/asset_ref.hpp"
+#include "nk/material/material_contract.hpp"
 #include "scene/canonical_types.hpp"
 #include "scene/cook/settle_spec.hpp"   // SettleSpec (plain data; persisted IC seam)
 #include "scene/ecs/entity.hpp"
@@ -365,6 +366,8 @@ struct MediaVbdMaterial {
 // Material of a material-field shell, mapped 1:1 to nk::MfMaterial: zero yield values keep the
 // response elastic and zero Maxwell moduli drop those branches. Friction comes from the vbd block.
 struct MediaFieldMaterial {
+    nk::ContractVersions contract;
+    uint32_t law         = nk::kMfSmallStrainLaw;  // kMfLogStrainOrthotropicLaw needs contract material 2 and a grain
     float density        = 0.0f;  // kg / m^3
     float thickness      = 0.0f;  // m
     float youngs         = 0.0f;  // Pa
@@ -379,6 +382,23 @@ struct MediaFieldMaterial {
     float bend_maxwell_time[2]{};     // s
     float tear_strength  = 0.0f;  // Pa, the traction at which a seam starts to part
     float tear_energy    = 0.0f;  // J / m^2 spent parting a seam
+    float weibull_modulus = 0.0f;  // > 0: any edge may crack, at tear_strength scattered with this modulus
+    float grain[3]{};              // the paper's machine direction, in the rest frame or the pattern's plane
+    float grain_ratio     = 0.0f;  // > 0: a crack across the grain needs this many times the strength of one along it
+    float shear_strength = 0.0f;  // Pa; zero uses tear_strength
+    float weibull_reference_area = 0.0f;  // m^2 of the specimen defining tear_strength; zero disables area scaling
+    float youngs_cd      = 0.0f;  // Pa across the grain; youngs is along it (log-strain law)
+    float shear_modulus  = 0.0f;  // Pa, in-plane
+    float yield_stress_cd = 0.0f;  // Pa across the grain; zero uses yield_stress
+    float yield_shear    = 0.0f;  // Pa; zero uses yield_stress / sqrt(3)
+    float yield_biaxial  = 0.0f;  // Pa, equibiaxial; zero uses yield_stress
+    float strain_range   = 0.0f;  // largest principal log strain the law is valid for
+    uint32_t fracture_law = nk::kMfIsotropicCohesive;  // kMfMixedModeCohesive needs contract fracture 2
+    float shear_tear_energy = 0.0f;  // J / m^2 spent parting a seam by sliding; zero uses tear_energy
+    float mixity_exponent   = 0.0f;  // Benzeggagh-Kenane exponent on the sliding energy share; zero uses 1
+    uint32_t section_law = nk::kMfPlateSection;  // kMfEffectiveSection needs contract section 2
+    float bend_stiffness  = 0.0f;  // N m along the grain; zero uses the plate value
+    float curvature_range = 0.0f;  // 1/m, largest principal curvature the section holds for
 };
 
 // Constitutive material for an MLS-MPM medium. Mirrors cook::MpmMaterialInput
@@ -453,9 +473,14 @@ struct MediaRecord {
         ClothPin   pin = ClothPin::FromFree;
     };
     struct ClothMesh {
+        struct Attachment {
+            uint32_t vertex = 0u;
+            float stiffness = 0.0f;
+        };
         math::Transform local_transform{};
         AssetRef material_mesh;
         std::vector<uint32_t> pinned_vertices;
+        std::vector<Attachment> attachments;
         std::vector<std::vector<uint32_t>> seams;  // vertex polylines a material-field cloth may tear along
     };
     struct TetSphere {

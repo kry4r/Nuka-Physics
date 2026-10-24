@@ -423,6 +423,17 @@ phi::Status StateSensorBank::Capture(StateSensorBankSnapshot* snapshot) const {
     return phi::BackendSynchronize(backend_);
 }
 
+phi::Status StateSensorBank::CaptureTransaction() {
+    std::vector<phi::BufferSnapshot::Region> regions;
+    if (clocks_) regions.push_back({clocks_, size_t{env_count_} * sizeof(double)});
+    for (const auto& channel : channels_) regions.push_back({channel->storage, channel->bytes});
+    return transaction_.Capture(regions.empty() ? nullptr : phi::BackendDeviceBufferType(backend_), regions);
+}
+
+phi::Status StateSensorBank::RollbackTransaction() {
+    return transaction_.Restore();
+}
+
 bool StateSensorBank::Compatible(const StateSensorBankSnapshot& snapshot) const {
     if (snapshot.reset_steps.size() != env_count_ || snapshot.sensors.size() > channels_.size() ||
         (!snapshot.times.empty() && snapshot.times.size() != env_count_)) return false;

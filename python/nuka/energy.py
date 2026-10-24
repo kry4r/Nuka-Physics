@@ -42,6 +42,8 @@ class EnergyColumn(IntEnum):
     PLASTIC_LOSS = 31
     VISCOUS_LOSS = 32
     COHESIVE_LOSS = 33
+    NUMERICAL_KINETIC = 34
+    NUMERICAL_POTENTIAL = 35
 
 
 class EnergyStatus(IntFlag):
@@ -123,7 +125,7 @@ def _summarize_stream(values, status):
         "negative_dat_records": int((records[:, c.DAT_KINETIC_LOSS] < -1e-9).sum()),
         "residual_gate": abs(net_residual) <= 0.01 * throughput,
         "positive_window_gate": bool((ratios <= 0.001).all()),
-        "dat_energy_gate": 0 <= truncation <= 0.001 * throughput,
+        "dat_energy_gate": -1e-9 <= truncation <= 0.001 * throughput,
     })
     report["passes_energy_gates"] = bool(throughput >= 0 and report["residual_gate"] and
         report["positive_window_gate"] and report["dat_energy_gate"] and negative_losses == 0 and

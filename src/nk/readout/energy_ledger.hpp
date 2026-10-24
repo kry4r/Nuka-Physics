@@ -13,7 +13,8 @@ enum class EnergyColumn : uint32_t {
     DriveWork, AeroWork, ExternalWork, KinematicElasticWork, KinematicContactWork,
     FrictionLoss, NormalLoss, LimitLoss, PassiveLoss, RayleighLoss,
     PositionPotential, DatKineticLoss, DatPotential, Residual, Throughput, Dt,
-    RowRateWork, RowPhysicalImpulseWork, UnclassifiedRowWork, Valid, PlasticLoss, ViscousLoss, CohesiveLoss, Count
+    RowRateWork, RowPhysicalImpulseWork, UnclassifiedRowWork, Valid, PlasticLoss, ViscousLoss, CohesiveLoss,
+    NumericalKinetic, NumericalPotential, Count
 };
 
 inline constexpr uint32_t kEnergyColumnCount = static_cast<uint32_t>(EnergyColumn::Count);

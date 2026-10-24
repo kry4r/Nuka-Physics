@@ -2323,6 +2323,7 @@ void EditorHost::State::ApplySnapshot(const Snapshot& snap) {
     loaded_->sim->ApplyGhost(snap.ghost_links, snap.ghost_bodies);
     loaded_->sim->ClearEnvs();
     for (const PoseSample& e : snap.envs) loaded_->sim->AddEnv(e.env, e.links, e.bodies, EnvOffset(e.env, snap.env));
+    if (!snap.surfaces.empty()) loaded_->sim->SetSurfaceTriangles(snap.surfaces);
     if (!snap.particles.empty()) loaded_->sim->ApplyParticles(snap.particles, snap.heat, ui_state_.solver.alert);
     ui_state_.robot.live = snap.joints;
     RecordPolicyNorm(snap);

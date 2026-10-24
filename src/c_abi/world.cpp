@@ -5,6 +5,7 @@
 
 #include "nk/pipeline/world.hpp"
 #include "nk/model/articulation_ik.hpp"
+#include "nk/material/material_contract.hpp"
 #include "nk/solve/nk_row.hpp"  // L1: kPairDrivenRowsPerSlot (general row budget)
 #include "runtime/articulation/articulation_cooker.hpp"
 #include "runtime/articulation/articulation_state.hpp"
@@ -110,16 +111,7 @@ void CaptureArticulationHostMirror(const scene::CookedBlob& blob, WorldRecord* r
         record->articulation_host = articulation::ArticulationHostState{};
         return;
     }
-    if (arts.size() > 1u) {
-        std::fprintf(stderr,
-                     "[nuka] CaptureArticulationHostMirror: %zu articulations "
-                     "cooked; noise/set_link_mass host mirror covers only "
-                     "articulation 0 (multi-articulation mirror not yet "
-                     "implemented).\n",
-                     arts.size());
-    }
-    record->articulation_host =
-        articulation::BuildArticulationHostState({arts.front()}, blob.bodies);
+    record->articulation_host = articulation::BuildArticulationHostState(arts, blob.bodies);
 }
 
 // Translate the compact coupled cloth slots into a first-class scene MediaRecord
@@ -575,6 +567,28 @@ nuka_result_t ExportSceneUsd(const nuka::scene::SceneIR& scene, const char* usd_
     }
 }
 
+std::vector<uint32_t> LiveSurfaceTriangles(const WorldRecord& record, size_t index) {
+    const std::vector<uint32_t>& cooked = record.particle_surfaces[index].triangles;
+    if (cooked.empty() || record.world->FieldPtr(nuka::nk::FieldId::ParticleSurfaceCorners) == nullptr)
+        return cooked;
+    // The collision surface over the same triangles holds their corners, local to its first particle.
+    const nuka::nk::Model& model = record.world->GetModel();
+    for (const nuka::collision::MeshSurfaceInfo& info : model.particles.surface_info) {
+        const auto local = model.particles.surface_triangles.begin() + size_t{info.triangle_offset} * 3u;
+        if (size_t{info.triangle_count} * 3u != cooked.size() ||
+            !std::equal(cooked.begin(), cooked.end(), local,
+                        [&](uint32_t particle, uint32_t vertex) { return particle == info.vertex_offset + vertex; }))
+            continue;
+        std::vector<uint32_t> live(cooked.size());
+        record.world->GetData().DownloadField(nuka::nk::FieldId::ParticleSurfaceCorners, live.data(),
+                                              live.size() * sizeof(uint32_t),
+                                              size_t{info.triangle_offset} * 3u * sizeof(uint32_t));
+        for (uint32_t& vertex : live) vertex += info.vertex_offset;
+        return live;
+    }
+    return cooked;
+}
+
 }  // namespace nuka::c_abi
 
 extern "C" {
@@ -689,6 +703,114 @@ nuka_result_t nuka_world_step(nuka_world_handle world) {
     return nuka_world_step_n(world, 1u);
 }
 
+nuka_result_t nuka_world_invalidate_diagnostics(nuka_world_handle world) {
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (!record) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->world) return NUKA_RESULT_NOT_SUPPORTED;
+    record->world->InvalidateDiagnostics();
+    return NUKA_RESULT_OK;
+}
+
+nuka_result_t nuka_world_get_step_report(nuka_world_handle world, uint32_t env,
+    nuka_step_report_t* report, uint32_t* executed_iterations, uint32_t iteration_capacity) {
+    if (!report || (report->struct_size != sizeof(nuka_step_report_t) &&
+                    report->struct_size != offsetof(nuka_step_report_t, contact_capacity)) ||
+        report->schema_version != 1u)
+        return NUKA_RESULT_INVALID_ARG;
+    const auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (!record) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->world) return NUKA_RESULT_NOT_SUPPORTED;
+    if (env >= record->world->EnvCount()) return NUKA_RESULT_INVALID_ARG;
+    const auto& step = record->world->LastStepReport();
+    if (step.environments.empty()) return NUKA_RESULT_NOT_SUPPORTED;
+    const auto& e = step.environments[env];
+    if ((executed_iterations && iteration_capacity < e.executed_iterations.size()) ||
+        (!executed_iterations && iteration_capacity != 0u)) return NUKA_RESULT_INVALID_ARG;
+    nuka_step_report_t out{};
+    out.struct_size = report->struct_size;
+    out.schema_version = 1u;
+    out.public_step = step.stamp.public_step;
+    out.state_version = step.stamp.state_version;
+    out.attempt = step.stamp.attempt;
+    out.diagnostics_valid = step.stamp.valid;
+    out.accepted = step.stamp.accepted;
+    out.rolled_back = step.rolled_back;
+    out.outcome = static_cast<uint32_t>(e.outcome);
+    out.flags = e.flags;
+    out.topology_epoch = e.topology_epoch;
+    out.requested_iterations = step.requested_iterations;
+    out.configured_iterations = step.configured_iterations;
+    out.iteration_budget = step.iteration_budget;
+    out.substeps = step.substeps;
+    out.physical_convergence_measured = step.physical_convergence_measured;
+    out.transaction_bytes = record->world->TransactionByteSize();
+    out.time = e.time;
+    out.advanced_dt = e.advanced_dt;
+    out.contact_capacity = step.contact_capacity;
+    out.contact_demand = e.contact_demand;
+    out.topology_pending = e.topology_pending;
+    out.range_element = e.range_element;
+    if (executed_iterations)
+        std::copy(e.executed_iterations.begin(), e.executed_iterations.end(), executed_iterations);
+    std::memcpy(report, &out, out.struct_size);
+    return NUKA_RESULT_OK;
+}
+
+nuka_result_t nuka_world_get_material_state_layout(nuka_world_handle world, uint32_t element,
+    nuka_material_state_layout_t* layout) {
+    if (!layout || layout->struct_size != sizeof(nuka_material_state_layout_t) || layout->schema_version != 1u)
+        return NUKA_RESULT_INVALID_ARG;
+    const auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (!record) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->world) return NUKA_RESULT_NOT_SUPPORTED;
+    const auto& model = record->world->GetModel();
+    const auto& cap = model.capacities;
+    if (element != UINT32_MAX && element >= model.particles.mf_elements.size()) return NUKA_RESULT_INVALID_ARG;
+    nuka_material_state_layout_t out{};
+    out.struct_size = sizeof(out);
+    out.schema_version = 1u;
+    out.state_schema_version = nuka::nk::kMfStateVersion;
+    out.element_count = cap.mf_elements_per_env;
+    out.environment_count = cap.env_count;
+    out.state_scalars_per_env = cap.mf_state_scalars_per_env;
+    out.trial_scalars_per_env = cap.mf_trial_scalars_per_env;
+    if (element != UINT32_MAX) {
+        const auto& e = model.particles.mf_elements[element];
+        const bool mixed = model.particles.mf_materials[e.material].fracture_law == nuka::nk::kMfMixedModeCohesive;
+        const auto kind = e.kind == nuka::nk::kMfTriangle ? nuka::nk::HistoryKind::PlaneStress
+            : e.kind == nuka::nk::kMfBend ? nuka::nk::HistoryKind::Plate
+            : mixed ? nuka::nk::HistoryKind::MixedCohesive : nuka::nk::HistoryKind::Cohesive;
+        out.history_kind = static_cast<uint32_t>(kind);
+        out.state_offset = e.state_offset;
+        out.state_count = e.state_count;
+        out.trial_offset = e.trial_offset;
+        out.trial_count = e.state_count + nuka::nk::kMfTrialLosses;
+        out.field_count = nuka::nk::MaterialStateLayout(kind).field_count;
+    }
+    *layout = out;
+    return NUKA_RESULT_OK;
+}
+
+nuka_result_t nuka_material_state_field_info(uint32_t state_version, uint32_t history_kind, uint32_t field,
+    nuka_material_state_field_t* info) {
+    if (!info || info->struct_size != sizeof(nuka_material_state_field_t) || info->schema_version != 1u)
+        return NUKA_RESULT_INVALID_ARG;
+    if (state_version != nuka::nk::kMfStateVersion) return NUKA_RESULT_NOT_SUPPORTED;
+    const auto layout = nuka::nk::MaterialStateLayout(static_cast<nuka::nk::HistoryKind>(history_kind));
+    if (layout.version == 0u) return NUKA_RESULT_NOT_SUPPORTED;
+    if (field >= layout.field_count) return NUKA_RESULT_INVALID_ARG;
+    const auto& item = layout.fields[field];
+    nuka_material_state_field_t out{};
+    out.struct_size = sizeof(out);
+    out.schema_version = 1u;
+    out.name = item.name;
+    out.unit = item.unit;
+    out.offset = item.offset;
+    out.count = item.count;
+    *info = out;
+    return NUKA_RESULT_OK;
+}
+
 nuka_result_t nuka_world_step_n(nuka_world_handle world, uint32_t step_count) {
     auto* record = nuka::c_abi::WorldTable().Get(world);
     if (record == nullptr) {
@@ -704,6 +826,7 @@ nuka_result_t nuka_world_step_n(nuka_world_handle world, uint32_t step_count) {
         for (uint32_t step = 0u; step < step_count; ++step) {
             const auto result = record->world->StepConfigured();
             if (result != nuka::phi::Status::Ok) {
+                nuka::c_abi::SetErrorMessage(record->world->LastExecutionError().message);
                 std::fprintf(stderr, "[World] step failed at op %u\n",
                     static_cast<unsigned>(record->world->LastExecutionError().failed_op));
                 return nuka::c_abi::MapStatusToResult(result);
@@ -842,7 +965,8 @@ nuka_result_t nuka_world_get_particle_surface(nuka_world_handle world, uint32_t 
     out->normal_offset = s.normal_offset;
     out->render_material_id = s.render_material_id;
     out->medium = s.medium;
-    std::copy_n(s.triangles.begin(), std::min(capacity, s.triangles.size()), triangles);
+    const std::vector<uint32_t> live = nuka::c_abi::LiveSurfaceTriangles(*record, index);
+    std::copy_n(live.begin(), std::min(capacity, live.size()), triangles);
     return NUKA_RESULT_OK;
 }
 

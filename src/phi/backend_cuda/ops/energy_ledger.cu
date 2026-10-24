@@ -32,7 +32,7 @@ constexpr uint32_t kThreads = 128u;
 constexpr uint32_t kColumns = nk::kEnergyColumnCount;
 constexpr uint32_t kForceWorkColumn = kColumns;
 constexpr uint32_t kReductionColumns = kColumns + 1u;
-static_assert(kColumns == 34u, "energy field record must match its named columns");
+static_assert(kColumns == 36u, "energy field record must match its named columns");
 // A partial row holds one block's column totals, wide enough for the stage metrics.
 constexpr uint32_t kPartialWidth = nk::kPhysicsStageColumnCount;
 static_assert(kReductionColumns <= kPartialWidth);
@@ -288,11 +288,22 @@ __device__ VertexBlockView LedgerVertices(const ModelView& m, const DataView& d,
     block.layout.elements = p.vbd_elements;
     block.layout.field_vertices = p.field_vertices;
     block.layout.field_elements = p.field_elements;
+    block.layout.field_state_scalars = p.field_state_scalars;
+    block.layout.field_trial_scalars = p.field_trial_scalars;
+    block.layout.spare_first = p.spare_first;
+    block.layout.spares = p.spares;
     block.layout.particles_per_env = p.particles_per_env;
     block.layout.env_count = p.env_count;
     block.dt = p.dt;
     BindFieldTables(block, m, d);
     return block;
+}
+
+// A field element on its env's split corners.
+__device__ nk::MfElement LedgerFieldElement(const ModelView& m, const DataView& d, const ReadoutEnergyLedgerParams& p,
+                                            uint32_t env, uint32_t index) {
+    return nk::WithCorners(m.mf_elements[index],
+                           d.mf_corner != nullptr ? d.mf_corner + (size_t{env} * p.field_elements + index) * nk::kMfMaxVertices : nullptr);
 }
 
 // Material-field elements push a kinematic vertex through their response at the committed history.
@@ -303,9 +314,10 @@ __device__ KinematicElasticResponse KinematicFieldReaction(const ModelView& m, c
     for (uint32_t k = m.mf_incidence_offsets[field_vertex]; k < m.mf_incidence_offsets[field_vertex + 1u]; ++k) {
         const uint32_t incidence = m.mf_incidence[k];
         const uint32_t index = nk::MfIncidenceElement(incidence);
-        const nk::MfElement element = m.mf_elements[index];
-        const float* history = d.mf_history + (size_t{particle / p.particles_per_env} * p.field_elements + index) *
-            nk::kMfHistory;
+        const nk::MfElement element = LedgerFieldElement(m, d, p, particle / p.particles_per_env, index);
+        if (!nk::MfVertexSlotHolds(element.vertex, nk::MfIncidenceLocal(incidence), particle - base)) continue;
+        const float* history = d.mf_history + size_t{particle / p.particles_per_env} * p.field_state_scalars +
+                               element.state_offset;
         const uint32_t anchor = base + element.vertex[0];
         nk::mf::FieldGeometry geometry;
         for (uint32_t j = 0u; j < nk::MfElementVertexCount(element); ++j) {
@@ -324,7 +336,7 @@ __device__ KinematicElasticResponse KinematicFieldReaction(const ModelView& m, c
 }
 
 __device__ KinematicElasticResponse KinematicElasticReaction(const ModelView& m, const DataView& d,
-    const ReadoutEnergyLedgerParams& p, uint32_t particle) {
+    const ReadoutEnergyLedgerParams& p, uint32_t particle, bool rayleigh = true) {
     if (!IsVertex(p, particle)) return {};
     const uint32_t vertex = particle % p.particles_per_env - p.vbd_begin;
     const uint32_t first_field = p.vbd_vertices - p.field_vertices;
@@ -345,7 +357,7 @@ __device__ KinematicElasticResponse KinematicElasticReaction(const ModelView& m,
         math::SymmetricMat3 hessian;
         const uint32_t local = nk::VbdIncidenceLocal(incidence);
         nk::vbd::ElementBlock(element, local, geometry, &gradient, &hessian);
-        if (element.damping > 0.0f) {
+        if (rayleigh && element.damping > 0.0f) {
             nk::vbd::ElementGeometry frozen;
             Vec3 rates[4];
             for (uint32_t j = 0u; j < nk::VbdElementVertexCount(element.kind); ++j) {
@@ -394,7 +406,7 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
         if (c >= Column(EnergyColumn::DriveWork) && c <= Column(EnergyColumn::ExternalWork))
             values[Column(EnergyColumn::Throughput)] += fabs(value);
         if ((c >= Column(EnergyColumn::FrictionLoss) && c <= Column(EnergyColumn::RayleighLoss)) ||
-            c >= Column(EnergyColumn::PlasticLoss))
+            (c >= Column(EnergyColumn::PlasticLoss) && c <= Column(EnergyColumn::NumericalPotential)))
             values[Column(EnergyColumn::Throughput)] += value;
     };
     double kinetic = 0.0, gravity = 0.0, elastic = 0.0, position = 0.0;
@@ -402,6 +414,7 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
     for (uint32_t local = s.first; local < p.particles_per_env; local += s.stride) {
         const uint32_t particle = env * p.particles_per_env + local;
         if (p.stage == EnergyStage::Begin) d.energy_particle_start[particle] = d.particle_pos[particle];
+        if (p.stage == EnergyStage::Begin) d.energy_particle_start_velocity[particle] = d.particle_vel[particle];
         const Vec3 velocity = ParticleVelocity(d, p, particle);
         if (p.stage == EnergyStage::Free) {
             d.energy_kinematic_contact_impulse[particle] = {};
@@ -412,6 +425,34 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
             d.energy_aero_impulse[particle] = impulse;
         }
         const float inverse_mass = d.particle_inv_mass[particle];
+        if (IsVertex(p, particle)) {
+            const double stiffness = d.particle_attachment_stiffness[particle];
+            const double previous = d.particle_attachment_previous_stiffness[particle];
+            const Vec3 target = d.particle_kinematic_target[particle];
+            const Vec3 old_target = d.particle_attachment_previous_target[particle];
+            const Vec3 x = ElementPosition(d, p, particle, false);
+            elastic += p.stage == EnergyStage::Begin
+                ? 0.5 * previous * Dot(x - old_target, x - old_target)
+                : 0.5 * stiffness * Dot(x - target, x - target);
+            if (p.stage == EnergyStage::Free) {
+                const Vec3 start = d.energy_particle_start[particle];
+                add(EnergyColumn::ExternalWork, 0.5 * stiffness * Dot(start - target, start - target) -
+                    0.5 * previous * Dot(start - old_target, start - old_target));
+            }
+            if (p.stage == EnergyStage::Projected) {
+                const Vec3 unprojected = ElementPosition(d, p, particle, true);
+                position += 0.5 * stiffness * (Dot(x - target, x - target) -
+                                               Dot(unprojected - target, unprojected - target));
+            }
+            // Backward Euler loses the end gradient's work over the move less the potential change; the
+            // elements subtract their change below, and the attachment's own gap is 0.5 k |dx|^2.
+            if (p.stage == EnergyStage::Solved) {
+                const Vec3 move = d.particle_vel[particle] * p.dt;
+                add(EnergyColumn::NumericalPotential,
+                    double(Dot(KinematicElasticReaction(m, d, p, particle, false).gradient, move)) +
+                    0.5 * stiffness * double(Dot(move, move)));
+            }
+        }
         if (!(inverse_mass > 0.0f)) {
             if (p.stage == EnergyStage::Solved) {
                 const double elastic_work = KinematicElasticWork(m, d, p, particle);
@@ -430,9 +471,11 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
             const VertexBlockView block = LedgerVertices(m, d, p);
             const Vec3 displacement = d.particle_vel[particle] * p.dt;
             const Vec3 force = VertexBlockForceDouble(block, d.particle_vel, env, vertex,
-                nk::vbd::InertialGradient(d.particle_vel[particle], d.vbd_free_rate[slot], d.vbd_inertia[slot], p.dt),
+                nk::vbd::InertialGradient(d.particle_vel[particle], d.vbd_solve_rate[slot], d.vbd_inertia[slot], p.dt),
                 d.particle_row_impulse[particle] / p.dt);
             values[kForceWorkColumn] -= Dot(force, displacement);
+            const Vec3 jump = d.particle_vel[particle] - d.energy_particle_start_velocity[particle];
+            add(EnergyColumn::NumericalKinetic, 0.5 * mass * double(Dot(jump, jump)));
         }
         kinetic += 0.5 * mass * Dot(velocity, velocity);
         gravity -= mass * Dot(g, d.particle_pos[particle]);
@@ -486,7 +529,12 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
         const double mass = inertia.m[21];
         const auto com = ComposeFrame(pose, m.link_inertial_frame[link]);
         gravity -= mass * Dot(g, com.position);
-        if (m.joint_armature[link] != 0.0f) atomicOr(coverage, nk::energy_status::kArmatureEnergy);
+        // Armature is rotor inertia on a one-coordinate joint's mass diagonal; a floating base keeps it unbalanced.
+        const auto joint = static_cast<ArticulationJointType>(m.joint_type[link]);
+        if (joint == ArticulationJointType::Revolute || joint == ArticulationJointType::Prismatic)
+            kinetic += 0.5 * double(m.joint_armature[link]) * d.qdot[link] * d.qdot[link];
+        else if (joint == ArticulationJointType::FloatingBase && m.joint_armature[link] != 0.0f)
+            atomicOr(coverage, nk::energy_status::kArmatureEnergy);
         if (p.stage == EnergyStage::Projected && p.pos_pass) {
             const auto no_position = ComposeFrame(d.energy_link_unprojected_pose[link], m.link_inertial_frame[link]);
             position -= mass * Dot(g, com.position - no_position.position);
@@ -527,6 +575,9 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
         if (p.stage == EnergyStage::Projected)
             position += double(nk::vbd::ElementEnergy(element, x)) - nk::vbd::ElementEnergy(element, unprojected);
         if (p.stage != EnergyStage::Solved) continue;
+        Vec3 move[4];
+        for (uint32_t j = 0u; j < count; ++j) move[j] = rates[j] * p.dt;
+        add(EnergyColumn::NumericalPotential, -double(nk::vbd::ElementMovesEnergyChange(element, frozen, move)));
         for (uint32_t j = 0u; j < count; ++j) {
             const uint32_t particle = env * p.particles_per_env + p.vbd_begin + element.vertex[j];
             if (!(element.damping > 0.0f)) continue;
@@ -539,10 +590,9 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
         }
     }
     for (uint32_t i = s.first; i < p.field_elements; i += s.stride) {
-        const nk::MfElement element = m.mf_elements[i];
+        const nk::MfElement element = LedgerFieldElement(m, d, p, env, i);
         const nk::MfMaterial material = m.mf_materials[element.material];
-        const size_t slot = size_t{env} * p.field_elements + i;
-        const float* history = d.mf_history + slot * nk::kMfHistory;
+        const float* history = d.mf_history + size_t{env} * p.field_state_scalars + element.state_offset;
         nk::mf::FieldGeometry x, unprojected;
         const uint32_t anchor = env * p.particles_per_env + p.vbd_begin + element.vertex[0];
         for (uint32_t j = 0u; j < nk::MfElementVertexCount(element); ++j) {
@@ -560,11 +610,27 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
         elastic += energy;
         if (p.stage == EnergyStage::Projected)
             position += energy - nk::mf::ElementEnergy(element, material, history, unprojected);
+        if (p.stage == EnergyStage::Solved) {
+            nk::mf::FieldGeometry start;
+            Vec3 move[nk::kMfMaxVertices];
+            for (uint32_t j = 0u; j < nk::MfElementVertexCount(element); ++j) {
+                const uint32_t particle = env * p.particles_per_env + p.vbd_begin + element.vertex[j];
+                start.start[j] = d.particle_prev_pos[particle];
+                move[j] = d.particle_vel[particle] * p.dt;
+            }
+            add(EnergyColumn::NumericalPotential,
+                -double(nk::mf::ElementMovesEnergyChange(element, material, history, start, nullptr, p.dt, move)));
+        }
         // The step's commit left its plastic, or a seam's cohesive, and viscous losses after the trial history.
         if (p.stage == EnergyStage::End) {
+            const float* trial = d.mf_trial + size_t{env} * p.field_trial_scalars + element.trial_offset;
             add(element.kind == nk::kMfSeam ? EnergyColumn::CohesiveLoss : EnergyColumn::PlasticLoss,
-                d.mf_trial[slot * (nk::kMfHistory + 2u) + nk::kMfHistory]);
-            add(EnergyColumn::ViscousLoss, d.mf_trial[slot * (nk::kMfHistory + 2u) + nk::kMfHistory + 1u]);
+                trial[element.state_count]);
+            add(EnergyColumn::ViscousLoss, trial[element.state_count + 1u]);
+            // The trial still holds the hinge damage before the step's seams weakened it; the bending energy the
+            // lost stiffness held is released as fracture dissipation.
+            if (element.kind == nk::kMfBend)
+                add(EnergyColumn::CohesiveLoss, nk::mf::ElementEnergy(element, material, trial, x) - energy);
         }
     }
     if (p.stage == EnergyStage::Solved) {
@@ -647,12 +713,15 @@ __global__ void FinishEnergyLedgerKernel(DataView d, ReadoutEnergyLedgerParams p
         losses += sum[c];
     }
     losses += sum[Column(EnergyColumn::PlasticLoss)] + sum[Column(EnergyColumn::ViscousLoss)] +
-              sum[Column(EnergyColumn::CohesiveLoss)];
+              sum[Column(EnergyColumn::CohesiveLoss)] + sum[Column(EnergyColumn::NumericalKinetic)] +
+              sum[Column(EnergyColumn::NumericalPotential)];
     const double residual = change - work + losses + get(EnergyColumn::DatKineticLoss) -
                              get(EnergyColumn::PositionPotential);
     output[Column(EnergyColumn::Dt)] = p.dt;
     output[Column(EnergyColumn::Valid)] = 1.0f;
-    if (d.env_status[env] != 0u) atomicOr(coverage, nk::energy_status::kPhysicsFailure);
+    // A field element past its calibrated range only warns; it voids no balance.
+    if ((d.env_status[env] & ~kEnvStatusMaterialFieldRange) != 0u)
+        atomicOr(coverage, nk::energy_status::kPhysicsFailure);
     if (!isfinite(residual)) atomicOr(coverage, nk::energy_status::kNonfinite);
     output[Column(EnergyColumn::Residual)] = *coverage == 0u ? float(residual) : nanf("");
     if (*coverage != 0u) output[Column(EnergyColumn::Throughput)] = nanf("");
@@ -716,6 +785,8 @@ __global__ void PhysicsStageMetricsKernel(ModelView m, DataView d, ReadoutEnergy
         if (p.stage == EnergyStage::Solved) {
             vector(C::VbdGravityImpulseX, Vec3{p.gravity[0], p.gravity[1], p.gravity[2]} * (p.dt / inverse_mass));
             vector(C::VbdRowImpulseX, d.particle_row_impulse[particle]);
+            vector(C::VbdElasticBoundaryImpulseX, (d.particle_kinematic_target[particle] - position) *
+                (d.particle_attachment_stiffness[particle] * p.dt));
         }
         add(C::VbdDynamicParticles, 1.0);
         if (p.stage == EnergyStage::Begin) continue;
@@ -727,7 +798,7 @@ __global__ void PhysicsStageMetricsKernel(ModelView m, DataView d, ReadoutEnergy
         const VertexBlockView block = LedgerVertices(m, d, p);
         const Vec3 displacement = d.particle_vel[particle] * p.dt;
         const Vec3 force = VertexBlockForceDouble(block, d.particle_vel, env, vertex,
-            nk::vbd::InertialGradient(d.particle_vel[particle], d.vbd_free_rate[slot], d.vbd_inertia[slot], p.dt),
+            nk::vbd::InertialGradient(d.particle_vel[particle], d.vbd_solve_rate[slot], d.vbd_inertia[slot], p.dt),
             d.particle_row_impulse[particle] / p.dt);
         const Vec3 defect = force * p.dt;
         vector(C::VbdMomentumDefectX, defect);

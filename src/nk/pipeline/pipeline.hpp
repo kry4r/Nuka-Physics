@@ -72,6 +72,9 @@ public:
                const sensor::StateSensorBank* sensors = nullptr);
     static uint32_t SubstepCount(const Model& model, const SolverConfig& cfg);
     uint32_t VelocityIterations() const { return p_block_descent_.iterations; }
+    // Solves one public step may spend re-equilibrating newly inserted seams (NUKA_TOPOLOGY_ATTEMPTS, default 8).
+    uint32_t TopologyAttempts() const { return topology_attempts_; }
+    const phi::ClothStepParams& ClothParams() const { return p_cloth_step_; }
 
     const std::vector<phi::OpCall>& Calls() const { return calls_; }
     size_t Size() const { return calls_.size(); }
@@ -134,6 +137,7 @@ private:
     phi::ParticleContactDeltaParams   p_part_contact_delta_{};
     phi::ParticleFinalizeParams       p_part_finalize_{};
     phi::ClothStepParams              p_cloth_step_{};
+    uint32_t                          topology_attempts_ = 8u;
     phi::MpmParams                    p_mpm_{};
     phi::ReadoutContactWrenchParams   p_readout_{};
     phi::RecordTelemetryParams        p_telemetry_{};

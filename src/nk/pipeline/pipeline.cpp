@@ -94,14 +94,13 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
     }
     const bool has_mpm = model.MpmParticlesPerEnv() > 0u && cap.mpm_grid_nodes_per_env > 0u;
     const bool mpm_reaction = has_mpm;
-    if (substeps == 1u && !mpm_reaction) return phi::Status::Ok;
     const uint64_t call_count = uint64_t(substeps) * (calls_.size() + 1u + uint32_t(mpm_reaction));
     if (call_count > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
         calls_.clear();
         return phi::Status::InvalidArgument;
     }
     const auto interval_calls = calls_;
-    p_int_vel_.clear_body_forces = 0u;
+    if (substeps > 1u || mpm_reaction) p_int_vel_.clear_body_forces = 0u;
     calls_.clear();
     calls_.reserve(static_cast<size_t>(call_count));
     p_accumulate_step_.resize(static_cast<size_t>(substeps) * 2u);
@@ -121,8 +120,8 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
         auto& outputs = p_accumulate_step_[static_cast<size_t>(step) * 2u + 1u];
         outputs = capture;
         outputs.flags = phi::kAccumulateOutputs;
-        if (cap.bodies_per_env > 0u) outputs.flags |= phi::kFinalizeBodyForces;
-        if (cap.links_per_env > 0u) outputs.flags |= phi::kFinalizeLinkWrench;
+        if (cap.bodies_per_env > 0u && (substeps > 1u || mpm_reaction)) outputs.flags |= phi::kFinalizeBodyForces;
+        if (cap.links_per_env > 0u && (substeps > 1u || mpm_reaction)) outputs.flags |= phi::kFinalizeLinkWrench;
         if (mpm_reaction) outputs.flags |= phi::kAccumulateMpmOutput;
         if (substeps > 1u && (readout_demand & kReadoutContactWrench) != 0u &&
             cap.max_contacts_per_env > 0u)
@@ -287,6 +286,10 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p.vbd_elements = cap.vbd_elements_per_env;
         p.field_vertices = cap.mf_vertices_per_env;
         p.field_elements = cap.mf_elements_per_env;
+        p.field_state_scalars = cap.mf_state_scalars_per_env;
+        p.field_trial_scalars = cap.mf_trial_scalars_per_env;
+        p.spare_first = cap.mf_spare_first;
+        p.spares = cap.mf_spares_per_env;
         p.bodies_per_env = cap.bodies_per_env;
         p.links_per_env = cap.links_per_env;
         p.artics_per_env = has_articulation ? cap.articulations_per_env : 0u;
@@ -404,6 +407,13 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     vertex_blocks.coarse_dense_nodes = cap.vbd_coarse_dense_nodes;
     vertex_blocks.field_vertices = cap.mf_vertices_per_env;
     vertex_blocks.field_elements = cap.mf_elements_per_env;
+    vertex_blocks.field_state_scalars = cap.mf_state_scalars_per_env;
+    vertex_blocks.field_trial_scalars = cap.mf_trial_scalars_per_env;
+    vertex_blocks.spare_first = cap.mf_spare_first;
+    vertex_blocks.spares = cap.mf_spares_per_env;
+    vertex_blocks.surfaces = cap.particle_surfaces_per_env;
+    vertex_blocks.surface_triangles = cap.particle_surface_triangles;
+    vertex_blocks.surface_edges = cap.particle_surface_edges_per_env;
     p_block_descent_.dt = cfg.dt;
     p_block_descent_.env_count = env_count;
     p_block_descent_.rows_per_env = cap.max_rows_per_env;
@@ -417,6 +427,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     p_block_descent_.material_cells_per_env = cap.mpm_stress_cells_per_env;
     p_block_descent_.grid_particles_per_env = grid_particles_per_env;
     std::copy(mp.mpm_grid_dims, mp.mpm_grid_dims + 3u, p_block_descent_.grid_dims);
+    p_block_descent_.grid_cell_size = mp.mpm_cell_size;
     p_block_descent_.base_link_count = base_link_count;
     p_block_descent_.contact_rows_per_env = contact_rows_per_env;
     p_block_descent_.distinct_owner_rows_per_env = cap.distinct_owner_rows_per_env;
@@ -434,6 +445,14 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         if (end == velocity_tolerance || *end != '\0' || !std::isfinite(tolerance) || tolerance < 0.0f)
             return phi::Status::InvalidArgument;
         p_block_descent_.velocity_tolerance = tolerance;
+    }
+    const char* topology_attempts = std::getenv("NUKA_TOPOLOGY_ATTEMPTS");
+    if (topology_attempts != nullptr) {
+        char* end = nullptr;
+        const unsigned long attempts = std::strtoul(topology_attempts, &end, 10);
+        if (end == topology_attempts || *end != '\0' || attempts == 0ul || attempts > 1024ul)
+            return phi::Status::InvalidArgument;
+        topology_attempts_ = static_cast<uint32_t>(attempts);
     }
     // Only head rows enter the incidence: one owner per plain side, every term of a point endpoint.
     p_block_descent_.incidence_per_env =
@@ -503,6 +522,10 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
             p_aero_drag_.max_dv = mp.aero_drag_max_dv;
             p_aero_drag_.tri_count = aero_tri_count;
             p_aero_drag_.particle_count = cap.particles_per_env * env_count;
+            p_aero_drag_.triangles_per_env = cap.aero_tris_per_env;
+            p_aero_drag_.particles_per_env = cap.particles_per_env;
+            p_aero_drag_.field_elements_per_env = cap.mf_elements_per_env;
+            p_aero_drag_.field_begin = cap.vbd_particle_begin;
             add(phi::NkOp::ParticleAeroDrag, &p_aero_drag_);
         }
 
@@ -585,7 +608,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         cap.particle_surfaces_per_env > 0u) {
         p_particle_surfaces_ = {env_count, per_env_particles, cap.particle_surfaces_per_env,
                                cap.particle_surface_triangles, cap.particle_surface_nodes_per_env,
-                               cap.particle_surface_edge_nodes_per_env};
+                               cap.particle_surface_edge_nodes_per_env, cap.particle_surface_edges_per_env};
         add(phi::NkOp::RefitParticleSurfaces, &p_particle_surfaces_);
     }
 
@@ -855,9 +878,6 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_dat_truncate_.mesh_vertex_sources = cap.mesh_vertex_source_count;
         p_dat_truncate_.mesh_edge_sources = cap.mesh_edge_source_count;
         p_dat_truncate_.excluded_pairs = cap.max_excluded_pairs;
-        p_dat_truncate_.slot_stride = cap.max_contacts_per_env;
-        p_dat_truncate_.slot_base = rigid_cap;
-        p_dat_truncate_.slot_capacity = cap.ogc_contacts_per_env;
         if (has_articulation || has_bodies)
             add(phi::NkOp::DatSnapshot, &p_dat_truncate_);
     }

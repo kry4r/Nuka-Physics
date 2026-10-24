@@ -98,6 +98,9 @@ struct BackendI {
     float       (*event_elapsed_ms)(Backend*, Event*, Event*);
     ResourceInfo (*resource_info)(Backend*);
     PlanMetrics (*plan_metrics)(Backend*, Plan*);
+    BufferType* (*device_buffer_type)(Backend*) = nullptr;
+    BufferType* (*host_buffer_type)(Backend*) = nullptr;
+    Status (*reserve_thread_stack)(Backend*, uint64_t) = nullptr;
 };
 
 // ---------------------------------------------------------------------------
@@ -191,9 +194,16 @@ Backend*       ActiveBackend();
 void           SetActiveBackend(Backend*);    // register the selected backend.
 void           ResetActiveBackend(Backend*);  // clear if it is the active one.
 
-BufferType*    BackendDeviceBufferType(Backend*);
-BufferType*    BackendHostBufferType(Backend*);
+inline BufferType* BackendDeviceBufferType(Backend* backend) {
+    return backend && IfaceOf(backend)->device_buffer_type ? IfaceOf(backend)->device_buffer_type(backend) : nullptr;
+}
+inline BufferType* BackendHostBufferType(Backend* backend) {
+    return backend && IfaceOf(backend)->host_buffer_type ? IfaceOf(backend)->host_buffer_type(backend) : nullptr;
+}
 // Raises the device's per-thread stack limit to at least `bytes`; it is never lowered.
-Status         BackendReserveThreadStack(Backend*, uint64_t bytes);
+inline Status BackendReserveThreadStack(Backend* backend, uint64_t bytes) {
+    return backend && IfaceOf(backend)->reserve_thread_stack ?
+        IfaceOf(backend)->reserve_thread_stack(backend, bytes) : Status::Unsupported;
+}
 
 } // namespace nuka::phi

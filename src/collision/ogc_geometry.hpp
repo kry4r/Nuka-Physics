@@ -40,6 +40,22 @@ struct OgcEdgePair {
     bool feasible = false;
 };
 
+// Affine coordinates of the plane projection; extrapolated coordinates retain the plane's exact normal Jacobian.
+NUKA_OGC_HD inline bool OgcPlaneCoordinates(math::Vec3 query, math::Vec3 a, math::Vec3 b, math::Vec3 c,
+                                            math::Vec3* weights) {
+    const math::Vec3 u = b - a, v = c - a, q = query - a;
+    const auto dot = [](math::Vec3 x, math::Vec3 y) {
+        return double(x.x) * y.x + double(x.y) * y.y + double(x.z) * y.z;
+    };
+    const double uu = dot(u, u), uv = dot(u, v), vv = dot(v, v);
+    const double determinant = uu * vv - uv * uv;
+    if (!(determinant > 0.0)) return false;
+    const double qu = dot(q, u), qv = dot(q, v);
+    const double y = (vv * qu - uv * qv) / determinant, z = (uu * qv - uv * qu) / determinant;
+    *weights = {static_cast<float>(1.0 - y - z), static_cast<float>(y), static_cast<float>(z)};
+    return weights->LengthSq() <= FLT_MAX;
+}
+
 NUKA_OGC_HD inline bool OgcEdgeInterior(math::Vec3 query, math::Vec3 a,
                                           math::Vec3 b) {
     const math::Vec3 edge = b - a;
@@ -51,10 +67,12 @@ NUKA_OGC_HD inline bool OgcEdgeInterior(math::Vec3 query, math::Vec3 a,
 
 NUKA_OGC_HD inline bool OgcOutsideAdjacentFace(math::Vec3 query,
                                                  math::Vec3 a, math::Vec3 edge,
-                                                 float inverse_length_sq,
                                                  math::Vec3 opposite) {
-    const math::Vec3 foot = a + edge * ((opposite - a).Dot(edge) * inverse_length_sq);
-    return (query - foot).Dot(foot - opposite) >= 0.0f;
+    const math::Vec3 offset = opposite - a, toward = query - a;
+    const auto dot = [](math::Vec3 u, math::Vec3 v) {
+        return double(u.x) * v.x + double(u.y) * v.y + double(u.z) * v.z;
+    };
+    return dot(toward, edge) * dot(offset, edge) - dot(toward, offset) * dot(edge, edge) >= 0.0;
 }
 
 NUKA_OGC_HD inline bool OgcEdgeFeasible(math::Vec3 query, math::Vec3 a,
@@ -62,10 +80,9 @@ NUKA_OGC_HD inline bool OgcEdgeFeasible(math::Vec3 query, math::Vec3 a,
                                           math::Vec3 opposite1, bool has_opposite1) {
     if (!OgcEdgeInterior(query, a, b)) return false;
     const math::Vec3 edge = b - a;
-    const float inverse_length_sq = 1.0f / edge.LengthSq();
-    return OgcOutsideAdjacentFace(query, a, edge, inverse_length_sq, opposite0) &&
+    return OgcOutsideAdjacentFace(query, a, edge, opposite0) &&
            (!has_opposite1 || OgcOutsideAdjacentFace(query, a, edge,
-                                                      inverse_length_sq, opposite1));
+                                                      opposite1));
 }
 
 NUKA_OGC_HD inline bool OgcWireVertexFeasible(math::Vec3 query,
@@ -77,33 +94,78 @@ NUKA_OGC_HD inline bool OgcWireVertexFeasible(math::Vec3 query,
            offset.Dot(vertex - neighbor1) >= 0.0f;
 }
 
-// Vertex-major incidence indexed by the surface's vertex offset plus its local vertex.
-// Entries hold a global element << 1 | side for edges and << 2 | corner for triangles.
+// Vertex-major incidence packs element << 1 | side for edges and element << 2 | corner for triangles.
+// Split vertices read their source's entries through roots and skip corners no longer on them.
 struct MeshVertexIncidence {
     const uint32_t* offsets = nullptr;
     const uint32_t* entries = nullptr;
+    const uint32_t* roots = nullptr;
 };
+
+// Adjacent features sharing a material vertex with the opposing primitive cannot replace this contact.
+struct MeshVertexExclusion {
+    const uint32_t* roots = nullptr;
+    const math::Vec3* rest = nullptr;
+    uint32_t vertex_offset = 0u;
+    uint32_t vertices[3] = {~0u, ~0u, ~0u};
+    uint32_t count = 0u;
+
+    NUKA_OGC_HD bool Contains(uint32_t vertex) const {
+        if (vertex == ~0u) return false;
+        const uint32_t a = roots ? roots[vertex_offset + vertex] : vertex_offset + vertex;
+        for (uint32_t i = 0u; i < count; ++i) {
+            const uint32_t b = roots ? roots[vertices[i]] : vertices[i];
+            if (a == b || (rest && rest[a].x == rest[b].x && rest[a].y == rest[b].y &&
+                          rest[a].z == rest[b].z)) return true;
+        }
+        return false;
+    }
+};
+
+NUKA_OGC_HD inline bool OgcEdgeFacesFeasible(
+    const MeshSurfaceView& view, const MeshSurfaceInfo& info, const MeshEdge& edge,
+    math::Vec3 query, MeshVertexExclusion excluded, math::Vec3 origin = {}) {
+    const math::Vec3 a = MeshSurfaceVertex(view, info, edge.vertex0) - origin;
+    const math::Vec3 b = MeshSurfaceVertex(view, info, edge.vertex1) - origin;
+    if (!OgcEdgeInterior(query, a, b)) return false;
+    const math::Vec3 direction = b - a;
+    const uint32_t opposites[2] = {edge.opposite0, edge.opposite1};
+    for (uint32_t opposite : opposites) {
+        if (opposite == ~0u || excluded.Contains(opposite)) continue;
+        if (opposite >= info.vertex_count || !OgcOutsideAdjacentFace(query, a, direction,
+            MeshSurfaceVertex(view, info, opposite) - origin)) return false;
+    }
+    return true;
+}
+
+NUKA_OGC_HD inline uint32_t MeshIncidenceAt(MeshVertexIncidence incidence, uint32_t vertex_offset,
+                                            uint32_t vertex) {
+    return incidence.roots ? incidence.roots[vertex_offset + vertex] : vertex_offset + vertex;
+}
 
 NUKA_OGC_HD inline bool OgcWireVertexFeasible(
     const MeshSurfaceView& view, const MeshSurfaceInfo& surface,
     const MeshEdge* edges, MeshVertexIncidence incidence, const MeshEdgeInfo& info,
-    uint32_t vertex, math::Vec3 query, uint32_t* owner_edge = nullptr) {
+    uint32_t vertex, math::Vec3 query, uint32_t* owner_edge = nullptr,
+    MeshVertexExclusion excluded = {}, math::Vec3 origin = {}) {
     if (!edges || !incidence.offsets || !incidence.entries ||
         vertex >= surface.vertex_count) return false;
-    const math::Vec3 center = MeshSurfaceVertex(view, surface, vertex);
+    const math::Vec3 center = MeshSurfaceVertex(view, surface, vertex) - origin;
     const math::Vec3 offset = query - center;
-    const uint32_t at = surface.vertex_offset + vertex;
+    const uint32_t at = MeshIncidenceAt(incidence, surface.vertex_offset, vertex);
     bool found = false;
     for (uint32_t i = incidence.offsets[at]; i < incidence.offsets[at + 1u]; ++i) {
         const uint32_t entry = incidence.entries[i];
         const uint32_t edge_id = (entry >> 1u) - info.edge_offset;
         if (edge_id >= info.edge_count) continue;
         const MeshEdge& edge = edges[info.edge_offset + edge_id];
+        if (((entry & 1u) != 0u ? edge.vertex1 : edge.vertex0) != vertex) continue;
         const uint32_t neighbor = (entry & 1u) != 0u ? edge.vertex0 : edge.vertex1;
         if (neighbor >= surface.vertex_count) return false;
+        if (excluded.Contains(neighbor)) continue;
         found = true;
         if (owner_edge && edge_id < *owner_edge) *owner_edge = edge_id;
-        if (offset.Dot(center - MeshSurfaceVertex(view, surface, neighbor)) < 0.0f) return false;
+        if (offset.Dot(center - (MeshSurfaceVertex(view, surface, neighbor) - origin)) < 0.0f) return false;
     }
     return found;
 }
@@ -111,18 +173,21 @@ NUKA_OGC_HD inline bool OgcWireVertexFeasible(
 NUKA_OGC_HD inline bool OgcSurfaceVertexFeasible(
     const MeshSurfaceView& view, const MeshSurfaceInfo& info,
     MeshVertexIncidence incidence, uint32_t vertex, math::Vec3 query,
-    uint32_t* owner_triangle = nullptr) {
+    uint32_t* owner_triangle = nullptr, MeshVertexExclusion excluded = {}) {
     if (!MeshSurfaceRangeValid(view, info) || vertex >= info.vertex_count ||
         !incidence.offsets || !incidence.entries) return false;
     const math::Vec3 center = MeshSurfaceVertex(view, info, vertex);
     const math::Vec3 offset = query - center;
-    const uint32_t at = info.vertex_offset + vertex;
+    const uint32_t at = MeshIncidenceAt(incidence, info.vertex_offset, vertex);
     bool found = false;
     for (uint32_t i = incidence.offsets[at]; i < incidence.offsets[at + 1u]; ++i) {
         const uint32_t entry = incidence.entries[i];
         const uint32_t triangle = (entry >> 2u) - info.triangle_offset;
         if (triangle >= info.triangle_count) continue;
         const size_t first = (static_cast<size_t>(info.triangle_offset) + triangle) * 3u;
+        if (view.triangles[first + (entry & 3u)] != vertex) continue;
+        if (excluded.Contains(view.triangles[first]) || excluded.Contains(view.triangles[first + 1u]) ||
+            excluded.Contains(view.triangles[first + 2u])) continue;
         found = true;
         if (owner_triangle && triangle < *owner_triangle) *owner_triangle = triangle;
         for (uint32_t step = 1u; step < 3u; ++step) {
@@ -139,7 +204,8 @@ NUKA_OGC_HD inline OgcTriangleFeature OgcFacetFeature(
     const MeshSurfaceView& view, const MeshSurfaceInfo& info,
     const MeshEdge* edges, const uint32_t* triangle_edges,
     const MeshEdgeInfo& edge_info, MeshVertexIncidence incidence,
-    uint32_t triangle, math::Vec3 query, float reach = INFINITY) {
+    uint32_t triangle, math::Vec3 query, float reach = INFINITY,
+    MeshVertexExclusion excluded = {}) {
     OgcTriangleFeature result;
     if (!MeshSurfaceRangeValid(view, info) || triangle >= info.triangle_count)
         return result;
@@ -165,7 +231,7 @@ NUKA_OGC_HD inline OgcTriangleFeature OgcFacetFeature(
         result.kind = 0u;
         result.index = ids[closest.feature];
         result.feasible = OgcSurfaceVertexFeasible(
-            view, info, incidence, result.index, query, &result.owner_triangle);
+            view, info, incidence, result.index, query, &result.owner_triangle, excluded);
     } else if (closest.feature < 6u) {
         if (!edges || !triangle_edges) return result;
         const uint32_t side = closest.feature - 3u;
@@ -173,12 +239,19 @@ NUKA_OGC_HD inline OgcTriangleFeature OgcFacetFeature(
         const uint32_t edge_id = triangle_edges[first + side];
         if (edge_id >= edge_info.edge_count) return result;
         const MeshEdge& edge = edges[edge_info.edge_offset + edge_id];
+        // A triangle a crack cut off this edge holds it as a boundary edge of its own.
+        if (incidence.roots && edge.triangle0 != triangle && edge.triangle1 != triangle) {
+            result.kind = 1u;
+            result.index = edge_id;
+            result.owner_triangle = triangle;
+            result.feasible = OgcEdgeFeasible(query, p[side], p[(side + 1u) % 3u], p[(side + 2u) % 3u],
+                                              math::Vec3{}, false);
+            return result;
+        }
         if (edge.vertex0 >= info.vertex_count || edge.vertex1 >= info.vertex_count ||
             edge.opposite0 >= info.vertex_count ||
             (edge.triangle1 != ~0u && edge.opposite1 >= info.vertex_count) ||
             (edge.triangle0 != triangle && edge.triangle1 != triangle)) return result;
-        const math::Vec3 e0 = MeshSurfaceVertex(view, info, edge.vertex0);
-        const math::Vec3 e1 = MeshSurfaceVertex(view, info, edge.vertex1);
         if (!(edge.vertex0 == a && edge.vertex1 == b) &&
             !(edge.vertex1 == a && edge.vertex0 == b)) return result;
         result.kind = 1u;
@@ -186,11 +259,9 @@ NUKA_OGC_HD inline OgcTriangleFeature OgcFacetFeature(
         result.owner_triangle = edge.triangle1 == ~0u
             ? edge.triangle0 : edge.triangle0 < edge.triangle1
                 ? edge.triangle0 : edge.triangle1;
-        result.feasible = OgcEdgeFeasible(query, e0, e1,
-            MeshSurfaceVertex(view, info, edge.opposite0),
-            edge.triangle1 != ~0u
-                ? MeshSurfaceVertex(view, info, edge.opposite1) : math::Vec3{},
-            edge.triangle1 != ~0u);
+        if (excluded.Contains(edge.opposite0)) result.owner_triangle = edge.triangle1;
+        if (excluded.Contains(edge.opposite1)) result.owner_triangle = edge.triangle0;
+        result.feasible = OgcEdgeFacesFeasible(view, info, edge, query, excluded);
     } else {
         result.kind = 2u;
         result.index = triangle;
@@ -234,7 +305,8 @@ NUKA_OGC_HD inline OgcEdgePair OgcEdgeContact(
     const MeshEdgeInfo& edge_info_a, uint32_t edge_a,
     const MeshSurfaceView& surface_b, const MeshSurfaceInfo& info_b,
     const MeshEdge* edges_b, MeshVertexIncidence incidence_b,
-    const MeshEdgeInfo& edge_info_b, uint32_t edge_b, float reach = INFINITY) {
+    const MeshEdgeInfo& edge_info_b, uint32_t edge_b, float reach = INFINITY,
+    MeshVertexExclusion excluded_a = {}, MeshVertexExclusion excluded_b = {}) {
     OgcEdgePair result;
     if (!edges_a || !edges_b || edge_a >= edge_info_a.edge_count ||
         edge_b >= edge_info_b.edge_count) return result;
@@ -247,9 +319,9 @@ NUKA_OGC_HD inline OgcEdgePair OgcEdgeContact(
     const math::Vec3 a1 = MeshSurfaceVertex(surface_a, info_a, ea.vertex1);
     const math::Vec3 b0 = MeshSurfaceVertex(surface_b, info_b, eb.vertex0);
     const math::Vec3 b1 = MeshSurfaceVertex(surface_b, info_b, eb.vertex1);
-    const OgcSegmentPair pair = OgcClosestSegments(a0, a1, b0, b1);
-    result.point_a = pair.a;
-    result.point_b = pair.b;
+    const OgcSegmentPair pair = OgcClosestSegments({}, a1 - a0, b0 - a0, b1 - a0);
+    result.point_a = a0 + pair.a;
+    result.point_b = a0 + pair.b;
     result.weight_a = pair.weight_a;
     result.weight_b = pair.weight_b;
     const math::Vec3 separation = pair.a - pair.b;
@@ -262,26 +334,16 @@ NUKA_OGC_HD inline OgcEdgePair OgcEdgeContact(
     result.owner_edge_a = edge_a;
     result.owner_edge_b = edge_b;
     if (!(result.distance <= reach)) return result;
-    const bool a_interior = ea.opposite0 == ~0u ||
-        (ea.opposite0 < info_a.vertex_count &&
-         (ea.opposite1 == ~0u || ea.opposite1 < info_a.vertex_count) &&
-         OgcEdgeFeasible(pair.b, a0, a1, MeshSurfaceVertex(surface_a, info_a, ea.opposite0),
-             ea.opposite1 == ~0u ? math::Vec3{} : MeshSurfaceVertex(surface_a, info_a, ea.opposite1),
-             ea.opposite1 != ~0u));
-    const bool b_interior = eb.opposite0 == ~0u ||
-        (eb.opposite0 < info_b.vertex_count &&
-         (eb.opposite1 == ~0u || eb.opposite1 < info_b.vertex_count) &&
-         OgcEdgeFeasible(pair.a, b0, b1, MeshSurfaceVertex(surface_b, info_b, eb.opposite0),
-             eb.opposite1 == ~0u ? math::Vec3{} : MeshSurfaceVertex(surface_b, info_b, eb.opposite1),
-             eb.opposite1 != ~0u));
+    const bool a_interior = OgcEdgeFacesFeasible(surface_a, info_a, ea, pair.b, excluded_a, a0);
+    const bool b_interior = OgcEdgeFacesFeasible(surface_b, info_b, eb, pair.a, excluded_b, a0);
     const bool a_feasible = pair.weight_a > 0.0f && pair.weight_a < 1.0f
         ? a_interior : OgcWireVertexFeasible(surface_a, info_a, edges_a, incidence_a,
             edge_info_a, pair.weight_a <= 0.0f ? ea.vertex0 : ea.vertex1,
-            pair.b, &result.owner_edge_a);
+            pair.b, &result.owner_edge_a, excluded_a, a0);
     const bool b_feasible = pair.weight_b > 0.0f && pair.weight_b < 1.0f
         ? b_interior : OgcWireVertexFeasible(surface_b, info_b, edges_b, incidence_b,
             edge_info_b, pair.weight_b <= 0.0f ? eb.vertex0 : eb.vertex1,
-            pair.a, &result.owner_edge_b);
+            pair.a, &result.owner_edge_b, excluded_b, a0);
     result.feasible = a_feasible && b_feasible &&
         result.normal.LengthSq() > 0.0f;
     return result;

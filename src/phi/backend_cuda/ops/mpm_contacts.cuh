@@ -5,6 +5,7 @@
 #include "nk/material/mpm_transfer.hpp"
 #include "nk/model/generated/views.hpp"
 #include "nk/solve/collidable_owner.hpp"
+#include "phi/backend_cuda/ops/particle_surface.cuh"
 #include "phi/backend_cuda/ops/rigid_types.cuh"
 #include "phi/backend_cuda/ops/surface_query.cuh"
 #include "phi/op_schema.hpp"
@@ -177,7 +178,7 @@ __device__ void VisitParticleSurfaces(const MpmParams& p, const ModelView& model
     const uint32_t env = sample / mpm_per_env;
     const collision::MeshSurfaceView particle_surfaces{
         reinterpret_cast<const float*>(data.particle_pos + size_t{env} * p.particles_per_env),
-        model.particle_surface_triangles,
+        ParticleSurfaceTriangles(model, data, env, p.particle_surface_triangles),
         data.particle_surface_nodes != nullptr
             ? data.particle_surface_nodes + size_t{env} * p.particle_surface_nodes_per_env : nullptr,
         {p.particles_per_env, p.particle_surface_triangles, p.particle_surface_nodes_per_env}};
@@ -205,7 +206,7 @@ __device__ void VisitParticleSurfaces(const MpmParams& p, const ModelView& model
             surface.barycentric.x, surface.barycentric.y, surface.barycentric.z};
         float face_thickness = 0.0f, face_mu = 0.0f;
         for (uint32_t i = 0u; i < nk::kTriangleEndpointTerms; ++i) {
-            const uint32_t local = info.vertex_offset + model.particle_surface_triangles[at + i];
+            const uint32_t local = info.vertex_offset + particle_surfaces.triangles[at + i];
             indices[i] = env * p.particles_per_env + local;
             vertices[i] = data.particle_pos[indices[i]];
             face_thickness += weights[i] * model.particle_half_thickness[local];

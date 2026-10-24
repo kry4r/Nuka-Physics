@@ -20,6 +20,7 @@ namespace nuka::runtime::app::viewer {
 struct ParticleSurfaceBinding {
     nuka_particle_surface_t info{};
     std::vector<uint32_t> triangles;
+    uint32_t index = 0u;  // the world's surface index
 };
 
 struct WorldLayout {
@@ -33,6 +34,7 @@ struct WorldLayout {
     uint32_t particles_per_env = 0u;
     std::vector<nuka_link_binding_t> links;  // per-environment link order
     std::vector<ParticleSurfaceBinding> surfaces;
+    bool fracturing = false;  // a field cloth splits, so its surface triangles change while it runs
 };
 
 // Throws std::runtime_error when a query fails; `what` names the call.
@@ -91,6 +93,10 @@ void DownloadEnvPoses(nuka_world_handle world, const WorldLayout& layout, uint32
 void DownloadEnvParticles(nuka_world_handle world, const WorldLayout& layout, uint32_t env_index,
                           std::vector<math::Vec3>* out);
 
+// A fracturing world's surface triangles as they are now, in layout order.
+void DownloadLiveSurfaces(nuka_world_handle world, const WorldLayout& layout,
+                          std::vector<std::vector<uint32_t>>* out);
+
 // A solver telemetry element in the world: where it is and the entity drawing it.
 struct LocatedElement {
     math::Vec3 position = math::Vec3::Zero();
@@ -140,6 +146,8 @@ public:
     // Rebuilds the particle surfaces from one environment's particles; per-particle residuals
     // colour them as a heatmap, an empty `heat` draws their materials.
     void ApplyParticles(const std::vector<math::Vec3>& positions, const std::vector<float>& heat, float alert);
+    // Moves the particle surfaces onto triangles a fracture changed, in layout order.
+    void SetSurfaceTriangles(const std::vector<std::vector<uint32_t>>& triangles);
     // Draws a terrain surface under the scene; an invalid grid removes it.
     void SetTerrain(const terrain::HeightField& terrain);
     // Replaces the velocity arrows.

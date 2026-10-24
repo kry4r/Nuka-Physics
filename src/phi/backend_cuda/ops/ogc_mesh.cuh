@@ -5,6 +5,7 @@
 #include "nk/contact/contact_profile.hpp"
 #include "scene/contact_filter.hpp"
 #include "phi/backend_cuda/ops/dat_chain.cuh"
+#include "phi/backend_cuda/ops/particle_surface.cuh"
 #include "phi/backend_cuda/ops/prims_types.cuh"
 
 namespace nuka::phi {
@@ -48,7 +49,7 @@ __device__ collision::MeshSurfaceView OgcParticleView(
     uint32_t env) {
     return {reinterpret_cast<const float*>(data.particle_pos +
                 size_t{env} * p.particles_per_env),
-            model.particle_surface_triangles,
+            ParticleSurfaceTriangles(model, data, env, p.triangles_per_env),
             data.particle_surface_nodes + size_t{env} * p.nodes_per_env,
             {p.particles_per_env, p.triangles_per_env, p.nodes_per_env}};
 }
@@ -391,12 +392,11 @@ __global__ void OgcMixedVertexFaceKernel(OgcDetectParams p, ModelView model,
                 if (node.triangle != ~0u) {
                     const auto feature = collision::OgcFacetFeature(
                         view, info,
-                        target_particle ? model.particle_surface_edges : model.mesh_edges,
+                        target_particle ? ParticleSurfaceEdges(model, data, env, p.edges_per_env) : model.mesh_edges,
                         target_particle ? model.particle_surface_triangle_edges : model.mesh_triangle_edges,
                         target_particle ? model.particle_surface_edge_info[target] : model.mesh_edge_info[target],
                         target_particle
-                            ? collision::MeshVertexIncidence{model.particle_surface_vertex_triangle_offsets,
-                                                             model.particle_surface_vertex_triangles}
+                            ? ParticleTriangleIncidence(model, data, env, p.particles_per_env)
                             : collision::MeshVertexIncidence{model.mesh_vertex_triangle_offsets,
                                                              model.mesh_vertex_triangles},
                         node.triangle, source, query);
@@ -523,9 +523,8 @@ __global__ void OgcMixedEdgeEdgeKernel(OgcDetectParams p, ModelView model,
                 source_info = model.particle_surface_info[s];
                 source_edges = info;
                 source_view = OgcParticleView(p, model, data, env);
-                source_array = model.particle_surface_edges;
-                source_incidence = {model.particle_surface_vertex_edge_offsets,
-                                    model.particle_surface_vertex_edges};
+                source_array = ParticleSurfaceEdges(model, data, env, p.edges_per_env);
+                source_incidence = ParticleEdgeIncidence(model, data, env, p.particles_per_env);
                 source_radius = model.particle_surface_thickness[s];
                 source_speed = data.particle_surface_max_speed[size_t{env} * p.surfaces_per_env + s];
                 break;
@@ -553,6 +552,8 @@ __global__ void OgcMixedEdgeEdgeKernel(OgcDetectParams p, ModelView model,
         }
     }
     const auto edge_a = source_array[source_edges.edge_offset + local_edge];
+    // A twin whose edge holds together is no edge.
+    if (edge_a.vertex0 == edge_a.vertex1) return;
     const math::Vec3 a0 = collision::MeshSurfaceVertex(source_view, source_info, edge_a.vertex0);
     const math::Vec3 a1 = collision::MeshSurfaceVertex(source_view, source_info, edge_a.vertex1);
     const math::Vec3 midpoint = (a0 + a1) * 0.5f;

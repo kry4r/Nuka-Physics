@@ -263,10 +263,25 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
         kWireDtypeF32, nk::FieldId::SolverResidual},
     {NUKA_FIELD_SOLVER_SWEEP_TRACE, nk::LayoutOf(nk::FieldId::SolverSweepTrace).elem_size,
         kWireDtypeF32, nk::FieldId::SolverSweepTrace},
+    {NUKA_FIELD_MF_CORNER, nk::LayoutOf(nk::FieldId::MfCorner).elem_size, kWireDtypeU32,
+        nk::FieldId::MfCorner},
+    {NUKA_FIELD_PARTICLE_ROOT, kStrideU32, kWireDtypeU32, nk::FieldId::ParticleRoot},
+    {NUKA_FIELD_MF_TOPOLOGY, kStrideU32, kWireDtypeU32, nk::FieldId::MfTopology},
+    {NUKA_FIELD_PARTICLE_SURFACE_CORNERS, kStrideU32, kWireDtypeU32, nk::FieldId::ParticleSurfaceCorners},
+    {NUKA_FIELD_MF_TRACTION, kStrideF32, kWireDtypeF32, nk::FieldId::MfTraction},
+    {NUKA_FIELD_PARTICLE_ATTACHMENT_STIFFNESS, kStrideF32, kWireDtypeF32,
+        nk::FieldId::ParticleAttachmentStiffness},
+    {NUKA_FIELD_MF_CRACK_LOAD, kStrideF32, kWireDtypeF32, nk::FieldId::MfCrackLoad},
+    {NUKA_FIELD_MATERIAL_STATE, kStrideF32, kWireDtypeF32, nk::FieldId::MfHistory},
 };
 
 inline constexpr size_t kDlpackFieldCount =
     sizeof(kDlpackFieldTable) / sizeof(kDlpackFieldTable[0]);
+static_assert([] {
+    for (size_t i = 1u; i < kDlpackFieldCount; ++i)
+        if (kDlpackFieldTable[i - 1u].field >= kDlpackFieldTable[i].field) return false;
+    return true;
+}(), "public field descriptors must be strictly ordered for binary search");
 static_assert(NUKA_ENERGY_COLUMN_COUNT == nk::kEnergyColumnCount,
               "public energy record columns must match the physics readout");
 static_assert(nk::LayoutOf(nk::FieldId::PhysicsStageMetrics).elem_size ==

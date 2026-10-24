@@ -233,6 +233,10 @@ nuka_result_t RenderBeauty(nuka_world_handle world,
                                    sizeof(nuka::math::Transform));
         }
 
+        // A fracturing field's surfaces draw on their live split corners.
+        for (size_t i = 0u, surface = 0u; i < record->particle_surfaces.size(); ++i)
+            if (!record->particle_surfaces[i].triangles.empty())
+                studio.surfaces[surface++].topology.triangles = nuka::c_abi::LiveSurfaceTriangles(*record, i);
         nuka::render::PublishStudioScene(studio, link_pose, particle_pos, body_pose);
 
         // Drive the camera + image size; trace the offline beauty frame to host.

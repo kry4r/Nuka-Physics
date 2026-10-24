@@ -1239,6 +1239,8 @@ void PhysicsWorker::Publish() {
             DownloadEnvPoses(bind_.world, bind_.layout, bind_.shown[i], &mirror_envs_[i].links, &mirror_envs_[i].bodies);
         }
         DownloadEnvParticles(bind_.world, bind_.layout, bind_.env, &mirror_particles_);
+        mirror_surfaces_.clear();
+        if (bind_.layout.fracturing) DownloadLiveSurfaces(bind_.world, bind_.layout, &mirror_surfaces_);
         if (bind_.layout.links_per_env != 0u) DownloadJointFrame(bind_.world, bind_.layout, bind_.env, &mirror_joints_);
         ReadOverlayData(bind_.world, bind_.layout, bind_.env, bind_.colliders, bind_.contacts, &overlay_);
         if (solver_.mask != 0u) ReadTelemetry();
@@ -1260,6 +1262,7 @@ void PhysicsWorker::Publish() {
     s.envs = mirror_envs_;
     s.particles = mirror_particles_;
     s.heat = mirror_heat_;
+    s.surfaces = mirror_surfaces_;
     s.joints = mirror_joints_;
     s.perturbs.clear();
     for (const Perturbation& p : perturbs_)

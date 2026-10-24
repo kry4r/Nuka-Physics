@@ -56,6 +56,61 @@ struct DatSweptPrimitive {
     uint32_t count = 0u;
 };
 
+// Round a linear path once, so sub-ulp motion does not accumulate three float arithmetic errors.
+NUKA_DAT_HD inline math::Vec3 DatLinearPoint(math::Vec3 start, math::Vec3 end, float fraction) {
+    return {static_cast<float>(double(start.x) + double(fraction) * (double(end.x) - start.x)),
+            static_cast<float>(double(start.y) + double(fraction) * (double(end.y) - start.y)),
+            static_cast<float>(double(start.z) + double(fraction) * (double(end.z) - start.z))};
+}
+
+NUKA_DAT_HD inline double DatLinearRoundoff(math::Vec3 start, math::Vec3 end, math::Vec3 normal);
+
+// A common linear fraction preserves every pairwise projection gap; independent fractions need a swept hull.
+NUKA_DAT_HD inline bool DatSharedLinearSeparated(const DatSweptPrimitive& a, const DatSweptPrimitive& b,
+                                                  math::Vec3 normal, float minimum_gap) {
+    const uint32_t na = a.count / 2u, nb = b.count / 2u;
+    for (uint32_t i = 0u; i < na; ++i)
+        for (uint32_t j = 0u; j < nb; ++j) {
+            const math::Vec3 a0 = a.vertex[i], a1 = a.vertex[i + na];
+            const math::Vec3 b0 = b.vertex[j], b1 = b.vertex[j + nb];
+            const double start = (double(a0.x) - b0.x) * normal.x + (double(a0.y) - b0.y) * normal.y +
+                                 (double(a0.z) - b0.z) * normal.z;
+            const double end = (double(a1.x) - b1.x) * normal.x + (double(a1.y) - b1.y) * normal.y +
+                               (double(a1.z) - b1.z) * normal.z;
+            const double error = DatLinearRoundoff(a0, a1, normal) + DatLinearRoundoff(b0, b1, normal);
+            if (!(fmin(start, end) > double(minimum_gap) + error)) return false;
+        }
+    return na > 0u && nb > 0u;
+}
+
+NUKA_DAT_HD inline double DatLinearRoundoff(math::Vec3 start, math::Vec3 end, math::Vec3 normal) {
+    if (start.x == end.x && start.y == end.y && start.z == end.z) return 0.0;
+    constexpr double roundoff = FLT_EPSILON / (2.0 - FLT_EPSILON) + 8.0 * DBL_EPSILON;
+    return roundoff * (fabs(double(normal.x)) * fmax(fabs(double(start.x)), fabs(double(end.x))) +
+        fabs(double(normal.y)) * fmax(fabs(double(start.y)), fabs(double(end.y))) +
+        fabs(double(normal.z)) * fmax(fabs(double(start.z)), fabs(double(end.z))));
+}
+
+// Reserve each side's interpolation uncertainty before sharing the remaining separation.
+NUKA_DAT_HD inline float DatLinearPlaneOffset(float gap, float fraction, double error_a, double error_b) {
+    const double free_gap = double(gap) - error_a - error_b;
+    return free_gap > 0.0 ? static_cast<float>(error_b + fraction * free_gap) : gap * fraction;
+}
+
+// The accepted prefix stays on its plane side after float interpolation, including independent smaller fractions.
+NUKA_DAT_HD inline float DatLinearPlaneFraction(math::Vec3 start, math::Vec3 end, math::Vec3 origin,
+                                                math::Vec3 normal, float offset, float relaxation) {
+    if (start.x == end.x && start.y == end.y && start.z == end.z) return 1.0f;
+    const double distance = (double(start.x) - origin.x) * normal.x +
+        (double(start.y) - origin.y) * normal.y + (double(start.z) - origin.z) * normal.z - offset;
+    const double closing = (double(start.x) - end.x) * normal.x +
+        (double(start.y) - end.y) * normal.y + (double(start.z) - end.z) * normal.z;
+    const double available = distance - DatLinearRoundoff(start, end, normal);
+    if (!(available > 0.0)) return 0.0f;
+    if (closing <= available) return 1.0f;
+    return static_cast<float>(relaxation * available / closing);
+}
+
 // Float intervals decide the certificate below when they clear its threshold by a slack that
 // bounds every float and double rounding difference; -1 leaves the decision to double precision.
 NUKA_DAT_HD inline int DatSweptAxisFilter(math::Vec3 axis, const DatSweptPrimitive& a,

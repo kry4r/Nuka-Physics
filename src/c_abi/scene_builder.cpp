@@ -29,6 +29,7 @@
 #include "scene/terrain/heightfield.hpp"
 
 #include <exception>
+#include <cmath>
 #include <memory>
 #include <new>
 #include <stdexcept>
@@ -441,7 +442,34 @@ nuka_result_t nuka_scene_add_field_media(nuka_scene_handle scene,
                                          const nuka_media_desc_t* desc,
                                          const nuka_field_material_desc_t* field,
                                          uint32_t* out_media_id) {
-    if (desc == nullptr || field == nullptr || field->struct_size != sizeof(nuka_field_material_desc_t) ||
+    static_assert(NUKA_FIELD_HISTORY_VERSION == nuka::nk::kMfStateVersion, "public history schema must match the engine");
+    static_assert(NUKA_FIELD_LAW_SMALL_STRAIN == nuka::nk::kMfSmallStrainLaw &&
+                  NUKA_FIELD_LAW_LOG_STRAIN_ORTHOTROPIC == nuka::nk::kMfLogStrainOrthotropicLaw,
+                  "public field laws must match the engine");
+    static_assert(NUKA_FIELD_FRACTURE_ISOTROPIC == nuka::nk::kMfIsotropicCohesive &&
+                  NUKA_FIELD_FRACTURE_MIXED_MODE == nuka::nk::kMfMixedModeCohesive,
+                  "public fracture laws must match the engine");
+    const bool logarithmic = field != nullptr && field->struct_size >= offsetof(nuka_field_material_desc_t, fracture_law) &&
+                             field->law == NUKA_FIELD_LAW_LOG_STRAIN_ORTHOTROPIC;
+    const bool mixed = field != nullptr && field->struct_size == sizeof(nuka_field_material_desc_t) &&
+                       field->fracture_law == NUKA_FIELD_FRACTURE_MIXED_MODE;
+    const nuka_field_contract_desc_t contract{sizeof(nuka_field_contract_desc_t), 1u, logarithmic ? 2u : 1u, 1u,
+                                              mixed ? 2u : 1u, NUKA_FIELD_HISTORY_VERSION};
+    return nuka_scene_add_field_media_v1(scene, desc, field, &contract, out_media_id);
+}
+
+nuka_result_t nuka_scene_add_field_media_v1(nuka_scene_handle scene,
+    const nuka_media_desc_t* desc, const nuka_field_material_desc_t* field,
+    const nuka_field_contract_desc_t* contract, uint32_t* out_media_id) {
+    if (!contract || contract->struct_size != sizeof(nuka_field_contract_desc_t)) return NUKA_RESULT_INVALID_ARG;
+    const nuka::nk::ContractVersions versions{contract->schema_version, contract->material_version,
+        contract->section_version, contract->fracture_version, contract->history_version};
+    if (!versions.Supported()) return NUKA_RESULT_NOT_SUPPORTED;
+    if (desc == nullptr || field == nullptr ||
+        (field->struct_size != offsetof(nuka_field_material_desc_t, shear_strength) &&
+         field->struct_size != offsetof(nuka_field_material_desc_t, law) &&
+         field->struct_size != offsetof(nuka_field_material_desc_t, fracture_law) &&
+         field->struct_size != sizeof(nuka_field_material_desc_t)) ||
         desc->method != NUKA_MEDIA_METHOD_FIELD)
         return NUKA_RESULT_INVALID_ARG;
     SceneRecord* sr = SceneTable().Get(scene);
@@ -450,6 +478,7 @@ nuka_result_t nuka_scene_add_field_media(nuka_scene_handle scene,
         nscene::MediaRecord media;
         if (!MediaFromDesc(*desc, &media)) return NUKA_RESULT_INVALID_ARG;
         nscene::MediaFieldMaterial& m = media.field;
+        m.contract = versions;
         m.density = field->density;
         m.thickness = field->thickness;
         m.youngs = field->youngs;
@@ -466,6 +495,32 @@ nuka_result_t nuka_scene_add_field_media(nuka_scene_handle scene,
         }
         m.tear_strength = field->tear_strength;
         m.tear_energy = field->tear_energy;
+        m.weibull_modulus = field->weibull_modulus;
+        for (int i = 0; i < 3; ++i) m.grain[i] = field->grain[i];
+        m.grain_ratio = field->grain_ratio;
+        if (field->struct_size >= offsetof(nuka_field_material_desc_t, law)) {
+            m.shear_strength = field->shear_strength;
+            m.weibull_reference_area = field->weibull_reference_area;
+        }
+        if (field->struct_size >= offsetof(nuka_field_material_desc_t, fracture_law)) {
+            m.law = field->law == 0u ? NUKA_FIELD_LAW_SMALL_STRAIN : field->law;
+            m.youngs_cd = field->youngs_cd;
+            m.shear_modulus = field->shear_modulus;
+            m.yield_stress_cd = field->yield_stress_cd;
+            m.yield_shear = field->yield_shear;
+            m.yield_biaxial = field->yield_biaxial;
+            m.strain_range = field->strain_range;
+        }
+        if (field->struct_size >= offsetof(nuka_field_material_desc_t, section_law)) {
+            m.fracture_law = field->fracture_law == 0u ? NUKA_FIELD_FRACTURE_ISOTROPIC : field->fracture_law;
+            m.shear_tear_energy = field->shear_tear_energy;
+            m.mixity_exponent = field->mixity_exponent;
+        }
+        if (field->struct_size == sizeof(nuka_field_material_desc_t)) {
+            m.section_law = field->section_law == 0u ? NUKA_FIELD_SECTION_PLATE : field->section_law;
+            m.bend_stiffness = field->bend_stiffness;
+            m.curvature_range = field->curvature_range;
+        }
         cook::ValidateMedia(std::vector<nscene::MediaRecord>{media});
         media.name = "media_" + std::to_string(sr->scene->MediaCount());
         const nscene::MediaId id = sr->scene->AddMedia(std::move(media));
@@ -579,6 +634,24 @@ nuka_result_t nuka_scene_add_cloth_seam(nuka_scene_handle scene, uint32_t media_
         return NUKA_RESULT_OUT_OF_MEMORY;
     } catch (const std::exception& error) {
         return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+nuka_result_t nuka_scene_add_cloth_attachment(nuka_scene_handle scene, uint32_t media_id,
+                                              uint32_t vertex, float stiffness) {
+    if (!(stiffness >= 0.0f) || !std::isfinite(stiffness)) return NUKA_RESULT_INVALID_ARG;
+    SceneRecord* sr = SceneTable().Get(scene);
+    if (sr == nullptr || !sr->scene) return NUKA_RESULT_NULL_HANDLE;
+    if (media_id >= sr->scene->MediaCount()) return NUKA_RESULT_INVALID_ARG;
+    try {
+        auto& rec = sr->scene->GetMediaMut(media_id);
+        if (rec.kind != nscene::MediaRecord::Kind::Cloth) return NUKA_RESULT_INVALID_ARG;
+        rec.cloth_mesh.attachments.push_back({vertex, stiffness});
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
     } catch (...) {
         return NUKA_RESULT_INTERNAL;
     }

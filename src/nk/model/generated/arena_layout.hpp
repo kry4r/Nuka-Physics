@@ -99,8 +99,8 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // foot_shape
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Body, 1, 3, 12, 0},  // body_linear_velocity
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Body, 1, 3, 12, 0},  // body_angular_velocity
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 1, 3, 12, 0},  // body_force
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 1, 3, 12, 0},  // body_torque
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Body, 1, 3, 12, 0},  // body_force
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Body, 1, 3, 12, 0},  // body_torque
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Body, 1, 3, 12, 0},  // body_inv_inertia
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 1, 3, 12, 0},  // body_aabb_lo
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 1, 3, 12, 0},  // body_aabb_hi
@@ -153,6 +153,7 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // particle_v_pre
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::AeroTri, 3, 1, 12, 0},  // aero_tri_verts
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::AeroTri, 1, 1, 4, 0},  // aero_tri_area
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::AeroTri, 1, 1, 4, 0},  // aero_tri_corner_source
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // pbf_predicted_pos
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Env, 1, 1, 8, 0},  // rng_state
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // env_status
@@ -360,12 +361,22 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 6, 24, 0},  // particle_response
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // particle_row_impulse
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 3, 12, 0},  // vbd_free_rate
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 3, 12, 0},  // vbd_solve_rate
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 3, 12, 0},  // vbd_offset
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // vbd_inertia
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Scalar, 1, 3, 12, 0},  // vbd_history_vel
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // vbd_history_ready
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // particle_kinematic_target
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // particle_attachment_stiffness
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // particle_attachment_previous_stiffness
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // particle_attachment_previous_target
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // snapshot_particle_attachment_stiffness
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // snapshot_particle_attachment_previous_stiffness
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // snapshot_particle_attachment_previous_target
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // snapshot_particle_kinematic_target
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // ogc_contact_count
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // ogc_contact_demand
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // mf_range_element
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // dat_particle_beta
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 1, 1, 4, 0},  // dat_body_beta
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Articulation, 1, 1, 4, 0},  // dat_artic_beta
@@ -407,14 +418,15 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 6, 1, 24, 0},  // solver_color_counts
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 8, 1, 64, 0},  // solver_phase_time
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // dat_surface_motion
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 34, 1, 136, 0},  // energy_ledger
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 34, 1, 272, 0},  // energy_ledger_sum
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 36, 1, 144, 0},  // energy_ledger
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 36, 1, 288, 0},  // energy_ledger_sum
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // energy_ledger_status
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 195, 1, 780, 0},  // physics_stage_metrics
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 8, 1, 32, 0},  // contact_audit_counts
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 7, 1, 56, 0},  // contact_audit_metrics
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 195, 1, 1560, 0},  // readout_partials
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // energy_particle_start
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // energy_particle_start_velocity
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // energy_aero_impulse
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // energy_kinematic_contact_impulse
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // energy_link_start_q
@@ -443,15 +455,37 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 1, 1, 4, 0},  // dat_body_parent
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Articulation, 1, 1, 4, 0},  // dat_artic_parent
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // telemetry
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 96, 96, 0},  // mf_elements
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 72, 72, 0},  // mf_materials
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 172, 172, 0},  // mf_elements
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // mf_face_partner
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 3, 12, 0},  // mf_stress
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // mf_crack_load
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 128, 128, 0},  // mf_materials
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // mf_incidence_offsets
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // mf_incidence
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 36, 36, 0},  // mf_start_metric
-    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Scalar, 13, 1, 52, 0},  // mf_history
-    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Scalar, 13, 1, 52, 0},  // snapshot_mf_history
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 15, 1, 60, 0},  // mf_trial
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // mf_history
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // snapshot_mf_history
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // mf_trial
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // mf_env_commit
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // mf_incidence_anchor
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // mf_color
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Scalar, 12, 1, 48, 0},  // mf_corner
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Scalar, 12, 1, 48, 0},  // snapshot_mf_corner
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // particle_root
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // snapshot_particle_root
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // snapshot_particle_inv_mass
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // mf_traction
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // mf_cracks
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // mf_crack_count
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // mf_opened
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // mf_opened_count
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // mf_topology
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // particle_surface_corner_source
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // particle_surface_corners
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // snapshot_particle_surface_corners
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Scalar, 1, 24, 24, 0},  // particle_surface_live_edges
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Scalar, 1, 24, 24, 0},  // snapshot_particle_surface_live_edges
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // solver_executed_iterations
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {

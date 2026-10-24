@@ -1679,6 +1679,8 @@ static void StageVertexBlocks(nk::Model& model, const VbdCookInput& in, uint32_t
     }
     mp.mf_materials = in.field_materials;
     cap.mf_vertices_per_env = in.field_count;
+    cap.mf_spare_first = in.spares > 0u ? in.spare_first - in.vbd_begin : 0u;
+    cap.mf_spares_per_env = in.spares;
     nk::BuildVertexBlockSchedule(&model);
     nk::BuildVertexBlockHierarchy(&model);
 }
@@ -1696,6 +1698,8 @@ void CookVbdParticles(nk::Model& model, uint32_t env_count,
     mp.friction = in.friction;
     mp.initial_vel = in.velocities;
     mp.inv_mass = in.inv_mass;
+    mp.attachment_stiffness = in.attachment_stiffness;
+    mp.attachment_stiffness.resize(mp.initial_pos.size(), 0.0f);
     if (mp.initial_vel.size() != mp.initial_pos.size()) {
         mp.initial_vel.assign(mp.initial_pos.size(), math::Vec3::Zero());
     }
@@ -1747,9 +1751,10 @@ void CookVbdParticles(nk::Model& model, uint32_t env_count,
         const auto& vertices = surface.triangles.empty() ? surface.edges : surface.triangles;
         const auto bounds = std::minmax_element(vertices.begin(), vertices.end());
         const uint32_t begin = *bounds.first;
-        if (*bounds.second >= mp.initial_pos.size() || *bounds.second >= mp.half_thickness.size())
+        const uint32_t end = std::max(*bounds.second + 1u, surface.end);
+        if (end > mp.initial_pos.size() || end > mp.half_thickness.size())
             throw std::invalid_argument("deformable collision surface has invalid vertex indices");
-        const uint32_t count = *bounds.second - begin + 1u;
+        const uint32_t count = end - begin;
         const float* positions = reinterpret_cast<const float*>(mp.initial_pos.data() + begin);
         std::vector<uint32_t> local(vertices.size());
         for (size_t i = 0u; i < vertices.size(); ++i) local[i] = vertices[i] - begin;
@@ -1768,6 +1773,10 @@ void CookVbdParticles(nk::Model& model, uint32_t env_count,
             cooked.info.flags |= collision::kMeshSurfaceOriented;
             cooked_edges = import::cooker::CookMeshEdges(
                 positions, count, oriented.data(), static_cast<uint32_t>(oriented.size() / 3u), false);
+            if (surface.twin_edges) {
+                import::cooker::AddTwinEdges(cooked_edges, positions);
+                cooked.info.flags |= collision::kMeshSurfaceTwinEdges;
+            }
         }
         cooked.info.vertex_offset = begin;
         cooked.info.triangle_offset = static_cast<uint32_t>(mp.surface_triangles.size() / 3u);
@@ -1920,6 +1929,7 @@ namespace {
 
 nk::MfMaterial FieldMaterial(const MediaFieldMaterial& f) {
     nk::MfMaterial m;
+    m.law = f.law;
     m.density = f.density;
     m.thickness = f.thickness;
     m.youngs = f.youngs;
@@ -1936,6 +1946,29 @@ nk::MfMaterial FieldMaterial(const MediaFieldMaterial& f) {
     }
     m.tear_strength = f.tear_strength;
     m.tear_energy = f.tear_energy;
+    m.shear_strength = f.shear_strength;
+    m.youngs_cd = f.youngs_cd;
+    m.shear_modulus = f.shear_modulus;
+    m.yield_stress_cd = f.yield_stress_cd;
+    m.yield_shear = f.yield_shear;
+    m.yield_biaxial = f.yield_biaxial;
+    m.strain_range = f.strain_range;
+    m.fracture_law = f.fracture_law;
+    m.shear_tear_energy = f.shear_tear_energy;
+    m.mixity_exponent = f.mixity_exponent;
+    m.section_law = f.section_law;
+    m.bend_stiffness = f.bend_stiffness;
+    m.curvature_range = f.curvature_range;
+    if (f.law != nk::kMfSmallStrainLaw && f.law != nk::kMfLogStrainOrthotropicLaw)
+        throw std::invalid_argument("field material: unregistered law");
+    if (f.fracture_law != nk::kMfIsotropicCohesive && f.fracture_law != nk::kMfMixedModeCohesive)
+        throw std::invalid_argument("field material: unregistered fracture law");
+    if (f.section_law != nk::kMfPlateSection && f.section_law != nk::kMfEffectiveSection)
+        throw std::invalid_argument("field material: unregistered section law");
+    auto descriptor = nk::DescribeField(m);
+    descriptor.versions = f.contract;
+    if (!nk::EncodeFieldMaterial(descriptor, &m))
+        throw std::invalid_argument("field material: unsupported law/section/fracture/history version or invalid SI parameters");
     return m;
 }
 
@@ -2002,15 +2035,40 @@ void ValidateMedia(const std::vector<MediaRecord>& media) {
                                         f.maxwell_modulus[0], f.maxwell_modulus[1], f.maxwell_time[0],
                                         f.maxwell_time[1], f.bend_maxwell_modulus[0], f.bend_maxwell_modulus[1],
                                         f.bend_maxwell_time[0], f.bend_maxwell_time[1], f.tear_strength,
-                                        f.tear_energy};
+                                        f.tear_energy, f.weibull_modulus, f.grain_ratio,
+                                        f.shear_strength, f.weibull_reference_area, f.youngs_cd, f.shear_modulus,
+                                        f.yield_stress_cd, f.yield_shear, f.yield_biaxial, f.strain_range,
+                                        f.shear_tear_energy, f.mixity_exponent, f.bend_stiffness,
+                                        f.curvature_range};
+            const float grain = f.grain[0] * f.grain[0] + f.grain[1] * f.grain[1] + f.grain[2] * f.grain[2];
+            const bool grained = grain > 0.0f && std::isfinite(grain);
             bool nonnegative = true;
             for (float value : parameters) nonnegative = nonnegative && std::isfinite(value) && value >= 0.0f;
             if (!nk::mf::ValidMaterial(FieldMaterial(f)) || !nonnegative || !m.cloth_regions.empty() ||
-                (!m.cloth_mesh.seams.empty() && !(f.tear_strength > 0.0f && f.tear_energy > 0.0f)))
+                ((!m.cloth_mesh.seams.empty() || f.weibull_modulus > 0.0f) &&
+                 !(f.tear_strength > 0.0f && f.tear_energy > 0.0f)) ||
+                (f.grain_ratio > 0.0f && !(f.grain_ratio >= 1.0f && grained)) ||
+                (f.law == nk::kMfLogStrainOrthotropicLaw && !grained))
                 throw std::runtime_error(
                     "ValidateMedia: a field cloth needs positive density, thickness and youngs, "
-                    "0 <= poisson < 0.5, nonnegative plastic, Maxwell and tear parameters, a positive tear "
-                    "strength and energy for seams, and no cloth regions");
+                    "0 <= poisson < 0.5 (log-strain law: positive cross-grain and shear moduli, a positive "
+                    "strain range, a positive-definite orthotropic stiffness, a convex Hill surface and a "
+                    "nonzero grain), nonnegative plastic, Maxwell and tear parameters, a positive tear "
+                    "strength and energy for seams or fracture, a grain ratio of at least 1 along a nonzero "
+                    "grain, and no cloth regions");
+            // Seams open at the mid-surface only, so a fracturing card keeps its outer-fiber bending stress below the
+            // tensile strength over the curvature range its section declares.
+            const nk::MfMaterial material = FieldMaterial(f);
+            const nk::mf::PlaneStressLaw bend = nk::mf::BendLaw(material);
+            const float moment = material.yield_moment > 0.0f
+                ? material.yield_moment + material.bend_hardening * bend.range
+                : nk::mf::BendingModulus<float>(material) * bend.range;
+            if ((!m.cloth_mesh.seams.empty() || f.weibull_modulus > 0.0f) &&
+                !(6.0f * moment / (f.thickness * f.thickness) < f.tear_strength))
+                throw std::runtime_error(
+                    "ValidateMedia: a fracturing field cloth opens its seams at the mid-surface only, so 6 M / t^2 "
+                    "must stay below tear_strength for the largest moment M of its section range: the yield moment "
+                    "plus hardening over the curvature range, or the elastic moment at that range");
         }
         if (m.method != Method::Field && !m.cloth_mesh.seams.empty())
             throw std::runtime_error("ValidateMedia: cloth seams tear only in a material-field cloth");
@@ -2085,6 +2143,9 @@ void CookMpmVbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
     mp.initial_vel.insert(mp.initial_vel.end(), xp.initial_vel.begin(),
                           xp.initial_vel.end());
     mp.inv_mass.insert(mp.inv_mass.end(), xp.inv_mass.begin(), xp.inv_mass.end());
+    mp.attachment_stiffness.resize(n_mpm, 0.0f);
+    mp.attachment_stiffness.insert(mp.attachment_stiffness.end(),
+                                  xp.attachment_stiffness.begin(), xp.attachment_stiffness.end());
     for (uint32_t v : xp.aero_tri_verts) mp.aero_tri_verts.push_back(v + n_mpm);
     mp.aero_tri_area = xp.aero_tri_area;
     mp.aero_drag_normal = xp.aero_drag_normal;
@@ -2377,6 +2438,26 @@ std::vector<const MediaRecord*> VertexBlockMediaOrder(const std::vector<MediaRec
     return order;
 }
 
+static void ClothAttachments(const MediaRecord& media, VbdCookInput& in,
+                             const std::vector<uint32_t>& weld = {}) {
+    in.attachment_stiffness.assign(in.positions.size(), 0.0f);
+    for (const auto& attachment : media.cloth_mesh.attachments) {
+        const uint32_t vertex = attachment.vertex;
+        if (vertex >= in.inv_mass.size() || !(in.inv_mass[vertex] > 0.0f) ||
+            !(attachment.stiffness >= 0.0f) || !std::isfinite(attachment.stiffness))
+            throw std::invalid_argument("Cloth attachment requires a dynamic vertex and finite nonnegative stiffness");
+        double mass = 0.0;
+        for (size_t v = 0u; v < in.inv_mass.size(); ++v)
+            if ((v < weld.size() ? weld[v] : v) == vertex) mass += 1.0 / in.inv_mass[v];
+        for (size_t v = 0u; v < in.inv_mass.size(); ++v) {
+            if ((v < weld.size() ? weld[v] : v) != vertex) continue;
+            float& stiffness = in.attachment_stiffness[v];
+            stiffness += static_cast<float>(attachment.stiffness / (mass * in.inv_mass[v]));
+            if (!std::isfinite(stiffness)) throw std::invalid_argument("Cloth attachment stiffness overflow");
+        }
+    }
+}
+
 VbdCookInput BuildClothVertexBlockInput(const MediaRecord& media) {
     VbdCookInput in;
     const auto geometry = BuildClothGeometry(media);
@@ -2456,6 +2537,7 @@ VbdCookInput BuildClothVertexBlockInput(const MediaRecord& media) {
         in.inv_mass.push_back(1.0f / mass);
     }
     PinClothVertices(media, in.inv_mass);
+    ClothAttachments(media, in);
     // Anisotropic aero drag: pass the coeffs through; seed the op with the cloth
     // triangles only when active (all-zero coeffs => no op => byte-identical cook).
     in.aero_drag_normal = media.vbd.aero_drag_normal;
@@ -2470,6 +2552,12 @@ VbdCookInput BuildClothVertexBlockInput(const MediaRecord& media) {
     return in;
 }
 
+// A fracturing field cloth keeps a quarter of its vertex count as free spares, parked 10 m above its first vertex.
+static uint32_t FractureSpares(const MediaRecord& media, uint32_t vertices) {
+    return media.method == MediaRecord::Method::Field && media.field.weibull_modulus > 0.0f
+               ? std::max(64u, vertices / 4u) : 0u;
+}
+
 VbdCookInput BuildFieldVertexBlockInput(const MediaRecord& media) {
     VbdCookInput in;
     const auto geometry = BuildClothGeometry(media);
@@ -2477,18 +2565,27 @@ VbdCookInput BuildFieldVertexBlockInput(const MediaRecord& media) {
     const auto& tris = geometry.triangles;
     if (rest.empty()) return in;
     const nk::MfMaterial material = FieldMaterial(media.field);
+    const float weibull = media.field.weibull_modulus;
+    const float* grain = media.field.grain;
     runtime::soft::BuildFieldShellElements(rest, tris, geometry.material_faces, geometry.weld, material, 0u,
-                                           in.field_elements);
+                                           weibull, math::Vec3{grain[0], grain[1], grain[2]},
+                                           media.field.grain_ratio, in.field_elements, media.field.weibull_reference_area);
     in.field_materials.push_back(material);
+    const uint32_t vertices = static_cast<uint32_t>(rest.size());
+    in.spares = FractureSpares(media, vertices);
+    in.spare_first = vertices;
     in.vbd_begin = 0u;
-    in.vbd_count = in.field_count = static_cast<uint32_t>(rest.size());
+    in.vbd_count = in.field_count = vertices + in.spares;
     in.positions = rest;
-    in.velocities.assign(rest.size(), math::Vec3::Zero());
-    in.half_thickness.assign(rest.size(), 0.5f * material.thickness);
-    in.friction.assign(rest.size(), media.vbd.friction);
+    in.positions.resize(in.vbd_count, rest[0] + math::Vec3{0.0f, 0.0f, 10.0f});
+    in.velocities.assign(in.vbd_count, math::Vec3::Zero());
+    in.half_thickness.assign(in.vbd_count, 0.5f * material.thickness);
+    in.friction.assign(in.vbd_count, media.vbd.friction);
     CookParticleSurface collision_surface;
     for (const auto& tri : tris)
         collision_surface.triangles.insert(collision_surface.triangles.end(), {tri.v[0], tri.v[1], tri.v[2]});
+    collision_surface.end = in.vbd_count;
+    collision_surface.twin_edges = in.spares > 0u;
     in.surfaces.push_back(std::move(collision_surface));
     std::vector<float> masses(rest.size(), 0.0f);
     const float areal = material.density * material.thickness / 6.0f;
@@ -2509,6 +2606,14 @@ VbdCookInput BuildFieldVertexBlockInput(const MediaRecord& media) {
     PinClothVertices(media, in.inv_mass);
     for (size_t v = 0u; v < geometry.weld.size(); ++v)
         if (in.inv_mass[geometry.weld[v]] == 0.0f) in.inv_mass[v] = 0.0f;
+    in.inv_mass.resize(in.vbd_count, 0.0f);
+    ClothAttachments(media, in, geometry.weld);
+    // Air drags a field cloth like a vertex-block cloth, over its cooked triangles.
+    in.aero_drag_normal = media.vbd.aero_drag_normal;
+    in.aero_drag_tangent = media.vbd.aero_drag_tangent;
+    in.aero_drag_max_dv = media.vbd.aero_drag_max_dv;
+    if (media.vbd.aero_drag_normal > 0.0f || media.vbd.aero_drag_tangent > 0.0f)
+        for (const auto& tri : tris) in.aero_triangles.push_back({tri.v[0], tri.v[1], tri.v[2]});
     return in;
 }
 
@@ -2651,6 +2756,8 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
         std::vector<uint32_t> tris;
         const auto geometry = BuildClothGeometry(m);
         const uint32_t verts = static_cast<uint32_t>(geometry.rest.size());
+        // A fracturing cloth's surface also reaches the spares its splits move corners onto.
+        const uint32_t spares = FractureSpares(m, verts);
         for (const auto& tri : geometry.triangles)
             tris.insert(tris.end(), {tri.v[0], tri.v[1], tri.v[2]});
         if (!tris.empty()) {
@@ -2658,7 +2765,7 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
             MediaRenderSurface s;
             s.triangles = std::move(tris);
             s.particle_first = base;
-            s.particle_count = verts;
+            s.particle_count = verts + spares;
             for (const auto& face : geometry.material_faces)
                 for (const auto& corner : face) s.corner_uvs.insert(s.corner_uvs.end(), {corner.x, corner.y});
             s.normal_offset = m.render_skin.normal_offset;
@@ -2667,7 +2774,7 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
             s.render_material_id = m.render_material_id;
             surfaces.push_back(std::move(s));
         }
-        base += verts;
+        base += verts + spares;
     };
     for (const MediaRecord* m : VertexBlockMediaOrder(media)) {
         const size_t first = surfaces.size();
@@ -3008,6 +3115,9 @@ void AppendSoftMedium(VbdCookInput& dst, const VbdCookInput& src) {
     dst.velocities.insert(dst.velocities.end(), src.velocities.begin(),
                           src.velocities.end());
     dst.inv_mass.insert(dst.inv_mass.end(), src.inv_mass.begin(), src.inv_mass.end());
+    dst.attachment_stiffness.resize(dst.positions.size(), 0.0f);
+    std::copy(src.attachment_stiffness.begin(), src.attachment_stiffness.end(),
+              dst.attachment_stiffness.begin() + base);
     dst.half_thickness.insert(dst.half_thickness.end(), src.half_thickness.begin(), src.half_thickness.end());
     dst.friction.insert(dst.friction.end(), src.friction.begin(), src.friction.end());
     for (std::array<uint32_t, 3> t : src.aero_triangles) {
@@ -3017,11 +3127,11 @@ void AppendSoftMedium(VbdCookInput& dst, const VbdCookInput& src) {
     for (auto surface : src.surfaces) {
         for (uint32_t& vertex : surface.triangles) vertex += base;
         for (uint32_t& vertex : surface.edges) vertex += base;
+        if (surface.end != 0u) surface.end += base;
         dst.surfaces.push_back(std::move(surface));
     }
-    // The soft slice carries one aero set (per-medium override is the medium's own);
-    // a single soft medium sets it verbatim, and drag-free field shells leave it.
-    if (src.field_count == 0u) {
+    // The soft slice carries one aero set, the last dragged medium's.
+    if (src.aero_drag_normal != 0.0f || src.aero_drag_tangent != 0.0f) {
         dst.aero_drag_normal = src.aero_drag_normal;
         dst.aero_drag_tangent = src.aero_drag_tangent;
         dst.aero_drag_max_dv = src.aero_drag_max_dv;
@@ -3029,6 +3139,12 @@ void AppendSoftMedium(VbdCookInput& dst, const VbdCookInput& src) {
     if (src.vbd_count == 0u) return;
     if (src.field_count == 0u && dst.field_count != 0u)
         throw std::invalid_argument("material-field media must follow the vertex-block media");
+    if (src.spares > 0u && dst.spares > 0u)
+        throw std::invalid_argument("a scene holds one fracturing material-field cloth");
+    if (src.spares > 0u) {
+        dst.spare_first = base + src.spare_first;
+        dst.spares = src.spares;
+    }
     // Vertex-block media append last, so their ranges join into one.
     if (dst.vbd_count != 0u && dst.vbd_begin + dst.vbd_count != base + src.vbd_begin)
         throw std::invalid_argument("vertex-block media must be contiguous in the soft slice");
@@ -3047,6 +3163,9 @@ void AppendSoftMedium(VbdCookInput& dst, const VbdCookInput& src) {
             element.vertex[4] += element_base;
             element.vertex[5] += element_base;
         }
+        if (element.kind == nk::kMfTriangle)
+            for (uint32_t j = 3u; j < 6u; ++j)
+                if (element.vertex[j] != ~0u) element.vertex[j] += element_base;
         element.material += material_base;
         dst.field_elements.push_back(element);
     }

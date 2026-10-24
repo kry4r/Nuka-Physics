@@ -257,6 +257,7 @@ struct Snapshot {
     std::vector<PoseSample> envs;       // the other displayed environments' poses
     std::vector<math::Vec3> particles;  // the shown environment's
     std::vector<float> heat;            // its per-particle residuals while the heatmap reads them
+    std::vector<std::vector<uint32_t>> surfaces;  // a fracturing world's surface triangles as they are now
     JointFrame joints;                  // its joints
     std::vector<Perturbation> perturbs;  // the loads held on it
     OverlayData overlay;
@@ -527,6 +528,7 @@ private:
     std::vector<PoseSample> mirror_envs_;
     std::vector<math::Vec3> mirror_particles_;
     std::vector<float> mirror_heat_;
+    std::vector<std::vector<uint32_t>> mirror_surfaces_;
     JointFrame mirror_joints_;
     OverlayData overlay_;
     WorkerTelemetry telemetry_;

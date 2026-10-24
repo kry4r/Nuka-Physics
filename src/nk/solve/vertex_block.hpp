@@ -70,6 +70,16 @@ NUKA_VBD_HD inline math::Vec3 PhysicalVelocity(math::Vec3 rate, math::Vec3 free_
             float(double(free_velocity.z) + (double(rate.z) - free_rate.z) * dt / effective_step)};
 }
 
+// The two quadratic potentials share one minimizer; the physical free rate remains independent.
+NUKA_VBD_HD inline math::Vec3 AttachmentRate(math::Vec3 free_rate, math::Vec3 target_delta,
+                                           float inertia, float stiffness, float dt) {
+    if (!(stiffness > 0.0f)) return free_rate;
+    const double weight = double(stiffness) / (double(inertia) + stiffness);
+    return {float(double(free_rate.x) + (double(target_delta.x) / dt - free_rate.x) * weight),
+            float(double(free_rate.y) + (double(target_delta.y) / dt - free_rate.y) * weight),
+            float(double(free_rate.z) + (double(target_delta.z) / dt - free_rate.z) * weight)};
+}
+
 NUKA_VBD_HD inline math::Vec3 InertialGradient(math::Vec3 rate, math::Vec3 free_rate,
                                                float inertia, float dt) {
     const double scale = double(inertia) * dt;
@@ -178,7 +188,11 @@ NUKA_VBD_HD inline double SmallestRelativeEigenvalue(const SymmetricMat3& a,
 // Vertex coordinates in double for element energy changes that subtract nearby values.
 struct Point {
     double x, y, z;
+    NUKA_VBD_HD Point operator+(const Point& o) const { return {x + o.x, y + o.y, z + o.z}; }
     NUKA_VBD_HD Point operator-(const Point& o) const { return {x - o.x, y - o.y, z - o.z}; }
+    NUKA_VBD_HD Point operator-() const { return {-x, -y, -z}; }
+    NUKA_VBD_HD Point operator*(double s) const { return {x * s, y * s, z * s}; }
+    NUKA_VBD_HD Point operator/(double s) const { return {x / s, y / s, z / s}; }
     NUKA_VBD_HD Point Cross(const Point& o) const {
         return {y * o.z - z * o.y, z * o.x - x * o.z, x * o.y - y * o.x};
     }

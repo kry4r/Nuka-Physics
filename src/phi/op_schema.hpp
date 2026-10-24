@@ -245,6 +245,7 @@ struct ParticleSurfacesParams {
     uint32_t triangles_per_env;
     uint32_t nodes_per_env;
     uint32_t edge_nodes_per_env;
+    uint32_t edges_per_env;
     uint32_t position_source = 0u;
 };
 
@@ -309,9 +310,6 @@ struct DatTruncateParams {
     uint32_t mesh_vertex_sources = 0u;
     uint32_t mesh_edge_sources = 0u;
     uint32_t excluded_pairs = 0u;
-    uint32_t slot_stride = 0u;
-    uint32_t slot_base = 0u;
-    uint32_t slot_capacity = 0u;
 };
 
 struct MpmParams {
@@ -541,6 +539,14 @@ struct VertexBlockLayout {
     // Material-field vertices end the range; their elements per env.
     uint32_t field_vertices = 0u;
     uint32_t field_elements = 0u;
+    uint32_t field_state_scalars = 0u;
+    uint32_t field_trial_scalars = 0u;
+    // Fracture spares [spare_first, + spares) of the range and each env's collision surfaces, triangles and edges.
+    uint32_t spare_first = 0u;
+    uint32_t spares = 0u;
+    uint32_t surfaces = 0u;
+    uint32_t surface_triangles = 0u;
+    uint32_t surface_edges = 0u;
 };
 
 struct AssembleRowsParams {
@@ -610,6 +616,8 @@ struct BlockDescentSolveParams {
     uint32_t material_cells_per_env = 0u;
     uint32_t grid_particles_per_env = 0u;
     uint32_t grid_dims[3] = {};
+    // The MPM cell edge, which turns a stress row's volume-rate residual into a velocity.
+    float grid_cell_size = 0.0f;
     uint32_t clear_failure_diagnostics = 1u;
     uint32_t substep_index = 0u;
     // Split-impulse iterations after the velocity solve, as the row solve's position pass.
@@ -662,6 +670,10 @@ struct AeroDragParams {
     float    max_dv;           // per-step impulse clamp (0 == uncapped)
     uint32_t tri_count;        // total env-major aero triangles (0 == inert)
     uint32_t particle_count;
+    uint32_t triangles_per_env;
+    uint32_t particles_per_env;
+    uint32_t field_elements_per_env;
+    uint32_t field_begin;
 };
 
 struct ParticlePredictParams {
@@ -738,6 +750,10 @@ struct ReadoutEnergyLedgerParams {
     uint32_t vbd_elements = 0u;
     uint32_t field_vertices = 0u;
     uint32_t field_elements = 0u;
+    uint32_t field_state_scalars = 0u;
+    uint32_t field_trial_scalars = 0u;
+    uint32_t spare_first = 0u;
+    uint32_t spares = 0u;
     uint32_t bodies_per_env = 0u;
     uint32_t links_per_env = 0u;
     uint32_t artics_per_env = 0u;
@@ -886,6 +902,9 @@ struct ResetEnvsParams {
     uint32_t point_endpoints_per_env = 0u;
     uint32_t point_endpoint_terms_per_env = 0u;
     uint32_t field_elements = 0u;   // material-field elements per env
+    uint32_t field_state_scalars = 0u;
+    uint32_t surface_edges = 0u;    // a fracturing field's collision edges and corners per env
+    uint32_t surface_corners = 0u;
 };
 
 struct SnapshotStateParams {
@@ -895,6 +914,9 @@ struct SnapshotStateParams {
     uint32_t total_body_count;
     uint32_t total_particle_count;
     uint32_t total_field_elements = 0u;
+    uint64_t total_field_state_scalars = 0u;
+    uint32_t total_surface_edges = 0u;
+    uint32_t total_surface_corners = 0u;
 };
 
 // Restore all environments with the same state lifecycle as a masked reset.
@@ -911,6 +933,9 @@ struct RestoreStateParams {
     uint32_t point_endpoints_per_env = 0u;
     uint32_t point_endpoint_terms_per_env = 0u;
     uint32_t total_field_elements = 0u;
+    uint64_t total_field_state_scalars = 0u;
+    uint32_t total_surface_edges = 0u;
+    uint32_t total_surface_corners = 0u;
 };
 
 struct ContactWarmStartParams {

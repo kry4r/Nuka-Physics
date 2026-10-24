@@ -37,6 +37,9 @@ struct VertexBlockView {
     const uint32_t* field_incidence = nullptr;
     const nk::vbd::MembraneStartState* field_start = nullptr;
     const float* field_history = nullptr;
+    // Per env, each field element's corners after fracture splits and the particle each particle was split from.
+    const uint32_t* field_corners = nullptr;
+    const uint32_t* particle_root = nullptr;
     VertexBlockLayout layout{};
     float dt = 0.0f;
 
@@ -56,20 +59,44 @@ __host__ __device__ inline void BindFieldTables(VertexBlockView& b, const ModelV
     b.field_incidence = model.mf_incidence;
     b.field_start = data.mf_start_metric;
     b.field_history = data.mf_history;
+    b.field_corners = data.mf_corner;
+    b.particle_root = data.particle_root;
+}
+
+__device__ inline const uint32_t* FieldCorners(const VertexBlockView& b, uint32_t env) {
+    return b.field_corners != nullptr ? b.field_corners + size_t{env} * b.layout.field_elements * nk::kMfMaxVertices : nullptr;
+}
+
+// A field element on the corners its env's splits gave it.
+__device__ inline nk::MfElement FieldElement(const VertexBlockView& b, uint32_t env, uint32_t index) {
+    const uint32_t* corners = FieldCorners(b, env);
+    return nk::WithCorners(b.field_elements[index], corners != nullptr ? corners + size_t{index} * nk::kMfMaxVertices : nullptr);
 }
 
 // A vertex's element list: its vertex-block elements, or its material-field elements past the first field vertex.
+// A split field vertex holds only the incidences whose corner it still is.
 struct VertexElementList {
     const uint32_t* incidence;
     uint32_t begin;
     uint32_t end;
     bool field;
+    const uint32_t* corners = nullptr;
+    uint32_t vertex = 0u;
+    const nk::MfElement* elements = nullptr;
+    __device__ bool Holds(uint32_t packed) const {
+        if (!field) return true;
+        const uint32_t element = nk::MfIncidenceElement(packed), local = nk::MfIncidenceLocal(packed);
+        const uint32_t* v = corners ? corners + size_t{element} * nk::kMfMaxVertices : elements[element].vertex;
+        return nk::MfVertexSlotHolds(v, local, vertex);
+    }
 };
 
-__device__ inline VertexElementList ElementsOf(const VertexBlockView& b, uint32_t vertex) {
+// A split vertex reads the incidences of the vertex it came from; a free spare, its own empty list.
+__device__ inline VertexElementList ElementsOf(const VertexBlockView& b, uint32_t env, uint32_t vertex) {
     if (vertex < b.FieldFirst()) return {b.incidence, b.offsets[vertex], b.offsets[vertex + 1u], false};
-    const uint32_t v = vertex - b.FieldFirst();
-    return {b.field_incidence, b.field_offsets[v], b.field_offsets[v + 1u], true};
+    const uint32_t v = (b.particle_root != nullptr ? b.particle_root[b.Particle(env, vertex)] - b.layout.begin : vertex) -
+                       b.FieldFirst();
+    return {b.field_incidence, b.field_offsets[v], b.field_offsets[v + 1u], true, FieldCorners(b, env), vertex, b.field_elements};
 }
 
 __device__ inline void RecordVertexDescentAudit(const VertexBlockView& b, uint32_t env,
@@ -165,12 +192,18 @@ __device__ inline const nk::vbd::MembraneStartState* FieldStart(const VertexBloc
 }
 
 __device__ inline const float* FieldHistory(const VertexBlockView& b, uint32_t env, uint32_t element) {
-    return b.field_history + (size_t{env} * b.layout.field_elements + element) * nk::kMfHistory;
+    return b.field_history + size_t{env} * b.layout.field_state_scalars + b.field_elements[element].state_offset;
 }
 
 __device__ inline nk::mf::FieldGeometry FieldStepGeometry(const VertexBlockView& b, const math::Vec3* velocity,
                                                          const nk::MfElement& element, uint32_t env) {
     return StepGeometry<nk::mf::FieldGeometry>(b, velocity, element.vertex, nk::MfElementVertexCount(element), env);
+}
+
+__device__ inline void SetFieldDelta(nk::mf::FieldGeometry& geometry, const nk::MfElement& e,
+                                      uint32_t local, math::Vec3 delta) {
+    for (uint32_t j = 0u; j < nk::MfElementVertexCount(e); ++j)
+        if (e.vertex[j] == e.vertex[local]) geometry.delta[j] = delta;
 }
 
 // Element damping uses all nodal rates and a material metric frozen at the interval start.
@@ -215,7 +248,7 @@ __device__ inline void VertexElementBlock(const VertexBlockView& b, const math::
 __device__ inline void FieldElementBlock(const VertexBlockView& b, const math::Vec3* velocity, uint32_t env,
                                          uint32_t packed, math::Vec3& g, math::SymmetricMat3& h) {
     const uint32_t index = nk::MfIncidenceElement(packed);
-    const nk::MfElement element = b.field_elements[index];
+    const nk::MfElement element = FieldElement(b, env, index);
     nk::mf::ElementBlock(element, b.field_materials[element.material], FieldHistory(b, env, index),
                          nk::MfIncidenceLocal(packed), FieldStepGeometry(b, velocity, element, env),
                          FieldStart(b, env, index), b.dt, &g, &h);
@@ -235,8 +268,9 @@ __device__ inline void GatherVertexBlock(const VertexBlockView& b, const math::V
     gradient = {};
     hessian = {};
     const math::Vec3 own = velocity[b.Particle(env, vertex)];
-    const VertexElementList list = ElementsOf(b, vertex);
+    const VertexElementList list = ElementsOf(b, env, vertex);
     for (uint32_t i = list.begin + lane; i < list.end; i += width) {
+        if (!list.Holds(list.incidence[i])) continue;
         math::Vec3 g;
         math::SymmetricMat3 h;
         ListElementBlock(b, velocity, env, own, list.field, list.incidence[i], g, h);
@@ -253,8 +287,9 @@ __device__ inline math::Vec3 VertexBlockForceDouble(const VertexBlockView& b, co
     const math::Vec3 own = velocity[b.Particle(env, vertex)];
     double force[3] = {double(impulse.x) - inertial.x, double(impulse.y) - inertial.y,
                        double(impulse.z) - inertial.z};
-    const VertexElementList list = ElementsOf(b, vertex);
+    const VertexElementList list = ElementsOf(b, env, vertex);
     for (uint32_t i = list.begin; i < list.end; ++i) {
+        if (!list.Holds(list.incidence[i])) continue;
         math::Vec3 g;
         math::SymmetricMat3 h;
         ListElementBlock(b, velocity, env, own, list.field, list.incidence[i], g, h);
@@ -310,10 +345,10 @@ __device__ inline VertexElementChangeTerms FieldElementChange(
     const VertexBlockView& b, const math::Vec3* velocity, uint32_t env, uint32_t packed,
     math::Vec3 from, math::Vec3 move) {
     const uint32_t index = nk::MfIncidenceElement(packed);
-    const nk::MfElement element = b.field_elements[index];
+    const nk::MfElement element = FieldElement(b, env, index);
     const uint32_t local = nk::MfIncidenceLocal(packed);
     nk::mf::FieldGeometry geometry = FieldStepGeometry(b, velocity, element, env);
-    SetDelta(geometry, local, (from - velocity[b.Particle(env, element.vertex[0])]) * b.dt);
+    SetFieldDelta(geometry, element, local, (from - velocity[b.Particle(env, element.vertex[0])]) * b.dt);
     return {nk::mf::ElementEnergyChange(element, b.field_materials[element.material], FieldHistory(b, env, index),
                                         local, geometry, FieldStart(b, env, index), b.dt, move * b.dt),
             0.0f, 0.0f};
@@ -339,10 +374,12 @@ __device__ inline float VertexEnergyChange(const VertexBlockView& b, const math:
                                            math::Vec3 move, uint32_t lane, uint32_t width,
                                            float* size = nullptr) {
     float change = 0.0f;
-    const VertexElementList list = ElementsOf(b, vertex);
-    for (uint32_t i = list.begin + lane; i < list.end; i += width)
+    const VertexElementList list = ElementsOf(b, env, vertex);
+    for (uint32_t i = list.begin + lane; i < list.end; i += width) {
+        if (!list.Holds(list.incidence[i])) continue;
         AddVertexElementChange(b, ListElementChange(b, velocity, env, list.field, list.incidence[i], from, move),
                                change, size);
+    }
     return change;
 }
 
@@ -350,9 +387,10 @@ __device__ inline float VertexEnergyChange(const VertexBlockView& b, const math:
 __device__ inline bool FieldElementStateValid(const VertexBlockView& b, const math::Vec3* velocity, uint32_t env,
                                               uint32_t packed, math::Vec3 from) {
     const uint32_t index = nk::MfIncidenceElement(packed);
-    const nk::MfElement element = b.field_elements[index];
+    const nk::MfElement element = FieldElement(b, env, index);
     nk::mf::FieldGeometry geometry = FieldStepGeometry(b, velocity, element, env);
-    SetDelta(geometry, nk::MfIncidenceLocal(packed), (from - velocity[b.Particle(env, element.vertex[0])]) * b.dt);
+    SetFieldDelta(geometry, element, nk::MfIncidenceLocal(packed),
+                  (from - velocity[b.Particle(env, element.vertex[0])]) * b.dt);
     return nk::mf::ElementStateValid(element, geometry, FieldStart(b, env, index)) &&
            fabs(nk::mf::ElementEnergy(element, b.field_materials[element.material], FieldHistory(b, env, index),
                                       geometry)) <= FLT_MAX;
@@ -362,9 +400,10 @@ __device__ inline bool VertexEnergyStateValid(const VertexBlockView& b, const ma
                                               uint32_t env, uint32_t vertex, math::Vec3 from,
                                               uint32_t lane, uint32_t width) {
     bool valid = true;
-    const VertexElementList list = ElementsOf(b, vertex);
+    const VertexElementList list = ElementsOf(b, env, vertex);
     for (uint32_t i = list.begin + lane; i < list.end; i += width) {
         const uint32_t packed = list.incidence[i];
+        if (!list.Holds(packed)) continue;
         if (list.field) {
             valid &= FieldElementStateValid(b, velocity, env, packed, from);
             continue;
@@ -453,7 +492,7 @@ __device__ inline float VertexBlockStationaryResidualWarp(const VertexBlockView&
     const math::Vec3 correction = inverse.Multiply(force) / b.dt;
     // Each term passes at most ceil(n/32) + 6 roundings here (lane sum, five shuffle levels, assembly); with the
     // ledger's own roundings its readout exceeds this force by at most (ceil(n/32) + 10) u per term magnitude.
-    const VertexElementList list = ElementsOf(b, vertex);
+    const VertexElementList list = ElementsOf(b, env, vertex);
     const uint32_t lane_terms = (list.end - list.begin + warpSize - 1u) / warpSize;
     const float rounding = 0.5f * static_cast<float>(lane_terms + 10u) * FLT_EPSILON;
     const math::Vec3 bound = (magnitude + math::Vec3{fabsf(inertial.x), fabsf(inertial.y), fabsf(inertial.z)} +
@@ -552,6 +591,108 @@ __device__ inline bool SolveVertexBlockWarp(const VertexBlockView& b, PointMassV
             fabsf(correction.z) <= tolerance && fabsf(momentum_error.x) <= tolerance &&
             fabsf(momentum_error.y) <= tolerance && fabsf(momentum_error.z) <= tolerance)
         : (force.x != 0.0f || force.y != 0.0f || force.z != 0.0f);
+}
+
+// Moves every live copy of a split field vertex by one common step, the mode its stiff seam pairs hold still in
+// the copies' own descents. Seams then keep their openings; copies that rows touch keep their own descents.
+__device__ inline void SolveCopiesWarp(const VertexBlockView& b, PointMassView points, const uint32_t* row_offsets,
+                                       uint32_t env, uint32_t root, uint32_t lane) {
+    constexpr uint32_t kMaxCopies = 16u;
+    const uint32_t particle = b.Particle(env, root);
+    if (root < b.FieldFirst() || b.particle_root == nullptr || !(points.particle_inv_mass[particle] > 0.0f) ||
+        b.particle_root[particle] != b.layout.begin + root) return;
+    const uint32_t* corners = FieldCorners(b, env);
+    const uint32_t begin = b.field_offsets[root - b.FieldFirst()], end = b.field_offsets[root - b.FieldFirst() + 1u];
+    const auto corner = [&](uint32_t packed) {
+        const uint32_t element = nk::MfIncidenceElement(packed);
+        return corners != nullptr ? corners + size_t{element} * nk::kMfMaxVertices : b.field_elements[element].vertex;
+    };
+    uint32_t copies[kMaxCopies], count = 0u;
+    for (uint32_t i = begin; i < end; ++i) {
+        const uint32_t copy = corner(b.field_incidence[i])[nk::MfIncidenceLocal(b.field_incidence[i])];
+        bool known = false;
+        for (uint32_t k = 0u; k < count; ++k) known |= copies[k] == copy;
+        if (known) continue;
+        const uint32_t q = b.Particle(env, copy);
+        if (count == kMaxCopies || !(points.particle_inv_mass[q] > 0.0f) || row_offsets[q + 1u] != row_offsets[q])
+            return;
+        copies[count++] = copy;
+    }
+    if (count < 2u) return;
+    const float h = b.dt;
+    math::Vec3 gradient{};
+    math::SymmetricMat3 hessian{};
+    // A common move leaves every seam opening unchanged, so seams add force but no curvature to it.
+    for (uint32_t i = begin + lane; i < end; i += warpSize) {
+        const uint32_t packed = b.field_incidence[i], local = nk::MfIncidenceLocal(packed);
+        if (!nk::MfVertexSlotHolds(corner(packed), local, corner(packed)[local])) continue;
+        math::Vec3 g;
+        math::SymmetricMat3 k;
+        FieldElementBlock(b, points.particle_velocity, env, packed, g, k);
+        gradient = gradient + g;
+        if (b.field_elements[nk::MfIncidenceElement(packed)].kind != nk::kMfSeam) nk::vbd::AddTo(hessian, k);
+    }
+    math::Vec3 force = -math::Vec3{WarpSum(gradient.x), WarpSum(gradient.y), WarpSum(gradient.z)};
+    hessian = {WarpSum(hessian.xx), WarpSum(hessian.yy), WarpSum(hessian.zz),
+               WarpSum(hessian.xy), WarpSum(hessian.xz), WarpSum(hessian.yz)};
+    float inertia = 0.0f;
+    for (uint32_t k = 0u; k < count; ++k) {
+        const uint32_t q = b.Particle(env, copies[k]), slot = b.Slot(env, copies[k]);
+        force = force - nk::vbd::InertialGradient(points.particle_velocity[q], b.free_rate[slot], b.inertia[slot], h);
+        inertia += b.inertia[slot];
+    }
+    nk::vbd::AddIdentity(hessian, inertia);
+    math::SymmetricMat3 inverse;
+    if (!nk::vbd::Invert(hessian, 1.0e-6f * inertia * inertia * inertia, &inverse)) return;
+    const math::Vec3 step = inverse.Multiply(force) / h;
+    const auto moved = [&](uint32_t q, float scale) {
+        const math::Vec3 u = points.particle_velocity[q];
+        return math::Vec3{nk::vbd::TrialValue(u.x, step.x, scale), nk::vbd::TrialValue(u.y, step.y, scale),
+                          nk::vbd::TrialValue(u.z, step.z, scale)};
+    };
+    float scale = 1.0f;
+    bool accepted = false;
+    for (uint32_t halving = 0u; halving <= kVertexStepHalvings && -h * force.Dot(step) < 0.0f; ++halving) {
+        float elastic = 0.0f;
+        for (uint32_t i = begin + lane; i < end; i += warpSize) {
+            const uint32_t index = nk::MfIncidenceElement(b.field_incidence[i]);
+            bool first = true;
+            for (uint32_t j = begin; j < i && first; ++j) first = nk::MfIncidenceElement(b.field_incidence[j]) != index;
+            if (!first) continue;
+            const nk::MfElement e = FieldElement(b, env, index);
+            math::Vec3 shift[nk::kMfMaxVertices];
+            for (uint32_t j = 0u; j < nk::kMfMaxVertices; ++j) {
+                shift[j] = {};
+                if (j >= nk::MfElementVertexCount(e)) continue;
+                const uint32_t q = b.Particle(env, e.vertex[j]);
+                if (b.particle_root[q] == b.layout.begin + root)
+                    shift[j] = (moved(q, scale) - points.particle_velocity[q]) * h;
+            }
+            elastic += nk::mf::ElementMovesEnergyChange(e, b.field_materials[e.material], FieldHistory(b, env, index),
+                                                       FieldStepGeometry(b, points.particle_velocity, e, env),
+                                                       FieldStart(b, env, index), h, shift);
+        }
+        double change = WarpSum(elastic), slope = 0.0;
+        for (uint32_t k = 0u; k < count; ++k) {
+            const uint32_t q = b.Particle(env, copies[k]), slot = b.Slot(env, copies[k]);
+            const math::Vec3 u = points.particle_velocity[q], move = moved(q, scale) - u;
+            change += nk::vbd::InertialEnergyChange(u, b.free_rate[slot], move, b.inertia[slot], h);
+            slope -= double(h) * (double(force.x) * move.x + double(force.y) * move.y + double(force.z) * move.z) /
+                     count;
+        }
+        if (slope <= 0.0 && change <= double(kVertexStepDecrease) * slope) {
+            accepted = true;
+            break;
+        }
+        scale *= 0.5f;
+    }
+    // Every lane has read the copies before lane 0 moves them.
+    __syncwarp();
+    if (!accepted || lane != 0u) return;
+    for (uint32_t k = 0u; k < count; ++k) {
+        const uint32_t q = b.Particle(env, copies[k]);
+        points.particle_velocity[q] = moved(q, scale);
+    }
 }
 
 }  // namespace nuka::phi::nkops

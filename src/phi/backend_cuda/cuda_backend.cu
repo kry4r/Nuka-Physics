@@ -73,6 +73,7 @@ const char* NkOpName(int op) {
         case NkOp::ReadoutContactAudit: return "ReadoutContactAudit";
         case NkOp::MimicReduce: return "MimicReduce";
         case NkOp::RecordTelemetry: return "RecordTelemetry";
+        case NkOp::ClothReplaySplits: return "ClothReplaySplits";
         default: return "op";
     }
 }
@@ -423,6 +424,22 @@ PlanMetrics BackendPlanMetricsImpl(Backend*, Plan* plan) {
     return AsPlan(plan)->metrics;
 }
 
+BufferType* BackendDeviceBufferTypeImpl(Backend* b) {
+    return reinterpret_cast<BufferType*>(&reinterpret_cast<CudaBackend*>(b)->device_bt);
+}
+
+BufferType* BackendHostBufferTypeImpl(Backend* b) {
+    return reinterpret_cast<BufferType*>(&reinterpret_cast<CudaBackend*>(b)->host_bt);
+}
+
+Status BackendReserveThreadStackImpl(Backend* b, uint64_t bytes) {
+    auto status = cudaSetDevice(reinterpret_cast<CudaBackend*>(b)->device_id);
+    size_t current = 0;
+    if (status == cudaSuccess) status = cudaDeviceGetLimit(&current, cudaLimitStackSize);
+    if (status == cudaSuccess && current < bytes) status = cudaDeviceSetLimit(cudaLimitStackSize, bytes);
+    return CudaStatus(status);
+}
+
 const BackendI kCudaBackendI = {
     /*get_name     =*/ &BackendGetName,
     /*free         =*/ &BackendFreeImpl,
@@ -438,6 +455,9 @@ const BackendI kCudaBackendI = {
     /*event_elapsed_ms =*/ &BackendEventElapsedMsImpl,
     /*resource_info =*/ &BackendResourceInfoImpl,
     /*plan_metrics =*/ &BackendPlanMetricsImpl,
+    &BackendDeviceBufferTypeImpl,
+    &BackendHostBufferTypeImpl,
+    &BackendReserveThreadStackImpl,
 };
 
 // ---------------------------------------------------------------------------
@@ -615,31 +635,6 @@ void CudaBackendUseCallerStream(CudaBackend* b, cudaStream_t stream) {
     (void)cudaStreamDestroy(b->main);
     b->main = stream;
     b->owns_main = false;
-}
-
-// ---------------------------------------------------------------------------
-// Backend-bound buffer-type accessors (declared in phi/backend.hpp). These hand
-// out the backend's own device_bt / host_bt, whose vtables resolve the async
-// stream to backend->main (cuda_buffer.cu). The buffer-sweep consumers that run
-// their ops on backend->main allocate from these (vs DeviceBufferType(device),
-// the stream-0 default type). CUDA-free at the call site (BufferType* is opaque).
-// ---------------------------------------------------------------------------
-BufferType* BackendDeviceBufferType(Backend* b) {
-    if (b == nullptr) { return nullptr; }
-    return reinterpret_cast<BufferType*>(&reinterpret_cast<CudaBackend*>(b)->device_bt);
-}
-
-BufferType* BackendHostBufferType(Backend* b) {
-    if (b == nullptr) { return nullptr; }
-    return reinterpret_cast<BufferType*>(&reinterpret_cast<CudaBackend*>(b)->host_bt);
-}
-
-Status BackendReserveThreadStack(Backend* b, uint64_t bytes) {
-    auto status = cudaSetDevice(reinterpret_cast<CudaBackend*>(b)->device_id);
-    size_t current = 0;
-    if (status == cudaSuccess) status = cudaDeviceGetLimit(&current, cudaLimitStackSize);
-    if (status == cudaSuccess && current < bytes) status = cudaDeviceSetLimit(cudaLimitStackSize, bytes);
-    return CudaStatus(status);
 }
 
 // ---------------------------------------------------------------------------

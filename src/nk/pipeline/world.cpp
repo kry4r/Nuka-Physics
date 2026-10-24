@@ -299,6 +299,9 @@ bool World::SeedInitialState() {
     snapshot_params_.total_body_count = total_body_count;
     snapshot_params_.total_particle_count = total_particle_count;
     snapshot_params_.total_field_elements = cap.mf_elements_per_env * E;
+    snapshot_params_.total_field_state_scalars = uint64_t{cap.mf_state_scalars_per_env} * E;
+    snapshot_params_.total_surface_edges = cap.mf_spares_per_env > 0u ? cap.particle_surface_edges_per_env * E : 0u;
+    snapshot_params_.total_surface_corners = cap.mf_spares_per_env > 0u ? cap.particle_surface_triangles * 3u * E : 0u;
     restore_params_.total_link_count = L * E;
     restore_params_.energy_substeps = cap.integration_substeps;
     restore_params_.env_count = E;
@@ -309,6 +312,9 @@ bool World::SeedInitialState() {
     restore_params_.total_body_count = total_body_count;
     restore_params_.total_particle_count = total_particle_count;
     restore_params_.total_field_elements = cap.mf_elements_per_env * E;
+    restore_params_.total_field_state_scalars = snapshot_params_.total_field_state_scalars;
+    restore_params_.total_surface_edges = snapshot_params_.total_surface_edges;
+    restore_params_.total_surface_corners = snapshot_params_.total_surface_corners;
     reset_params_.count = 0;
     reset_params_.energy_substeps = cap.integration_substeps;
     reset_params_.env_count = E;
@@ -327,6 +333,9 @@ bool World::SeedInitialState() {
     fk_params_.articulations_per_env = cap.articulations_per_env;
     reset_params_.particle_count = cap.particles_per_env;
     reset_params_.field_elements = cap.mf_elements_per_env;
+    reset_params_.field_state_scalars = cap.mf_state_scalars_per_env;
+    reset_params_.surface_edges = snapshot_params_.total_surface_edges / E;
+    reset_params_.surface_corners = snapshot_params_.total_surface_corners / E;
     reset_params_.point_endpoints_per_env = cap.point_endpoints_per_env;
     reset_params_.point_endpoint_terms_per_env = cap.point_endpoint_terms_per_env;
     restore_params_.point_endpoints_per_env = cap.point_endpoints_per_env;
@@ -419,6 +428,7 @@ bool World::SeedInitialState() {
         std::vector<math::Vec3> pos(static_cast<size_t>(P) * E);
         std::vector<math::Vec3> vel(static_cast<size_t>(P) * E);
         std::vector<float> inv_mass(static_cast<size_t>(P) * E, 0.0f);
+        std::vector<float> attachment_stiffness(static_cast<size_t>(P) * E, 0.0f);
         for (uint32_t e = 0; e < E; ++e) {
             for (uint32_t i = 0; i < P; ++i) {
                 const size_t at = static_cast<size_t>(e) * P + i;
@@ -427,6 +437,7 @@ bool World::SeedInitialState() {
                 vel[at] = i < mp.initial_vel.size() ? mp.initial_vel[i]
                                                     : math::Vec3::Zero();
                 inv_mass[at] = i < mp.inv_mass.size() ? mp.inv_mass[i] : 0.0f;
+                attachment_stiffness[at] = i < mp.attachment_stiffness.size() ? mp.attachment_stiffness[i] : 0.0f;
             }
         }
         if (!data_.UploadField(FieldId::ParticlePos, pos.data(),
@@ -437,6 +448,12 @@ bool World::SeedInitialState() {
                                vel.size() * sizeof(math::Vec3)) ||
             !data_.UploadField(FieldId::ParticleKinematicTarget, pos.data(),
                                pos.size() * sizeof(math::Vec3)) ||
+            !data_.UploadField(FieldId::ParticleAttachmentPreviousTarget, pos.data(),
+                               pos.size() * sizeof(math::Vec3)) ||
+            !data_.UploadField(FieldId::ParticleAttachmentStiffness, attachment_stiffness.data(),
+                               attachment_stiffness.size() * sizeof(float)) ||
+            !data_.UploadField(FieldId::ParticleAttachmentPreviousStiffness, attachment_stiffness.data(),
+                               attachment_stiffness.size() * sizeof(float)) ||
             !data_.UploadField(FieldId::ParticleInvMass, inv_mass.data(),
                                inv_mass.size() * sizeof(float))) {
             return false;
@@ -480,6 +497,39 @@ bool World::SeedInitialState() {
                 if (!data_.UploadField(FieldId::ParticlePlasticF, plastic.data(),
                                       plastic.size() * sizeof(float))) return false;
             }
+        }
+        // A fracturing field starts on its cooked corners and edges with every particle its own root.
+        if (cap.mf_spares_per_env > 0u) {
+            const std::vector<MfElement>& elements = mp.mf_elements;
+            const std::vector<uint32_t>& surface = mp.surface_triangles;
+            std::vector<uint32_t> corners(elements.size() * kMfMaxVertices * E), root(size_t{cap.particles_per_env} * E),
+                surface_corners(surface.size() * E);
+            std::vector<collision::MeshEdge> edges(mp.surface_edges.size() * E);
+            for (uint32_t e = 0; e < E; ++e) {
+                for (size_t i = 0u; i < elements.size(); ++i)
+                    std::copy(elements[i].vertex, elements[i].vertex + kMfMaxVertices,
+                              corners.begin() + (e * elements.size() + i) * kMfMaxVertices);
+                std::copy(surface.begin(), surface.end(), surface_corners.begin() + e * surface.size());
+                std::copy(mp.surface_edges.begin(), mp.surface_edges.end(), edges.begin() + e * mp.surface_edges.size());
+                for (uint32_t i = 0u; i < cap.particles_per_env; ++i) root[size_t{e} * cap.particles_per_env + i] = i;
+            }
+            // Twins start with both ends on one vertex: no edge until a crack cuts theirs.
+            for (size_t s = 0u; s < mp.surface_info.size(); ++s) {
+                if ((mp.surface_info[s].flags & collision::kMeshSurfaceTwinEdges) == 0u) continue;
+                const collision::MeshEdgeInfo& info = mp.surface_edge_info[s];
+                for (uint32_t e = 0; e < E; ++e)
+                    for (uint32_t k = info.edge_count / 2u; k < info.edge_count; ++k) {
+                        collision::MeshEdge& twin = edges[size_t{e} * mp.surface_edges.size() + info.edge_offset + k];
+                        twin.vertex1 = twin.vertex0;
+                    }
+            }
+            if (!data_.UploadField(FieldId::MfCorner, corners.data(), corners.size() * sizeof(uint32_t)) ||
+                !data_.UploadField(FieldId::ParticleRoot, root.data(), root.size() * sizeof(uint32_t)) ||
+                !data_.UploadField(FieldId::ParticleSurfaceLiveEdges, edges.data(),
+                                   edges.size() * sizeof(collision::MeshEdge)) ||
+                !data_.UploadField(FieldId::ParticleSurfaceCorners, surface_corners.data(),
+                                   surface_corners.size() * sizeof(uint32_t)))
+                return false;
         }
     }
 
@@ -648,20 +698,188 @@ StepResult World::Step() {
         return out;
     }
     const std::vector<phi::OpCall>& calls = pipeline_->Calls();
-    out.result = phi::Status::Ok;
-    out.status.reserve(calls.size());
-    for (const phi::OpCall& call : calls) {
-        const phi::Status s = DispatchChecked(backend_, model_view_, data_view_, call, &execution_error_);
-        out.status.push_back(s);
-        if (s != phi::Status::Ok) {
-            out.result = s;
-            out.failed_op = call.op;
-            break;
+    out.result = BeginStep();
+    if (out.result != phi::Status::Ok) return out;
+    for (bool again = true; again;) {
+        out.result = phi::Status::Ok;
+        out.status.clear();
+        out.status.reserve(calls.size());
+        for (const phi::OpCall& call : calls) {
+            const phi::Status s = DispatchChecked(backend_, model_view_, data_view_, call, &execution_error_);
+            out.status.push_back(s);
+            if (s != phi::Status::Ok) {
+                out.result = s;
+                out.failed_op = call.op;
+                break;
+            }
+        }
+        again = false;
+        if (out.result == phi::Status::Ok) out.result = ReplayOpenedSeams(&again);
+    }
+    out.result = FinishStep(out.result);
+    return out;
+}
+
+phi::Status World::ReplayOpenedSeams(bool* again) {
+    *again = false;
+    if (model_.capacities.mf_spares_per_env == 0u || step_report_.stamp.attempt >= pipeline_->TopologyAttempts())
+        return phi::Status::Ok;
+    OpenedSeams opened;
+    opened.counts.assign(EnvCount(), 0u);
+    auto status = phi::BackendSynchronize(backend_, &execution_error_);
+    if (status == phi::Status::Ok)
+        status = data_.DownloadFieldStatus(FieldId::MfOpenedCount, opened.counts.data(),
+                                           opened.counts.size() * sizeof(uint32_t));
+    if (status != phi::Status::Ok ||
+        std::all_of(opened.counts.begin(), opened.counts.end(), [](uint32_t count) { return count == 0u; }))
+        return status;
+    opened.seams.resize(size_t{EnvCount()} * model_.capacities.mf_elements_per_env);
+    status = data_.DownloadFieldStatus(FieldId::MfOpened, opened.seams.data(), opened.seams.size() * sizeof(uint32_t));
+    if (status != phi::Status::Ok) return status;
+    opened_attempts_.push_back(std::move(opened));
+    // The step-start state takes every attempt's seams in order, then the next attempt solves with them.
+    status = data_.RollbackTransaction();
+    if (status == phi::Status::Ok && telemetry_mask_ != 0u) status = RestartTelemetry();
+    if (status == phi::Status::Ok) status = state_sensors_.RollbackTransaction();
+    for (const OpenedSeams& attempt : opened_attempts_) {
+        if (status == phi::Status::Ok)
+            status = data_.UploadScratchField(FieldId::MfOpened, attempt.seams.data(),
+                                              attempt.seams.size() * sizeof(uint32_t));
+        if (status == phi::Status::Ok)
+            status = data_.UploadScratchField(FieldId::MfOpenedCount, attempt.counts.data(),
+                                              attempt.counts.size() * sizeof(uint32_t));
+        if (status == phi::Status::Ok) status = DispatchOp(phi::NkOp::ClothReplaySplits, &pipeline_->ClothParams());
+    }
+    if (status == phi::Status::Ok) status = data_.ClearScratchField(FieldId::MfOpenedCount);
+    if (status == phi::Status::Ok) status = data_.ClearScratchField(FieldId::MfRangeElement);
+    if (status != phi::Status::Ok) return status;
+    ++step_report_.stamp.attempt;
+    *again = true;
+    return status;
+}
+
+void World::InvalidateDiagnostics() {
+    ++state_version_;
+    step_data_version_ = data_.MutationVersion();
+    step_report_.stamp.valid = false;
+}
+
+phi::Status World::RestorePersistentState(const std::vector<uint8_t>& bytes) {
+    if (!ready_ || !backend_) return last_status_ = phi::Status::Failed;
+    if (!data_.UploadPersistent(bytes)) return last_status_ = phi::Status::InvalidArgument;
+    if (telemetry_mask_ != 0u && RestartTelemetry() != phi::Status::Ok) return last_status_;
+    InvalidateDiagnostics();
+    return Synchronize();
+}
+
+phi::Status World::BeginStep() {
+    if (step_data_version_ != data_.MutationVersion()) InvalidateDiagnostics();
+    step_report_ = {};
+    step_report_.stamp.public_step = ++public_step_;
+    step_report_.stamp.state_version = state_version_;
+    step_report_.stamp.attempt = 1u;
+    step_report_.requested_iterations = cfg_.velocity_iterations_override ? cfg_.vel_iters : 0u;
+    step_report_.configured_iterations = cfg_.vel_iters;
+    step_report_.iteration_budget = pipeline_->VelocityIterations();
+    step_report_.substeps = model_.capacities.integration_substeps;
+    step_report_.contact_capacity = model_.capacities.ogc_contacts_per_env;
+    step_report_.environments.resize(EnvCount());
+    step_flags_.assign(EnvCount(), 0u);
+    step_epochs_.assign(EnvCount(), 0u);
+    step_demand_.assign(EnvCount(), 0u);
+    step_pending_.assign(EnvCount(), 0u);
+    step_range_.assign(EnvCount(), 0u);
+    opened_attempts_.clear();
+    step_iterations_.assign(size_t{EnvCount()} * step_report_.substeps, 0u);
+    for (uint32_t env = 0; env < EnvCount(); ++env) {
+        step_report_.environments[env].time = state_sensors_.SimulationTime(env);
+        step_report_.environments[env].executed_iterations.resize(step_report_.substeps);
+    }
+    auto status = data_.CaptureTransaction();
+    if (status == phi::Status::Ok) status = state_sensors_.CaptureTransaction();
+    if (status == phi::Status::Ok) status = data_.ClearScratchField(FieldId::OgcContactDemand);
+    if (status == phi::Status::Ok) status = data_.ClearScratchField(FieldId::MfRangeElement);
+    if (status == phi::Status::Ok && model_.capacities.mf_spares_per_env > 0u)
+        status = data_.ClearScratchField(FieldId::MfOpenedCount);
+    return last_status_ = status;
+}
+
+phi::Status World::FinishStep(phi::Status status) {
+    if (status == phi::Status::Ok)
+        status = phi::BackendSynchronize(backend_, &execution_error_);
+    auto& flags = step_flags_;
+    auto& epochs = step_epochs_;
+    auto& demand = step_demand_;
+    auto& iterations = step_iterations_;
+    if (status == phi::Status::Ok) {
+        status = data_.DownloadFieldStatus(FieldId::EnvStatus, flags.data(), flags.size() * sizeof(uint32_t));
+        if (status == phi::Status::Ok)
+            status = data_.DownloadFieldStatus(FieldId::SolverExecutedIterations, iterations.data(),
+                iterations.size() * sizeof(uint32_t));
+        if (status == phi::Status::Ok && model_.capacities.ElementCount(FieldId::MfTopology) > 0u)
+            status = data_.DownloadFieldStatus(FieldId::MfTopology, epochs.data(), epochs.size() * sizeof(uint32_t));
+        if (status == phi::Status::Ok)
+            status = data_.DownloadFieldStatus(FieldId::OgcContactDemand, demand.data(), demand.size() * sizeof(uint32_t));
+        if (status == phi::Status::Ok)
+            status = data_.DownloadFieldStatus(FieldId::MfRangeElement, step_range_.data(),
+                                               step_range_.size() * sizeof(uint32_t));
+        if (status == phi::Status::Ok && model_.capacities.mf_spares_per_env > 0u)
+            status = data_.DownloadFieldStatus(FieldId::MfOpenedCount, step_pending_.data(),
+                                               step_pending_.size() * sizeof(uint32_t));
+        if (status == phi::Status::Ok) status = phi::BackendSynchronize(backend_, &execution_error_);
+    }
+    bool rejected = status != phi::Status::Ok;
+    for (uint32_t env = 0; env < EnvCount(); ++env) {
+        auto& report = step_report_.environments[env];
+        report.flags = flags[env];
+        report.topology_epoch = epochs[env];
+        report.contact_demand = demand[env];
+        report.topology_pending = step_pending_[env];
+        report.range_element = step_range_[env];
+        for (uint32_t step = 0; step < step_report_.substeps; ++step)
+            report.executed_iterations[step] = iterations[size_t{step} * EnvCount() + env];
+        if (status != phi::Status::Ok) report.outcome = StepOutcome::BackendFailure;
+        else if ((flags[env] & phi::kEnvStatusMaterialFieldRange) != 0u)
+            report.outcome = StepOutcome::MaterialOutOfRange;
+        else if ((flags[env] & (phi::kEnvStatusMaterialFieldFailure | phi::kEnvStatusConstitutiveFailure)) != 0u)
+            report.outcome = StepOutcome::LocalMaterialFailure;
+        else if ((flags[env] & (phi::kEnvStatusPairOverflow | phi::kEnvStatusGridContactOverflow |
+                               phi::kEnvStatusDofOverflow | phi::kEnvStatusSensorQueueOverflow)) != 0u)
+            report.outcome = StepOutcome::CapacityExceeded;
+        else if (flags[env] != 0u) report.outcome = StepOutcome::SolverFailure;
+        else report.outcome = StepOutcome::Accepted;
+        rejected |= report.outcome != StepOutcome::Accepted;
+    }
+    if (rejected) {
+        const auto failure = execution_error_;
+        auto rollback = data_.RollbackTransaction();
+        if (rollback == phi::Status::Ok && telemetry_mask_ != 0u) rollback = RestartTelemetry();
+        if (rollback == phi::Status::Ok) rollback = state_sensors_.RollbackTransaction();
+        if (rollback == phi::Status::Ok) rollback = phi::BackendSynchronize(backend_);
+        step_report_.rolled_back = rollback == phi::Status::Ok;
+        for (auto& env : step_report_.environments)
+            if (env.outcome == StepOutcome::Accepted) env.outcome = StepOutcome::BatchRejected;
+        execution_error_ = failure;
+        if (status == phi::Status::Ok) {
+            status = phi::Status::Failed;
+            execution_error_.status = status;
+            std::snprintf(execution_error_.message, sizeof(execution_error_.message),
+                "public step rejected by environment status; persistent state rolled back: %s",
+                step_report_.rolled_back ? "yes" : "no");
+        }
+        if (rollback != phi::Status::Ok) { ready_ = false; status = rollback; }
+    } else {
+        state_sensors_.StepCompleted();
+        ++state_version_;
+        for (uint32_t env = 0; env < EnvCount(); ++env) {
+            step_report_.environments[env].time = state_sensors_.SimulationTime(env);
+            step_report_.environments[env].advanced_dt = cfg_.dt;
         }
     }
-    last_status_ = out.result;
-    if (out.result == phi::Status::Ok) state_sensors_.StepCompleted();
-    return out;
+    step_report_.stamp.valid = !rejected;
+    step_report_.stamp.accepted = !rejected;
+    step_report_.stamp.state_version = state_version_;
+    return last_status_ = status;
 }
 
 phi::Status World::PrepareGraph() {
@@ -686,9 +904,15 @@ phi::Status World::PrepareGraph() {
 phi::Status World::StepPlanned() {
     const auto status = PrepareGraph();
     if (status != phi::Status::Ok) return status;
-    last_status_ = phi::BackendPlanExecute(backend_, plan_, &execution_error_);
-    if (last_status_ == phi::Status::Ok) { ++graph_replays_; state_sensors_.StepCompleted(); }
-    return last_status_;
+    const auto begun = BeginStep();
+    if (begun != phi::Status::Ok) return begun;
+    for (bool again = true; again;) {
+        last_status_ = phi::BackendPlanExecute(backend_, plan_, &execution_error_);
+        if (last_status_ == phi::Status::Ok) ++graph_replays_;
+        again = false;
+        if (last_status_ == phi::Status::Ok) last_status_ = ReplayOpenedSeams(&again);
+    }
+    return FinishStep(last_status_);
 }
 
 phi::Status World::SetExecutionMode(ExecutionMode mode) {
@@ -732,6 +956,7 @@ phi::Status World::Reset(const std::vector<uint32_t>& env_ids) {
         : DispatchOp(phi::NkOp::ResetEnvs, &reset_params_);
     if (status != phi::Status::Ok) return status;
     status = RefreshPoses(reset_params_.count);
+    InvalidateDiagnostics();
     return status == phi::Status::Ok ? state_sensors_.Reset(selected) : status;
 }
 
@@ -784,13 +1009,15 @@ phi::Status World::SetGravity(const math::Vec3& gravity) {
     pipeline_ = std::move(candidate);
     cfg_ = config;
     state_sensors_.SetGravity(gravity);
+    InvalidateDiagnostics();
     return last_status_ = phi::Status::Ok;
 }
 
 phi::Status World::SetVelocityIterations(uint32_t iterations) {
     if (!ready_ || iterations == 0u || iterations > UINT16_MAX)
         return last_status_ = phi::Status::InvalidArgument;
-    if (iterations == VelocityIterations()) return last_status_ = phi::Status::Ok;
+    if (cfg_.velocity_iterations_override && iterations == cfg_.vel_iters)
+        return last_status_ = phi::Status::Ok;
     auto config = cfg_;
     config.vel_iters = static_cast<uint16_t>(iterations);
     config.velocity_iterations_override = true;
@@ -844,6 +1071,7 @@ phi::Status World::SetLinkParam(FieldId id, uint32_t link_index, const float* va
     }
     last_status_ = Synchronize();
     if (last_status_ != phi::Status::Ok) return last_status_;
+    InvalidateDiagnostics();
     for (uint32_t env = 0u; env < EnvCount(); ++env) {
         const size_t offset = (size_t(env) * links + link_index) * bytes;
         last_status_ = model_owned ? phi::BufferUpload(model_.DeviceBuffer(), value, base + offset, bytes)
@@ -1007,12 +1235,8 @@ phi::Status World::SetTelemetry(uint32_t mask, float alert_velocity) {
         last_status_ = data_.AllocateField(phi::BackendDeviceBufferType(backend_), FieldId::Telemetry,
                                            words * sizeof(uint32_t));
         if (last_status_ != phi::Status::Ok) return last_status_;
-        TelemetryHeader header{};
-        header.capacity = kTelemetryRecords;
-        header.alert_velocity = alert_velocity;
-        last_status_ = data_.UploadFieldStatus(FieldId::Telemetry, &header, sizeof(header), 0u);
-        if (last_status_ != phi::Status::Ok) return last_status_;
-        telemetry_read_ = 0u;
+        telemetry_alert_ = alert_velocity;
+        if (RestartTelemetry() != phi::Status::Ok) return last_status_;
     }
     std::unique_ptr<Pipeline> candidate;
     last_status_ = BuildDemanded(Demand(mask), &candidate);
@@ -1020,6 +1244,14 @@ phi::Status World::SetTelemetry(uint32_t mask, float alert_velocity) {
     InstallPipeline(std::move(candidate));
     telemetry_mask_ = mask;
     return last_status_;
+}
+
+phi::Status World::RestartTelemetry() {
+    TelemetryHeader header{};
+    header.capacity = kTelemetryRecords;
+    header.alert_velocity = telemetry_alert_;
+    telemetry_read_ = 0u;
+    return last_status_ = data_.UploadFieldStatus(FieldId::Telemetry, &header, sizeof(header), 0u);
 }
 
 phi::Status World::ReadTelemetry(std::vector<TelemetryRecord>* out, uint32_t capacity, uint32_t* dropped) {

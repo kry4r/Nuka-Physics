@@ -479,7 +479,10 @@ __global__ void ResetEnvsKernel(DataView data, ResetEnvsParams p) {
         data.particle_pos[particle] = data.snapshot_particle_pos[particle];
         data.particle_prev_pos[particle] = data.snapshot_particle_prev_pos[particle];
         data.particle_vel[particle] = data.snapshot_particle_vel[particle];
-        data.particle_kinematic_target[particle] = data.snapshot_particle_pos[particle];
+        data.particle_kinematic_target[particle] = data.snapshot_particle_kinematic_target[particle];
+        data.particle_attachment_stiffness[particle] = data.snapshot_particle_attachment_stiffness[particle];
+        data.particle_attachment_previous_stiffness[particle] = data.snapshot_particle_attachment_previous_stiffness[particle];
+        data.particle_attachment_previous_target[particle] = data.snapshot_particle_attachment_previous_target[particle];
         data.particle_pseudo_vel[particle] = {};
         if (data.particle_F != nullptr) {
             for (uint32_t component = 0u; component < 9u; ++component) {
@@ -493,9 +496,27 @@ __global__ void ResetEnvsKernel(DataView data, ResetEnvsParams p) {
                 data.particle_plastic_F[particle * 9u + component] =
                     data.snapshot_particle_plastic_F[particle * 9u + component];
     }
-    const size_t field_history = size_t{p.field_elements} * nk::kMfHistory;
+    const size_t field_history = p.field_state_scalars;
     for (uint32_t local = threadIdx.x; local < field_history; local += blockDim.x)
         data.mf_history[env * field_history + local] = data.snapshot_mf_history[env * field_history + local];
+    // A fracturing field takes back its corners, roots, masses and collision corners and edges, under a new topology.
+    if (data.snapshot_mf_corner != nullptr) {
+        const size_t corners = size_t{p.field_elements} * nk::kMfMaxVertices;
+        for (uint32_t local = threadIdx.x; local < corners; local += blockDim.x)
+            data.mf_corner[env * corners + local] = data.snapshot_mf_corner[env * corners + local];
+        for (uint32_t local = threadIdx.x; local < p.particle_count; local += blockDim.x) {
+            data.particle_root[env * p.particle_count + local] = data.snapshot_particle_root[env * p.particle_count + local];
+            data.particle_inv_mass[env * p.particle_count + local] =
+                data.snapshot_particle_inv_mass[env * p.particle_count + local];
+        }
+        for (uint32_t local = threadIdx.x; local < p.surface_corners; local += blockDim.x)
+            data.particle_surface_corners[env * p.surface_corners + local] =
+                data.snapshot_particle_surface_corners[env * p.surface_corners + local];
+        for (uint32_t local = threadIdx.x; local < p.surface_edges; local += blockDim.x)
+            data.particle_surface_live_edges[env * p.surface_edges + local] =
+                data.snapshot_particle_surface_live_edges[env * p.surface_edges + local];
+        if (threadIdx.x == 0u) ++data.mf_topology[env];
+    }
     if (threadIdx.x == 0u) {
         data.contact_count[env] = 0u;
         data.env_status[env] = 0u;
@@ -703,6 +724,15 @@ Status OpSnapshotState(const ModelView& /*model*/, const DataView& data,
                          stream) != cudaSuccess ||
          cudaMemcpyAsync(data.snapshot_particle_vel, data.particle_vel,
                          np * sizeof(Vec3), cudaMemcpyDeviceToDevice,
+                         stream) != cudaSuccess ||
+         cudaMemcpyAsync(data.snapshot_particle_kinematic_target, data.particle_kinematic_target,
+                         np * sizeof(Vec3), cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
+         cudaMemcpyAsync(data.snapshot_particle_attachment_stiffness, data.particle_attachment_stiffness,
+                         np * sizeof(float), cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
+         cudaMemcpyAsync(data.snapshot_particle_attachment_previous_stiffness, data.particle_attachment_previous_stiffness,
+                         np * sizeof(float), cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
+         cudaMemcpyAsync(data.snapshot_particle_attachment_previous_target, data.particle_attachment_previous_target,
+                         np * sizeof(Vec3), cudaMemcpyDeviceToDevice,
                          stream) != cudaSuccess)) {
         return Status::Failed;
     }
@@ -723,10 +753,24 @@ Status OpSnapshotState(const ModelView& /*model*/, const DataView& data,
         cudaMemcpyAsync(data.snapshot_particle_plastic_F, data.particle_plastic_F,
                         np * 9u * sizeof(float), cudaMemcpyDeviceToDevice, stream) != cudaSuccess)
         return Status::Failed;
-    const size_t field_history = size_t{p->total_field_elements} * nk::kMfHistory;
+    const size_t field_history = p->total_field_state_scalars;
     if (field_history > 0u &&
         cudaMemcpyAsync(data.snapshot_mf_history, data.mf_history, field_history * sizeof(float),
                         cudaMemcpyDeviceToDevice, stream) != cudaSuccess)
+        return Status::Failed;
+    if (data.mf_corner != nullptr &&
+        (cudaMemcpyAsync(data.snapshot_mf_corner, data.mf_corner, size_t{p->total_field_elements} * nk::kMfMaxVertices *
+                         sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
+         cudaMemcpyAsync(data.snapshot_particle_root, data.particle_root, np * sizeof(uint32_t),
+                         cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
+         cudaMemcpyAsync(data.snapshot_particle_inv_mass, data.particle_inv_mass, np * sizeof(float),
+                         cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
+         cudaMemcpyAsync(data.snapshot_particle_surface_corners, data.particle_surface_corners,
+                         size_t{p->total_surface_corners} * sizeof(uint32_t), cudaMemcpyDeviceToDevice,
+                         stream) != cudaSuccess ||
+         cudaMemcpyAsync(data.snapshot_particle_surface_live_edges, data.particle_surface_live_edges,
+                         size_t{p->total_surface_edges} * sizeof(collision::MeshEdge), cudaMemcpyDeviceToDevice,
+                         stream) != cudaSuccess))
         return Status::Failed;
     return Status::Ok;
 }
@@ -738,7 +782,8 @@ Status OpRestoreState(const ModelView& model, const DataView& data,
     const uint32_t envs = p->env_count;
     if (p->total_link_count % envs || p->articulation_count % envs ||
         p->total_body_count % envs || p->total_particle_count % envs ||
-        p->total_field_elements % envs || p->row_slot_count % envs ||
+        p->total_field_elements % envs || p->total_field_state_scalars % envs ||
+        p->total_field_state_scalars / envs > UINT32_MAX || p->row_slot_count % envs ||
         p->contact_slot_count % envs) return Status::Failed;
     ResetEnvsParams reset{};
     reset.energy_substeps = p->energy_substeps;
@@ -751,6 +796,9 @@ Status OpRestoreState(const ModelView& model, const DataView& data,
     reset.body_count = p->total_body_count / envs;
     reset.particle_count = p->total_particle_count / envs;
     reset.field_elements = p->total_field_elements / envs;
+    reset.field_state_scalars = static_cast<uint32_t>(p->total_field_state_scalars / envs);
+    reset.surface_edges = p->total_surface_edges / envs;
+    reset.surface_corners = p->total_surface_corners / envs;
     reset.point_endpoints_per_env = p->point_endpoints_per_env;
     reset.point_endpoint_terms_per_env = p->point_endpoint_terms_per_env;
     reset.lambda_stride = p->row_slot_count / envs;

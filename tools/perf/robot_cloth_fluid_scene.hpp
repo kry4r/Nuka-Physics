@@ -56,7 +56,7 @@ inline nk::Pipeline::SolverConfig Cfg() {
     return cfg;
 }
 inline cook::VbdCookInput BuildCloth(float cx, float cy, float z, uint32_t nx = kClothNx,
-                                     float spacing_x = kClothSpacing) {
+                                     float spacing_x = kClothSpacing, bool field_shell = false) {
     Require(nx >= 3u && uint64_t{nx} * nx <= std::numeric_limits<uint32_t>::max() / 6u,
             "cloth grid exceeds topology index range");
     Require(std::isfinite(spacing_x) && spacing_x > 0.0f, "cloth spacing must be positive");
@@ -91,8 +91,21 @@ inline cook::VbdCookInput BuildCloth(float cx, float cy, float z, uint32_t nx = 
         in.inv_mass[idx(k, 0)] = 0.0f; in.inv_mass[idx(k, last)] = 0.0f;
         in.inv_mass[idx(0, k)] = 0.0f; in.inv_mass[idx(last, k)] = 0.0f;
     }
-    soft::BuildClothVertexBlocks(rest, tris, {}, std::vector<soft::ShellMaterial>(tris.size(), shell),
-                                 in.vbd_elements);
+    if (field_shell) {
+        nk::MfMaterial material;
+        material.thickness = std::sqrt(12.0f * shell.bend_stiffness * (1.0f - shell.poisson * shell.poisson) /
+                                       shell.stretch_stiffness);
+        material.youngs = shell.stretch_stiffness / material.thickness;
+        material.poisson = shell.poisson;
+        material.density = kClothParticleMass / (spacing_x * kClothSpacing * material.thickness);
+        in.field_materials.push_back(material);
+        in.field_count = static_cast<uint32_t>(rest.size());
+        soft::BuildFieldShellElements(rest, tris, {}, {}, material, 0u, 0.0f, Vec3{}, 1.0f,
+                                     in.field_elements);
+    } else {
+        soft::BuildClothVertexBlocks(rest, tris, {}, std::vector<soft::ShellMaterial>(tris.size(), shell),
+                                     in.vbd_elements);
+    }
     in.vbd_count = static_cast<uint32_t>(rest.size());
     for (const auto& triangle : tris)
         in.aero_triangles.push_back({triangle.v[0], triangle.v[1], triangle.v[2]});
@@ -220,9 +233,10 @@ inline PreparedScene Prepare(const std::filesystem::path& path, phi::Device* dev
 
 inline nk::Model CookPrepared(const PreparedScene& scene, uint32_t envs = 1u,
                               bool patch_present = true, uint32_t cloth_nx = kClothNx,
-                              SceneVisuals* visuals = nullptr) {
+                              SceneVisuals* visuals = nullptr, bool field_shell = false) {
     nk::Model model = CookRobot(scene.path, true, visuals);
-    auto cloth = BuildCloth(scene.front_centre.x, scene.front_centre.y, scene.cloth_z, cloth_nx);
+    auto cloth = BuildCloth(scene.front_centre.x, scene.front_centre.y, scene.cloth_z, cloth_nx,
+                            kClothSpacing, field_shell);
     if (!patch_present)
         for (auto& position : cloth.positions) position.z -= 10.0f;
     cook::CookVbdParticles(model, envs, cloth);
@@ -260,7 +274,8 @@ inline std::vector<uint32_t> LatticeBoundary(const std::array<uint32_t, 3>& dime
 }
 
 inline nk::Model CookMpmPrepared(const PreparedScene& prepared, uint32_t envs,
-                                SceneVisuals* visuals = nullptr, bool implicit_stress = false) {
+                                SceneVisuals* visuals = nullptr, bool implicit_stress = false,
+                                bool field_shell = false) {
     constexpr float radius = 0.028f, mass = 0.15f, dx = 0.02f;
     // The membrane starts 1 mm into the loaded front feet, so they rest on it.
     const float cloth_z = prepared.cloth_z - 0.0175f + 0.001f;
@@ -304,7 +319,7 @@ inline nk::Model CookMpmPrepared(const PreparedScene& prepared, uint32_t envs,
     model.articulation.initial_link_velocity = prepared.settled_link_velocity;
     // The membrane reaches past both contact points, so half of each body's footprint stays over bare material.
     auto cloth = BuildCloth(cloth_x, prepared.front_centre.y, cloth_z, kClothNx,
-                            cloth_span / float(kClothNx - 1u));
+                            cloth_span / float(kClothNx - 1u), field_shell);
     cloth.aero_drag_normal = cloth.aero_drag_tangent = cloth.aero_drag_max_dv = 0.0f;
     cook::MpmCookInput mpm;
     mpm.implicit_stress = implicit_stress;

@@ -151,6 +151,10 @@ SettleResult Settle(nk::World& world, const SceneIR& scene, const SceneMap& map,
     snap.total_particle_count = world.GetModel().capacities.particles_per_env * E;
     snap.total_body_count = B * E;
     snap.total_field_elements = world.GetModel().capacities.mf_elements_per_env * E;
+    if (world.GetModel().capacities.mf_spares_per_env > 0u) {
+        snap.total_surface_edges = world.GetModel().capacities.particle_surface_edges_per_env * E;
+        snap.total_surface_corners = world.GetModel().capacities.particle_surface_triangles * 3u * E;
+    }
     if (world.DispatchOp(phi::NkOp::SnapshotState, &snap) != phi::Status::Ok) {
         return result;  // ok == false.
     }

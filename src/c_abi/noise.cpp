@@ -147,8 +147,8 @@ nuka_result_t ApplyPerEpisodeRandomization(
     CaptureNominalBaseline(record);
 
     auto& host = record.articulation_host;
-    // The host mirror is SINGLE-ENV (CaptureArticulationHostMirror cooks the first
-    // articulation only); the live nk arena LinkInertia/JointArmature fields are
+    // The host mirror is SINGLE-ENV (CaptureArticulationHostMirror cooks one env's
+    // articulations); the live nk arena LinkInertia/JointArmature fields are
     // env-replicated (links_per_env * env_count). The DR multiplier is per-env, so
     // we iterate the arena's full env-major span: per-env link count == the host
     // mirror's link count, which is the env-major tile stride.

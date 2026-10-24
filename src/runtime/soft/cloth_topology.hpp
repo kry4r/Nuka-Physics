@@ -41,13 +41,16 @@ void BuildClothVertexBlocks(const std::vector<math::Vec3>& rest_positions,
 // Material-field shell elements over the same topology: plane-stress membranes, and per face a bend whose
 // curvature, exact for quadratic deflection, comes from its three hinge turns; free-edge hinges are condensed.
 // `weld` maps seam copies to the vertex they were cut from (empty: none); bends reach across a cut edge, which
-// then takes a seam over the pairs of copies at its ends.
+// then takes a seam over the pairs of copies at its ends. A positive Weibull modulus gives every other interior
+// edge a seam that holds nothing until fracture splits its ends, at a strength scattered with that modulus. A
+// positive grain ratio raises a seam's strength from 1x along `grain` to that ratio across it.
 void BuildFieldShellElements(const std::vector<math::Vec3>& rest_positions,
                              const std::vector<ClothTriangle>& triangles,
                              const std::vector<std::array<math::Vec3, 3>>& material_faces,
                              const std::vector<uint32_t>& weld,
                              const nk::MfMaterial& material, uint32_t material_index,
-                             std::vector<nk::MfElement>& out);
+                             float weibull_modulus, const math::Vec3& grain, float grain_ratio,
+                             std::vector<nk::MfElement>& out, float weibull_reference_area = 0.0f);
 
 // Axial springs between consecutive chain vertices and a bend over each interior vertex.
 void BuildRodVertexBlocks(const std::vector<math::Vec3>& rest_positions,

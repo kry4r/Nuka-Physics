@@ -1,15 +1,9 @@
 """Constitutive materials for the authoring facade.
 
-A material is a parameter bag that also SELECTS the solver method for its medium:
-``Cloth.VBD`` (cloth, vertex blocks), ``Cloth.Field`` (cloth, material-field shell),
-``Cable.VBD`` (rope, vertex blocks),
-``Soft.MPM`` (tet soft body), ``Fluid.MPM`` (fluid), and ``Rigid``
-(a rigid primitive). Each
-maps onto the ``SceneBuilder.add_media`` / ``add_rigid_primitive`` kwargs through a
-small ``*_kwargs`` method (mirroring ``ClothMaterial.cook_kwargs``) and declares
-the medium ``MEDIA_KIND`` it solves + the ``MEDIA_METHOD`` it uses, so the scene
-assembler can reject a morph paired with an incompatible material. No cook math
-runs here -- a material only carries parameters.
+Materials declare constitutive parameters and compatible discretizations for
+``SceneBuilder.add_media`` / ``add_rigid_primitive``. ``MEDIA_KIND`` and
+``MEDIA_METHOD`` let the assembler validate geometry compatibility; all media
+join the shared dynamics and contact solve. Cooking runs in the engine.
 """
 
 from __future__ import annotations
@@ -61,8 +55,11 @@ class ClothMaterial:
 
 @_dc.dataclass(frozen=True)
 class FieldMaterial:
-    """Material-field shell parameters -> the field_material block (18 floats in
-    ``nuka_field_material_desc_t`` order) plus the shared contact friction."""
+    """Synthetic shell material: the small-strain adapter (law 1, valid through 5% surface strain) or the
+    Lagrangian log-strain orthotropic Hill law (law 2, valid through ``strain_range``). The compatibility
+    encoding contains 25 named material scalars and contact friction; law 2 appends its code and 6 scalars, the
+    mixed-mode fracture law (2) appends the law block, its code and 2 scalars, and the effective section (2) appends
+    the law and fracture blocks, its code and 2 scalars."""
 
     MEDIA_KIND = "cloth"
     MEDIA_METHOD = "field"
@@ -82,13 +79,51 @@ class FieldMaterial:
     bend_maxwell_time: Tuple[float, float] = (0.0, 0.0)
     tear_strength: float = 0.0
     tear_energy: float = 0.0
+    weibull_modulus: float = 0.0
+    grain: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    grain_ratio: float = 0.0
+    shear_strength: float = 0.0
+    weibull_reference_area: float = 0.0
+    schema_version: int = 1
+    law: int = 1
+    youngs_cd: float = 0.0
+    shear_modulus: float = 0.0
+    yield_stress_cd: float = 0.0
+    yield_shear: float = 0.0
+    yield_biaxial: float = 0.0
+    strain_range: float = 0.0
+    fracture_law: int = 1
+    shear_tear_energy: float = 0.0
+    mixity_exponent: float = 0.0
+    section_law: int = 1
+    bend_stiffness: float = 0.0
+    curvature_range: float = 0.0
 
     def media_material_kwargs(self) -> dict:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise ValueError(f"unsupported field material schema version: {self.schema_version}")
         values = (self.density, self.thickness, self.youngs, self.poisson, self.yield_stress,
                   self.hardening, self.yield_moment, self.bend_hardening, *self.maxwell_modulus,
                   *self.maxwell_time, *self.bend_maxwell_modulus, *self.bend_maxwell_time,
-                  self.tear_strength, self.tear_energy)
-        return dict(vbd_friction=float(self.friction), field_material=[float(v) for v in values])
+                  self.tear_strength, self.tear_energy, self.weibull_modulus, *self.grain, self.grain_ratio,
+                  self.shear_strength, self.weibull_reference_area)
+        if self.law == 2 or self.fracture_law == 2 or self.section_law == 2:
+            values += (float(self.law), self.youngs_cd, self.shear_modulus, self.yield_stress_cd, self.yield_shear,
+                       self.yield_biaxial, self.strain_range)
+        if self.law not in (1, 2):
+            raise ValueError(f"unsupported field material law: {self.law}")
+        if self.fracture_law == 2:
+            values += (2.0, self.shear_tear_energy, self.mixity_exponent)
+        elif self.fracture_law != 1:
+            raise ValueError(f"unsupported field fracture law: {self.fracture_law}")
+        elif self.section_law == 2:
+            values += (1.0, 0.0, 0.0)
+        if self.section_law == 2:
+            values += (2.0, self.bend_stiffness, self.curvature_range)
+        elif self.section_law != 1:
+            raise ValueError(f"unsupported field section law: {self.section_law}")
+        return dict(vbd_friction=float(self.friction), field_material=[float(v) for v in values],
+                    field_contract_version=self.schema_version)
 
 
 class Cloth:
@@ -123,23 +158,80 @@ class Cloth:
               maxwell_time: Tuple[float, float] = (0.0, 0.0),
               bend_maxwell_modulus: Tuple[float, float] = (0.0, 0.0),
               bend_maxwell_time: Tuple[float, float] = (0.0, 0.0),
-              tear_strength: float = 0.0, tear_energy: float = 0.0) -> FieldMaterial:
+              tear_strength: float = 0.0, tear_energy: float = 0.0,
+              weibull_modulus: float = 0.0, grain: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+              grain_ratio: float = 0.0, shear_strength: float = 0.0,
+              weibull_reference_area: float = 0.0, law: str = "small_strain",
+              youngs_cd: float = 0.0, shear_modulus: float = 0.0, yield_stress_cd: float = 0.0,
+              yield_shear: float = 0.0, yield_biaxial: float = 0.0,
+              strain_range: float = 0.0, fracture_law: str = "isotropic", shear_tear_energy: float = 0.0,
+              mixity_exponent: float = 0.0, bend_stiffness: float = 0.0,
+              curvature_range: float = 0.0) -> FieldMaterial:
         """Plane-stress membrane (kg/m³, m, Pa) with plate bending D = Y t³ / (12 (1 - ν²)),
         optional membrane and hinge plasticity and two Maxwell branches each; seams part at
-        ``tear_strength`` (Pa) after spending ``tear_energy`` (J/m²)."""
+        ``tear_strength`` (Pa) after spending ``tear_energy`` (J/m²). A positive ``weibull_modulus``
+        lets any edge crack at its own strength, ``tear_strength`` scattered with that Weibull modulus.
+        A positive ``grain_ratio`` (>= 1) makes a crack across ``grain``, the paper's machine direction,
+        that many times stronger than one along it.
+
+        ``law="log_strain_orthotropic"`` measures membrane strain as (1/2) ln C in the grain frame: ``youngs``
+        and ``poisson`` act along ``grain`` (nonzero), ``youngs_cd`` across it and ``shear_modulus`` in shear,
+        with Hill yield at ``yield_stress`` along, ``yield_stress_cd`` across, ``yield_shear`` in shear and
+        ``yield_biaxial`` equibiaxially (zeros take the isotropic values); plates bend with D = Q t³ / 12.
+
+        ``fracture_law="mixed_mode"`` parts seams in opening at ``tear_strength`` after ``tear_energy`` and in
+        sliding at ``shear_strength`` after ``shear_tear_energy`` (zeros take the opening values), with toughness
+        G_I + (G_S - G_I) b^``mixity_exponent`` (zero: 1) at sliding energy share b; compression does not damage.
+
+        A positive ``curvature_range`` (1/m) makes the plate an effective section that declares the largest principal
+        curvature its moment law holds for (zero: surface strain 5%); its ``bend_stiffness`` (N m along the grain,
+        zero: the plate value) replaces the plate stiffness."""
         if not (density > 0.0 and thickness > 0.0 and youngs > 0.0):
             raise ValueError("Cloth.Field: density, thickness and youngs must be > 0")
-        if not 0.0 <= poisson < 0.5:
+        if law not in ("small_strain", "log_strain_orthotropic"):
+            raise ValueError("Cloth.Field: law must be 'small_strain' or 'log_strain_orthotropic'")
+        if fracture_law not in ("isotropic", "mixed_mode"):
+            raise ValueError("Cloth.Field: fracture_law must be 'isotropic' or 'mixed_mode'")
+        mixed = fracture_law == "mixed_mode"
+        if not all(_math.isfinite(v) and v >= 0.0 for v in (shear_tear_energy, mixity_exponent)) or \
+                (not mixed and (shear_tear_energy or mixity_exponent)):
+            raise ValueError("Cloth.Field: shear_tear_energy and mixity_exponent must be finite, nonnegative and only "
+                             "set with the mixed-mode fracture law")
+        if not all(_math.isfinite(v) and v >= 0.0 for v in (bend_stiffness, curvature_range)) or \
+                (bend_stiffness > 0.0 and not curvature_range > 0.0):
+            raise ValueError("Cloth.Field: bend_stiffness and curvature_range must be finite and nonnegative, and an "
+                             "effective section must declare its curvature_range")
+        orthotropic = law == "log_strain_orthotropic"
+        if not orthotropic and not 0.0 <= poisson < 0.5:
             raise ValueError("Cloth.Field: poisson must be in [0, 0.5)")
+        extra = (youngs_cd, shear_modulus, yield_stress_cd, yield_shear, yield_biaxial, strain_range)
+        if not all(_math.isfinite(v) and v >= 0.0 for v in extra) or \
+                (not orthotropic and any(extra)):
+            raise ValueError("Cloth.Field: orthotropic parameters must be finite, nonnegative and only set "
+                             "with the log-strain law")
+        if orthotropic and not (youngs_cd > 0.0 and shear_modulus > 0.0 and strain_range > 0.0 and
+                                poisson >= 0.0 and poisson * poisson * youngs_cd < youngs and any(grain)):
+            raise ValueError("Cloth.Field: the log-strain law needs positive youngs_cd, shear_modulus and "
+                             "strain_range, 0 <= poisson with poisson² youngs_cd < youngs, and a nonzero grain")
         rest = (yield_stress, hardening, yield_moment, bend_hardening, *maxwell_modulus,
-                *maxwell_time, *bend_maxwell_modulus, *bend_maxwell_time, tear_strength, tear_energy)
-        if len(rest) != 14 or not all(_math.isfinite(v) and v >= 0.0 for v in rest):
-            raise ValueError("Cloth.Field: plastic, Maxwell and tear parameters must be finite and nonnegative")
+                *maxwell_time, *bend_maxwell_modulus, *bend_maxwell_time, tear_strength, tear_energy,
+                weibull_modulus, grain_ratio, shear_strength, weibull_reference_area)
+        if len(rest) != 18 or not all(_math.isfinite(v) and v >= 0.0 for v in rest):
+            raise ValueError("Cloth.Field: plastic, Maxwell, tear, Weibull and grain-ratio parameters must be "
+                             "finite and nonnegative")
+        if len(grain) != 3 or not all(_math.isfinite(g) for g in grain) or \
+                (grain_ratio > 0.0 and not (grain_ratio >= 1.0 and any(grain))):
+            raise ValueError("Cloth.Field: grain must be 3 finite floats, nonzero under a grain_ratio of at least 1")
         return FieldMaterial(float(density), float(thickness), float(youngs), float(poisson),
                              float(friction), float(yield_stress), float(hardening),
                              float(yield_moment), float(bend_hardening), tuple(maxwell_modulus),
                              tuple(maxwell_time), tuple(bend_maxwell_modulus), tuple(bend_maxwell_time),
-                             float(tear_strength), float(tear_energy))
+                             float(tear_strength), float(tear_energy), float(weibull_modulus),
+                             tuple(float(g) for g in grain), float(grain_ratio),
+                             float(shear_strength), float(weibull_reference_area), 1,
+                             2 if orthotropic else 1, *(float(v) for v in extra), 2 if mixed else 1,
+                             float(shear_tear_energy), float(mixity_exponent), 2 if curvature_range > 0.0 else 1,
+                             float(bend_stiffness), float(curvature_range))
 
 
 @_dc.dataclass(frozen=True)

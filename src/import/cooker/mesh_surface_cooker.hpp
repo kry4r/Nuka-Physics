@@ -48,6 +48,9 @@ CookedMeshEdges CookMeshEdges(const float* vertices, uint32_t vertex_count,
 CookedMeshEdges CookWireEdges(const float* vertices, uint32_t vertex_count,
     const uint32_t* indices, uint32_t edge_count);
 
+// Appends a twin of every edge on its second triangle's side (or a copy of a boundary edge) and rebuilds the tree.
+void AddTwinEdges(CookedMeshEdges& cooked, const float* vertices);
+
 CookedMeshSurface CookMeshSurfaceCached(const float* vertices, uint32_t vertex_count,
     const uint32_t* indices, uint32_t triangle_count, bool require_convex,
     const MeshSurfaceCookOptions& options = {});

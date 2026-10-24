@@ -19,10 +19,13 @@
 #include "c_abi/handle_table.hpp"
 #include "c_abi/internal.hpp"
 #include "core/checked_size.hpp"
+#include "constraint/coulomb_contact.hpp"
 #include "phi/articulation_contract.hpp"
 #include "nk/solve/block_row_schedule.hpp"
 #include "nk/solve/point_endpoint.hpp"
 #include "nk/solve/vertex_block.hpp"
+#include "nk/readout/energy_ledger.hpp"
+#include "nk/readout/physics_diagnostics.hpp"
 #include "render/render_world.hpp"
 #include "render/sensor_backend.hpp"
 #include "render/rt_adapter.hpp"
@@ -52,6 +55,8 @@ struct Options {
     uint32_t mpm_implicit_stress = 0u;
     uint32_t velocity_iterations = 48u;
     bool velocity_iterations_explicit = false;
+    bool progress = false;
+    std::string cloth_discretization = "vertex";
     uint32_t state_sensors = 0u;
     uint32_t tactile_grid = 0u;
     uint32_t cloth_nx = fixture::kClothNx;
@@ -59,6 +64,8 @@ struct Options {
     uint32_t render_samples = 4u, render_shadows = 4u, render_ao = 3u, render_warmup = 32u;
     uint32_t imaging_models = 0u;
     std::string render_output;
+    std::string sweep_trace;
+    std::string telemetry_output;
 };
 
 uint32_t ParseU32(const std::string& value) {
@@ -95,11 +102,13 @@ Options Parse(int argc, char** argv) {
             if (consumed != value.size()) throw std::invalid_argument("invalid timestep");
         }
         else if (flag == "--execution") options.execution = value;
+        else if (flag == "--progress") options.progress = ParseU32(value) != 0u;
         else if (flag == "--perf-json") options.output = value;
         else if (flag == "--state-output") options.state_output = value;
         else if (flag == "--wrench-output") options.wrench_output = value;
         else if (flag == "--capacity-scale") options.capacity_scale = ParseU32(value);
         else if (flag == "--cloth-grid") options.cloth_nx = ParseU32(value);
+        else if (flag == "--cloth-discretization") options.cloth_discretization = value;
         else if (flag == "--render-sensors") options.render_sensors = ParseU32(value);
         else if (flag == "--render-width") options.render_width = ParseU32(value);
         else if (flag == "--render-height") options.render_height = ParseU32(value);
@@ -109,11 +118,14 @@ Options Parse(int argc, char** argv) {
         else if (flag == "--render-warmup") options.render_warmup = ParseU32(value);
         else if (flag == "--imaging-models") options.imaging_models = ParseU32(value);
         else if (flag == "--render-output") options.render_output = value;
+        else if (flag == "--sweep-trace") options.sweep_trace = value;
+        else if (flag == "--telemetry-output") options.telemetry_output = value;
         else throw std::invalid_argument("unknown option " + flag);
     }
     if (options.envs == 0u || options.steps == 0u || options.capacity_scale == 0u || options.substeps == 0u ||
         options.velocity_iterations == 0u || options.velocity_iterations > UINT16_MAX ||
         (options.scene == "robot-rigid-mpm-cloth" && options.cloth_nx != fixture::kClothNx) ||
+        (options.cloth_discretization != "vertex" && options.cloth_discretization != "field") ||
         options.state_sensors > 2u || options.imaging_models > 1u || options.mpm_implicit_stress > 1u ||
         uint64_t{options.tactile_grid} * options.tactile_grid + 1u > UINT32_MAX ||
         !(options.dt > 0.0f) || !std::isfinite(options.dt) ||
@@ -153,6 +165,8 @@ struct Events {
 };
 
 void Step(nk::World& world, const Options& options) {
+    if (options.progress) std::fprintf(stderr, "[pipeline] begin public request %llu\n",
+        static_cast<unsigned long long>(world.LastStepReport().stamp.public_step + 1u));
     const auto status = options.execution == "graph" ? world.StepPlanned() : world.Step().result;
     if (status != phi::Status::Ok) {
         const auto& error = world.LastExecutionError();
@@ -161,6 +175,8 @@ void Step(nk::World& world, const Options& options) {
                                  ", op " + std::to_string(static_cast<unsigned>(error.failed_op)) +
                                  ", native " + std::to_string(error.native_code) + ": " + error.message);
     }
+    if (options.progress) std::fprintf(stderr, "[pipeline] completed public request %llu\n",
+        static_cast<unsigned long long>(world.LastStepReport().stamp.public_step));
 }
 
 void AttachStateSensors(nk::World& world, const Options& options) {
@@ -261,12 +277,14 @@ std::vector<uint8_t> StateSensorBytes(nk::World& world, bool include_tactile = t
     return bytes;
 }
 
-constexpr std::array<nk::FieldId, 14> kPhysicalFields{
+constexpr std::array<nk::FieldId, 19> kPhysicalFields{
     nk::FieldId::BasePose, nk::FieldId::Q, nk::FieldId::Qdot,
     nk::FieldId::LinkVelocity, nk::FieldId::BodyPose,
     nk::FieldId::BodyLinearVelocity, nk::FieldId::BodyAngularVelocity,
     nk::FieldId::ParticlePos, nk::FieldId::ParticlePrevPos, nk::FieldId::ParticleVel,
-    nk::FieldId::ParticleF, nk::FieldId::ParticleC, nk::FieldId::ParticlePlastic, nk::FieldId::ParticlePlasticF};
+    nk::FieldId::ParticleF, nk::FieldId::ParticleC, nk::FieldId::ParticlePlastic, nk::FieldId::ParticlePlasticF,
+    nk::FieldId::MfHistory, nk::FieldId::MfCorner, nk::FieldId::ParticleRoot,
+    nk::FieldId::ParticleInvMass, nk::FieldId::MfTopology};
 
 std::vector<nk::FieldId> StateFields(bool cache) {
     std::vector<nk::FieldId> fields(kPhysicalFields.begin(), kPhysicalFields.end());
@@ -291,6 +309,51 @@ std::vector<uint8_t> State(nk::World& world, bool cache = true) {
         fixture::Require(world.GetData().DownloadField(field, result.data() + offset, bytes),
                          "state download failed");
     }
+    return result;
+}
+
+Json TransactionChecks(nk::World& world, const Options& options) {
+    std::vector<uint8_t> checkpoint, accepted, after;
+    nuka::sensor::StateSensorBankSnapshot sensors;
+    fixture::Require(world.GetData().DownloadPersistent(&checkpoint), "transaction checkpoint failed");
+    fixture::Require(world.StateSensors().Capture(&sensors) == phi::Status::Ok, "sensor checkpoint failed");
+    const auto sensor_bytes = StateSensorBytes(world);
+    const auto restore = [&] {
+        fixture::Require(world.RestorePersistentState(checkpoint) == phi::Status::Ok, "checkpoint restore failed");
+        fixture::Require(world.RestoreStateSensors(sensors) == phi::Status::Ok, "sensor restore failed");
+    };
+    Step(world, options);
+    fixture::Require(world.GetData().DownloadPersistent(&accepted), "accepted state download failed");
+    const auto accepted_sensors = StateSensorBytes(world);
+    restore();
+    const bool diagnostics_invalidated = !world.LastStepReport().stamp.valid;
+    std::vector<uint32_t> injected(options.envs, 0u);
+    injected[0] = phi::kEnvStatusMaterialFieldRange;
+    fixture::Require(world.GetData().UploadField(nk::FieldId::EnvStatus, injected.data(),
+        injected.size() * sizeof(uint32_t)), "fault status upload failed");
+    const auto rejected = options.execution == "graph" ? world.StepPlanned() : world.Step().result;
+    const auto failure = world.LastStepReport();
+    fixture::Require(world.GetData().DownloadPersistent(&after), "rollback state download failed");
+    const bool persistent_equal = after == checkpoint;
+    const bool sensor_equal = StateSensorBytes(world) == sensor_bytes;
+    bool times_unchanged = true;
+    for (const auto& env : failure.environments) times_unchanged &= env.advanced_dt == 0.0;
+    const bool rollback = rejected != phi::Status::Ok && failure.rolled_back &&
+        !failure.stamp.accepted && !failure.stamp.valid && persistent_equal && sensor_equal && times_unchanged &&
+        failure.environments[0].outcome == nk::StepOutcome::MaterialOutOfRange;
+    Step(world, options);
+    fixture::Require(world.GetData().DownloadPersistent(&after), "retry state download failed");
+    const bool retry_equal = after == accepted && StateSensorBytes(world) == accepted_sensors;
+    restore();
+    Json result = Json::Object();
+    result.Set("scope", Json::Str("complete public-step rollback, sensor noise/queue/time, checkpoint and deterministic retry"));
+    result.Set("injection", Json::Str("material range flag before the public request"));
+    result.Set("persistent_rollback_equal", Json::Bool(persistent_equal));
+    result.Set("sensor_rollback_equal", Json::Bool(sensor_equal));
+    result.Set("diagnostics_invalidated", Json::Bool(diagnostics_invalidated));
+    result.Set("retry_equal", Json::Bool(retry_equal));
+    result.Set("transaction_bytes", Json::Int(world.TransactionByteSize()));
+    result.Set("valid", Json::Bool(rollback && retry_equal && diagnostics_invalidated));
     return result;
 }
 
@@ -560,6 +623,18 @@ Json VbdQuality(nk::World& world, uint32_t step) {
                 ++vbd_edge_samples;
             }
         }
+        for (const nk::MfElement& element : particles.mf_elements) {
+            if (element.kind != nk::kMfTriangle) continue;
+            for (uint32_t j = 0u; j < 3u; ++j) {
+                const uint32_t a = caps.vbd_particle_begin + element.vertex[j];
+                const uint32_t b = caps.vbd_particle_begin + element.vertex[(j + 1u) % 3u];
+                fixture::Require(a < caps.particles_per_env && b < caps.particles_per_env,
+                                 "field quality edge index exceeds the particle extent");
+                const auto d = particles.initial_pos[a] - particles.initial_pos[b];
+                strain(a, b, std::sqrt(double{d.x} * d.x + double{d.y} * d.y + double{d.z} * d.z));
+                ++vbd_edge_samples;
+            }
+        }
         if (env_distance_count > 0u && env_strain_defined)
             distance_rms_max_env = std::max(distance_rms_max_env,
                 std::sqrt(env_distance_squared / static_cast<double>(env_distance_count)));
@@ -649,6 +724,194 @@ struct VbdAcceptance {
         result.Set("first_pinned_failure_sample", first_pinned_failure_sample);
         result.Set("first_undefined_strain_step", first_undefined_strain_step > 0u ? Json::Int(first_undefined_strain_step) : Json::Null());
         result.Set("first_strain_failure_step", first_strain_failure_step > 0u ? Json::Int(first_strain_failure_step) : Json::Null());
+        result.Set("valid", Json::Bool(Valid()));
+        return result;
+    }
+};
+
+// Solve residuals and energy balances of every replay step against the frozen quality scales.
+struct ResidualAcceptance {
+    // V* = 1 m/s and E* = 1.69 J of the frozen quality profile.
+    static constexpr double velocity_scale = 1.0, energy_scale = 1.69;
+    static constexpr double vertex_limit = 1.0e-3 * velocity_scale + 1.0e-6;
+    static constexpr double contact_limit = 1.0e-4 * velocity_scale + 1.0e-6;
+    static constexpr double energy_step_limit = 1.0e-3 * energy_scale, energy_total_limit = 1.0e-2 * energy_scale;
+
+    struct Worst {
+        double value = 0.0;
+        uint32_t step = 0u, env = 0u, index = 0u;
+        bool nonfinite = false;
+
+        void Observe(double v, uint32_t s, uint32_t e, uint32_t i) {
+            if (!std::isfinite(v)) nonfinite = true;
+            else if (v > value) value = v, step = s, env = e, index = i;
+        }
+
+        Json Report(const char* index_name) const {
+            Json result = Json::Object();
+            result.Set("value", Json::Float(value));
+            result.Set("step", step > 0u ? Json::Int(step) : Json::Null());
+            result.Set("env", step > 0u ? Json::Int(env) : Json::Null());
+            result.Set(index_name, step > 0u ? Json::Int(index) : Json::Null());
+            result.Set("nonfinite", Json::Bool(nonfinite));
+            return result;
+        }
+    };
+
+    uint32_t envs, substeps;
+    std::vector<float> stages, ledger;
+    std::vector<uint32_t> ledger_status, contact_counts;
+    std::vector<uint64_t> contact_metrics, vertex_metrics;
+    Worst vertex_defect, vertex_correction, normal, tangent, penetration_rate, normal_impulse, cone,
+        complementarity, friction_work, dissipation, energy_step, passive_gain;
+    uint64_t contact_rows = 0u, invalid_rows = 0u, vertex_records = 0u, energy_records = 0u, energy_unmeasured = 0u;
+    double injecting_rows = 0.0, energy_abs_sum = 0.0, energy_net = 0.0;
+    uint32_t energy_status_union = 0u, steps_checked = 0u;
+    uint32_t first_vertex_failure_step = 0u, first_contact_failure_step = 0u, first_energy_failure_step = 0u;
+
+    ResidualAcceptance(nk::World& world, uint32_t env_count)
+        : envs(env_count), substeps(world.GetModel().capacities.integration_substeps),
+          stages(size_t{env_count} * substeps * nk::kEnergyStageCount * nk::kPhysicsStageColumnCount),
+          ledger(size_t{env_count} * substeps * nk::kEnergyColumnCount), ledger_status(size_t{env_count} * substeps),
+          contact_counts(size_t{env_count} * nuka::constraint::kContactSolveCountSize),
+          contact_metrics(size_t{env_count} * nuka::constraint::kContactSolveMetricCount),
+          vertex_metrics(size_t{env_count} * 2u) {}
+
+    static float PackedValue(uint64_t packed) {
+        const uint32_t bits = static_cast<uint32_t>(packed >> 32u);
+        float value = 0.0f;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
+
+    void Observe(nk::World& world, uint32_t step) {
+        const auto& data = world.GetData();
+        fixture::Require(
+            data.DownloadField(nk::FieldId::PhysicsStageMetrics, stages.data(), stages.size() * sizeof(float)) &&
+            data.DownloadField(nk::FieldId::EnergyLedger, ledger.data(), ledger.size() * sizeof(float)) &&
+            data.DownloadField(nk::FieldId::EnergyLedgerStatus, ledger_status.data(),
+                               ledger_status.size() * sizeof(uint32_t)) &&
+            data.DownloadField(nk::FieldId::ContactSolveCounts, contact_counts.data(),
+                               contact_counts.size() * sizeof(uint32_t)) &&
+            data.DownloadField(nk::FieldId::ContactSolveMetrics, contact_metrics.data(),
+                               contact_metrics.size() * sizeof(uint64_t)) &&
+            data.DownloadField(nk::FieldId::VbdSolveMetrics, vertex_metrics.data(),
+                               vertex_metrics.size() * sizeof(uint64_t)), "residual readout download failed");
+        using S = nk::PhysicsStageColumn;
+        using E = nk::EnergyColumn;
+        using M = nuka::constraint::ContactSolveMetric;
+        const auto stage = [&](uint32_t record, uint32_t index, S column) {
+            return double(stages[(size_t{record} * nk::kEnergyStageCount + index) * nk::kPhysicsStageColumnCount +
+                                 static_cast<uint32_t>(column)]);
+        };
+        const uint32_t solved = static_cast<uint32_t>(nk::EnergyStage::Solved);
+        bool vertex_failed = false, contact_failed = false, energy_failed = false;
+        for (uint32_t env = 0u; env < envs; ++env) {
+            for (uint32_t slot = 0u; slot < substeps; ++slot) {
+                const uint32_t record = env * substeps + slot;
+                if (stage(record, solved, S::VbdDynamicParticles) > 0.0) {
+                    const double defect = stage(record, solved, S::MaxVbdMomentumVelocityError);
+                    vertex_defect.Observe(defect, step, env, slot);
+                    vertex_failed |= !(defect <= vertex_limit);
+                    ++vertex_records;
+                }
+                for (uint32_t index = 0u; index < nk::kEnergyStageCount; ++index) {
+                    injecting_rows = std::max(injecting_rows, stage(record, index, S::EnergyInjectingPassiveRows));
+                    passive_gain.Observe(stage(record, index, S::MaxPassiveRowEnergyGain), step, env, slot);
+                }
+                const float* row = ledger.data() + size_t{record} * nk::kEnergyColumnCount;
+                const double residual = row[static_cast<uint32_t>(E::Residual)];
+                if (ledger_status[record] == 0u && row[static_cast<uint32_t>(E::Valid)] == 1.0f) {
+                    energy_step.Observe(std::fabs(residual), step, env, slot);
+                    energy_failed |= !(std::fabs(residual) <= energy_step_limit);
+                    energy_abs_sum += std::fabs(residual);
+                    energy_net += residual;
+                    ++energy_records;
+                } else {
+                    energy_status_union |= ledger_status[record];
+                    ++energy_unmeasured;
+                }
+            }
+            const uint32_t* counts = contact_counts.data() + size_t{env} * nuka::constraint::kContactSolveCountSize;
+            const uint64_t* metrics = contact_metrics.data() + size_t{env} * nuka::constraint::kContactSolveMetricCount;
+            const auto metric = [&](M m) { return metrics[static_cast<uint32_t>(m)]; };
+            const auto observe = [&](Worst& worst, M m) {
+                worst.Observe(PackedValue(metric(m)), step, env, ~static_cast<uint32_t>(metric(m)));
+                return double(PackedValue(metric(m)));
+            };
+            contact_rows += counts[0];
+            invalid_rows += counts[1];
+            const double projected = std::max(observe(normal, M::NormalVelocity), observe(tangent, M::TangentVelocity));
+            const double penetrating = observe(penetration_rate, M::NormalVelocityViolation);
+            observe(normal_impulse, M::NormalImpulseViolation);
+            observe(complementarity, M::ComplementarityWork);
+            observe(cone, M::FrictionImpulseViolation);
+            observe(friction_work, M::FrictionWorkViolation);
+            observe(dissipation, M::FrictionDissipationWork);
+            contact_failed |= counts[1] != 0u || !(projected <= contact_limit) || !(penetrating <= contact_limit);
+            const uint64_t correction = vertex_metrics[size_t{env} * 2u];
+            vertex_correction.Observe(PackedValue(correction), step, env, ~static_cast<uint32_t>(correction));
+            vertex_failed |= !(double(PackedValue(correction)) <= vertex_limit);
+        }
+        if (vertex_failed && first_vertex_failure_step == 0u) first_vertex_failure_step = step;
+        if (contact_failed && first_contact_failure_step == 0u) first_contact_failure_step = step;
+        if (energy_failed && first_energy_failure_step == 0u) first_energy_failure_step = step;
+        ++steps_checked;
+    }
+
+    bool EnergyCovered() const { return energy_unmeasured == 0u && energy_records > 0u; }
+
+    bool Valid() const {
+        return steps_checked > 0u && first_vertex_failure_step == 0u && first_contact_failure_step == 0u &&
+               first_energy_failure_step == 0u && !(energy_abs_sum > energy_total_limit);
+    }
+
+    Json Report() const {
+        Json result = Json::Object(), vertex = Json::Object(), contact = Json::Object(), energy = Json::Object();
+        result.Set("velocity_scale_m_s", Json::Float(velocity_scale));
+        result.Set("energy_scale_j", Json::Float(energy_scale));
+        result.Set("steps_checked", Json::Int(steps_checked));
+        vertex.Set("scope", Json::Str("vertex momentum equations of VBD and material-field particles after every substep solve"));
+        vertex.Set("limit_m_s", Json::Float(vertex_limit));
+        vertex.Set("records", Json::Int(static_cast<int64_t>(vertex_records)));
+        vertex.Set("max_momentum_velocity_defect", vertex_defect.Report("substep"));
+        vertex.Set("last_solve_max_newton_correction", vertex_correction.Report("particle"));
+        vertex.Set("first_failure_step", first_vertex_failure_step > 0u ? Json::Int(first_vertex_failure_step) : Json::Null());
+        result.Set("vertex", std::move(vertex));
+        contact.Set("scope", Json::Str("block-normal contact rows of the last block-descent solve of each step"));
+        contact.Set("limit_m_s", Json::Float(contact_limit));
+        contact.Set("rows", Json::Int(static_cast<int64_t>(contact_rows)));
+        contact.Set("invalid_rows", Json::Int(static_cast<int64_t>(invalid_rows)));
+        contact.Set("normal_projection_velocity", normal.Report("row"));
+        contact.Set("tangent_projection_velocity", tangent.Report("row"));
+        contact.Set("normal_velocity_violation", penetration_rate.Report("row"));
+        contact.Set("normal_impulse_violation_n_s", normal_impulse.Report("row"));
+        contact.Set("complementarity_work_j", complementarity.Report("row"));
+        contact.Set("friction_impulse_violation_n_s", cone.Report("row"));
+        contact.Set("friction_work_violation_j", friction_work.Report("row"));
+        contact.Set("friction_dissipation_work_error_j", dissipation.Report("row"));
+        contact.Set("passive_rows_injecting_energy_max", Json::Float(injecting_rows));
+        contact.Set("passive_row_energy_gain_j", passive_gain.Report("substep"));
+        contact.Set("first_failure_step", first_contact_failure_step > 0u ? Json::Int(first_contact_failure_step) : Json::Null());
+        result.Set("contact", std::move(contact));
+        energy.Set("scope", Json::Str("unexplained balance of each substep record whose ledger coverage is complete"));
+        energy.Set("step_limit_j", Json::Float(energy_step_limit));
+        energy.Set("trajectory_abs_limit_j", Json::Float(energy_total_limit));
+        energy.Set("measured_records", Json::Int(static_cast<int64_t>(energy_records)));
+        energy.Set("unmeasured_records", Json::Int(static_cast<int64_t>(energy_unmeasured)));
+        energy.Set("unmeasured_status_union", Json::Int(energy_status_union));
+        energy.Set("coverage_complete", Json::Bool(EnergyCovered()));
+        energy.Set("max_abs_step_residual", energy_step.Report("substep"));
+        energy.Set("trajectory_abs_residual_j", Json::Float(energy_abs_sum));
+        energy.Set("trajectory_net_residual_j", Json::Float(energy_net));
+        energy.Set("first_failure_step", first_energy_failure_step > 0u ? Json::Int(first_energy_failure_step) : Json::Null());
+        result.Set("energy", std::move(energy));
+        Json unmeasured = Json::Array();
+        unmeasured.PushBack(Json::Str("rigid body, articulation and MPM grid block momentum residuals"));
+        unmeasured.PushBack(Json::Str("contact rows of solves before the last one in a step"));
+        unmeasured.PushBack(Json::Str("relative friction cone violation and penetration depth against shell thickness"));
+        if (!EnergyCovered()) unmeasured.PushBack(Json::Str("energy balance of records with incomplete ledger coverage"));
+        result.Set("unmeasured", std::move(unmeasured));
         result.Set("valid", Json::Bool(Valid()));
         return result;
     }
@@ -1569,8 +1832,10 @@ Json Run(const Options& options) {
     const double preparation_ms = Milliseconds(prepare_start);
     const auto cook_start = Clock::now();
     fixture::SceneVisuals visuals;
-    auto model = four_systems ? fixture::CookMpmPrepared(prepared, options.envs, &visuals, options.mpm_implicit_stress != 0u)
-                             : fixture::CookPrepared(prepared, options.envs, true, options.cloth_nx, &visuals);
+    const bool field_shell = options.cloth_discretization == "field";
+    auto model = four_systems ? fixture::CookMpmPrepared(prepared, options.envs, &visuals,
+                                                        options.mpm_implicit_stress != 0u, field_shell)
+                             : fixture::CookPrepared(prepared, options.envs, true, options.cloth_nx, &visuals, field_shell);
     const auto slots = uint64_t{model.capacities.max_contacts_per_env} * options.capacity_scale;
     const auto rows = slots * nk::kPairDrivenRowsPerSlot;
     fixture::Require(rows * options.envs <= std::numeric_limits<int>::max(), "contact capacity exceeds index range");
@@ -1584,6 +1849,12 @@ Json Run(const Options& options) {
     fixture::Require(world.Ready(), world.CreationError());
     AttachStateSensors(world, options);
     AttachTactileSensors(world, options, prepared);
+    // Traced sweeps record every residual class of each env after every sweep of the replayed steps; telemetry
+    // output keeps each substep's record, including the entity with the largest residual.
+    if (!options.sweep_trace.empty() || !options.telemetry_output.empty())
+        fixture::Require(world.SetTelemetry(nk::kTelemetrySolve |
+                         (options.sweep_trace.empty() ? 0u : nk::kTelemetrySweeps), 0.0f) == phi::Status::Ok,
+                         "sweep telemetry failed");
     fixture::Require(world.FieldPtr(nk::FieldId::ContactForce) != nullptr, "contact readout unavailable");
     CheckCuda(cudaStreamSynchronize(stream));
     const double creation_ms = Milliseconds(create_start);
@@ -1629,8 +1900,15 @@ Json Run(const Options& options) {
     }
     const auto timed_state = State(world);
     const auto timed_sensors = StateSensorBytes(world);
+    const auto timed_step_report = world.LastStepReport();
+    // Later lifecycle checks rebuild the pipeline and release the plan the timed steps replayed.
+    const auto timed_graph = world.GraphMetrics();
+    const uint64_t timed_graph_replays = world.GraphReplays();
 
     const auto quality_start = Clock::now();
+    // The replay measures solve residuals; matching the timed state shows the measurement leaves the solve unchanged.
+    fixture::Require(world.FieldPtr(nk::FieldId::PhysicsStageMetrics) != nullptr,
+                     "residual readout unavailable");
     fixture::Require(world.Reset() == phi::Status::Ok, "quality replay reset failed");
     const bool reset_equal = State(world, false) == initial;
     std::vector<uint32_t> status(options.envs);
@@ -1649,13 +1927,48 @@ Json Run(const Options& options) {
         wrench_output.open(options.wrench_output, std::ios::binary);
         fixture::Require(wrench_output.is_open(), "cannot open wrench output");
     }
+    std::vector<float> sweep_trace(options.sweep_trace.empty() ? 0u : caps.ElementCount(nk::FieldId::SolverSweepTrace) *
+        nk::LayoutOf(nk::FieldId::SolverSweepTrace).elem_size / sizeof(float));
+    std::ofstream sweep_trace_output;
+    if (!options.sweep_trace.empty()) {
+        sweep_trace_output.open(options.sweep_trace, std::ios::binary);
+        fixture::Require(sweep_trace_output.is_open(), "cannot open sweep trace output");
+    }
+    std::ofstream telemetry_output;
+    std::vector<nk::TelemetryRecord> telemetry_records;
+    if (!options.telemetry_output.empty()) {
+        telemetry_output.open(options.telemetry_output, std::ios::binary);
+        fixture::Require(telemetry_output.is_open(), "cannot open telemetry output");
+    }
     uint64_t wrench_hash = 14695981039346656037ull;
     bool wrench_finite = true;
     Json workload_samples = Json::Array(), vbd_samples = Json::Array();
     bool solver_workload_valid = true;
     VbdAcceptance vbd_acceptance;
+    ResidualAcceptance residual_acceptance(world, options.envs);
     for (uint32_t i = 0; i < options.warmup + options.steps; ++i) {
+        // Untraced sweeps of an early stop read as zero.
+        if (sweep_trace_output.is_open()) {
+            std::fill(sweep_trace.begin(), sweep_trace.end(), 0.0f);
+            fixture::Require(world.GetData().UploadField(nk::FieldId::SolverSweepTrace, sweep_trace.data(),
+                             sweep_trace.size() * sizeof(float)), "sweep trace reset failed");
+        }
         Step(world, options);
+        if (sweep_trace_output.is_open()) {
+            fixture::Require(world.GetData().DownloadField(nk::FieldId::SolverSweepTrace, sweep_trace.data(),
+                             sweep_trace.size() * sizeof(float)), "sweep trace download failed");
+            sweep_trace_output.write(reinterpret_cast<const char*>(sweep_trace.data()),
+                                     sweep_trace.size() * sizeof(float));
+            fixture::Require(sweep_trace_output.good(), "cannot write sweep trace output");
+        }
+        if (telemetry_output.is_open()) {
+            uint32_t dropped = 0u;
+            fixture::Require(world.ReadTelemetry(&telemetry_records, 1u << 16u, &dropped) == phi::Status::Ok &&
+                             dropped == 0u, "telemetry read failed or dropped records");
+            telemetry_output.write(reinterpret_cast<const char*>(telemetry_records.data()),
+                                   telemetry_records.size() * sizeof(nk::TelemetryRecord));
+            fixture::Require(telemetry_output.good(), "cannot write telemetry output");
+        }
         fixture::Require(world.GetData().DownloadField(nk::FieldId::EnvStatus, status.data(),
                          status.size() * sizeof(uint32_t)), "status download failed");
         bool first_failure_step = false;
@@ -1678,6 +1991,7 @@ Json Run(const Options& options) {
         }
         auto vbd_quality = VbdQuality(world, i + 1u);
         vbd_acceptance.Observe(vbd_quality);
+        residual_acceptance.Observe(world, i + 1u);
         fixture::Require(world.GetData().DownloadField(nk::FieldId::Urows, rows_host.data(),
                          rows_host.size() * sizeof(nk::NkRow)), "row download failed");
         fixture::Require(world.GetData().DownloadField(nk::FieldId::Lambda, impulses.data(),
@@ -1712,6 +2026,8 @@ Json Run(const Options& options) {
         fixture::Require(output.good(), "cannot write state output");
     }
     const std::vector<uint32_t> reset_envs{0u};
+    Json transactions = TransactionChecks(world, options);
+    const bool transaction_valid = transactions.At("valid").AsBool();
     fixture::Require(world.Reset(reset_envs) == phi::Status::Ok, "masked reset failed");
     const auto masked_reset_errors = MaskedResetMismatches(world, initial, physical_state,
                                                          State(world, false), reset_envs);
@@ -1720,6 +2036,7 @@ Json Run(const Options& options) {
     Json result = Json::Object(), execution = Json::Object(), timing = Json::Object();
     result.Set("schema_version", Json::Int(4));
     result.Set("scene", Json::Str(options.scene));
+    result.Set("transactions", std::move(transactions));
     Json configuration = Json::Object();
     configuration.Set("envs", Json::Int(options.envs));
     configuration.Set("dt", Json::Float(options.dt));
@@ -1751,7 +2068,19 @@ Json Run(const Options& options) {
     solver.Set("velocity_iterations_override", Json::Bool(config.velocity_iterations_override));
     solver.Set("actual_velocity_iterations", Json::Int(world.GetPipeline().VelocityIterations()));
     solver.Set("actual_budget_scope", Json::Str("built pipeline budget per interval; individual solve calls are listed separately"));
-    solver.Set("executed_iterations_status", Json::Str("unmeasured"));
+    solver.Set("executed_iterations_status", Json::Str("measured per environment and substep of final timed step"));
+    Json executed = Json::Array();
+    for (const auto& env : timed_step_report.environments) {
+        Json row = Json::Array();
+        for (uint32_t count : env.executed_iterations) row.PushBack(Json::Int(count));
+        executed.PushBack(std::move(row));
+    }
+    solver.Set("executed_iterations", std::move(executed));
+    solver.Set("public_step", Json::Int(timed_step_report.stamp.public_step));
+    solver.Set("state_version", Json::Int(timed_step_report.stamp.state_version));
+    solver.Set("diagnostics_valid", Json::Bool(timed_step_report.stamp.valid));
+    solver.Set("physical_convergence_status", Json::Str("unmeasured"));
+    solver.Set("transaction_bytes", Json::Int(world.TransactionByteSize()));
     uint32_t solve_call_count = 0u;
     for (const auto& call : world.GetPipeline().Calls()) {
         Json solve = Json::Object();
@@ -1778,6 +2107,10 @@ Json Run(const Options& options) {
     solver.Set("environment", std::move(solver_environment));
     configuration.Set("solver", std::move(solver));
     configuration.Set("cloth_grid", Json::Int(options.cloth_nx));
+    configuration.Set("cloth_discretization", Json::Str(options.cloth_discretization));
+    configuration.Set("field_state_version", Json::Int(nk::kMfStateVersion));
+    configuration.Set("field_state_scalars_per_env", Json::Int(caps.mf_state_scalars_per_env));
+    configuration.Set("field_trial_scalars_per_env", Json::Int(caps.mf_trial_scalars_per_env));
     configuration.Set("capacity_scale", Json::Int(options.capacity_scale));
     configuration.Set("contact_slots_per_env", Json::Int(caps.max_contacts_per_env));
     configuration.Set("rows_per_env", Json::Int(caps.max_rows_per_env));
@@ -1786,7 +2119,8 @@ Json Run(const Options& options) {
     result.Set("config", std::move(configuration));
     execution.Set("mode", Json::Str(options.execution));
     execution.Set("stream", Json::Str("nonblocking caller"));
-    const auto graph = world.GraphMetrics();
+    const auto& graph = timed_graph;
+    execution.Set("graph_replays_at_timing_end", Json::Int(static_cast<int64_t>(timed_graph_replays)));
     execution.Set("graph_nodes", Json::Int(graph.nodes));
     execution.Set("graph_kernels", Json::Int(graph.kernels));
     execution.Set("graph_clears", Json::Int(graph.clears));
@@ -1796,6 +2130,7 @@ Json Run(const Options& options) {
     execution.Set("graph_forked_operators", Json::Int(graph.forked_operators));
     execution.Set("warmup", Json::Int(options.warmup));
     execution.Set("steps", Json::Int(options.steps));
+    execution.Set("progress_logging", Json::Bool(options.progress));
     execution.Set("boundary", Json::Str("full physics pipeline with contact readout; held control; per-step GPU events; no timed D2H"));
     result.Set("execution", std::move(execution));
     timing.Set("scene_preparation_ms", Json::Float(preparation_ms));
@@ -1887,6 +2222,7 @@ Json Run(const Options& options) {
     quality.Set("coupling_acceptance", coupling_acceptance.Report());
     quality.Set("vbd_samples", std::move(vbd_samples));
     quality.Set("vbd_acceptance", vbd_acceptance.Report());
+    quality.Set("residual_acceptance", residual_acceptance.Report());
     result.Set("quality", std::move(quality));
     bool render_valid = true;
     if (options.render_sensors != 0u) {
@@ -1907,14 +2243,16 @@ Json Run(const Options& options) {
     result.Set("hardware", std::move(hardware));
     Json validity = Json::Object(), unavailable = Json::Array();
     const bool valid = finite && wrench_finite && status_union == 0u && reset_equal && masked_reset_errors.empty() && timed_state == replay_state &&
-                       solver_workload_valid &&
+                       solver_workload_valid && transaction_valid &&
                        coupling_valid && mismatched_envs.empty() && vbd_acceptance.Valid() && render_valid &&
                        timed_sensors == replay_sensors;
     validity.Set("valid", Json::Bool(valid));
     validity.Set("valid_scope", Json::Str("lifecycle/state/render/deformation/coupling workload contracts"));
     validity.Set("passes_full_physics_acceptance", Json::Bool(false));
-    validity.Set("physical_acceptance_status", Json::Str("unmeasured"));
-    validity.Set("physical_acceptance_reason", Json::Str("full-system energy ledger, analytic checks, reference comparisons and independent CCD are not integrated into this program"));
+    validity.Set("physical_acceptance_status", Json::Str(residual_acceptance.Valid() ? "unmeasured" : "failed"));
+    validity.Set("physical_acceptance_reason", Json::Str(residual_acceptance.Valid()
+        ? "rigid, articulation and MPM residuals, analytic checks, reference comparisons and independent CCD are not integrated into this program"
+        : "measured solve residuals or energy balances exceed the frozen quality budgets"));
     Json failures = Json::Array();
     if (status_union != 0u) failures.PushBack(Json::Str("nonzero environment failure flags"));
     if (!solver_workload_valid) failures.PushBack(Json::Str("grid block coloring conflicts or lacks owner coverage"));
@@ -1928,7 +2266,7 @@ Json Run(const Options& options) {
     if (timed_sensors != replay_sensors) failures.PushBack(Json::Str("mounted sensor replay mismatch"));
     validity.Set("failures", std::move(failures));
     unavailable.PushBack(Json::Str("GPU clocks, source/binary SHA256 and process identity are collected by the sweep runner"));
-    unavailable.PushBack(Json::Str("residual, complementarity and detailed penetration observability remain incomplete"));
+    unavailable.PushBack(Json::Str("solve residual coverage gaps are listed in quality.residual_acceptance.unmeasured"));
     validity.Set("unavailable", std::move(unavailable));
     result.Set("status", std::move(validity));
     return result;

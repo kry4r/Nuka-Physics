@@ -97,8 +97,8 @@ fields:
   - {name: body_angular_velocity, dtype: vec3, per: body, arena: persistent, owner: data}
   # World-frame COM force [N] and torque [N*m] for dynamic free-body owners.
   # Velocity integration consumes and clears these transient inputs each step.
-  - {name: body_force,            dtype: vec3, per: body, arena: scratch,    owner: data}
-  - {name: body_torque,           dtype: vec3, per: body, arena: scratch,    owner: data}
+  - {name: body_force,            dtype: vec3, per: body, arena: persistent, owner: data}
+  - {name: body_torque,           dtype: vec3, per: body, arena: persistent, owner: data}
   - {name: body_inv_inertia,      dtype: vec3, per: body, arena: persistent, owner: data, flags: [param]}
 
   # =========================================================================
@@ -256,6 +256,7 @@ fields:
   # =========================================================================
   - {name: aero_tri_verts,    dtype: u32,  per: aero_tri, arena: persistent, owner: model, elem: 3}
   - {name: aero_tri_area,     dtype: f32,  per: aero_tri, arena: persistent, owner: model}
+  - {name: aero_tri_corner_source, dtype: u32, per: aero_tri, arena: persistent, owner: model}
 
   # Shared working positions for all row-coupled particle materials; committed once at finalize.
   - {name: pbf_predicted_pos,  dtype: vec3, per: particle, arena: scratch, owner: data}
@@ -718,13 +719,25 @@ fields:
   - {name: particle_response, dtype: symmat3, per: particle, arena: scratch, owner: data}
   - {name: particle_row_impulse, dtype: vec3, per: particle, arena: scratch, owner: data}
   - {name: vbd_free_rate, dtype: vec3, per: scalar, count: "vbd_vertices_per_env*env_count", arena: scratch, owner: data}
+  - {name: vbd_solve_rate, dtype: vec3, per: scalar, count: "vbd_vertices_per_env*env_count", arena: scratch, owner: data}
   - {name: vbd_offset, dtype: vec3, per: scalar, count: "vbd_vertices_per_env*env_count", arena: scratch, owner: data}
   - {name: vbd_inertia, dtype: f32, per: scalar, count: "vbd_vertices_per_env*env_count", arena: scratch, owner: data}
   # Second-order history: the previous velocity, and whether it belongs to the current trajectory.
   - {name: vbd_history_vel, dtype: vec3, per: scalar, count: "vbd_vertices_per_env*env_count", arena: persistent, owner: data}
   - {name: vbd_history_ready, dtype: u32, per: env, arena: persistent, owner: data}
   - {name: particle_kinematic_target, dtype: vec3, per: particle, arena: persistent, owner: data, flags: [param]}
+  - {name: particle_attachment_stiffness, dtype: f32, per: particle, arena: persistent, owner: data, flags: [param]}
+  - {name: particle_attachment_previous_stiffness, dtype: f32, per: particle, arena: persistent, owner: data}
+  - {name: particle_attachment_previous_target, dtype: vec3, per: particle, arena: persistent, owner: data}
+  - {name: snapshot_particle_attachment_stiffness, dtype: f32, per: particle, arena: persistent, owner: data}
+  - {name: snapshot_particle_attachment_previous_stiffness, dtype: f32, per: particle, arena: persistent, owner: data}
+  - {name: snapshot_particle_attachment_previous_target, dtype: vec3, per: particle, arena: persistent, owner: data}
+  - {name: snapshot_particle_kinematic_target, dtype: vec3, per: particle, arena: persistent, owner: data}
   - {name: ogc_contact_count, dtype: u32, per: env, arena: scratch, owner: data}
+  # Largest OGC slot request of the public step, kept past the clamp so an overflow reports its need.
+  - {name: ogc_contact_demand, dtype: u32, per: env, arena: scratch, owner: data}
+  # One plus the largest field element whose law left its declared range in the step's last attempt, 0 if none.
+  - {name: mf_range_element, dtype: u32, per: env, arena: scratch, owner: data}
   - {name: dat_particle_beta, dtype: f32, per: particle, arena: scratch, owner: data, flags: [readout]}
   - {name: dat_body_beta, dtype: u32, per: body, arena: scratch, owner: data}
   - {name: dat_artic_beta, dtype: u32, per: articulation, arena: scratch, owner: data}
@@ -781,15 +794,16 @@ fields:
   # acceleration, dual, check.
   - {name: solver_phase_time, dtype: u64, per: env, elem: 8, arena: scratch, owner: data}
   - {name: dat_surface_motion, dtype: f32, per: scalar, count: "particle_surfaces_per_env*env_count", arena: scratch, owner: data}
-  - {name: energy_ledger, dtype: f32, per: scalar, count: "integration_substeps*env_count", elem: 34, arena: scratch, owner: data, flags: [readout]}
+  - {name: energy_ledger, dtype: f32, per: scalar, count: "integration_substeps*env_count", elem: 36, arena: scratch, owner: data, flags: [readout]}
   # The ledger record in double; residuals difference stage energies far larger than their change.
-  - {name: energy_ledger_sum, dtype: f64, per: scalar, count: "integration_substeps*env_count", elem: 34, arena: scratch, owner: data}
+  - {name: energy_ledger_sum, dtype: f64, per: scalar, count: "integration_substeps*env_count", elem: 36, arena: scratch, owner: data}
   - {name: energy_ledger_status, dtype: u32, per: scalar, count: "integration_substeps*env_count", arena: scratch, owner: data, flags: [readout]}
   - {name: physics_stage_metrics, dtype: f32, per: scalar, count: "integration_substeps*env_count", elem: 195, arena: scratch, owner: data, flags: [readout]}
   - {name: contact_audit_counts, dtype: u32, per: scalar, count: "integration_substeps*env_count", elem: 8, arena: scratch, owner: data, flags: [readout]}
   - {name: contact_audit_metrics, dtype: u64, per: scalar, count: "integration_substeps*env_count", elem: 7, arena: scratch, owner: data, flags: [readout]}
   - {name: readout_partials, dtype: f64, per: scalar, count: "max(env_count,readout_partial_rows)", elem: 195, arena: scratch, owner: data}
   - {name: energy_particle_start, dtype: vec3, per: particle, arena: scratch, owner: data}
+  - {name: energy_particle_start_velocity, dtype: vec3, per: particle, arena: scratch, owner: data}
   - {name: energy_aero_impulse, dtype: vec3, per: particle, arena: scratch, owner: data}
   - {name: energy_kinematic_contact_impulse, dtype: vec3, per: particle, arena: scratch, owner: data}
   - {name: energy_link_start_q, dtype: f32, per: link, arena: scratch, owner: data}
@@ -832,13 +846,40 @@ fields:
   # Material-field shells close the vertex-block range: membrane and bend elements, their materials and the
   # field vertices' incidence (element << 3 | local); the interval-start membrane metric of each triangle.
   - {name: mf_elements, dtype: mf_element, per: scalar, count: "mf_elements_per_env", arena: persistent, owner: model}
+  - {name: mf_face_partner, dtype: u32, per: scalar, count: "mf_elements_per_env", arena: persistent, owner: model}
+  - {name: mf_stress, dtype: vec3, per: scalar, count: "mf_elements_per_env*env_count", arena: scratch, owner: data}
+  - {name: mf_crack_load, dtype: f32, per: scalar, count: "mf_elements_per_env*env_count", arena: scratch, owner: data}
   - {name: mf_materials, dtype: mf_material, per: scalar, count: "mf_materials", arena: persistent, owner: model}
   - {name: mf_incidence_offsets, dtype: u32, per: scalar, count: "mf_vertices_per_env+1", arena: persistent, owner: model}
   - {name: mf_incidence, dtype: u32, per: scalar, count: "mf_incidence_per_env", arena: persistent, owner: model}
   - {name: mf_start_metric, dtype: vbd_membrane_start, per: scalar, count: "mf_elements_per_env*env_count", arena: scratch, owner: data}
-  # Each element's committed history and its reset twin, the step's trial (history, then its plastic or a seam's
-  # cohesive loss and its viscous loss), and each env's commit failures.
-  - {name: mf_history, dtype: f32, per: scalar, count: "mf_elements_per_env*env_count", arena: persistent, owner: data, elem: 13}
-  - {name: snapshot_mf_history, dtype: f32, per: scalar, count: "mf_elements_per_env*env_count", arena: persistent, owner: data, elem: 13}
-  - {name: mf_trial, dtype: f32, per: scalar, count: "mf_elements_per_env*env_count", arena: scratch, owner: data, elem: 15}
+  # Element metadata defines typed state spans; trial appends plastic/cohesive and viscous losses to each span.
+  - {name: mf_history, dtype: f32, per: scalar, count: "mf_state_scalars_per_env*env_count", arena: persistent, owner: data}
+  - {name: snapshot_mf_history, dtype: f32, per: scalar, count: "mf_state_scalars_per_env*env_count", arena: persistent, owner: data}
+  - {name: mf_trial, dtype: f32, per: scalar, count: "mf_trial_scalars_per_env*env_count", arena: scratch, owner: data}
   - {name: mf_env_commit, dtype: u32, per: scalar, count: "env_count", arena: scratch, owner: data}
+  # Fracture splits vertices into spares: each incidence's side triangle and each field vertex's color; per env the
+  # element corners, each particle's source (itself unless split off), reset twins, edge tractions, cracks and a
+  # topology version.
+  - {name: mf_incidence_anchor, dtype: u32, per: scalar, count: "mf_incidence_per_env", arena: persistent, owner: model}
+  - {name: mf_color, dtype: u32, per: scalar, count: "mf_vertices_per_env", arena: persistent, owner: model}
+  - {name: mf_corner, dtype: u32, per: scalar, count: "mf_elements_per_env*env_count", arena: persistent, owner: data, elem: 12}
+  - {name: snapshot_mf_corner, dtype: u32, per: scalar, count: "mf_elements_per_env*env_count", arena: persistent, owner: data, elem: 12}
+  - {name: particle_root, dtype: u32, per: scalar, count: "particles_per_env*env_count", arena: persistent, owner: data}
+  - {name: snapshot_particle_root, dtype: u32, per: scalar, count: "particles_per_env*env_count", arena: persistent, owner: data}
+  - {name: snapshot_particle_inv_mass, dtype: f32, per: scalar, count: "particles_per_env*env_count", arena: persistent, owner: data}
+  - {name: mf_traction, dtype: f32, per: scalar, count: "mf_elements_per_env*env_count", arena: scratch, owner: data}
+  - {name: mf_cracks, dtype: u32, per: scalar, count: "mf_elements_per_env*env_count", arena: scratch, owner: data}
+  - {name: mf_crack_count, dtype: u32, per: scalar, count: "env_count", arena: scratch, owner: data}
+  # Seams the step's attempt opened, in opening order, for the insertion event loop to replay on the step start.
+  - {name: mf_opened, dtype: u32, per: scalar, count: "mf_elements_per_env*env_count", arena: scratch, owner: data}
+  - {name: mf_opened_count, dtype: u32, per: scalar, count: "env_count", arena: scratch, owner: data}
+  - {name: mf_topology, dtype: u32, per: scalar, count: "env_count", arena: persistent, owner: data}
+  # The field corner each collision triangle corner follows (~0u none), then each env's collision corners and edges
+  # once its field cloth has split.
+  - {name: particle_surface_corner_source, dtype: u32, per: scalar, count: "particle_surface_triangles*3", arena: persistent, owner: model}
+  - {name: particle_surface_corners, dtype: u32, per: scalar, count: "particle_surface_triangles*3*env_count", arena: persistent, owner: data}
+  - {name: snapshot_particle_surface_corners, dtype: u32, per: scalar, count: "particle_surface_triangles*3*env_count", arena: persistent, owner: data}
+  - {name: particle_surface_live_edges, dtype: mesh_edge, per: scalar, count: "particle_surface_edges_per_env*env_count", arena: persistent, owner: data}
+  - {name: snapshot_particle_surface_live_edges, dtype: mesh_edge, per: scalar, count: "particle_surface_edges_per_env*env_count", arena: persistent, owner: data}
+  - {name: solver_executed_iterations, dtype: u32, per: scalar, count: "integration_substeps*env_count", arena: scratch, owner: data}

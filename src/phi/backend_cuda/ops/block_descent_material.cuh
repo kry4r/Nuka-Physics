@@ -8,21 +8,22 @@ __device__ MaterialRowState& MaterialState(BlockDescentSolveParams p, BlockScrat
     return s.material_state[size_t{env} * p.material_cells_per_env + cell];
 }
 
+// The deviator ball's yield radius from the cell's pressure bound; DBL_MAX without plasticity.
+__device__ double MaterialYieldRadius(const NkRow& head, const MaterialRowState& state) {
+    return head.friction_secondary < FLT_MAX
+        ? fmax(double(head.mu) * state.pressure_bound + head.friction_secondary, 0.0) : DBL_MAX;
+}
+
 __device__ nk::augmented::BallTerm<nk::kMpmDeviatorComponents> EvaluateMaterialDeviator(
-    DataView data, BlockScratch s, uint32_t slot, const MaterialRowState& state,
-    const Vec3* jacobians, Vec3 move) {
+    DataView data, BlockScratch s, uint32_t slot, const MaterialRowState& state) {
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
-    const NkRow head = rows[slot];
     double dual[nk::kMpmDeviatorComponents], residual[nk::kMpmDeviatorComponents];
     for (uint32_t k = 0u; k < nk::kMpmDeviatorComponents; ++k) {
         dual[k] = data.lambda[slot + 1u + k];
-        residual[k] = state.residual[1u + k] -
-            (jacobians != nullptr ? jacobians[1u + k].Dot(move) : 0.0f);
+        residual[k] = state.residual[1u + k];
     }
-    const double radius = head.friction_secondary < FLT_MAX
-        ? fmax(double(head.mu) * state.pressure_bound + head.friction_secondary, 0.0) : DBL_MAX;
     return nk::augmented::EvaluateBall(dual, double(s.penalty[slot]), residual,
-        double(rows[slot + 1u].compliance_alpha), radius);
+        double(rows[slot + 1u].compliance_alpha), MaterialYieldRadius(rows[slot], state));
 }
 
 __global__ void CacheMaterialRowsKernel(DataView data, BlockDescentSolveParams p,
@@ -69,10 +70,6 @@ __global__ void CacheMaterialRowsKernel(DataView data, BlockDescentSolveParams p
         const auto pressure = nk::augmented::EvaluateScalar(data.lambda[slot], s.penalty[slot],
             state.residual[0], head.compliance_alpha, head.lower, head.upper, s.scalar_response[slot]);
         state.pressure_bound = pressure.impulse;
-        if (snapshot) {
-            const auto deviator = EvaluateMaterialDeviator(data, s, slot, state, nullptr, {});
-            s.row_state[slot].potential = pressure.potential + deviator.potential;
-        }
         valid &= fabsf(state.pressure_bound) <= FLT_MAX;
         if (!valid) {
             const auto term = points.At(head.a, 0u);
@@ -82,8 +79,8 @@ __global__ void CacheMaterialRowsKernel(DataView data, BlockDescentSolveParams p
     }
 }
 
-// A grid incidence's potential change along the node move from its cached state; with `impulse`, the
-// move is zero and its response is added too. Point rows run entirely on float scales.
+// A grid incidence's potential change along the node move, integrated from its cached state; with `impulse`,
+// the move is zero and only its response is added. Point rows run entirely on float scales.
 __device__ double EvaluateGridRow(DataView data, BlockDescentSolveParams p, BlockScratch s,
                                   size_t at, Vec3 move,
                                   Vec3* impulse, SymmetricMat3* curvature) {
@@ -111,33 +108,57 @@ __device__ double EvaluateGridRow(DataView data, BlockDescentSolveParams p, Bloc
         nk::material::MpmDeviatorGradient(k, jacobian[0].x, jacobian[0].y, jacobian[0].z, components);
         jacobian[1u + k] = {components[0], components[1], components[2]};
     }
-    const auto pressure = nk::augmented::EvaluateScalar(data.lambda[slot], s.penalty[slot],
-        state.residual[0] - jacobian[0].Dot(move), head.compliance_alpha, head.lower, head.upper,
-        s.scalar_response[slot]);
-    const auto deviator = EvaluateMaterialDeviator(data, s, slot, state, jacobian, move);
-    if (impulse != nullptr) {
-        *impulse += jacobian[0] * pressure.impulse;
-        AddOuter(*curvature, jacobian[0], pressure.curvature);
+    if (impulse == nullptr) {
+        double dual[nk::kMpmDeviatorComponents], residual[nk::kMpmDeviatorComponents];
+        double drop[nk::kMpmDeviatorComponents];
         for (uint32_t k = 0u; k < nk::kMpmDeviatorComponents; ++k) {
-            const Vec3 j = jacobian[1u + k];
-            *impulse += j * deviator.impulse[k];
-            AddOuter(*curvature, j, deviator.curvature[k][k]);
-            for (uint32_t l = k + 1u; l < nk::kMpmDeviatorComponents; ++l) {
-                const Vec3 other = jacobian[1u + l];
-                const float cross = deviator.curvature[k][l];
-                AddOuter(*curvature, j + other, cross);
-                AddOuter(*curvature, j, -cross);
-                AddOuter(*curvature, other, -cross);
-            }
+            dual[k] = data.lambda[slot + 1u + k];
+            residual[k] = state.residual[1u + k];
+            drop[k] = jacobian[1u + k].Dot(move);
+        }
+        return nk::augmented::ScalarPotentialChange(data.lambda[slot], s.penalty[slot], state.residual[0],
+                   jacobian[0].Dot(move), head.compliance_alpha, head.lower, head.upper, s.scalar_response[slot]) +
+               nk::augmented::BallPotentialChange(dual, double(s.penalty[slot]), residual, drop,
+                   double(rows[slot + 1u].compliance_alpha), MaterialYieldRadius(head, state));
+    }
+    const auto pressure = nk::augmented::EvaluateScalar(data.lambda[slot], s.penalty[slot],
+        state.residual[0], head.compliance_alpha, head.lower, head.upper, s.scalar_response[slot]);
+    const auto deviator = EvaluateMaterialDeviator(data, s, slot, state);
+    *impulse += jacobian[0] * pressure.impulse;
+    AddOuter(*curvature, jacobian[0], pressure.curvature);
+    for (uint32_t k = 0u; k < nk::kMpmDeviatorComponents; ++k) {
+        const Vec3 j = jacobian[1u + k];
+        *impulse += j * deviator.impulse[k];
+        AddOuter(*curvature, j, deviator.curvature[k][k]);
+        for (uint32_t l = k + 1u; l < nk::kMpmDeviatorComponents; ++l) {
+            const Vec3 other = jacobian[1u + l];
+            const float cross = deviator.curvature[k][l];
+            AddOuter(*curvature, j + other, cross);
+            AddOuter(*curvature, j, -cross);
+            AddOuter(*curvature, other, -cross);
         }
     }
-    return pressure.potential + deviator.potential - s.row_state[slot].potential;
+    return 0.0;
 }
 
-__device__ void UpdateMaterialDual(DataView data, BlockDescentSolveParams p, BlockScratch s,
-                                  uint32_t slot) {
-    const auto deviator = EvaluateMaterialDeviator(data, s, slot, MaterialState(p, s, slot), nullptr, {});
-    data.lambda[slot] = MaterialState(p, s, slot).pressure_bound;
-    for (uint32_t k = 0u; k < nk::kMpmDeviatorComponents; ++k)
+// Sets a material cell's multipliers to its projected impulses. Returns their step over the residual scales,
+// the compliant stress rows' volume-rate residual, per cell face area as a velocity.
+__device__ float UpdateMaterialDual(DataView data, BlockDescentSolveParams p, BlockScratch s,
+                                   uint32_t slot) {
+    const auto& state = MaterialState(p, s, slot);
+    const auto deviator = EvaluateMaterialDeviator(data, s, slot, state);
+    const float rho = s.penalty[slot];
+    const float compliance = reinterpret_cast<const NkRow*>(data.urows)[slot + 1u].compliance_alpha;
+    const float deviator_scale = rho > 0.0f ? rho / fmaf(rho, compliance, 1.0f) : 0.0f;
+    float square = 0.0f;
+    for (uint32_t k = 0u; k < nk::kMpmDeviatorComponents; ++k) {
+        const float change = MultiplierSteps({data.lambda[slot + 1u + k], 0.0f, 0.0f},
+            {deviator.impulse[k], 0.0f, 0.0f}, deviator_scale, rho, 0.0f, 0.0f).x;
+        square = fmaf(change, change, square);
         data.lambda[slot + 1u + k] = deviator.impulse[k];
+    }
+    const float pressure = MultiplierSteps({data.lambda[slot], 0.0f, 0.0f}, {state.pressure_bound, 0.0f, 0.0f},
+        static_cast<float>(s.scalar_response[slot].residual_scale), rho, 0.0f, 0.0f).x;
+    data.lambda[slot] = state.pressure_bound;
+    return fmaxf(pressure, sqrtf(square)) / (p.grid_cell_size * p.grid_cell_size);
 }

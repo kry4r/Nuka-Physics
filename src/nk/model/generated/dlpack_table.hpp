@@ -128,6 +128,7 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::ParticleVPre, DlpackDtype::kF32, 2, false},  // particle_v_pre
     {FieldId::AeroTriVerts, DlpackDtype::kU32, 2, false},  // aero_tri_verts
     {FieldId::AeroTriArea, DlpackDtype::kF32, 1, false},  // aero_tri_area
+    {FieldId::AeroTriCornerSource, DlpackDtype::kU32, 1, false},  // aero_tri_corner_source
     {FieldId::PbfPredictedPos, DlpackDtype::kF32, 2, false},  // pbf_predicted_pos
     {FieldId::RngState, DlpackDtype::kU64, 1, false},  // rng_state
     {FieldId::EnvStatus, DlpackDtype::kU32, 1, true},  // env_status
@@ -335,12 +336,22 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::ParticleResponse, DlpackDtype::kF32, 2, false},  // particle_response
     {FieldId::ParticleRowImpulse, DlpackDtype::kF32, 2, false},  // particle_row_impulse
     {FieldId::VbdFreeRate, DlpackDtype::kF32, 2, false},  // vbd_free_rate
+    {FieldId::VbdSolveRate, DlpackDtype::kF32, 2, false},  // vbd_solve_rate
     {FieldId::VbdOffset, DlpackDtype::kF32, 2, false},  // vbd_offset
     {FieldId::VbdInertia, DlpackDtype::kF32, 1, false},  // vbd_inertia
     {FieldId::VbdHistoryVel, DlpackDtype::kF32, 2, false},  // vbd_history_vel
     {FieldId::VbdHistoryReady, DlpackDtype::kU32, 1, false},  // vbd_history_ready
     {FieldId::ParticleKinematicTarget, DlpackDtype::kF32, 2, false},  // particle_kinematic_target
+    {FieldId::ParticleAttachmentStiffness, DlpackDtype::kF32, 1, false},  // particle_attachment_stiffness
+    {FieldId::ParticleAttachmentPreviousStiffness, DlpackDtype::kF32, 1, false},  // particle_attachment_previous_stiffness
+    {FieldId::ParticleAttachmentPreviousTarget, DlpackDtype::kF32, 2, false},  // particle_attachment_previous_target
+    {FieldId::SnapshotParticleAttachmentStiffness, DlpackDtype::kF32, 1, false},  // snapshot_particle_attachment_stiffness
+    {FieldId::SnapshotParticleAttachmentPreviousStiffness, DlpackDtype::kF32, 1, false},  // snapshot_particle_attachment_previous_stiffness
+    {FieldId::SnapshotParticleAttachmentPreviousTarget, DlpackDtype::kF32, 2, false},  // snapshot_particle_attachment_previous_target
+    {FieldId::SnapshotParticleKinematicTarget, DlpackDtype::kF32, 2, false},  // snapshot_particle_kinematic_target
     {FieldId::OgcContactCount, DlpackDtype::kU32, 1, false},  // ogc_contact_count
+    {FieldId::OgcContactDemand, DlpackDtype::kU32, 1, false},  // ogc_contact_demand
+    {FieldId::MfRangeElement, DlpackDtype::kU32, 1, false},  // mf_range_element
     {FieldId::DatParticleBeta, DlpackDtype::kF32, 1, true},  // dat_particle_beta
     {FieldId::DatBodyBeta, DlpackDtype::kU32, 1, false},  // dat_body_beta
     {FieldId::DatArticBeta, DlpackDtype::kU32, 1, false},  // dat_artic_beta
@@ -390,6 +401,7 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::ContactAuditMetrics, DlpackDtype::kU64, 2, true},  // contact_audit_metrics
     {FieldId::ReadoutPartials, DlpackDtype::kF64, 2, false},  // readout_partials
     {FieldId::EnergyParticleStart, DlpackDtype::kF32, 2, false},  // energy_particle_start
+    {FieldId::EnergyParticleStartVelocity, DlpackDtype::kF32, 2, false},  // energy_particle_start_velocity
     {FieldId::EnergyAeroImpulse, DlpackDtype::kF32, 2, false},  // energy_aero_impulse
     {FieldId::EnergyKinematicContactImpulse, DlpackDtype::kF32, 2, false},  // energy_kinematic_contact_impulse
     {FieldId::EnergyLinkStartQ, DlpackDtype::kF32, 1, false},  // energy_link_start_q
@@ -419,14 +431,36 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::DatArticParent, DlpackDtype::kU32, 1, false},  // dat_artic_parent
     {FieldId::Telemetry, DlpackDtype::kU32, 1, true},  // telemetry
     {FieldId::MfElements, DlpackDtype::kU8, 2, false},  // mf_elements
+    {FieldId::MfFacePartner, DlpackDtype::kU32, 1, false},  // mf_face_partner
+    {FieldId::MfStress, DlpackDtype::kF32, 2, false},  // mf_stress
+    {FieldId::MfCrackLoad, DlpackDtype::kF32, 1, false},  // mf_crack_load
     {FieldId::MfMaterials, DlpackDtype::kU8, 2, false},  // mf_materials
     {FieldId::MfIncidenceOffsets, DlpackDtype::kU32, 1, false},  // mf_incidence_offsets
     {FieldId::MfIncidence, DlpackDtype::kU32, 1, false},  // mf_incidence
     {FieldId::MfStartMetric, DlpackDtype::kU8, 2, false},  // mf_start_metric
-    {FieldId::MfHistory, DlpackDtype::kF32, 2, false},  // mf_history
-    {FieldId::SnapshotMfHistory, DlpackDtype::kF32, 2, false},  // snapshot_mf_history
-    {FieldId::MfTrial, DlpackDtype::kF32, 2, false},  // mf_trial
+    {FieldId::MfHistory, DlpackDtype::kF32, 1, false},  // mf_history
+    {FieldId::SnapshotMfHistory, DlpackDtype::kF32, 1, false},  // snapshot_mf_history
+    {FieldId::MfTrial, DlpackDtype::kF32, 1, false},  // mf_trial
     {FieldId::MfEnvCommit, DlpackDtype::kU32, 1, false},  // mf_env_commit
+    {FieldId::MfIncidenceAnchor, DlpackDtype::kU32, 1, false},  // mf_incidence_anchor
+    {FieldId::MfColor, DlpackDtype::kU32, 1, false},  // mf_color
+    {FieldId::MfCorner, DlpackDtype::kU32, 2, false},  // mf_corner
+    {FieldId::SnapshotMfCorner, DlpackDtype::kU32, 2, false},  // snapshot_mf_corner
+    {FieldId::ParticleRoot, DlpackDtype::kU32, 1, false},  // particle_root
+    {FieldId::SnapshotParticleRoot, DlpackDtype::kU32, 1, false},  // snapshot_particle_root
+    {FieldId::SnapshotParticleInvMass, DlpackDtype::kF32, 1, false},  // snapshot_particle_inv_mass
+    {FieldId::MfTraction, DlpackDtype::kF32, 1, false},  // mf_traction
+    {FieldId::MfCracks, DlpackDtype::kU32, 1, false},  // mf_cracks
+    {FieldId::MfCrackCount, DlpackDtype::kU32, 1, false},  // mf_crack_count
+    {FieldId::MfOpened, DlpackDtype::kU32, 1, false},  // mf_opened
+    {FieldId::MfOpenedCount, DlpackDtype::kU32, 1, false},  // mf_opened_count
+    {FieldId::MfTopology, DlpackDtype::kU32, 1, false},  // mf_topology
+    {FieldId::ParticleSurfaceCornerSource, DlpackDtype::kU32, 1, false},  // particle_surface_corner_source
+    {FieldId::ParticleSurfaceCorners, DlpackDtype::kU32, 1, false},  // particle_surface_corners
+    {FieldId::SnapshotParticleSurfaceCorners, DlpackDtype::kU32, 1, false},  // snapshot_particle_surface_corners
+    {FieldId::ParticleSurfaceLiveEdges, DlpackDtype::kU8, 2, false},  // particle_surface_live_edges
+    {FieldId::SnapshotParticleSurfaceLiveEdges, DlpackDtype::kU8, 2, false},  // snapshot_particle_surface_live_edges
+    {FieldId::SolverExecutedIterations, DlpackDtype::kU32, 1, false},  // solver_executed_iterations
 };
 
 } // namespace nuka::nk

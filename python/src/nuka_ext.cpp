@@ -505,8 +505,84 @@ public:
     ~World() { destroy(); }
 
     void step() { check(unlocked([this] { return nuka_world_step(h_); }), "nuka_world_step"); }
+
+    nb::dict step_report(uint32_t env) const {
+        nuka_step_report_t report{};
+        report.struct_size = sizeof(report);
+        report.schema_version = 1u;
+        check(nuka_world_get_step_report(h_, env, &report, nullptr, 0u), "nuka_world_get_step_report");
+        std::vector<uint32_t> executed(report.substeps);
+        check(nuka_world_get_step_report(h_, env, &report, executed.data(), report.substeps),
+            "nuka_world_get_step_report");
+        nb::dict result;
+        result["schema_version"] = report.schema_version;
+        result["public_step"] = report.public_step;
+        result["state_version"] = report.state_version;
+        result["attempt"] = report.attempt;
+        result["diagnostics_valid"] = bool(report.diagnostics_valid);
+        result["accepted"] = bool(report.accepted);
+        result["rolled_back"] = bool(report.rolled_back);
+        result["outcome"] = report.outcome;
+        result["flags"] = report.flags;
+        result["topology_epoch"] = report.topology_epoch;
+        result["requested_iterations"] = report.requested_iterations;
+        result["configured_iterations"] = report.configured_iterations;
+        result["iteration_budget"] = report.iteration_budget;
+        result["substeps"] = report.substeps;
+        result["physical_convergence_measured"] = bool(report.physical_convergence_measured);
+        result["transaction_bytes"] = report.transaction_bytes;
+        result["time"] = report.time;
+        result["advanced_dt"] = report.advanced_dt;
+        result["contact_capacity"] = report.contact_capacity;
+        result["contact_demand"] = report.contact_demand;
+        result["topology_pending"] = report.topology_pending;
+        result["range_element"] = report.range_element;
+        result["executed_iterations"] = nb::cast(executed);
+        return result;
+    }
     void step_n(uint32_t n) {
         check(unlocked([&] { return nuka_world_step_n(h_, n); }), "nuka_world_step_n");
+    }
+    nb::dict material_state_layouts() const {
+        nuka_material_state_layout_t layout{};
+        layout.struct_size = sizeof(layout);
+        layout.schema_version = 1u;
+        check(nuka_world_get_material_state_layout(h_, UINT32_MAX, &layout), "nuka_world_get_material_state_layout");
+        nb::dict result;
+        result["schema_version"] = layout.schema_version;
+        result["state_schema_version"] = layout.state_schema_version;
+        result["environment_count"] = layout.environment_count;
+        result["state_scalars_per_env"] = layout.state_scalars_per_env;
+        result["trial_scalars_per_env"] = layout.trial_scalars_per_env;
+        nb::list elements;
+        for (uint32_t i = 0u; i < layout.element_count; ++i) {
+            check(nuka_world_get_material_state_layout(h_, i, &layout), "nuka_world_get_material_state_layout");
+            nb::dict entry;
+            entry["element"] = i;
+            entry["history_kind"] = layout.history_kind;
+            entry["state_offset"] = layout.state_offset;
+            entry["state_count"] = layout.state_count;
+            entry["trial_offset"] = layout.trial_offset;
+            entry["trial_count"] = layout.trial_count;
+            nb::list fields;
+            for (uint32_t j = 0u; j < layout.field_count; ++j) {
+                nuka_material_state_field_t field{};
+                field.struct_size = sizeof(field);
+                field.schema_version = 1u;
+                check(nuka_material_state_field_info(layout.state_schema_version, layout.history_kind, j, &field),
+                      "nuka_material_state_field_info");
+                nb::dict semantic;
+                semantic["name"] = field.name;
+                semantic["unit"] = field.unit;
+                semantic["offset"] = field.offset;
+                semantic["count"] = field.count;
+                fields.append(semantic);
+            }
+            entry["fields"] = fields;
+            elements.append(entry);
+        }
+        result["elements"] = elements;
+        return result;
     }
     void set_execution_mode(const std::string& mode) {
         if (mode != "eager" && mode != "graph")
@@ -1790,7 +1866,8 @@ public:
                    uint32_t cable_slab_render_material_id,
                    float mpm_yield_stress, float mpm_hardening_modulus,
                    uint32_t mpm_contact_capacity, float vbd_half_thickness,
-                   float vbd_surface_density, const std::vector<float>& field_material) {
+                   float vbd_surface_density, const std::vector<float>& field_material,
+                   uint32_t field_contract_version) {
         auto vec3 = [](const std::vector<float>& v, float* out, const char* what) {
             if (v.empty()) return;
             if (v.size() != 3) {
@@ -1860,12 +1937,42 @@ public:
         d.cable_slab_render_material_id = cable_slab_render_material_id;
         uint32_t media_id = 0u;
         if (method == NUKA_MEDIA_METHOD_FIELD) {
-            if (field_material.size() != 18u)
-                throw std::runtime_error("field_material must be 18 floats in nuka_field_material_desc_t order");
+            // The full form appends the law code and its six parameters after the reference area, then optionally the
+            // fracture law code and its two parameters, then optionally the section law code and its two parameters.
+            constexpr size_t field_values = (offsetof(nuka_field_material_desc_t, law) - sizeof(uint32_t)) / sizeof(float);
+            constexpr size_t legacy_values = (offsetof(nuka_field_material_desc_t, shear_strength) - sizeof(uint32_t)) / sizeof(float);
+            constexpr size_t law_values = (offsetof(nuka_field_material_desc_t, fracture_law) -
+                                           offsetof(nuka_field_material_desc_t, youngs_cd)) / sizeof(float);
+            constexpr size_t fracture_values = (offsetof(nuka_field_material_desc_t, section_law) -
+                                                offsetof(nuka_field_material_desc_t, shear_tear_energy)) / sizeof(float);
+            constexpr size_t section_values = (sizeof(nuka_field_material_desc_t) -
+                                               offsetof(nuka_field_material_desc_t, bend_stiffness)) / sizeof(float);
+            const bool sectioned =
+                field_material.size() == field_values + 3u + law_values + fracture_values + section_values;
+            const bool fractured = field_material.size() == field_values + 2u + law_values + fracture_values || sectioned;
+            const bool lawful = field_material.size() == field_values + 1u + law_values || fractured;
+            if (field_material.size() != field_values && field_material.size() != legacy_values && !lawful)
+                throw std::runtime_error("field_material must match nuka_field_material_desc_t, with optional shear and "
+                                         "reference area, then optional law and its parameters, then optional fracture "
+                                         "law and its parameters, then optional section law and its parameters");
             nuka_field_material_desc_t f{};
             f.struct_size = sizeof(nuka_field_material_desc_t);
-            std::memcpy(&f.density, field_material.data(), 18u * sizeof(float));
-            check(nuka_scene_add_field_media(h_, &d, &f, &media_id), "nuka_scene_add_field_media");
+            std::memcpy(&f.density, field_material.data(), std::min(field_material.size(), field_values) * sizeof(float));
+            f.law = lawful ? static_cast<uint32_t>(field_material[field_values]) : NUKA_FIELD_LAW_SMALL_STRAIN;
+            if (lawful) std::memcpy(&f.youngs_cd, field_material.data() + field_values + 1u, law_values * sizeof(float));
+            const size_t fracture = field_values + 1u + law_values;
+            f.fracture_law = fractured ? static_cast<uint32_t>(field_material[fracture]) : NUKA_FIELD_FRACTURE_ISOTROPIC;
+            if (fractured)
+                std::memcpy(&f.shear_tear_energy, field_material.data() + fracture + 1u, fracture_values * sizeof(float));
+            const size_t section = fracture + 1u + fracture_values;
+            f.section_law = sectioned ? static_cast<uint32_t>(field_material[section]) : NUKA_FIELD_SECTION_PLATE;
+            if (sectioned)
+                std::memcpy(&f.bend_stiffness, field_material.data() + section + 1u, section_values * sizeof(float));
+            const nuka_field_contract_desc_t contract{sizeof(nuka_field_contract_desc_t),
+                field_contract_version, f.law == NUKA_FIELD_LAW_LOG_STRAIN_ORTHOTROPIC ? 2u : 1u,
+                f.section_law == NUKA_FIELD_SECTION_EFFECTIVE ? 2u : 1u,
+                f.fracture_law == NUKA_FIELD_FRACTURE_MIXED_MODE ? 2u : 1u, NUKA_FIELD_HISTORY_VERSION};
+            check(nuka_scene_add_field_media_v1(h_, &d, &f, &contract, &media_id), "nuka_scene_add_field_media_v1");
             return media_id;
         }
         const nuka_mpm_plasticity_desc_t plasticity{
@@ -1936,6 +2043,10 @@ public:
     }
 
     // Append a tearable seam polyline to the material-field cloth `media_id`.
+    void add_cloth_attachment(uint32_t media_id, uint32_t vertex, float stiffness) {
+        check(nuka_scene_add_cloth_attachment(h_, media_id, vertex, stiffness), "nuka_scene_add_cloth_attachment");
+    }
+
     void add_cloth_seam(uint32_t media_id, const std::vector<uint32_t>& vertices) {
         check(nuka_scene_add_cloth_seam(h_, media_id, vertices.data(), static_cast<uint32_t>(vertices.size())),
               "nuka_scene_add_cloth_seam");
@@ -2218,6 +2329,9 @@ NB_MODULE(_nuka_ext, m) {
         .value("PARTICLE_VELOCITY", NUKA_FIELD_PARTICLE_VELOCITY)
         .value("PARTICLE_INV_MASS", NUKA_FIELD_PARTICLE_INV_MASS)
         .value("PARTICLE_KINEMATIC_TARGET", NUKA_FIELD_PARTICLE_KINEMATIC_TARGET)
+        .value("PARTICLE_ATTACHMENT_STIFFNESS", NUKA_FIELD_PARTICLE_ATTACHMENT_STIFFNESS)
+        .value("MF_CRACK_LOAD", NUKA_FIELD_MF_CRACK_LOAD)
+        .value("MATERIAL_STATE", NUKA_FIELD_MATERIAL_STATE)
         .value("OGC_CONTACT_COUNT", NUKA_FIELD_OGC_CONTACT_COUNT)
         .value("MESH_OGC_PAIR_COUNT", NUKA_FIELD_MESH_OGC_PAIR_COUNT)
         .value("MESH_SDF_PAIR_COUNT", NUKA_FIELD_MESH_SDF_PAIR_COUNT)
@@ -2246,6 +2360,11 @@ NB_MODULE(_nuka_ext, m) {
         .value("SOLVER_PHASE_TIME", NUKA_FIELD_SOLVER_PHASE_TIME)
         .value("SOLVER_RESIDUAL", NUKA_FIELD_SOLVER_RESIDUAL)
         .value("SOLVER_SWEEP_TRACE", NUKA_FIELD_SOLVER_SWEEP_TRACE)
+        .value("MF_CORNER", NUKA_FIELD_MF_CORNER)
+        .value("PARTICLE_ROOT", NUKA_FIELD_PARTICLE_ROOT)
+        .value("MF_TOPOLOGY", NUKA_FIELD_MF_TOPOLOGY)
+        .value("PARTICLE_SURFACE_CORNERS", NUKA_FIELD_PARTICLE_SURFACE_CORNERS)
+        .value("MF_TRACTION", NUKA_FIELD_MF_TRACTION)
         .value("VBD_SOLVE_AUDIT", NUKA_FIELD_VBD_SOLVE_AUDIT)
         .value("UCONTACT_ROW_RANGE", NUKA_FIELD_UCONTACT_ROW_RANGE)
         .value("CONTACT_WARM_START_COUNTS", NUKA_FIELD_CONTACT_WARM_START_COUNTS)
@@ -3275,6 +3394,13 @@ NB_MODULE(_nuka_ext, m) {
              "Set finite uniform gravity Z (m/s^2), preserving X and Y. Applies to "
              "the next production step in every environment; a changed value "
              "invalidates the execution graph.")
+        .def("step_report", &World::step_report, nb::arg("env") = 0u,
+             "Last public step outcome, diagnostic provenance, actual iterations and rollback memory.")
+        .def("material_state_layouts", &World::material_state_layouts,
+             "Typed material state spans, schema versions, field names and SI units.")
+        .def("invalidate_diagnostics", [](World& w) {
+            check(nuka_world_invalidate_diagnostics(w.raw()), "nuka_world_invalidate_diagnostics");
+        }, "Invalidate measured diagnostics after writing through a device view.")
         .def("set_velocity_iterations", &World::set_velocity_iterations, nb::arg("iterations"),
              "Set the block-descent iterations of the contact solve (1..65535). Preserves the "
              "timestep and invalidates the execution graph when the value changes.")
@@ -3647,13 +3773,16 @@ NB_MODULE(_nuka_ext, m) {
              nb::arg("vbd_half_thickness") = 0.0f,
              nb::arg("vbd_surface_density") = 0.0f,
              nb::arg("field_material") = std::vector<float>{},
+             nb::arg("field_contract_version") = 1u,
              "Add a TAGGED media record. kind is a MEDIA_* code (CLOTH/SOFT_TET/"
              "FLUID/GRANULAR/CABLE); method a MEDIA_METHOD_* code (MLSMPM/VBD/FIELD). kind "
              "selects the geometry block (cloth_*/tet_*/fluid_*/cable_*); method selects the "
-             "material block (vbd_*/mpm_*/field_material). A FIELD cloth takes field_material as 18 "
+             "material block (vbd_*/mpm_*/field_material). A FIELD cloth takes field_material as 25 "
              "floats: density, thickness, youngs, poisson, yield_stress, hardening, yield_moment, "
              "bend_hardening, maxwell_modulus[2], maxwell_time[2], bend_maxwell_modulus[2], "
-             "bend_maxwell_time[2], tear_strength, tear_energy. A cable is VBD: cable_start/end + "
+             "bend_maxwell_time[2], tear_strength, tear_energy, weibull_modulus, grain[3], grain_ratio, "
+             "shear_strength, weibull_reference_area. A cable is "
+             "VBD: cable_start/end + "
              "cable_segments links, cable_radius bead size, cable_pin endpoint, optional "
              "cable_slab_* rigid weight welded to the loaded end. Material scalars at 0 take "
              "the cook's own defaults. An illegal (kind x method) pair raises here; an "
@@ -3679,6 +3808,9 @@ NB_MODULE(_nuka_ext, m) {
              "Append a material region to the cloth medium `media_id`: listed vertices take its "
              "contact thickness, friction and particle mass; faces with all three vertices listed "
              "take its density and moduli. Later regions win.")
+        .def("add_cloth_attachment", &SceneBuilder::add_cloth_attachment,
+             nb::arg("media_id"), nb::arg("vertex"), nb::arg("stiffness"),
+             "Add a finite-mass cloth vertex attachment; stiffness is in N/m and the target is a runtime parameter.")
         .def("add_cloth_seam", &SceneBuilder::add_cloth_seam, nb::arg("media_id"), nb::arg("vertices"),
              "Append a seam polyline to the material-field cloth `media_id`: the faces split along it "
              "and a cohesive layer of the medium's tear_strength and tear_energy holds them until it tears.")

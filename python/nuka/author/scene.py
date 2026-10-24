@@ -236,7 +236,7 @@ class Scene:
             e.render is not None for e in self._entities)
         gravity = any(float(g) != 0.0 for g in self.options.gravity)
         thick_grid = any(getattr(e.material, "half_thickness", 0.0) > 0.0 or
-                         getattr(e.material, "surface_density", 0.0) > 0.0 or e.morph.regions
+                         getattr(e.material, "surface_density", 0.0) > 0.0 or e.morph.regions or e.morph.attachments
                          or isinstance(e.material, _materials.FieldMaterial)
                          for e in grids)
         if (not scenes or tets or fluids or grans or cables or rigids or appearance or thick_grid
@@ -444,6 +444,8 @@ class Scene:
                 bend_stiffness=rkw["vbd_bend_stiffness"], damping=rkw["vbd_damping"])
         for seam in getattr(morph, "seams", ()):
             builder.add_cloth_seam(media_id, [int(v) for v in seam])
+        for attachment in getattr(morph, "attachments", ()):
+            builder.add_cloth_attachment(media_id, int(attachment.vertex), float(attachment.stiffness))
 
 
 __all__ = ["Scene", "SimOptions", "Environment"]

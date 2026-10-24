@@ -6,6 +6,7 @@
 
 #include "phi/backend.hpp"
 #include "sensor/state_types.hpp"
+#include "phi/buffer_snapshot.hpp"
 
 namespace nuka::nk { class Model; }
 
@@ -43,6 +44,9 @@ public:
     phi::Status Capture(StateSensorBankSnapshot* snapshot) const;
     bool Compatible(const StateSensorBankSnapshot& snapshot) const;
     phi::Status Restore(const StateSensorBankSnapshot& snapshot);
+    phi::Status CaptureTransaction();
+    phi::Status RollbackTransaction();
+    size_t TransactionByteSize() const { return transaction_.ByteSize(); }
 
     uint32_t Count() const;
     bool HasActive() const;
@@ -79,6 +83,7 @@ private:
     std::vector<phi::OpCall> before_;
     std::vector<phi::OpCall> after_;
     math::Vec3 gravity_;
+    phi::BufferSnapshot transaction_;
 };
 
 }  // namespace nuka::sensor

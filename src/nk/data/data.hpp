@@ -18,6 +18,7 @@
 #include "phi/backend.hpp"   // DataView, BufferType
 #include "nk/data/arena.hpp"
 #include "nk/model/generated/views.hpp"
+#include "phi/buffer_snapshot.hpp"
 
 namespace nuka::nk {
 
@@ -59,6 +60,15 @@ public:
     bool Restore();
     bool HasSnapshot() const { return !snapshot_persistent_.empty(); }
 
+    phi::Status CaptureTransaction();
+    phi::Status RollbackTransaction();
+    phi::Status InvalidateScratch() const;
+    // Scratch bookkeeping on the main stream, not state mutations: zero one scratch field, or write its prefix.
+    phi::Status ClearScratchField(FieldId id) const;
+    phi::Status UploadScratchField(FieldId id, const void* src, uint64_t bytes) const;
+    uint64_t TransactionByteSize() const { return transaction_.ByteSize(); }
+    uint64_t MutationVersion() const { return mutation_version_; }
+
     void* Ptr(FieldId id) const;
     template <class T> T* Ptr(FieldId id) const { return static_cast<T*>(Ptr(id)); }
 
@@ -91,6 +101,9 @@ private:
     const FieldBuffer* OwnBuffer(FieldId id) const;
 
     Arena arena_;
+    phi::BufferType* buffer_type_ = nullptr;
+    phi::BufferSnapshot transaction_;
+    mutable uint64_t mutation_version_ = 0u;
     std::vector<FieldBuffer> own_;
     std::vector<uint8_t> snapshot_persistent_;  // host mirror of the Persistent buffer.
 };

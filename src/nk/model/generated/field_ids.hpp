@@ -60,8 +60,8 @@ enum class FieldId : uint16_t {
     FootShape,  // foot_shape (per:scalar arena:persistent owner:model count:foot_shape_count*5)
     BodyLinearVelocity,  // body_linear_velocity (per:body arena:persistent owner:data)
     BodyAngularVelocity,  // body_angular_velocity (per:body arena:persistent owner:data)
-    BodyForce,  // body_force (per:body arena:scratch owner:data)
-    BodyTorque,  // body_torque (per:body arena:scratch owner:data)
+    BodyForce,  // body_force (per:body arena:persistent owner:data)
+    BodyTorque,  // body_torque (per:body arena:persistent owner:data)
     BodyInvInertia,  // body_inv_inertia (per:body arena:persistent owner:data flags:[param])
     BodyAabbLo,  // body_aabb_lo (per:body arena:scratch owner:data)
     BodyAabbHi,  // body_aabb_hi (per:body arena:scratch owner:data)
@@ -114,6 +114,7 @@ enum class FieldId : uint16_t {
     ParticleVPre,  // particle_v_pre (per:particle arena:scratch owner:data)
     AeroTriVerts,  // aero_tri_verts (per:aero_tri arena:persistent owner:model elem:3)
     AeroTriArea,  // aero_tri_area (per:aero_tri arena:persistent owner:model)
+    AeroTriCornerSource,  // aero_tri_corner_source (per:aero_tri arena:persistent owner:model)
     PbfPredictedPos,  // pbf_predicted_pos (per:particle arena:scratch owner:data)
     RngState,  // rng_state (per:env arena:persistent owner:data flags:[param])
     EnvStatus,  // env_status (per:env arena:scratch owner:data flags:[readout])
@@ -321,12 +322,22 @@ enum class FieldId : uint16_t {
     ParticleResponse,  // particle_response (per:particle arena:scratch owner:data)
     ParticleRowImpulse,  // particle_row_impulse (per:particle arena:scratch owner:data)
     VbdFreeRate,  // vbd_free_rate (per:scalar arena:scratch owner:data count:vbd_vertices_per_env*env_count)
+    VbdSolveRate,  // vbd_solve_rate (per:scalar arena:scratch owner:data count:vbd_vertices_per_env*env_count)
     VbdOffset,  // vbd_offset (per:scalar arena:scratch owner:data count:vbd_vertices_per_env*env_count)
     VbdInertia,  // vbd_inertia (per:scalar arena:scratch owner:data count:vbd_vertices_per_env*env_count)
     VbdHistoryVel,  // vbd_history_vel (per:scalar arena:persistent owner:data count:vbd_vertices_per_env*env_count)
     VbdHistoryReady,  // vbd_history_ready (per:env arena:persistent owner:data)
     ParticleKinematicTarget,  // particle_kinematic_target (per:particle arena:persistent owner:data flags:[param])
+    ParticleAttachmentStiffness,  // particle_attachment_stiffness (per:particle arena:persistent owner:data flags:[param])
+    ParticleAttachmentPreviousStiffness,  // particle_attachment_previous_stiffness (per:particle arena:persistent owner:data)
+    ParticleAttachmentPreviousTarget,  // particle_attachment_previous_target (per:particle arena:persistent owner:data)
+    SnapshotParticleAttachmentStiffness,  // snapshot_particle_attachment_stiffness (per:particle arena:persistent owner:data)
+    SnapshotParticleAttachmentPreviousStiffness,  // snapshot_particle_attachment_previous_stiffness (per:particle arena:persistent owner:data)
+    SnapshotParticleAttachmentPreviousTarget,  // snapshot_particle_attachment_previous_target (per:particle arena:persistent owner:data)
+    SnapshotParticleKinematicTarget,  // snapshot_particle_kinematic_target (per:particle arena:persistent owner:data)
     OgcContactCount,  // ogc_contact_count (per:env arena:scratch owner:data)
+    OgcContactDemand,  // ogc_contact_demand (per:env arena:scratch owner:data)
+    MfRangeElement,  // mf_range_element (per:env arena:scratch owner:data)
     DatParticleBeta,  // dat_particle_beta (per:particle arena:scratch owner:data flags:[readout])
     DatBodyBeta,  // dat_body_beta (per:body arena:scratch owner:data)
     DatArticBeta,  // dat_artic_beta (per:articulation arena:scratch owner:data)
@@ -368,14 +379,15 @@ enum class FieldId : uint16_t {
     SolverColorCounts,  // solver_color_counts (per:env arena:scratch owner:data elem:6)
     SolverPhaseTime,  // solver_phase_time (per:env arena:scratch owner:data elem:8)
     DatSurfaceMotion,  // dat_surface_motion (per:scalar arena:scratch owner:data count:particle_surfaces_per_env*env_count)
-    EnergyLedger,  // energy_ledger (per:scalar arena:scratch owner:data elem:34 count:integration_substeps*env_count flags:[readout])
-    EnergyLedgerSum,  // energy_ledger_sum (per:scalar arena:scratch owner:data elem:34 count:integration_substeps*env_count)
+    EnergyLedger,  // energy_ledger (per:scalar arena:scratch owner:data elem:36 count:integration_substeps*env_count flags:[readout])
+    EnergyLedgerSum,  // energy_ledger_sum (per:scalar arena:scratch owner:data elem:36 count:integration_substeps*env_count)
     EnergyLedgerStatus,  // energy_ledger_status (per:scalar arena:scratch owner:data count:integration_substeps*env_count flags:[readout])
     PhysicsStageMetrics,  // physics_stage_metrics (per:scalar arena:scratch owner:data elem:195 count:integration_substeps*env_count flags:[readout])
     ContactAuditCounts,  // contact_audit_counts (per:scalar arena:scratch owner:data elem:8 count:integration_substeps*env_count flags:[readout])
     ContactAuditMetrics,  // contact_audit_metrics (per:scalar arena:scratch owner:data elem:7 count:integration_substeps*env_count flags:[readout])
     ReadoutPartials,  // readout_partials (per:scalar arena:scratch owner:data elem:195 count:max(env_count,readout_partial_rows))
     EnergyParticleStart,  // energy_particle_start (per:particle arena:scratch owner:data)
+    EnergyParticleStartVelocity,  // energy_particle_start_velocity (per:particle arena:scratch owner:data)
     EnergyAeroImpulse,  // energy_aero_impulse (per:particle arena:scratch owner:data)
     EnergyKinematicContactImpulse,  // energy_kinematic_contact_impulse (per:particle arena:scratch owner:data)
     EnergyLinkStartQ,  // energy_link_start_q (per:link arena:scratch owner:data)
@@ -405,14 +417,36 @@ enum class FieldId : uint16_t {
     DatArticParent,  // dat_artic_parent (per:articulation arena:scratch owner:data)
     Telemetry,  // telemetry (per:scalar arena:scratch owner:data count:telemetry_words flags:[readout])
     MfElements,  // mf_elements (per:scalar arena:persistent owner:model count:mf_elements_per_env)
+    MfFacePartner,  // mf_face_partner (per:scalar arena:persistent owner:model count:mf_elements_per_env)
+    MfStress,  // mf_stress (per:scalar arena:scratch owner:data count:mf_elements_per_env*env_count)
+    MfCrackLoad,  // mf_crack_load (per:scalar arena:scratch owner:data count:mf_elements_per_env*env_count)
     MfMaterials,  // mf_materials (per:scalar arena:persistent owner:model count:mf_materials)
     MfIncidenceOffsets,  // mf_incidence_offsets (per:scalar arena:persistent owner:model count:mf_vertices_per_env+1)
     MfIncidence,  // mf_incidence (per:scalar arena:persistent owner:model count:mf_incidence_per_env)
     MfStartMetric,  // mf_start_metric (per:scalar arena:scratch owner:data count:mf_elements_per_env*env_count)
-    MfHistory,  // mf_history (per:scalar arena:persistent owner:data elem:13 count:mf_elements_per_env*env_count)
-    SnapshotMfHistory,  // snapshot_mf_history (per:scalar arena:persistent owner:data elem:13 count:mf_elements_per_env*env_count)
-    MfTrial,  // mf_trial (per:scalar arena:scratch owner:data elem:15 count:mf_elements_per_env*env_count)
+    MfHistory,  // mf_history (per:scalar arena:persistent owner:data count:mf_state_scalars_per_env*env_count)
+    SnapshotMfHistory,  // snapshot_mf_history (per:scalar arena:persistent owner:data count:mf_state_scalars_per_env*env_count)
+    MfTrial,  // mf_trial (per:scalar arena:scratch owner:data count:mf_trial_scalars_per_env*env_count)
     MfEnvCommit,  // mf_env_commit (per:scalar arena:scratch owner:data count:env_count)
+    MfIncidenceAnchor,  // mf_incidence_anchor (per:scalar arena:persistent owner:model count:mf_incidence_per_env)
+    MfColor,  // mf_color (per:scalar arena:persistent owner:model count:mf_vertices_per_env)
+    MfCorner,  // mf_corner (per:scalar arena:persistent owner:data elem:12 count:mf_elements_per_env*env_count)
+    SnapshotMfCorner,  // snapshot_mf_corner (per:scalar arena:persistent owner:data elem:12 count:mf_elements_per_env*env_count)
+    ParticleRoot,  // particle_root (per:scalar arena:persistent owner:data count:particles_per_env*env_count)
+    SnapshotParticleRoot,  // snapshot_particle_root (per:scalar arena:persistent owner:data count:particles_per_env*env_count)
+    SnapshotParticleInvMass,  // snapshot_particle_inv_mass (per:scalar arena:persistent owner:data count:particles_per_env*env_count)
+    MfTraction,  // mf_traction (per:scalar arena:scratch owner:data count:mf_elements_per_env*env_count)
+    MfCracks,  // mf_cracks (per:scalar arena:scratch owner:data count:mf_elements_per_env*env_count)
+    MfCrackCount,  // mf_crack_count (per:scalar arena:scratch owner:data count:env_count)
+    MfOpened,  // mf_opened (per:scalar arena:scratch owner:data count:mf_elements_per_env*env_count)
+    MfOpenedCount,  // mf_opened_count (per:scalar arena:scratch owner:data count:env_count)
+    MfTopology,  // mf_topology (per:scalar arena:persistent owner:data count:env_count)
+    ParticleSurfaceCornerSource,  // particle_surface_corner_source (per:scalar arena:persistent owner:model count:particle_surface_triangles*3)
+    ParticleSurfaceCorners,  // particle_surface_corners (per:scalar arena:persistent owner:data count:particle_surface_triangles*3*env_count)
+    SnapshotParticleSurfaceCorners,  // snapshot_particle_surface_corners (per:scalar arena:persistent owner:data count:particle_surface_triangles*3*env_count)
+    ParticleSurfaceLiveEdges,  // particle_surface_live_edges (per:scalar arena:persistent owner:data count:particle_surface_edges_per_env*env_count)
+    SnapshotParticleSurfaceLiveEdges,  // snapshot_particle_surface_live_edges (per:scalar arena:persistent owner:data count:particle_surface_edges_per_env*env_count)
+    SolverExecutedIterations,  // solver_executed_iterations (per:scalar arena:scratch owner:data count:integration_substeps*env_count)
     Count
 };
 
@@ -522,6 +556,7 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "particle_v_pre",
     "aero_tri_verts",
     "aero_tri_area",
+    "aero_tri_corner_source",
     "pbf_predicted_pos",
     "rng_state",
     "env_status",
@@ -729,12 +764,22 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "particle_response",
     "particle_row_impulse",
     "vbd_free_rate",
+    "vbd_solve_rate",
     "vbd_offset",
     "vbd_inertia",
     "vbd_history_vel",
     "vbd_history_ready",
     "particle_kinematic_target",
+    "particle_attachment_stiffness",
+    "particle_attachment_previous_stiffness",
+    "particle_attachment_previous_target",
+    "snapshot_particle_attachment_stiffness",
+    "snapshot_particle_attachment_previous_stiffness",
+    "snapshot_particle_attachment_previous_target",
+    "snapshot_particle_kinematic_target",
     "ogc_contact_count",
+    "ogc_contact_demand",
+    "mf_range_element",
     "dat_particle_beta",
     "dat_body_beta",
     "dat_artic_beta",
@@ -784,6 +829,7 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "contact_audit_metrics",
     "readout_partials",
     "energy_particle_start",
+    "energy_particle_start_velocity",
     "energy_aero_impulse",
     "energy_kinematic_contact_impulse",
     "energy_link_start_q",
@@ -813,6 +859,9 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "dat_artic_parent",
     "telemetry",
     "mf_elements",
+    "mf_face_partner",
+    "mf_stress",
+    "mf_crack_load",
     "mf_materials",
     "mf_incidence_offsets",
     "mf_incidence",
@@ -821,6 +870,25 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "snapshot_mf_history",
     "mf_trial",
     "mf_env_commit",
+    "mf_incidence_anchor",
+    "mf_color",
+    "mf_corner",
+    "snapshot_mf_corner",
+    "particle_root",
+    "snapshot_particle_root",
+    "snapshot_particle_inv_mass",
+    "mf_traction",
+    "mf_cracks",
+    "mf_crack_count",
+    "mf_opened",
+    "mf_opened_count",
+    "mf_topology",
+    "particle_surface_corner_source",
+    "particle_surface_corners",
+    "snapshot_particle_surface_corners",
+    "particle_surface_live_edges",
+    "snapshot_particle_surface_live_edges",
+    "solver_executed_iterations",
 };
 inline constexpr const char* FieldName(FieldId id) {
     return static_cast<int>(id) < kFieldCount ? kFieldNames[static_cast<int>(id)] : "unknown";

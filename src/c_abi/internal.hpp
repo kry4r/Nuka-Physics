@@ -44,6 +44,7 @@ class StudioRtRenderer;   // render/studio_beauty.hpp -- the offline RT beauty t
 namespace nuka::c_abi {
 
 nuka_result_t MapStatusToResult(phi::Status status) noexcept;
+void SetErrorMessage(const char* message) noexcept;
 
 struct DeviceRecord {
     // Device ordinal shared by physics and noise.
@@ -304,5 +305,8 @@ bool SceneSensorShapesAgree(const nuka::scene::SceneIR& scene);
 // sensor.cpp), carrying render settings and imaging models from `previous`.
 nuka_result_t AttachSceneSensors(WorldRecord& record, const SensorAttachment* previous,
                                  uint32_t* cameras, uint32_t* lidars);
+
+// Render surface `index`'s triangles; a fracturing field's follow env 0's live split corners (world.cpp).
+std::vector<uint32_t> LiveSurfaceTriangles(const WorldRecord& record, size_t index);
 
 } // namespace nuka::c_abi

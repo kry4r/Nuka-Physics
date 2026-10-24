@@ -28,6 +28,15 @@ double Cross2(Point2 a, Point2 b) { return a[0] * b[1] - a[1] * b[0]; }
 double Dot2(Point2 a, Point2 b) { return a[0] * b[0] + a[1] * b[1]; }
 Point2 Sub2(Point2 a, Point2 b) { return {a[0] - b[0], a[1] - b[1]}; }
 
+// A uniform draw in (0, 1) fixed by an edge's two welded ends.
+double EdgeUniform(uint32_t a, uint32_t b) {
+    uint64_t h = (uint64_t{std::min(a, b)} << 32u | std::max(a, b)) * 0x9E3779B97F4A7C15ull;
+    h ^= h >> 31u;
+    h *= 0xBF58476D1CE4E5B9ull;
+    h ^= h >> 29u;
+    return (double(h >> 11u) + 0.5) / 9007199254740992.0;
+}
+
 // Rest corners of a face in its own plane: the pattern face when given, else the 3D rest triangle.
 std::array<Point2, 3> FaceLayout(const std::vector<math::Vec3>& rest_positions, const ClothTriangle& tri,
                                  const std::vector<std::array<math::Vec3, 3>>& material_faces, size_t f) {
@@ -176,28 +185,66 @@ void BuildFieldShellElements(const std::vector<math::Vec3>& rest_positions,
                              const std::vector<std::array<math::Vec3, 3>>& material_faces,
                              const std::vector<uint32_t>& weld,
                              const nk::MfMaterial& material, uint32_t material_index,
-                             std::vector<nk::MfElement>& out) {
+                             float weibull_modulus, const math::Vec3& grain, float grain_ratio,
+                             std::vector<nk::MfElement>& out, float weibull_reference_area) {
     if (!nk::mf::ValidMaterial(material))
         throw std::invalid_argument("Material-field shell needs positive density, thickness and modulus");
+    const bool orthotropic = material.law == nk::kMfLogStrainOrthotropicLaw;
     ShellMaterial shell;
     shell.stretch_stiffness = material.youngs * material.thickness;
-    shell.poisson = material.poisson;
+    shell.poisson = orthotropic ? 0.0f : material.poisson;
     std::vector<nk::VbdElement> elements;
     BuildClothVertexBlocks(rest_positions, triangles, material_faces,
                            std::vector<ShellMaterial>(triangles.size(), shell), elements);
-    for (const nk::VbdElement& e : elements) {
+    // The orthotropic law reads each face in its grain frame: axis 1 along the grain projected into the face.
+    std::vector<Point2> axis(orthotropic ? triangles.size() : 0u);
+    for (size_t f = 0u; f < axis.size(); ++f) {
+        Point2 g{grain.x, grain.y};
+        if (material_faces.empty()) {
+            const math::Vec3 e1 = rest_positions[triangles[f].v[1]] - rest_positions[triangles[f].v[0]];
+            const math::Vec3 normal = e1.Cross(rest_positions[triangles[f].v[2]] - rest_positions[triangles[f].v[0]]);
+            const math::Vec3 t = e1 / e1.Length(), b = normal.Cross(t) / normal.Length();
+            g = {grain.Dot(t), grain.Dot(b)};
+        }
+        const double length = std::sqrt(Dot2(g, g));
+        if (!(length >= 0.5 * grain.Length()))
+            throw std::invalid_argument("Material-field grain must lie within 60 degrees of every rest face");
+        axis[f] = {g[0] / length, g[1] / length};
+    }
+    const size_t first_triangle = out.size();
+    for (size_t k = 0u; k < elements.size(); ++k) {
+        const nk::VbdElement& e = elements[k];
         nk::MfElement f;
         f.material = material_index;
         f.kind = nk::kMfTriangle;
         for (uint32_t j = 0u; j < 3u; ++j) f.vertex[j] = e.vertex[j];
         for (uint32_t j = 0u; j < 5u; ++j) f.rest[j] = e.rest[j];
+        if (orthotropic) {
+            // Inverse rest edges times Q^T, with Q taking face coordinates to the grain frame.
+            const double c = axis[k][0], s = axis[k][1];
+            for (uint32_t row = 0u; row < 2u; ++row) {
+                const double r0 = e.rest[2u * row], r1 = e.rest[2u * row + 1u];
+                f.rest[2u * row] = static_cast<float>(r0 * c + r1 * s);
+                f.rest[2u * row + 1u] = static_cast<float>(r1 * c - r0 * s);
+            }
+        }
         out.push_back(f);
     }
     std::vector<std::array<Point2, 3>> layout(triangles.size());
     const auto welded = [&](uint32_t v) { return weld.empty() ? v : weld[v]; };
+    // A face corner's rest point, in the pattern's plane when a pattern is given.
+    const auto corner = [&](size_t f, uint32_t k) {
+        return material_faces.empty() ? rest_positions[triangles[f].v[k]]
+                                      : math::Vec3{material_faces[f][k].x, material_faces[f][k].y, 0.0f};
+    };
     std::map<std::pair<uint32_t, uint32_t>, std::vector<std::pair<uint32_t, uint32_t>>> edge_faces;
     for (size_t f = 0u; f < triangles.size(); ++f) {
         layout[f] = FaceLayout(rest_positions, triangles[f], material_faces, f);
+        if (orthotropic)
+            for (Point2& p : layout[f]) {
+                const Point2 q = p;
+                p = {axis[f][0] * q[0] + axis[f][1] * q[1], axis[f][0] * q[1] - axis[f][1] * q[0]};
+            }
         for (uint32_t j = 0u; j < 3u; ++j) {
             const uint32_t a = welded(triangles[f].v[j]), b = welded(triangles[f].v[(j + 1u) % 3u]);
             edge_faces[{std::min(a, b), std::max(a, b)}].push_back({static_cast<uint32_t>(f), j});
@@ -205,9 +252,19 @@ void BuildFieldShellElements(const std::vector<math::Vec3>& rest_positions,
     }
     const double D = nk::mf::BendingModulus<double>(material), nu = material.poisson;
     // Plate rigidity over (kxx, kxy, kyy): D [nu tr^2 + (1 - nu)(kxx^2 + 2 kxy^2 + kyy^2)].
-    const double P[3][3] = {{D, 0.0, nu * D}, {0.0, 2.0 * (1.0 - nu) * D, 0.0}, {nu * D, 0.0, D}};
+    double P[3][3] = {{D, 0.0, nu * D}, {0.0, 2.0 * (1.0 - nu) * D, 0.0}, {nu * D, 0.0, D}};
+    if (orthotropic) {
+        // The orthotropic section stiffness over Voigt (kxx, kyy, 2 kxy), reordered to (kxx, kxy, kyy).
+        const auto base = nk::mf::BendBase<double>(material);
+        const auto& v = base.value;
+        const double reordered[3][3] = {{v[0][0], 2.0 * v[0][2], v[0][1]},
+                                        {2.0 * v[0][2], 4.0 * v[2][2], 2.0 * v[1][2]},
+                                        {v[0][1], 2.0 * v[1][2], v[1][1]}};
+        for (uint32_t a = 0u; a < 3u; ++a)
+            for (uint32_t b = 0u; b < 3u; ++b) P[a][b] = reordered[a][b];
+    }
     // Each cut edge as (face, hinge) on both sides, and each face's bend.
-    std::vector<std::array<uint32_t, 4>> cuts;
+    std::vector<std::array<uint32_t, 4>> cuts, uncut;
     std::vector<uint32_t> bend_of(triangles.size(), ~0u);
     for (size_t f = 0u; f < triangles.size(); ++f) {
         const ClothTriangle& tri = triangles[f];
@@ -236,6 +293,8 @@ void BuildFieldShellElements(const std::vector<math::Vec3>& rest_positions,
                     throw std::invalid_argument("Cloth faces sharing an edge must be consistently wound");
                 if (f < g && (other.v[cg] != tri.v[i1] || other.v[(cg + 1u) % 3u] != tri.v[i0]))
                     cuts.push_back({static_cast<uint32_t>(f), i, g, (cg + 2u) % 3u});
+                else if (f < g && weibull_modulus > 0.0f)
+                    uncut.push_back({static_cast<uint32_t>(f), i, g, (cg + 2u) % 3u});
                 const uint32_t w = (cg + 2u) % 3u;
                 const Point2 to0 = Sub2(layout[g][w], layout[g][(cg + 1u) % 3u]);
                 const Point2 to1 = Sub2(layout[g][w], layout[g][cg]);
@@ -245,7 +304,10 @@ void BuildFieldShellElements(const std::vector<math::Vec3>& rest_positions,
                 const double side = Cross2(u, r) > 0.0 ? -1.0 : 1.0;
                 far = {x0[0] + along * u[0] - side * height * u[1], x0[1] + along * u[1] + side * height * u[0]};
                 bend.hinges |= 1u << i;
-                bend.vertex[3u + far_count++] = other.v[w];
+                const uint32_t offset = 3u + 3u * far_count++;
+                bend.vertex[offset] = other.v[(cg + 1u) % 3u];
+                bend.vertex[offset + 1u] = other.v[cg];
+                bend.vertex[offset + 2u] = other.v[w];
                 bend.rest[10u + i] = material_faces.empty()
                     ? DihedralAngle(rest_positions[tri.v[i0]], rest_positions[tri.v[i1]],
                                     rest_positions[tri.v[i]], rest_positions[other.v[w]])
@@ -293,12 +355,16 @@ void BuildFieldShellElements(const std::vector<math::Vec3>& rest_positions,
             bend.rest[6u + k] = static_cast<float>(2.0 * B[1][k]);
         }
         bend.rest[9] = static_cast<float>(area);
+        if (!nk::mf::InitializeBendDual(bend, material))
+            throw std::invalid_argument("Material-field bend curvature map is rank deficient");
         bend_of[f] = static_cast<uint32_t>(out.size());
         out.push_back(bend);
     }
-    // A cut edge runs from face a's corner i + 1 to i + 2 and back over face b's corners j + 2 to j + 1; each end
-    // whose copies differ is a node pair of weight L t / 2, held by a cohesive layer 1% as compliant as the face.
-    for (const auto& [fa, i, fb, j] : cuts) {
+    // Corresponding edge endpoints form cohesive pairs of weight L t / 2 and 1% of the face compliance.
+    // An uncut edge pairs each endpoint with itself until fracture separates its copies.
+    for (size_t k = 0u; k < cuts.size() + uncut.size(); ++k) {
+        const bool cut = k < cuts.size();
+        const auto [fa, i, fb, j] = cut ? cuts[k] : uncut[k - cuts.size()];
         const ClothTriangle &a = triangles[fa], &b = triangles[fb];
         const uint32_t ends[2][2] = {{a.v[(i + 1u) % 3u], b.v[(j + 2u) % 3u]}, {a.v[(i + 2u) % 3u], b.v[(j + 1u) % 3u]}};
         nk::MfElement seam;
@@ -306,7 +372,7 @@ void BuildFieldShellElements(const std::vector<math::Vec3>& rest_positions,
         seam.material = material_index;
         uint32_t pairs = 0u;
         for (const auto& end : ends)
-            if (end[0] != end[1]) {
+            if (end[0] != end[1] || !cut) {
                 seam.vertex[2u * pairs] = end[0];
                 seam.vertex[2u * pairs + 1u] = end[1];
                 ++pairs;
@@ -318,10 +384,25 @@ void BuildFieldShellElements(const std::vector<math::Vec3>& rest_positions,
         const double length = std::sqrt(Dot2(edge, edge));
         seam.rest[0] = static_cast<float>(0.5 * length * material.thickness);
         seam.rest[1] = static_cast<float>(100.0 * material.youngs / length);
+        const double tributary_area = (out[first_triangle + fa].rest[4] + out[first_triangle + fb].rest[4]) / 3.0;
+        const double scale = weibull_reference_area > 0.0f ? weibull_reference_area / tributary_area : 1.0;
+        const double scatter = cut ? 1.0 : std::pow(
+            -std::log(EdgeUniform(welded(ends[0][0]), welded(ends[1][0]))), 1.0 / weibull_modulus);
+        // Paper parts along its grain at the tear strength and across it at grain_ratio times that.
+        const math::Vec3 line = corner(fa, (i + 2u) % 3u) - corner(fa, (i + 1u) % 3u);
+        const double along = grain_ratio > 0.0f ? line.Dot(grain) / (line.Length() * grain.Length()) : 1.0;
+        seam.rest[3] = static_cast<float>((1.0 + (grain_ratio - 1.0) * (1.0 - along * along)) * scatter);
+        // Weakest-link area scaling controls nucleation; the cohesive traction law is a local material property.
+        seam.rest[2] = seam.rest[3] * static_cast<float>(cut ? 1.0 : std::pow(scale, 1.0 / weibull_modulus));
         const nk::mf::CohesiveLaw law = nk::mf::SeamLaw(seam, material);
-        if (!(material.tear_strength > 0.0f) || !(law.Parting() > law.Onset()))
+        const nk::mf::MixedCohesiveLaw mixed = nk::mf::MixedSeamLaw(seam, material);
+        if (!(material.tear_strength > 0.0f) || !(law.Parting() > law.Onset()) ||
+            (material.fracture_law == nk::kMfMixedModeCohesive && !(mixed.shear_toughness > mixed.Onset())))
             throw std::invalid_argument("Material-field seams need a tear strength and a tear energy above "
-                                        "strength^2 / (2 x seam stiffness)");
+                                        "strength^2 / (2 x seam stiffness), in opening and in sliding");
+        if (weibull_modulus > 0.0f)
+            out[first_triangle + fa].vertex[3u + i] = out[first_triangle + fb].vertex[3u + j] =
+                static_cast<uint32_t>(out.size());
         out.push_back(seam);
     }
 }

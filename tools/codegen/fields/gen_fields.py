@@ -63,8 +63,8 @@ DTYPE_INFO: dict[str, dict[str, Any]] = {
     "point_endpoint_term": {"cpp": "::nuka::nk::PointEndpointTerm", "code": "kU8", "lanes": 44},
     "vbd_element": {"cpp": "::nuka::nk::VbdElement", "code": "kU8", "lanes": 64},
     "vbd_membrane_start": {"cpp": "::nuka::nk::vbd::MembraneStartState", "code": "kU8", "lanes": 36},
-    "mf_element": {"cpp": "::nuka::nk::MfElement", "code": "kU8", "lanes": 96},
-    "mf_material": {"cpp": "::nuka::nk::MfMaterial", "code": "kU8", "lanes": 72},
+    "mf_element": {"cpp": "::nuka::nk::MfElement", "code": "kU8", "lanes": 172},
+    "mf_material": {"cpp": "::nuka::nk::MfMaterial", "code": "kU8", "lanes": 128},
 }
 
 VALID_PER = {
@@ -246,6 +246,13 @@ def gen_views(fields: list[dict[str, Any]]) -> str:
     lines.append("};")
     lines.append("")
     lines.append("} // namespace nuka::phi")
+    lines.append("")
+    # A byte-registered struct larger than its registry entry would lose its tail on upload.
+    used = sorted({f["dtype"] for f in fields if DTYPE_INFO[f["dtype"]]["code"] == "kU8" and f["dtype"] != "u8"})
+    for name in used:
+        info = DTYPE_INFO[name]
+        lines.append(f'static_assert(sizeof({info["cpp"]}) == {info["lanes"]}u, '
+                     f'"{name}: sizeof differs from its fields.yaml registry size");')
     lines.append("")
     return "\n".join(lines)
 

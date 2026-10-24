@@ -42,6 +42,14 @@ class ClothRegion:
 
 
 @_dc.dataclass(frozen=True)
+class ClothAttachment:
+    """A finite-mass vertex spring to a world-space runtime target; stiffness is in N/m."""
+
+    vertex: int
+    stiffness: float
+
+
+@_dc.dataclass(frozen=True)
 class Grid:
     """A flat ``nx`` x ``ny`` cloth lattice at ``spacing`` m, centred on ``origin``.
 
@@ -59,6 +67,7 @@ class Grid:
     origin: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     regions: Tuple[ClothRegion, ...] = ()
     seams: Tuple[Tuple[int, ...], ...] = ()
+    attachments: Tuple[ClothAttachment, ...] = ()
 
     def media_geometry_kwargs(self) -> dict:
         """The cloth geometry block for ``SceneBuilder.add_media`` (used when the
@@ -328,6 +337,6 @@ class Ground:
 
 
 __all__ = [
-    "NKS", "ClothRegion", "Grid", "TetSphere", "FluidBox", "GranularBed", "MpmFill", "Cable",
+    "NKS", "ClothRegion", "ClothAttachment", "Grid", "TetSphere", "FluidBox", "GranularBed", "MpmFill", "Cable",
     "CableSlab", "Box", "Sphere", "Capsule", "Cylinder", "Plane", "Ground",
 ]

@@ -498,7 +498,7 @@ nuka_result_t nuka_world_checkpoint_restore(nuka_world_handle world,
         // Gravity lives on the world, outside the persistent bytes, and randomization may have moved it.
         const nuka::phi::Status gravity = record->world->SetGravity(saved->step_options.gravity);
         if (gravity != nuka::phi::Status::Ok) return nuka::c_abi::MapStatusToResult(gravity);
-        if (!record->world->GetData().UploadPersistent(saved->persistent)) {
+        if (record->world->RestorePersistentState(saved->persistent) != nuka::phi::Status::Ok) {
             return NUKA_RESULT_INVALID_ARG;
         }
         nuka::c_abi::RestoreHostState(*saved, record);

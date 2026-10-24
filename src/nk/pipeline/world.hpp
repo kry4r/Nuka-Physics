@@ -15,6 +15,7 @@
 #include "nk/model/generated/views.hpp"
 #include "nk/readout/telemetry.hpp"
 #include "sensor/state_bank.hpp"
+#include "nk/pipeline/step_report.hpp"
 
 namespace nuka::nk {
 
@@ -59,6 +60,15 @@ public:
     phi::Status CreationStatus() const { return creation_status_; }
     const std::string& CreationError() const { return creation_error_; }
     phi::Status LastStatus() const { return last_status_; }
+    const PublicStepReport& LastStepReport() const {
+        if (step_data_version_ != data_.MutationVersion()) step_report_.stamp.valid = false;
+        return step_report_;
+    }
+    void InvalidateDiagnostics();
+    phi::Status RestorePersistentState(const std::vector<uint8_t>& bytes);
+    uint64_t TransactionByteSize() const {
+        return data_.TransactionByteSize() + state_sensors_.TransactionByteSize();
+    }
     uint32_t EnvCount() const { return model_.capacities.env_count; }
 
     // Rebuild the common operator parameters; state and readout buffers retain their identity.
@@ -115,7 +125,10 @@ public:
     phi::Status Reset(const std::vector<uint32_t>& env_ids = {});
 
     // Recompute every environment's link and body poses from joint state without stepping.
-    phi::Status ForwardKinematics() { return RefreshPoses(0u); }
+    phi::Status ForwardKinematics() {
+        InvalidateDiagnostics();
+        return RefreshPoses(0u);
+    }
 
     // Dispatch a single op outside the per-step pipeline (oracle harness +
     // snapshot/restore/obs plumbing). params must match the op's POD.
@@ -137,6 +150,11 @@ public:
     phi::Backend* Backend() const { return backend_; }
 
 private:
+    phi::Status BeginStep();
+    phi::Status FinishStep(phi::Status status);
+    // The insertion event loop: after an attempt that opened seams, roll back to the step start, reopen every
+    // attempt's seams in their order and ask for another attempt, until one opens none or the budget is spent.
+    phi::Status ReplayOpenedSeams(bool* again);
     // Seed environment state from the model and capture the reset snapshot.
     bool SeedInitialState();
     phi::Status RefreshPoses(uint32_t selected_env_count);
@@ -152,6 +170,8 @@ private:
     // Builds the pipeline for a demand, widening the solver scratch and measurement buffers it needs.
     phi::Status BuildDemanded(uint32_t demand, std::unique_ptr<Pipeline>* out);
     void InstallPipeline(std::unique_ptr<Pipeline> candidate);
+    // Clearing scratch clears the telemetry ring with its header; this reopens it empty at its capacity.
+    phi::Status RestartTelemetry();
 
     Model           model_;
     sensor::StateSensorBank state_sensors_;
@@ -162,6 +182,7 @@ private:
     uint32_t        readout_demand_ = 0;
     uint32_t        telemetry_mask_ = 0u;
     uint32_t        telemetry_read_ = 0u;  // sequence of the next unread telemetry record
+    float           telemetry_alert_ = 0.0f;
     phi::Backend*   backend_ = nullptr;
     phi::ModelView  model_view_{};
     phi::DataView   data_view_{};
@@ -176,6 +197,16 @@ private:
     phi::Status     creation_status_ = phi::Status::Failed;
     phi::Status     last_status_ = phi::Status::Ok;
     std::string     creation_error_;
+    mutable PublicStepReport step_report_;
+    uint64_t step_data_version_ = 0u;
+    uint64_t public_step_ = 0u;
+    uint64_t state_version_ = 0u;
+    std::vector<uint32_t> step_flags_, step_epochs_, step_iterations_, step_demand_, step_pending_, step_range_;
+    // Per attempt of the current step: each env's opened-seam count and its list, env-major at the field stride.
+    struct OpenedSeams {
+        std::vector<uint32_t> counts, seams;
+    };
+    std::vector<OpenedSeams> opened_attempts_;
 
     // Reset/snapshot op params storage (stable addresses for dispatch).
     phi::ResetEnvsParams     reset_params_{};

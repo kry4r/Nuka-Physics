@@ -252,6 +252,80 @@ void nuka_world_destroy(nuka_world_handle world);
 nuka_result_t nuka_world_step(nuka_world_handle world);
 nuka_result_t nuka_world_step_n(nuka_world_handle world, uint32_t step_count);
 
+typedef enum nuka_step_outcome_t {
+    NUKA_STEP_UNMEASURED = 0, NUKA_STEP_ACCEPTED = 1, NUKA_STEP_BACKEND_FAILURE = 2,
+    NUKA_STEP_LOCAL_MATERIAL_FAILURE = 3, NUKA_STEP_MATERIAL_OUT_OF_RANGE = 4,
+    NUKA_STEP_CAPACITY_EXCEEDED = 5, NUKA_STEP_INVALID_GEOMETRY = 6,
+    NUKA_STEP_SOLVER_FAILURE = 7, NUKA_STEP_BATCH_REJECTED = 8
+} nuka_step_outcome_t;
+
+typedef struct nuka_step_report_t {
+    uint32_t struct_size;
+    uint32_t schema_version;
+    uint64_t public_step;
+    uint64_t state_version;
+    uint32_t attempt;
+    uint32_t diagnostics_valid;
+    uint32_t accepted;
+    uint32_t rolled_back;
+    uint32_t outcome;
+    uint32_t flags;
+    uint32_t topology_epoch;
+    uint32_t requested_iterations;
+    uint32_t configured_iterations;
+    uint32_t iteration_budget;
+    uint32_t substeps;
+    uint32_t physical_convergence_measured;
+    uint64_t transaction_bytes;
+    double time;
+    double advanced_dt;
+    uint32_t contact_capacity;  // OGC contact slots per environment
+    uint32_t contact_demand;    // the step's largest OGC slot request; above contact_capacity when it overflowed
+    // Seams the step's last attempt opened without re-solving with them; nonzero only once `attempt` reached the
+    // insertion event loop's budget.
+    uint32_t topology_pending;
+    // One plus the largest material-field element whose law left its declared range in the last attempt, 0 if none.
+    uint32_t range_element;
+} nuka_step_report_t;
+
+// A batch rejection rolls back every environment; failed-attempt flags remain in this report. struct_size may
+// also be offsetof(nuka_step_report_t, contact_capacity), which omits the contact fields.
+nuka_result_t nuka_world_get_step_report(nuka_world_handle world, uint32_t env,
+    nuka_step_report_t* report, uint32_t* executed_iterations, uint32_t iteration_capacity);
+
+typedef struct nuka_material_state_layout_t {
+    uint32_t struct_size;
+    uint32_t schema_version;
+    uint32_t state_schema_version;
+    uint32_t element_count;
+    uint32_t environment_count;
+    uint32_t state_scalars_per_env;
+    uint32_t trial_scalars_per_env;
+    uint32_t history_kind;
+    uint32_t state_offset;
+    uint32_t state_count;
+    uint32_t trial_offset;
+    uint32_t trial_count;
+    uint32_t field_count;
+} nuka_material_state_layout_t;
+
+// UINT32_MAX queries bank extents; other indices return one element's schema and environment-local spans.
+nuka_result_t nuka_world_get_material_state_layout(nuka_world_handle world, uint32_t element,
+    nuka_material_state_layout_t* layout);
+
+typedef struct nuka_material_state_field_t {
+    uint32_t struct_size;
+    uint32_t schema_version;
+    const char* name;
+    const char* unit;
+    uint32_t offset;
+    uint32_t count;
+} nuka_material_state_field_t;
+
+// Names and units remain valid until the library unloads; offsets are relative to an element's state span.
+nuka_result_t nuka_material_state_field_info(uint32_t state_version, uint32_t history_kind, uint32_t field,
+    nuka_material_state_field_t* info);
+
 typedef enum nuka_execution_mode_t {
     NUKA_EXECUTION_EAGER = 0,
     NUKA_EXECUTION_GRAPH = 1
@@ -360,6 +434,8 @@ nuka_result_t nuka_world_begin_execution_window(nuka_world_handle world, void** 
 nuka_result_t nuka_world_end_execution_window(nuka_world_handle world, void* window, nuka_execution_window_t* out);
 // Wait for submitted physics work and report asynchronous device errors.
 nuka_result_t nuka_world_synchronize(nuka_world_handle world);
+// Call after writing through a device view so reports cannot describe the modified state as measured.
+nuka_result_t nuka_world_invalidate_diagnostics(nuka_world_handle world);
 
 // Restore all environments' initial physical state and clear solver history.
 // Drive/task targets and view storage are preserved; any environment count is supported.
@@ -785,7 +861,7 @@ typedef enum nuka_state_field_t {
     NUKA_FIELD_CONTACT_SOLVE_COUNTS = 62,
     // WRITE: per-particle inverse mass. Zero selects a driven kinematic particle.
     NUKA_FIELD_PARTICLE_INV_MASS = 63,
-    // WRITE: next position of each zero-inverse-mass particle, in world coordinates.
+    // WRITE: world-space target of a kinematic particle or a finite-mass vertex-block attachment.
     NUKA_FIELD_PARTICLE_KINEMATIC_TARGET = 64,
     NUKA_FIELD_OGC_CONTACT_COUNT = 65,
     // READ: per-environment particle, joint, and free-body truncations in the latest step.
@@ -874,7 +950,25 @@ typedef enum nuka_state_field_t {
     NUKA_FIELD_SOLVER_RESIDUAL = 109,
     // READ: per environment and sweep, the four SOLVER_RESIDUAL classes after that sweep; filled while
     // sweep telemetry is on, for at most the sweep budget set when it was turned on.
-    NUKA_FIELD_SOLVER_SWEEP_TRACE = 110
+    NUKA_FIELD_SOLVER_SWEEP_TRACE = 110,
+    // READ: per environment and material-field element, 12 uint32 vertex slots after runtime fracture splits.
+    NUKA_FIELD_MF_CORNER = 111,
+    // READ: per environment and particle, the particle a fracture split it from, itself unless split.
+    NUKA_FIELD_PARTICLE_ROOT = 112,
+    // READ: per environment, a counter bumped whenever fracture or a reset changes the field topology.
+    NUKA_FIELD_MF_TOPOLOGY = 113,
+    // READ: per environment, the three uint32 surface-local vertices of every particle surface triangle.
+    NUKA_FIELD_PARTICLE_SURFACE_CORNERS = 114,
+    // READ: per environment and field element, outer-fiber normal traction at seams or principal tension at faces,
+    // in Pa at the latest step's end positions; zero when fracture is off.
+    NUKA_FIELD_MF_TRACTION = 115,
+    // READ/WRITE: vertex-block particle attachment stiffness in N/m, finite and nonnegative; zero disables it.
+    // The potential is 0.5*k*|x-PARTICLE_KINEMATIC_TARGET|^2; attached particles retain finite mass.
+    NUKA_FIELD_PARTICLE_ATTACHMENT_STIFFNESS = 116,
+    // READ: dimensionless fracture driving load; at least one allows nucleation or tip extension.
+    NUKA_FIELD_MF_CRACK_LOAD = 117,
+    // READ: flat environment-major material state; query each element's typed span and state schema.
+    NUKA_FIELD_MATERIAL_STATE = 118
 } nuka_state_field_t;
 
 typedef enum nuka_vbd_element_kind_t {
@@ -903,6 +997,8 @@ typedef enum nuka_energy_column_t {
     NUKA_ENERGY_ROW_RATE_WORK, NUKA_ENERGY_ROW_PHYSICAL_IMPULSE_WORK,
     NUKA_ENERGY_UNCLASSIFIED_ROW_WORK, NUKA_ENERGY_VALID, NUKA_ENERGY_PLASTIC_LOSS, NUKA_ENERGY_VISCOUS_LOSS,
     NUKA_ENERGY_COHESIVE_LOSS,
+    // Backward Euler's vertex dissipation: 0.5 dv^T M dv, and the potential's Bregman gap over the step.
+    NUKA_ENERGY_NUMERICAL_KINETIC, NUKA_ENERGY_NUMERICAL_POTENTIAL,
     NUKA_ENERGY_COLUMN_COUNT
 } nuka_energy_column_t;
 
@@ -1085,7 +1181,8 @@ typedef struct nuka_particle_surface_t {
 } nuka_particle_surface_t;
 
 nuka_result_t nuka_world_get_particle_surface_count(nuka_world_handle world, uint32_t* out_count);
-// Describes surface `index` and copies up to `capacity` of its 3 * triangle_count indices.
+// Describes surface `index` and copies up to `capacity` of its 3 * triangle_count indices; a fracturing
+// field's indices are env 0's current ones, which change when NUKA_FIELD_MF_TOPOLOGY does.
 nuka_result_t nuka_world_get_particle_surface(nuka_world_handle world, uint32_t index,
                                               nuka_particle_surface_t* out, uint32_t* triangles,
                                               size_t capacity);

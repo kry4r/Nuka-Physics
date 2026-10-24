@@ -10,6 +10,8 @@ namespace nuka::collision {
 inline constexpr uint32_t kMeshSurfaceClosed = 1u;
 inline constexpr uint32_t kMeshSurfaceConvex = 2u;
 inline constexpr uint32_t kMeshSurfaceOriented = 4u;
+// Its edge range is doubled: edge i + n/2 holds the second triangle's side of edge i once a crack cuts it.
+inline constexpr uint32_t kMeshSurfaceTwinEdges = 8u;
 
 struct MeshGeometryCounts {
     uint32_t vertices = 0u;

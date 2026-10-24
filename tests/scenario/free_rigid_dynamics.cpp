@@ -223,15 +223,25 @@ TEST(FreeRigidDynamics, FreeRotationConservesMomentumAndConvergesToTheReference)
             invalid[0].x = std::numeric_limits<float>::infinity();
             ASSERT_TRUE(world.GetData().UploadField(nk::FieldId::BodyAngularVelocity,
                                                    invalid.data(), invalid.size() * sizeof(Vec3)));
-            ASSERT_TRUE(world.Step().AllOk());
-            const auto status = Read<uint32_t>(world, nk::FieldId::BodyGyroStatus, 2u);
-            EXPECT_EQ(status[0], phi::kBodyGyroInvalidInput);
-            EXPECT_EQ(status[1], 0u);
-            const auto env_status = Read<uint32_t>(world, nk::FieldId::EnvStatus, 2u);
-            EXPECT_EQ(env_status[0] & phi::kEnvStatusGyroFailure, phi::kEnvStatusGyroFailure);
-            EXPECT_EQ(env_status[1], 0u);
+            EXPECT_FALSE(world.LastStepReport().stamp.valid);
+            std::vector<uint8_t> before, after;
+            ASSERT_TRUE(world.GetData().DownloadPersistent(&before));
+            ASSERT_FALSE(world.Step().AllOk());
+            ASSERT_TRUE(world.GetData().DownloadPersistent(&after));
+            EXPECT_EQ(before, after);
+            const auto& failure = world.LastStepReport();
+            EXPECT_TRUE(failure.rolled_back);
+            EXPECT_FALSE(failure.stamp.valid);
+            EXPECT_FALSE(failure.stamp.accepted);
+            EXPECT_EQ(failure.environments[0].outcome, nk::StepOutcome::SolverFailure);
+            EXPECT_EQ(failure.environments[0].flags & phi::kEnvStatusGyroFailure, phi::kEnvStatusGyroFailure);
+            EXPECT_EQ(failure.environments[1].outcome, nk::StepOutcome::BatchRejected);
+            EXPECT_EQ(failure.environments[1].flags, 0u);
+            EXPECT_EQ(failure.environments[0].advanced_dt, 0.0);
+            EXPECT_EQ(failure.environments[1].advanced_dt, 0.0);
+            EXPECT_EQ(Read<uint32_t>(world, nk::FieldId::BodyGyroStatus, 2u), std::vector<uint32_t>(2u));
             ASSERT_EQ(world.Reset({1u}), phi::Status::Ok);
-            EXPECT_EQ(Read<uint32_t>(world, nk::FieldId::BodyGyroStatus, 2u), status);
+            EXPECT_FALSE(world.LastStepReport().stamp.valid);
             ASSERT_EQ(world.Reset({0u}), phi::Status::Ok);
             EXPECT_EQ(Read<uint32_t>(world, nk::FieldId::BodyGyroStatus, 2u), std::vector<uint32_t>(2u));
         }
@@ -301,6 +311,9 @@ TEST(PipelineContracts, MissingOpsAndDispatchFailureStopAtTheBoundary) {
         uint32_t captures = 0u;
         bool throw_dispatch = false;
         bool fail_completion = false;
+        uint32_t fail_occurrence = 1u;
+        uint32_t occurrences = 0u;
+        DeviceProxy* device_proxy = nullptr;
     };
     auto device_iface = *phi::IfaceOf(real.device);
     device_iface.supports_op = [](phi::Device* device, phi::NkOp op) {
@@ -314,11 +327,22 @@ TEST(PipelineContracts, MissingOpsAndDispatchFailureStopAtTheBoundary) {
         return phi::DeviceBufferType(proxy.real);
     };
     auto backend_iface = *phi::IfaceOf(real.backend);
+    backend_iface.device_buffer_type = [](phi::Backend* backend) {
+        auto& proxy = *reinterpret_cast<BackendProxy*>(backend);
+        proxy.device_proxy->allocated = true;
+        return proxy.device_proxy->no_buffer ? nullptr : phi::BackendDeviceBufferType(proxy.real);
+    };
+    backend_iface.host_buffer_type = [](phi::Backend* backend) {
+        return phi::BackendHostBufferType(reinterpret_cast<BackendProxy*>(backend)->real);
+    };
+    backend_iface.reserve_thread_stack = [](phi::Backend* backend, uint64_t bytes) {
+        return phi::BackendReserveThreadStack(reinterpret_cast<BackendProxy*>(backend)->real, bytes);
+    };
     backend_iface.dispatch = [](phi::Backend* backend, const phi::ModelView& model,
                                 const phi::DataView& data, const phi::OpCall& call) {
         auto& proxy = *reinterpret_cast<BackendProxy*>(backend);
         proxy.calls.push_back(call.op);
-        if (call.op == proxy.failure) {
+        if (call.op == proxy.failure && ++proxy.occurrences >= proxy.fail_occurrence) {
             if (proxy.throw_dispatch) throw std::runtime_error("injected operator exception");
             return phi::Status::Failed;
         }
@@ -349,6 +373,7 @@ TEST(PipelineContracts, MissingOpsAndDispatchFailureStopAtTheBoundary) {
     };
     DeviceProxy device{&device_iface, real.device};
     BackendProxy backend{&backend_iface, real.backend};
+    backend.device_proxy = &device;
     auto* dev = reinterpret_cast<phi::Device*>(&device);
     auto* be = reinterpret_cast<phi::Backend*>(&backend);
     scene::RigidBodyRecord body;
@@ -420,6 +445,33 @@ TEST(PipelineContracts, MissingOpsAndDispatchFailureStopAtTheBoundary) {
     backend.fail_completion = false;
     EXPECT_EQ(world.Synchronize(), phi::Status::Ok);
     EXPECT_EQ(world.LastExecutionError().status, phi::Status::Ok);
+    auto later_config = Config();
+    later_config.substeps = 3u;
+    later_config.gravity[2] = -9.81f;
+    nk::World later(CookFreeBody(body, false), 1u, dev, be, later_config);
+    ASSERT_TRUE(later.Ready()) << later.CreationError();
+    const Vec3 force{1.0f, 2.0f, 0.0f}, torque{0.1f, 0.0f, 0.0f};
+    ASSERT_TRUE(later.GetData().UploadField(nk::FieldId::BodyForce, &force, sizeof(force)));
+    ASSERT_TRUE(later.GetData().UploadField(nk::FieldId::BodyTorque, &torque, sizeof(torque)));
+    std::vector<uint8_t> before, after;
+    ASSERT_TRUE(later.GetData().DownloadPersistent(&before));
+    backend.failure = phi::NkOp::IntegratePosition;
+    backend.occurrences = 0u;
+    backend.fail_occurrence = 2u;
+    EXPECT_EQ(later.Step().result, phi::Status::Failed);
+    ASSERT_TRUE(later.GetData().DownloadPersistent(&after));
+    EXPECT_EQ(before, after);
+    ExpectVectorNear(Read<Vec3>(later, nk::FieldId::BodyForce, 1u)[0], force, 0.0f);
+    ExpectVectorNear(Read<Vec3>(later, nk::FieldId::BodyTorque, 1u)[0], torque, 0.0f);
+    EXPECT_TRUE(later.LastStepReport().rolled_back);
+    EXPECT_FALSE(later.LastStepReport().stamp.accepted);
+    EXPECT_EQ(later.StateSensors().SimulationTime(0u), 0.0);
+    backend.failure = phi::NkOp::Count;
+    ASSERT_TRUE(later.Step().AllOk());
+    EXPECT_DOUBLE_EQ(later.LastStepReport().environments[0].advanced_dt, later_config.dt);
+    ExpectVectorNear(Read<Vec3>(later, nk::FieldId::BodyLinearVelocity, 1u)[0],
+        (force / body.mass + Vec3{0.0f, 0.0f, -9.81f}) * later_config.dt, 1.0e-6f);
+    ExpectVectorNear(Read<Vec3>(later, nk::FieldId::BodyForce, 1u)[0], {}, 0.0f);
 }
 
 TEST(PipelineContracts, BufferFailuresPreserveStatusAndReleaseAllocations) {

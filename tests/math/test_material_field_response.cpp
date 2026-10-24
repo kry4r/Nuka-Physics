@@ -15,7 +15,7 @@ namespace nk = nuka::nk;
 namespace mf = nuka::nk::mf;
 using nuka::math::SymmetricMat3;
 using nuka::math::Vec3;
-using Points = std::array<Vec3, 6>;
+using Points = std::array<Vec3, nk::kMfMaxVertices>;
 
 // A 1 mm polymer sheet and a 2 cm rest triangle (0,0), (a,0), (c,d) in the material frame.
 constexpr float kA = 0.02f, kC = 0.007f, kD = 0.017f;
@@ -54,7 +54,7 @@ mf::PlaneStressLaw Law(bool yielding, bool viscous) {
 }
 
 // Plastic strain, equivalent plastic strain and the two Maxwell strains of a loaded element.
-constexpr float kCommitted[nk::kMfHistory] = {0.002f, -0.001f, 0.0005f, 0.001f, 0.001f,
+constexpr float kCommitted[nk::kMfResponseStateCapacity] = {0.002f, -0.001f, 0.0005f, 0.001f, 0.001f,
                                               0.0f,   0.0002f, -0.0005f, 0.0003f, 0.0f};
 
 nk::MfElement Triangle() {
@@ -76,13 +76,14 @@ nk::MfElement Bend(bool flat = false) {
     nk::MfElement e;
     e.kind = nk::kMfBend;
     e.hinges = 7u;
-    for (uint32_t j = 0u; j < 6u; ++j) e.vertex[j] = j;
+    for (uint32_t j = 0u; j < nk::kMfMaxVertices; ++j) e.vertex[j] = j;
     const float map[9] = {40.0f, -10.0f, 5.0f, -8.0f, 35.0f, 12.0f, 15.0f, 20.0f, -30.0f};
     for (uint32_t k = 0u; k < 9u; ++k) e.rest[k] = map[k];
     e.rest[9] = 0.5f * kA * kD;
     e.rest[10] = 0.0f;
     e.rest[11] = flat ? 0.0f : 0.05f;
     e.rest[12] = flat ? 0.0f : -0.03f;
+    if (!mf::InitializeBendDual(e, Sheet())) throw std::runtime_error("Invalid bend curvature map");
     return e;
 }
 
@@ -93,8 +94,15 @@ Points RestTriangle() {
 // The rest triangle with far vertices beyond edges (1, 2), (2, 0) and (0, 1), lifted by `angle`.
 Points BentPatch(float angle) {
     const float s = std::sin(angle);
-    return {Vec3{0.0f, 0.0f, 0.0f}, Vec3{kA, 0.0f, 0.0f}, Vec3{kC, kD, 0.0f},
-            Vec3{0.022f, 0.019f, 0.012f * s}, Vec3{-0.012f, 0.012f, -0.009f * s}, Vec3{0.011f, -0.015f, 0.015f * s}};
+    Points x = RestTriangle();
+    const Vec3 far[3] = {{0.022f, 0.019f, 0.012f * s}, {-0.012f, 0.012f, -0.009f * s},
+                         {0.011f, -0.015f, 0.015f * s}};
+    for (uint32_t i = 0u; i < 3u; ++i) {
+        x[3u + 3u * i] = x[(i + 1u) % 3u];
+        x[4u + 3u * i] = x[(i + 2u) % 3u];
+        x[5u + 3u * i] = far[i];
+    }
+    return x;
 }
 
 // Rotation about the unit axis (2, -1, 2) / 3.
@@ -127,7 +135,7 @@ Points Deformed(const std::array<float, 9>& rotation, Vec3 offset) {
 
 mf::FieldGeometry Geometry(const Points& x) {
     mf::FieldGeometry g{};
-    for (uint32_t j = 0u; j < 6u; ++j) g.start[j] = x[j];
+    for (uint32_t j = 0u; j < nk::kMfMaxVertices; ++j) g.start[j] = x[j];
     return g;
 }
 
@@ -183,6 +191,8 @@ nk::MfElement Seam() {
     for (uint32_t j = 0u; j < 4u; ++j) e.vertex[j] = j;
     e.rest[0] = 0.5f * kPaperEdge * Paper().thickness;
     e.rest[1] = 100.0f * Paper().youngs / kPaperEdge;
+    e.rest[2] = 1.0f;
+    e.rest[3] = 1.0f;
     return e;
 }
 
@@ -231,9 +241,39 @@ TEST(MaterialFieldResponse, StressAndTangentMatchFiniteDifferences) {
     }
 }
 
+TEST(MaterialFieldResponse, DirectionalMetricEliminationHasAConsistentTangent) {
+    const auto law = Law(true, true);
+    const double metrics[3][6] = {{2.2e6, 3.0e6, 0.3e6, 0.4e6, 0.05e6, 0.08e6},
+                                  {0.0, 2.0e6, 1.0e6, 0.0, 0.0, 0.0}, {}};
+    const double strain[3] = {0.01, -0.004, 0.003};
+    for (const auto& metric : metrics) {
+        mf::FieldResponse<double> response;
+        ASSERT_EQ(mf::EvaluatePlaneStress<double>(law, kCommitted, strain, 1.0 / 240.0,
+                                                  response, nullptr, metric), nk::MfStatus::Ok);
+        EXPECT_TRUE(response.local.converged);
+        EXPECT_GE(response.plastic, -1e-12);
+        EXPECT_GE(response.viscous, -1e-12);
+        for (uint32_t axis = 0u; axis < 3u; ++axis) {
+            double up[3] = {strain[0], strain[1], strain[2]}, down[3] = {strain[0], strain[1], strain[2]};
+            const double delta = 1e-7;
+            up[axis] += delta;
+            down[axis] -= delta;
+            mf::FieldResponse<double> a, b;
+            ASSERT_EQ(mf::EvaluatePlaneStress<double>(law, kCommitted, up, 1.0 / 240.0, a, nullptr, metric),
+                      nk::MfStatus::Ok);
+            ASSERT_EQ(mf::EvaluatePlaneStress<double>(law, kCommitted, down, 1.0 / 240.0, b, nullptr, metric),
+                      nk::MfStatus::Ok);
+            EXPECT_NEAR((a.psi - b.psi) / (2 * delta), response.stress[axis], 1e-4);
+            for (uint32_t row = 0u; row < 3u; ++row)
+                EXPECT_NEAR((a.stress[row] - b.stress[row]) / (2 * delta),
+                            response.tangent[TangentIndex(row, axis)], 0.02);
+        }
+    }
+}
+
 TEST(MaterialFieldResponse, TrialsAreReadOnlyAndFailuresLeaveTheOutput) {
     const mf::PlaneStressLaw law = Law(true, true);
-    float committed[nk::kMfHistory];
+    float committed[nk::kMfResponseStateCapacity];
     std::memcpy(committed, kCommitted, sizeof(committed));
     const float E[3] = {0.01f, -0.002f, 0.004f};
     for (int trial = 0; trial < 100; ++trial) {
@@ -247,7 +287,12 @@ TEST(MaterialFieldResponse, TrialsAreReadOnlyAndFailuresLeaveTheOutput) {
     out.psi = 7.0f;
     out.stress[1] = -3.0f;
     out.history[4] = 0.5f;
-    EXPECT_EQ(mf::EvaluatePlaneStress(law, committed, E, 0.0f, out), nk::MfStatus::InvalidParameters);
+    mf::LocalMaterialReport<float> report;
+    EXPECT_EQ(mf::EvaluatePlaneStress(law, committed, E, 0.0f, out, &report), nk::MfStatus::InvalidParameters);
+    EXPECT_FALSE(report.converged);
+    EXPECT_EQ(report.status, nk::MfStatus::InvalidParameters);
+    EXPECT_EQ(mf::EvaluatePlaneStress(law, committed, E, std::numeric_limits<float>::infinity(), out),
+              nk::MfStatus::InvalidParameters);
     const float broken[3] = {std::nanf(""), 0.0f, 0.0f};
     EXPECT_EQ(mf::EvaluatePlaneStress(law, committed, broken, kStep, out), nk::MfStatus::NonFinite);
     EXPECT_EQ(out.psi, 7.0f);
@@ -264,13 +309,16 @@ TEST(MaterialFieldResponse, TrialsAreReadOnlyAndFailuresLeaveTheOutput) {
     invalid = Yielding();
     invalid.yield_moment = -1.0f;
     EXPECT_FALSE(mf::ValidMaterial(invalid));
+    invalid = Yielding();
+    invalid.hardening = std::numeric_limits<float>::infinity();
+    EXPECT_FALSE(mf::ValidMaterial(invalid));
 }
 
 TEST(MaterialFieldResponse, UniaxialTensionFollowsTheBilinearCurve) {
     // S22 = S12 = 0 by Newton on E22; past yield S11 = Y + Et (E11 - Y/E) with Et = E H / (E + H).
     const mf::PlaneStressLaw law = Law(true, false);
     const double nu = law.poisson, young = law.modulus * (1.0 - nu * nu), H = law.hardening;
-    float history[nk::kMfHistory] = {};
+    float history[nk::kMfResponseStateCapacity] = {};
     double e22 = 0.0;
     int yielded = 0;
     for (int n = 1; n <= 40; ++n) {
@@ -288,7 +336,7 @@ TEST(MaterialFieldResponse, UniaxialTensionFollowsTheBilinearCurve) {
         EXPECT_NEAR(r.stress[1], 0.0, 1.0e-8 * law.yield);
         EXPECT_NEAR(r.stress[2], 0.0, 1.0e-8 * law.yield);
         yielded += r.yielded ? 1 : 0;
-        for (uint32_t k = 0u; k < nk::kMfHistory; ++k) history[k] = float(r.history[k]);
+        for (uint32_t k = 0u; k < nk::kMfResponseStateCapacity; ++k) history[k] = float(r.history[k]);
     }
     EXPECT_EQ(yielded, 32);
     EXPECT_NEAR(history[3], history[0], 1.0e-6f);
@@ -302,7 +350,7 @@ TEST(MaterialFieldResponse, HeldStrainRelaxesLikeAStandardLinearSolid) {
     const double E[3] = {0.003, 0.001, 0.0};
     mf::FieldResponse<double> elastic{};
     ASSERT_EQ(mf::EvaluatePlaneStress(Law(false, false), nullptr, E, h, elastic), nk::MfStatus::Ok);
-    float history[nk::kMfHistory] = {};
+    float history[nk::kMfResponseStateCapacity] = {};
     double dissipated = 0.0;
     for (int n = 1; n <= 400; ++n) {
         mf::FieldResponse<double> r{};
@@ -314,7 +362,7 @@ TEST(MaterialFieldResponse, HeldStrainRelaxesLikeAStandardLinearSolid) {
             EXPECT_NEAR(r.stress[k] / elastic.stress[k], continuous, 1.0e-2) << "step " << n;
         }
         dissipated += r.viscous;
-        for (uint32_t k = 0u; k < nk::kMfHistory; ++k) history[k] = float(r.history[k]);
+        for (uint32_t k = 0u; k < nk::kMfResponseStateCapacity; ++k) history[k] = float(r.history[k]);
     }
     // The branch's loaded energy is dissipated in full; backward Euler keeps 2 / (2 + h / tau) of it.
     const double loaded = law.modulus * law.maxwell[0] * mf::UnitEnergy(double(law.poisson), E);
@@ -330,8 +378,8 @@ TEST(MaterialFieldResponse, ReturnedStressesAreAdmissibleAndDissipationIsNonnega
     };
     int yielded = 0;
     for (int sample = 0; sample < 500; ++sample) {
-        float committed[nk::kMfHistory];
-        for (uint32_t k = 0u; k < nk::kMfHistory; ++k) committed[k] = float(0.003 * next());
+        float committed[nk::kMfResponseStateCapacity];
+        for (uint32_t k = 0u; k < nk::kMfResponseStateCapacity; ++k) committed[k] = float(0.003 * next());
         committed[3] = float(0.002 * (next() + 1.0));
         const double E[3] = {0.02 * next(), 0.02 * next(), 0.02 * next()};
         mf::FieldResponse<double> r{};
@@ -353,8 +401,14 @@ TEST(MaterialFieldResponse, ReturnedStressesAreAdmissibleAndDissipationIsNonnega
 TEST(MaterialFieldResponse, ElementGradientsMatchStoredEnergy) {
     const Points triangle = Deformed(Rotation(0.6f), Vec3{0.3f, -0.1f, 0.25f});
     const Points patch = BentPatch(0.35f);
+    Points opened = patch;
+    for (uint32_t i = 0u; i < 3u; ++i)
+        for (uint32_t j = 0u; j < 3u; ++j)
+            opened[3u + 3u * i + j] = Apply(Rotation(0.2f * (i + 1u)), patch[3u + 3u * i + j]) +
+                                       Vec3{0.003f * i, -0.002f, 0.001f};
     for (const auto& [element, x, count] : {std::make_tuple(Triangle(), triangle, 3u),
-                                            std::make_tuple(Bend(), patch, 6u)}) {
+                                            std::make_tuple(Bend(), patch, nk::kMfMaxVertices),
+                                            std::make_tuple(Bend(), opened, nk::kMfMaxVertices)}) {
         const float largest = Largest(element, x, count);
         ASSERT_GT(largest, 0.0f);
         const float h = 2.0e-6f;
@@ -375,18 +429,21 @@ TEST(MaterialFieldResponse, ElementGradientsMatchStoredEnergy) {
 TEST(MaterialFieldResponse, EnergyChangeMatchesTheEnergyDifference) {
     const Points triangle = Deformed(Rotation(-0.4f), Vec3{0.3f, -0.1f, 0.25f});
     const Points patch = BentPatch(-0.25f);
-    const Vec3 move{1.5e-5f, -0.8e-5f, 1.1e-5f};
+    const Vec3 direction{1.5e-5f, -0.8e-5f, 1.1e-5f};
     for (const auto& [element, x, count] : {std::make_tuple(Triangle(), triangle, 3u),
-                                            std::make_tuple(Bend(), patch, 6u)}) {
-        for (uint32_t local = 0u; local < count; ++local) {
-            const mf::FieldGeometry g = Geometry(x);
-            mf::FieldGeometry moved = g;
-            moved.delta[local] = move;
-            const float change = mf::ElementEnergyChange(element, Sheet(), nullptr, local, g, nullptr, kStep, move);
-            const double expected = mf::ElementEnergy(element, Sheet(), nullptr, moved) -
-                                    mf::ElementEnergy(element, Sheet(), nullptr, g);
-            const double scale = std::abs(double(Gradient(element, x, local).Dot(move))) + std::abs(expected);
-            EXPECT_NEAR(change, expected, 1.0e-3 * scale) << "local " << local;
+                                            std::make_tuple(Bend(), patch, nk::kMfMaxVertices)}) {
+        for (uint32_t trial = 0u; trial < (element.kind == nk::kMfBend ? 2u : 1u); ++trial) {
+            const Vec3 move = direction * (trial == 0u ? 1.0f : 1.0e-5f);
+            for (uint32_t local = 0u; local < count; ++local) {
+                const mf::FieldGeometry g = Geometry(x);
+                mf::FieldGeometry moved = g;
+                moved.delta[local] = move;
+                const float change = mf::ElementEnergyChange(element, Sheet(), nullptr, local, g, nullptr, kStep, move);
+                const double expected = mf::ElementEnergy(element, Sheet(), nullptr, moved) -
+                                        mf::ElementEnergy(element, Sheet(), nullptr, g);
+                const double magnitude = std::abs(double(Gradient(element, x, local).Dot(move))) + std::abs(expected);
+                EXPECT_NEAR(change, expected, 1.0e-3 * magnitude) << "local " << local;
+            }
         }
     }
 }
@@ -398,7 +455,7 @@ TEST(MaterialFieldResponse, YieldingElementChangeFollowsItsGradient) {
     // Small against the strain, whose direction sets the plastic tangent.
     const Vec3 move{1.0e-6f, -0.6e-6f, 0.8e-6f};
     for (const auto& [element, x, count] : {std::make_tuple(Triangle(), triangle, 3u),
-                                            std::make_tuple(Bend(), patch, 6u)}) {
+                                            std::make_tuple(Bend(), patch, nk::kMfMaxVertices)}) {
         const mf::FieldGeometry g = Geometry(x);
         mf::FieldResponse<float> trial{};
         ASSERT_EQ(mf::ElementTrial(element, m, nullptr, g, kStep, trial), nk::MfStatus::Ok);
@@ -429,9 +486,9 @@ TEST(MaterialFieldKinematics, RigidMotionHasNoStrainOrTurn) {
         EXPECT_NEAR(Energy(Triangle(), x), 0.0, 1.0e-6);
         const Points flat = BentPatch(0.0f);
         Points moved{};
-        for (uint32_t j = 0u; j < 6u; ++j) moved[j] = Apply(r, flat[j]) + offset;
+        for (uint32_t j = 0u; j < nk::kMfMaxVertices; ++j) moved[j] = Apply(r, flat[j]) + offset;
         EXPECT_NEAR(Energy(Bend(true), moved), 0.0, 1.0e-10);
-        for (uint32_t local = 0u; local < 6u; ++local) {
+        for (uint32_t local = 0u; local < nk::kMfMaxVertices; ++local) {
             const Vec3 g = Gradient(Bend(true), moved, local);
             EXPECT_NEAR(g.Length(), 0.0f, 1.0e-5f) << "local " << local;
         }
@@ -466,7 +523,7 @@ TEST(MaterialFieldKinematics, RotationKeepsStrainEnergyAndRotatesTheGradient) {
 
     const Points patch = BentPatch(0.5f);
     for (const auto& [element, x, count] : {std::make_tuple(Triangle(), triangle, 3u),
-                                            std::make_tuple(Bend(), patch, 6u)}) {
+                                            std::make_tuple(Bend(), patch, nk::kMfMaxVertices)}) {
         Points turned{};
         for (uint32_t j = 0u; j < count; ++j) turned[j] = Apply(r, x[j]);
         const double energy = Energy(element, x);
@@ -527,7 +584,7 @@ TEST(MaterialFieldSeam, PairGradientsFollowTheEnergyChange) {
     const float onset = float(mf::SeamLaw(seam, m).Onset());
     // Pair 0 holds elastically, pair 1 softens; a committed reach makes pair 0 unload.
     const mf::FieldGeometry g = SeamGeometry(Vec3{0.3f, -0.2f, 0.25f} * onset, Vec3{-12.0f, 30.0f, 20.0f} * onset);
-    float history[nk::kMfHistory]{};
+    float history[nk::kMfResponseStateCapacity]{};
     history[0] = 4.0f * onset;
     for (const float* committed : {static_cast<const float*>(nullptr), static_cast<const float*>(history)}) {
         const Vec3 move = Vec3{1.0f, -0.6f, 0.8f} * (0.01f * onset);
@@ -554,14 +611,134 @@ TEST(MaterialFieldSeam, PairGradientsFollowTheEnergyChange) {
 
 TEST(MaterialFieldSeam, PartedHingesStopBending) {
     const Points patch = BentPatch(0.35f);
-    float parted[nk::kMfHistory]{};
+    float parted[nk::kMfResponseStateCapacity]{};
     for (uint32_t i = 0u; i < 3u; ++i) parted[nk::kMfHingeDamage + i] = 1.0f;
     ASSERT_GT(Energy(Bend(), patch), 0.0);
     EXPECT_EQ(mf::ElementEnergy(Bend(), Sheet(), parted, Geometry(patch)), 0.0);
-    for (uint32_t local = 0u; local < 6u; ++local) {
+    for (uint32_t local = 0u; local < nk::kMfMaxVertices; ++local) {
         Vec3 gradient;
         SymmetricMat3 hessian;
         mf::ElementBlock(Bend(), Sheet(), parted, local, Geometry(patch), nullptr, kStep, &gradient, &hessian);
         EXPECT_EQ(gradient.LengthSq(), 0.0f) << "local " << local;
+    }
+}
+
+TEST(MaterialFieldSeam, DamageDegradesElasticStorageWithCommittedPlasticAndMaxwellHistory) {
+    for (uint32_t mask = 1u; mask < 8u; ++mask) {
+        auto element = Bend();
+        element.hinges = mask;
+        const auto material = Sheet();
+        ASSERT_TRUE(mf::InitializeBendDual(element, material));
+        double entries[6], projection[3][3];
+        mf::BendMetric(element, material, nullptr, entries, projection);
+        const double elastic[3] = {0.7, -0.4, 0.3};
+        double full[3], condensed[3];
+        mf::MetricProduct(mf::ElasticMetric<double>(mf::BendLaw(material)), elastic, full);
+        mf::TangentProduct(entries, elastic, condensed);
+        for (uint32_t i = 0u; i < 3u; ++i) {
+            if (((mask >> i) & 1u) == 0u) continue;
+            double expected = 0.0, actual = 0.0;
+            for (uint32_t r = 0u; r < 3u; ++r) {
+                expected += element.rest[3u * r + i] * full[r];
+                actual += element.rest[3u * r + i] * condensed[r];
+            }
+            EXPECT_NEAR(actual, expected, 2e-6 * std::abs(expected) + 1e-8) << "hinges=" << mask;
+        }
+    }
+    const auto patch = Geometry(BentPatch(0.35f));
+    auto material = Yielding();
+    material.bend_hardening = 0.0f;
+    float history[nk::kMfResponseStateCapacity];
+    std::memcpy(history, kCommitted, sizeof(history));
+    for (uint32_t i = 0u; i < 3u; ++i) history[nk::kMfHingeDamage + i] = 1.0f;
+    const auto bend = Bend();
+    EXPECT_EQ(mf::ElementEnergy(bend, material, history, patch), 0.0);
+    mf::FieldResponse<float> trial;
+    ASSERT_EQ(mf::ElementTrial(bend, material, history, patch, kStep, trial), nk::MfStatus::Ok);
+    EXPECT_EQ(trial.stored, 0.0f);
+    EXPECT_EQ(trial.plastic, 0.0f);
+    EXPECT_EQ(trial.viscous, 0.0f);
+    EXPECT_FALSE(trial.beyond_range);
+    for (uint32_t local = 0u; local < nk::kMfMaxVertices; ++local) {
+        Vec3 gradient;
+        SymmetricMat3 hessian;
+        mf::ElementBlock(bend, material, history, local, patch, nullptr, kStep, &gradient, &hessian);
+        EXPECT_EQ(gradient.LengthSq(), 0.0f);
+    }
+    history[nk::kMfHingeDamage] = 0.25f;
+    history[nk::kMfHingeDamage + 1u] = 0.8f;
+    const Vec3 move{1e-7f, -1.5e-7f, 0.5e-7f};
+    for (uint32_t local = 0u; local < nk::kMfMaxVertices; ++local) {
+        Vec3 gradient;
+        SymmetricMat3 hessian;
+        mf::ElementBlock(bend, material, history, local, patch, nullptr, kStep, &gradient, &hessian);
+        const auto forward = mf::ElementEnergyChange(bend, material, history, local, patch, nullptr, kStep, move);
+        const auto backward = mf::ElementEnergyChange(bend, material, history, local, patch, nullptr, kStep, -move);
+        EXPECT_NEAR(0.5 * (forward - backward), gradient.Dot(move),
+                    0.01 * gradient.Length() * move.Length() + 1e-12);
+    }
+}
+
+TEST(MaterialFieldKinematics, SplitFacesKeepTheirOwnGeometry) {
+    const nk::MfElement e = Bend();
+    const Points x = BentPatch(0.35f);
+    const double energy = Energy(e, x);
+    Points moved = x;
+    for (uint32_t i = 0u; i < 3u; ++i) {
+        const uint32_t first = mf::HingeFace(e, i);
+        const Vec3 shift = x[(i + 1u) % 3u] - x[first + 2u];
+        for (uint32_t j = 0u; j < 3u; ++j) moved[first + j] += shift;
+    }
+    EXPECT_NEAR(Energy(e, moved), energy, 1.0e-6 * energy);
+    const float largest = Largest(e, x, nk::kMfMaxVertices);
+    for (uint32_t local = 0u; local < nk::kMfMaxVertices; ++local)
+        EXPECT_NEAR((Gradient(e, moved, local) - Gradient(e, x, local)).Length(), 0.0f, 2.0e-6f * largest);
+}
+
+TEST(MaterialFieldKinematics, JoinedHingeAliasesGiveTheSharedEdgeDerivative) {
+    nk::MfElement e = Bend();
+    const Points x = BentPatch(0.35f);
+    for (uint32_t i = 0u; i < 3u; ++i) {
+        const uint32_t first = mf::HingeFace(e, i);
+        e.vertex[first] = (i + 1u) % 3u;
+        e.vertex[first + 1u] = (i + 2u) % 3u;
+        nk::vbd::Point joined[6];
+        mf::HingePoints(e, Geometry(x), i, joined);
+        Vec3 q[6], original[4];
+        const Vec3 shared[4] = {x[(i + 1u) % 3u], x[(i + 2u) % 3u], x[i], x[first + 2u]};
+        float theta, reference;
+        ASSERT_TRUE(mf::HingeAngleGradient(joined, q, &theta));
+        ASSERT_TRUE(nk::vbd::HingeAngleGradient(shared, original, &reference));
+        EXPECT_NEAR(theta, reference, 1.0e-6f);
+        EXPECT_NEAR((q[0] + q[3] - original[0]).Length(), 0.0f, 1.0e-4f);
+        EXPECT_NEAR((q[1] + q[4] - original[1]).Length(), 0.0f, 1.0e-4f);
+        EXPECT_NEAR((q[2] - original[2]).Length(), 0.0f, 1.0e-4f);
+        EXPECT_NEAR((q[5] - original[3]).Length(), 0.0f, 1.0e-4f);
+    }
+    const Vec3 move{1.5e-5f, -0.8e-5f, 1.1e-5f};
+    const mf::FieldGeometry g = Geometry(x);
+    for (uint32_t local = 0u; local < 3u; ++local) {
+        mf::FieldGeometry moved = g;
+        Vec3 shifts[nk::kMfMaxVertices]{};
+        for (uint32_t j = 0u; j < nk::MfElementVertexCount(e); ++j)
+            if (e.vertex[j] == e.vertex[local]) moved.delta[j] = shifts[j] = move;
+        const double expected = mf::ElementEnergy(e, Sheet(), nullptr, moved) - mf::ElementEnergy(e, Sheet(), nullptr, g);
+        const float single = mf::ElementEnergyChange(e, Sheet(), nullptr, local, g, nullptr, kStep, move);
+        const float together = mf::ElementMovesEnergyChange(e, Sheet(), nullptr, g, nullptr, kStep, shifts);
+        EXPECT_NEAR(single, expected, 1.0e-4 * std::abs(expected));
+        EXPECT_NEAR(together, expected, 1.0e-4 * std::abs(expected));
+        const float h = 1.0e-6f;
+        for (int axis = 0; axis < 3; ++axis) {
+            mf::FieldGeometry up = g, down = g;
+            for (uint32_t j = 0u; j < nk::MfElementVertexCount(e); ++j)
+                if (e.vertex[j] == e.vertex[local]) {
+                    Axis(up.delta[j], axis) = h;
+                    Axis(down.delta[j], axis) = -h;
+                }
+            const double numeric = (mf::ElementEnergy(e, Sheet(), nullptr, up) -
+                                    mf::ElementEnergy(e, Sheet(), nullptr, down)) / (2.0 * h);
+            Vec3 gradient = Gradient(e, x, local);
+            EXPECT_NEAR(Axis(gradient, axis), numeric, 1.0e-4 * gradient.Length());
+        }
     }
 }

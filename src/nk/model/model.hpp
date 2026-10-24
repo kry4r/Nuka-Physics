@@ -101,8 +101,13 @@ struct ModelCapacities {
     // Material-field vertices are the last mf_vertices_per_env of the vertex-block range.
     uint32_t mf_vertices_per_env = 0u;
     uint32_t mf_elements_per_env = 0u;
+    uint32_t mf_state_scalars_per_env = 0u;
+    uint32_t mf_trial_scalars_per_env = 0u;
     uint32_t mf_incidence_per_env = 0u;
     uint32_t mf_materials = 0u;
+    // Free field vertices [mf_spare_first, + mf_spares_per_env) of the vertex-block range that fracture splits into.
+    uint32_t mf_spare_first = 0u;
+    uint32_t mf_spares_per_env = 0u;
     uint32_t num_material_buckets = 0;  // physics-material bucket table rows.
     uint32_t obs_width            = 64; // per-env observation export width.
 
@@ -362,6 +367,7 @@ public:
         // Single-env initial state, replicated env-major by SeedInitialState; initial_pos is
         // also the rest shape that self contact excludes neighbours by.
         std::vector<math::Vec3> initial_pos;
+        std::vector<float> attachment_stiffness;
         std::vector<math::Vec3> initial_vel;
         std::vector<float>      inv_mass;
         std::vector<collision::MeshSurfaceInfo> surface_info;
@@ -387,6 +393,7 @@ public:
         // = rest-space area / triangle. Empty for a drag-free cook.
         std::vector<uint32_t>   aero_tri_verts;     // 3 / triangle
         std::vector<float>      aero_tri_area;      // 1 / triangle
+        std::vector<uint32_t>   aero_tri_corner_source;
         std::vector<uint32_t>   aero_particle_offset;
         std::vector<uint32_t>   aero_particle_count;
         std::vector<uint32_t>   aero_incident_tri;
@@ -407,8 +414,15 @@ public:
         // Material-field elements and materials; incidence covers the field vertices from their first.
         std::vector<MfElement>  mf_elements;
         std::vector<MfMaterial> mf_materials;
+        std::vector<uint32_t> mf_face_partner;
         std::vector<uint32_t>   mf_incidence_offsets;
         std::vector<uint32_t>   mf_incidence;
+        // The triangle whose side of a split vertex each field incidence follows.
+        std::vector<uint32_t>   mf_incidence_anchor;
+        // Each field vertex's descent color, spares included, which a split keeps apart from its neighbors'.
+        std::vector<uint32_t>   mf_color;
+        // The field corner (element * 6 + slot) each collision triangle corner follows, ~0u for none.
+        std::vector<uint32_t>   surface_corner_source;
         // Anisotropic air-drag coefficients (lumped 0.5*rho*Cn, 0.5*rho*Ct). Both
         // default 0 -> the drag op is inert (a drag-free world stays byte-identical).
         // Cn >> Ct (normal-dominant) is what destabilizes a flat falling sheet into

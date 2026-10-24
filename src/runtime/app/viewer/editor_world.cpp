@@ -197,8 +197,12 @@ WorldLayout QueryLayout(nuka_world_handle world) {
         CheckResult(nuka_world_get_particle_surface(world, s, &surface.info, surface.triangles.data(),
                                                     surface.triangles.size()),
                     "nuka_world_get_particle_surface");
+        surface.index = s;
         layout.surfaces.push_back(std::move(surface));
     }
+    uint32_t topology = 0u;
+    layout.fracturing = nuka_world_download_field(world, NUKA_FIELD_MF_TOPOLOGY, &topology, sizeof(topology), 0u) ==
+                        NUKA_RESULT_OK;
     return layout;
 }
 
@@ -315,6 +319,18 @@ void DownloadEnvParticles(nuka_world_handle world, const WorldLayout& layout, ui
     CheckResult(nuka_world_download_field(world, NUKA_FIELD_PARTICLE_POSITION, out->data(), bytes,
                                           (env_index % layout.env_count) * bytes),
                 "download particle positions");
+}
+
+void DownloadLiveSurfaces(nuka_world_handle world, const WorldLayout& layout,
+                          std::vector<std::vector<uint32_t>>* out) {
+    out->resize(layout.surfaces.size());
+    for (size_t i = 0; i < layout.surfaces.size(); ++i) {
+        nuka_particle_surface_t info{};
+        (*out)[i].resize(layout.surfaces[i].triangles.size());
+        CheckResult(nuka_world_get_particle_surface(world, layout.surfaces[i].index, &info, (*out)[i].data(),
+                                                    (*out)[i].size()),
+                    "nuka_world_get_particle_surface");
+    }
 }
 
 bool LocateTelemetry(nuka_world_handle world, const WorldLayout& layout, const scene::SceneIR& scene,
@@ -484,6 +500,10 @@ void EditorSim::ApplyParticles(const std::vector<math::Vec3>& positions, const s
         render_world_.meshes.ReplaceGeometry(s.mesh, std::move(geo));
         render_world_.instances[s.instance].render_material_id = heated ? heat_material_ : s.material;
     }
+}
+
+void EditorSim::SetSurfaceTriangles(const std::vector<std::vector<uint32_t>>& triangles) {
+    for (size_t i = 0; i < surfaces_.size(); ++i) surfaces_[i].topology.triangles = triangles[i];
 }
 
 void EditorSim::SetTerrain(const terrain::HeightField& terrain) {

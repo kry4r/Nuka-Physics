@@ -388,6 +388,40 @@ NUKA_AUGMENTED_HD inline BallTerm<N> EvaluateBall(
     return term;
 }
 
+// Change of EvaluateBall's potential when the residuals drop by `drop`: the inside quadratic, radius times the
+// norm change outside, and their (norm - radius)^2 / (2k) gap across the radius, so no potentials are subtracted.
+template <uint32_t N>
+NUKA_AUGMENTED_HD inline double BallPotentialChange(
+    const double (&dual)[N], double rho, const double (&residual)[N], const double (&drop)[N],
+    double compliance, double radius) {
+    if ((rho <= 0.0 && fabs(rho) <= DBL_MAX) || compliance == double(FLT_MAX)) return 0.0;
+    const double denominator = 1.0 + rho * compliance;
+    const double s = 1.0 / denominator;
+    const double k = rho / denominator;
+    if (!(rho > 0.0 && rho <= DBL_MAX && compliance >= 0.0 && compliance <= DBL_MAX && radius >= 0.0 &&
+          radius <= DBL_MAX && denominator <= DBL_MAX && k > 0.0 && k <= DBL_MAX)) return double(NAN);
+    double before_sq = 0.0, after_sq = 0.0, stick = 0.0, chord = 0.0;
+    for (uint32_t i = 0u; i < N; ++i) {
+        const double x = s * dual[i] + k * residual[i];
+        const double step = -k * drop[i];
+        before_sq += x * x;
+        after_sq += (x + step) * (x + step);
+        stick -= drop[i] * (x + 0.5 * step);
+        chord -= drop[i] * (2.0 * x + step);
+    }
+    if (!(fabs(stick) <= DBL_MAX && fabs(chord) <= DBL_MAX && before_sq <= DBL_MAX && after_sq <= DBL_MAX))
+        return double(NAN);
+    const double before = sqrt(before_sq), after = sqrt(after_sq);
+    if (radius == DBL_MAX || (before <= radius && after <= radius)) return stick;
+    if (before >= radius && after >= radius) {
+        const double sum = before + after;
+        return sum > 0.0 ? radius * chord / sum : 0.0;
+    }
+    const double over = fmax(before, after) - radius;
+    const double slip = 0.5 * over * over / k;
+    return after > before ? stick - slip : stick + slip;
+}
+
 }  // namespace nuka::nk::augmented
 
 #undef NUKA_AUGMENTED_HD

@@ -1,8 +1,10 @@
 #pragma once
 
+#include "collision/dat_geometry.hpp"
 #include "math/cuda_vec_ops.cuh"
 #include "phi/backend_cuda/ops/dat_chain.cuh"
 #include "phi/backend_cuda/ops/kinematics.cuh"
+#include "phi/backend_cuda/ops/particle_surface.cuh"
 
 namespace nuka::phi {
 namespace {
@@ -101,7 +103,7 @@ __device__ math::Vec3 DatPointAt(const DatTruncateParams& p, const ModelView& mo
                                  DatPointRef ref, float s, uint32_t frame = ~0u) {
     if (ref.particle) {
         const auto start = data.particle_prev_pos[ref.owner];
-        return start + (data.particle_pos[ref.owner] - start) * s;
+        return collision::DatLinearPoint(start, data.particle_pos[ref.owner], s);
     }
     const auto pose = DatBodyPoseAt(p, model, data, env, ref.owner, s, frame);
     return pose.position + math::gpu::RotateByQuatNormalized(
@@ -135,8 +137,9 @@ __device__ bool DatMixedRefs(DatTruncateParams p, ModelView model, DataView data
             const auto info = model.particle_surface_info[owner_b];
             if (feature_b >= info.triangle_count) return false;
             const size_t at = (size_t{info.triangle_offset} + feature_b) * 3u;
+            const uint32_t* triangles = ParticleSurfaceTriangles(model, data, env, p.triangles_per_env);
             for (uint32_t j = 0u; j < 3u; ++j) {
-                const uint32_t vertex = model.particle_surface_triangles[at + j];
+                const uint32_t vertex = triangles[at + j];
                 if (vertex >= info.vertex_count) return false;
                 b[j] = {env * p.particles_per_env + info.vertex_offset + vertex, 0u, true};
             }
@@ -160,7 +163,7 @@ __device__ bool DatMixedRefs(DatTruncateParams p, ModelView model, DataView data
         const auto info = model.particle_surface_info[owner_a];
         const auto edges = model.particle_surface_edge_info[owner_a];
         if (feature_a >= edges.edge_count) return false;
-        const auto edge = model.particle_surface_edges[edges.edge_offset + feature_a];
+        const auto edge = ParticleSurfaceEdges(model, data, env, p.edges_per_env)[edges.edge_offset + feature_a];
         if (edge.vertex0 >= info.vertex_count || edge.vertex1 >= info.vertex_count) return false;
         a[0] = {env * p.particles_per_env + info.vertex_offset + edge.vertex0, 0u, true};
         a[1] = {env * p.particles_per_env + info.vertex_offset + edge.vertex1, 0u, true};

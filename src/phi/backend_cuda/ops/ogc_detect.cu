@@ -75,12 +75,18 @@ __device__ void OgcEmitParticleFace(const OgcDetectParams& p, const ModelView& m
     const math::Vec3 source = data.particle_pos[item];
     const float query = c.query;
     const uint32_t triangle = c.target;
+    collision::MeshVertexExclusion excluded;
+    if (c.source_surface == target_surface) {
+        excluded.roots = data.particle_root ? data.particle_root + env * p.particles_per_env : nullptr;
+        excluded.rest = model.particle_rest_pos;
+        excluded.vertex_offset = target_info.vertex_offset;
+        excluded.vertices[0] = item - env * p.particles_per_env;
+        excluded.count = 1u;
+    }
     const auto feature = collision::OgcFacetFeature(view, target_info,
-        model.particle_surface_edges, model.particle_surface_triangle_edges,
+        ParticleSurfaceEdges(model, data, env, p.edges_per_env), model.particle_surface_triangle_edges,
         model.particle_surface_edge_info[target_surface],
-        {model.particle_surface_vertex_triangle_offsets,
-         model.particle_surface_vertex_triangles},
-        triangle, source, query);
+        ParticleTriangleIncidence(model, data, env, p.particles_per_env), triangle, source, query, excluded);
     if (!(feature.feasible && feature.owner_triangle == triangle &&
           feature.distance <= query && feature.distance > 0.0f)) return;
     const uint32_t source_local = item - env * p.particles_per_env;
@@ -91,8 +97,9 @@ __device__ void OgcEmitParticleFace(const OgcDetectParams& p, const ModelView& m
         // Features of one surface already within their contact distance at rest are neighbours, not contacts.
         math::Vec3 rest[3];
         for (uint32_t j = 0u; j < 3u; ++j)
-            rest[j] = model.particle_rest_pos[target_info.vertex_offset + view.triangles[tri_at + j]];
-        const math::Vec3 source_rest = model.particle_rest_pos[source_local];
+            rest[j] = ParticleRest(model, data, env, p.particles_per_env,
+                                   target_info.vertex_offset + view.triangles[tri_at + j]);
+        const math::Vec3 source_rest = ParticleRest(model, data, env, p.particles_per_env, source_local);
         if ((collision::ClosestTrianglePoint(source_rest, rest[0], rest[1], rest[2]).point - source_rest)
                 .LengthSq() < radius * radius) return;
     }
@@ -160,15 +167,28 @@ __device__ void OgcEmitParticleEdge(const OgcDetectParams& p, const ModelView& m
     const auto target_edges = model.particle_surface_edge_info[target_surface];
     const uint32_t source_edge = local_edge - source_edges.edge_offset;
     const uint32_t target_edge = c.target;
-    const auto edge_a = model.particle_surface_edges[local_edge];
-    const auto edge_b = model.particle_surface_edges[target_edges.edge_offset + target_edge];
+    const auto* edges = ParticleSurfaceEdges(model, data, env, p.edges_per_env);
+    const auto edge_a = edges[local_edge];
+    const auto edge_b = edges[target_edges.edge_offset + target_edge];
     const float query = c.query;
-    const collision::MeshVertexIncidence incidence{
-        model.particle_surface_vertex_edge_offsets, model.particle_surface_vertex_edges};
+    const auto incidence = ParticleEdgeIncidence(model, data, env, p.particles_per_env);
+    collision::MeshVertexExclusion excluded_a, excluded_b;
+    if (source_surface == target_surface) {
+        excluded_a.roots = incidence.roots;
+        excluded_a.rest = model.particle_rest_pos;
+        excluded_a.vertex_offset = source_info.vertex_offset;
+        excluded_a.vertices[0] = target_info.vertex_offset + edge_b.vertex0;
+        excluded_a.vertices[1] = target_info.vertex_offset + edge_b.vertex1;
+        excluded_a.count = 2u;
+        excluded_b = excluded_a;
+        excluded_b.vertex_offset = target_info.vertex_offset;
+        excluded_b.vertices[0] = source_info.vertex_offset + edge_a.vertex0;
+        excluded_b.vertices[1] = source_info.vertex_offset + edge_a.vertex1;
+    }
     const auto pair = collision::OgcEdgeContact(
-        view, source_info, model.particle_surface_edges, incidence,
+        view, source_info, edges, incidence,
         source_edges, source_edge, view, target_info,
-        model.particle_surface_edges, incidence, target_edges, target_edge, query);
+        edges, incidence, target_edges, target_edge, query, excluded_a, excluded_b);
     if (!(pair.feasible && pair.owner_edge_a == source_edge &&
           pair.owner_edge_b == target_edge &&
           pair.distance <= query && pair.distance > 0.0f)) return;
@@ -183,10 +203,12 @@ __device__ void OgcEmitParticleEdge(const OgcDetectParams& p, const ModelView& m
                   weight_b * model.particle_half_thickness[target_info.vertex_offset + vertices_b[j]];
     }
     if (source_surface == target_surface) {
-        const auto* rest = model.particle_rest_pos;
+        const auto rest = [&](uint32_t particle) {
+            return ParticleRest(model, data, env, p.particles_per_env, particle);
+        };
         const auto at_rest = collision::OgcClosestSegments(
-            rest[source_info.vertex_offset + vertices_a[0]], rest[source_info.vertex_offset + vertices_a[1]],
-            rest[target_info.vertex_offset + vertices_b[0]], rest[target_info.vertex_offset + vertices_b[1]]);
+            rest(source_info.vertex_offset + vertices_a[0]), rest(source_info.vertex_offset + vertices_a[1]),
+            rest(target_info.vertex_offset + vertices_b[0]), rest(target_info.vertex_offset + vertices_b[1]));
         if ((at_rest.a - at_rest.b).LengthSq() < radius * radius) return;
     }
     const uint32_t ordinal = OgcClaimSlot(p, data, env);
@@ -335,7 +357,10 @@ __global__ void OgcParticleEdgeEdgeKernel(OgcDetectParams p, ModelView model,
     const auto source_edges = active ? model.particle_surface_edge_info[source_surface]
                                      : collision::MeshEdgeInfo{};
     const uint32_t source_edge = local_edge - source_edges.edge_offset;
-    const auto edge_a = active ? model.particle_surface_edges[local_edge] : collision::MeshEdge{};
+    const auto* edges = ParticleSurfaceEdges(model, data, env, p.edges_per_env);
+    const auto edge_a = active ? edges[local_edge] : collision::MeshEdge{};
+    // A twin whose edge holds together is no edge.
+    active = active && edge_a.vertex0 != edge_a.vertex1;
     math::Vec3 midpoint{};
     float half_length = 0.0f;
     if (active) {
@@ -387,8 +412,7 @@ __global__ void OgcParticleEdgeEdgeKernel(OgcDetectParams p, ModelView model,
                 continue;
             }
             if (source_surface == target_surface && target_edge <= source_edge) continue;
-            const auto edge_b = model.particle_surface_edges[
-                target_edges.edge_offset + target_edge];
+            const auto edge_b = edges[target_edges.edge_offset + target_edge];
             if (source_surface == target_surface &&
                 (edge_a.vertex0 == edge_b.vertex0 || edge_a.vertex0 == edge_b.vertex1 ||
                  edge_a.vertex1 == edge_b.vertex0 || edge_a.vertex1 == edge_b.vertex1)) continue;
@@ -401,11 +425,101 @@ __global__ void OgcParticleEdgeEdgeKernel(OgcDetectParams p, ModelView model,
         [&](const OgcCandidate& c) { OgcEmitParticleEdge(p, model, data, c); });
 }
 
+// How far a hinge's first wing lies off its second face's plane, along that plane's normal turned toward it, once
+// the hinge folds past square; negative while it opens wider.
+__device__ float HingeFold(const math::Vec3 (&x)[4], math::Vec3* normal) {
+    const math::Vec3 axis = x[1] - x[0], first = x[2] - x[0], second = x[3] - x[0];
+    const math::Vec3 wing0 = first * axis.LengthSq() - axis * first.Dot(axis);
+    const math::Vec3 wing1 = second * axis.LengthSq() - axis * second.Dot(axis);
+    if (!(wing0.Dot(wing1) > 0.0f)) return -1.0f;
+    *normal = axis.Cross(wing1);
+    *normal = *normal / sqrtf(normal->LengthSq());
+    const float gap = first.Dot(*normal);
+    if (gap < 0.0f) *normal = -*normal;
+    return fabsf(gap);
+}
+
+// Two faces folded shut over their shared edge meet along it, where no vertex-face or edge-edge feature holds them
+// apart; a hinge folded past square keeps its wings a contact radius apart across the second face's plane.
+__global__ void OgcParticleHingeKernel(OgcDetectParams p, ModelView model, DataView data) {
+    const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
+    if (item >= p.env_count * p.edges_per_env) return;
+    const uint32_t env = item / p.edges_per_env, local_edge = item % p.edges_per_env;
+    const collision::MeshEdge edge = ParticleSurfaceEdges(model, data, env, p.edges_per_env)[local_edge];
+    if (edge.triangle1 == ~0u || edge.vertex0 == edge.vertex1) return;
+    uint32_t surface = 0u;
+    for (; surface < p.surfaces_per_env; ++surface) {
+        const auto edges = model.particle_surface_edge_info[surface];
+        if (local_edge >= edges.edge_offset && local_edge - edges.edge_offset < edges.edge_count) break;
+    }
+    if (surface == p.surfaces_per_env) return;
+    const auto info = model.particle_surface_info[surface];
+    const uint32_t local[4] = {info.vertex_offset + edge.vertex0, info.vertex_offset + edge.vertex1,
+                               info.vertex_offset + edge.opposite0, info.vertex_offset + edge.opposite1};
+    math::Vec3 x[4], rest[4], normal{}, rest_normal{};
+    for (uint32_t k = 0u; k < 4u; ++k) {
+        x[k] = data.particle_pos[size_t{env} * p.particles_per_env + local[k]];
+        rest[k] = ParticleRest(model, data, env, p.particles_per_env, local[k]);
+    }
+    const float gap = HingeFold(x, &normal);
+    if (!(gap >= 0.0f && gap <= OgcParticleQuery(p, model, data, env, surface, surface))) return;
+    const float radius = model.particle_half_thickness[local[2]] + model.particle_half_thickness[local[3]];
+    // A hinge folded within its contact distance at rest is shaped so, not in contact.
+    const float rest_gap = HingeFold(rest, &rest_normal);
+    if (rest_gap >= 0.0f && rest_gap < radius) return;
+    math::Vec3 barycentric;
+    if (!collision::OgcPlaneCoordinates(x[2], x[0], x[1], x[3], &barycentric)) return;
+    const uint32_t ordinal = OgcClaimSlot(p, data, env);
+    if (ordinal >= p.slot_capacity) {
+        atomicOr(data.env_status + env, kEnvStatusPairOverflow);
+        return;
+    }
+    const uint32_t slot = env * p.slot_stride + p.slot_base + ordinal;
+    const size_t at = size_t{slot} * nk::kPairDrivenPtsPerSlot;
+    const uint32_t endpoint = env * p.point_endpoints_per_env + p.point_endpoint_first + ordinal * 2u + 1u;
+    const uint32_t first = env * p.point_endpoint_terms_per_env + p.point_endpoint_term_first + ordinal * 6u + 3u;
+    const uint32_t wing = env * p.particles_per_env + local[2];
+    // Plane coordinates give the gap's derivative even when the wing projects outside the second face.
+    const uint32_t face[3] = {local[0], local[1], local[3]};
+    const float weights[3] = {barycentric.x, barycentric.y, barycentric.z};
+    for (uint32_t j = 0u; j < 3u; ++j)
+        data.point_endpoint_terms[first + j] =
+            nk::WeightedPointEndpointTerm(nk::kNkSideParticle, env * p.particles_per_env + face[j], weights[j]);
+    data.point_endpoint_ranges[endpoint] = {first, nk::CanonicalizePointEndpointTerms(data.point_endpoint_terms + first, 3u)};
+    data.ucontact_point[at] = x[2] - normal * (0.5f * gap);
+    data.ucontact_witness_a[at] = x[2];
+    data.ucontact_witness_b[at] = x[2] - normal * gap;
+    data.ucontact_normal[at] = normal;
+    data.ucontact_depth[at] = radius - gap;
+    data.ucontact_a[at] = wing;
+    data.ucontact_b[at] = endpoint;
+    data.ucontact_a_kind[at] = nk::kUContactSideParticle;
+    data.ucontact_b_kind[at] = nk::kUContactSidePointEndpoint;
+    data.ucontact_gen[at] = 1u;
+    data.ucontact_law[slot] = nk::kContactLawSpeculative;
+    data.ucontact_friction[slot] = fmaxf(model.particle_friction[local[2]], model.particle_friction[local[3]]);
+    nk::CanonicalContactDescriptor descriptor;
+    descriptor.a.type = constraint::CollidableType::Particle;
+    descriptor.a.handle = wing;
+    descriptor.b.type = constraint::CollidableType::ParticleSurface;
+    descriptor.b.handle = env * p.surfaces_per_env + surface;
+    descriptor.feature_a = 0u;
+    descriptor.feature_b = local_edge << 2u | 3u;
+    descriptor.contact_kind = nk::kContactKindOgcVertexFace;
+    descriptor.normal = normal;
+    const nk::ContactId id = nk::MakeContactId(descriptor);
+    data.ucontact_id_pair[at] = id.pair;
+    data.ucontact_id_feature[at] = id.feature;
+    data.ucontact_count[slot] = 1u;
+    atomicAdd(data.contact_count + env, 1u);
+}
+
 __global__ void FinalizeOgcCountKernel(OgcDetectParams p, DataView data) {
     const uint64_t env = uint64_t{blockIdx.x} * blockDim.x + threadIdx.x;
     if (env >= p.env_count) return;
     const uint32_t count = data.ogc_contact_count[env];
     data.ogc_contact_count[env] = min(count, p.slot_capacity);
+    data.ogc_contact_demand[env] = max(data.ogc_contact_demand[env], count);
     if (count > p.slot_capacity) atomicOr(data.env_status + env, kEnvStatusPairOverflow);
 }
 
@@ -453,7 +567,7 @@ Status OpOgcDetect(const ModelView& model, const DataView& data,
                      !model.link_geom_kind || !model.link_geom_local ||
                      !model.mesh_vertex_reach || !data.q || !data.qdot ||
                      !data.dat_joint_motion || !data.dat_joint_rate)))) ||
-        !data.ogc_contact_count || !data.contact_count ||
+        !data.ogc_contact_count || !data.ogc_contact_demand || !data.contact_count ||
         !data.ucontact_count || !data.ucontact_point || !data.ucontact_normal ||
         !data.ucontact_witness_a || !data.ucontact_witness_b ||
         !data.ucontact_depth || !data.ucontact_a || !data.ucontact_b ||
@@ -501,6 +615,9 @@ Status OpOgcDetect(const ModelView& model, const DataView& data,
     if (edges > 0u)
         LaunchCuda(OgcParticleEdgeEdgeKernel,
                    dim3((static_cast<uint32_t>(edges) * kTreeShares + kBlockSize - 1u) / kBlockSize),
+                   dim3(kBlockSize), 0u, stream, *p, model, data);
+    if (edges > 0u)
+        LaunchCuda(OgcParticleHingeKernel, dim3((static_cast<uint32_t>(edges) + kBlockSize - 1u) / kBlockSize),
                    dim3(kBlockSize), 0u, stream, *p, model, data);
     if (mixed && vertices > 0u)
         LaunchCuda(OgcMixedVertexFaceKernel,

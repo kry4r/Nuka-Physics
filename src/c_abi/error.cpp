@@ -38,6 +38,11 @@ nuka_result_t MapStatusToResult(phi::Status status) noexcept {
     }
 }
 
+void SetErrorMessage(const char* message) noexcept {
+    try { g_last_error = message ? message : ""; }
+    catch (...) { g_last_error.clear(); }
+}
+
 nuka_result_t MapExceptionToResult(const std::exception& error) noexcept {
     const std::string message = error.what();
     g_last_error = message;
