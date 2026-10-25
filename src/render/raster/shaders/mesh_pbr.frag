@@ -319,5 +319,5 @@ void main() {
     color = AcesFilmic(color);
     color = LinearToSrgb(color);
 
-    oColor = vec4(color, opacity * vBaseColor.a);
+    oColor = vec4(color, opacity);
 }

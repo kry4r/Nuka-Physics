@@ -2653,7 +2653,8 @@ struct PresentRenderer::Impl {
         SetViewport(cmd, rect);
         for (const InstanceDraw& draw : draws) {
             const uint8_t f = draw.instance_row < flags.size() ? flags[draw.instance_row] : uint8_t{0};
-            const bool see_through = (f & kInstanceSeeThrough) != 0;
+            const bool flagged = (f & kInstanceSeeThrough) != 0;
+            const bool see_through = flagged || draw.opacity < 1.0f;
             if (pass == DrawPass::Id ? (f & kInstanceUnpickable) != 0 : see_through != (pass == DrawPass::SeeThrough))
                 continue;
             PushBlock push{};
@@ -2663,7 +2664,7 @@ struct PresentRenderer::Impl {
             std::memcpy(push.model, draw.model.m.data(), sizeof(push.model));
             std::memcpy(push.base_color, draw.base_color, sizeof(push.base_color));
             push.mr[0] = draw.metallic; push.mr[1] = draw.roughness;
-            push.mr[2] = pass == DrawPass::SeeThrough ? draw.opacity * kSeeThroughOpacity : draw.opacity;
+            push.mr[2] = flagged && pass == DrawPass::SeeThrough ? draw.opacity * kSeeThroughOpacity : draw.opacity;
             push.mr[3] = pass == DrawPass::Id ? 0.0f : draw.maps_slot;
             push.emissive[0] = draw.emissive[0]; push.emissive[1] = draw.emissive[1];
             push.emissive[2] = draw.emissive[2]; push.emissive[3] = draw.shade;
@@ -2966,8 +2967,13 @@ struct PresentRenderer::Impl {
         const bool outline = !shot.Empty() && Marked(options.instance_flags);
         if (outline) RecordIdPass(cmd, prepared, sets, options.instance_flags, pose);
         RecordOcclusionPass(cmd, prepared, sets, options.instance_flags, pose);
-        const bool see_through = std::any_of(options.instance_flags.begin(), options.instance_flags.end(),
-                                             [](uint8_t f) { return (f & kInstanceSeeThrough) != 0; });
+        // Flagged instances and translucent materials (opacity < 1) both draw in the blended pass.
+        const bool see_through =
+            std::any_of(options.instance_flags.begin(), options.instance_flags.end(),
+                        [](uint8_t f) { return (f & kInstanceSeeThrough) != 0; }) ||
+            std::any_of(prepared.begin(), prepared.end(), [](const PreparedView& v) {
+                return std::any_of(v.draws.begin(), v.draws.end(), [](const InstanceDraw& d) { return d.opacity < 1.0f; });
+            });
 
         std::array<VkClearValue, 2> clears{};
         clears[0].color = {{static_cast<float>(options.background.r) / 255.0f,
