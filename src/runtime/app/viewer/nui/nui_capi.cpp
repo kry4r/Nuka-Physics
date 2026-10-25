@@ -58,6 +58,7 @@ uint32_t Host::PanelNode(const std::string& panel_id, const std::string& panel_t
     std::lock_guard<std::recursive_mutex> lock(mu_);
     Panel& panel = AddPanel(panel_id, panel_title, nullptr);
     panel.dock = panel_dock;
+    panel.script = true;
     if (panel.Root().handle == 0u) panel_roots_[Register(panel.Root())] = &panel;
     return panel.Root().handle;
 }

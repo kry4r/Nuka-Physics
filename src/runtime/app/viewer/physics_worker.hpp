@@ -375,6 +375,8 @@ public:
     uint64_t Push(TickCommand cmd);
     // Applies the queued commands, publishes and dispatches the tick callback.
     void Pump();
+    // Writes the held loads' wrenches for the next step, for a script that steps the world itself.
+    void WriteHeldLoads();
     std::vector<TickResult> TakeResults();
     const Snapshot* AcquireSnapshot() { return ring_.Acquire(); }
     PoseSlotPool& Slots() { return slots_; }

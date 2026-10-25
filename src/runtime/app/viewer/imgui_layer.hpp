@@ -434,8 +434,6 @@ struct ViewerUiState {
     int script_node_count = 0;
 
     // A script owns the world: New and Open start another editor, closing keeps the world.
-    bool script_session = false;
-    bool script_driven = false;  // the script steps the world, not the editor
     std::string script_name;
     std::string doc_title = "untitled";
     std::string prompt;  // the action waiting on save, don't save or cancel

@@ -116,6 +116,18 @@ const std::string& Tr(const std::string& text);
 const char* Tr(const char* text);
 // A copy, for threads other than the UI thread.
 std::string TrCopy(const std::string& text);
+// The owner of the editor's own string tables.
+inline constexpr const char* kEditorStrings = "nuka";
+// While one lives on this thread Tr skips the editor's own tables: a script's panel shows its
+// text as written, translated only by tables an extension ships.
+class ScriptText {
+public:
+    explicit ScriptText(bool on);
+    ~ScriptText();
+
+private:
+    bool was_;
+};
 
 struct LocaleInfo {
     std::string id;
@@ -949,6 +961,7 @@ public:
     std::string dock;  // "left", "right", "bottom" or "float" for panels the layout does not place
     bool open = true;
     bool focus_request = false;
+    bool script = false;  // made by a script or extension: its text is not the editor's to translate
     std::function<void(VStack& root)> build;
     std::function<uint64_t()> key;
     ImGuiWindowFlags flags = 0;

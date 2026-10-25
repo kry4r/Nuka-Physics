@@ -599,10 +599,14 @@ Panel::Panel(std::string panel_id, std::string caption, const char* glyph)
     : id(std::move(panel_id)), title(std::move(caption)), icon(glyph != nullptr ? glyph : ""),
       root_(std::make_unique<VStack>()) {}
 
-std::string Panel::WindowName() const { return WithIcon(icon, Tr(title)) + "###" + id; }
+std::string Panel::WindowName() const {
+    const ScriptText words(script);
+    return WithIcon(icon, Tr(title)) + "###" + id;
+}
 
 void Panel::Draw(Host&) {
     if (!open) return;
+    const ScriptText words(script);
     const bool focus = focus_request;
     if (focus) {
         ImGui::SetNextWindowFocus();

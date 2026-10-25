@@ -336,6 +336,12 @@ void PhysicsWorker::Pump() {
     });
 }
 
+void PhysicsWorker::WriteHeldLoads() {
+    Guarded([&] {
+        if (bound_) WritePerturbations();
+    });
+}
+
 std::vector<TickResult> PhysicsWorker::TakeResults() {
     std::vector<TickResult> out;
     std::lock_guard<std::mutex> lock(mu_);

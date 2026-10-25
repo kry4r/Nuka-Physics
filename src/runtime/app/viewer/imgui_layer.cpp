@@ -447,7 +447,7 @@ private:
 // ---- setup --------------------------------------------------------------------------------
 
 ImGuiLayer::ImGuiLayer() : stage_items_(std::make_shared<SceneItems>(frame_)) {
-    nui::LoadTranslationDir(nui::BuiltinTranslationDir(), "nuka");
+    nui::LoadTranslationDir(nui::BuiltinTranslationDir(), nui::kEditorStrings);
 }
 
 ImGuiLayer::~ImGuiLayer() = default;
@@ -2155,10 +2155,6 @@ void ImGuiLayer::DrawToolbar() {
             x = c0.x - 6.0f * s;
             return clicked;
         };
-        // A script session names its script; a script that steps the world drives the transport.
-        if (ui.script_session)
-            chip(std::string(Tr(ui.script_driven ? "SCRIPT DRIVEN" : "SCRIPT")) + "  " + Upper(ui.doc_title), theme::kInfo,
-                 icon::kConsole, ui.script_driven, nullptr);
         if (ui.has_scene) {
             if (stats.capped_batches != 0u)
                 chip(Fmt(Tr("CAP \xC3\x97%llu"), static_cast<unsigned long long>(stats.capped_batches)), theme::kWarn, icon::kWarn, false,

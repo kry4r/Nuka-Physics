@@ -1722,7 +1722,6 @@ EditorHost::State::State(const std::vector<std::string>& args, nuka_world_handle
         throw std::runtime_error(std::string(e.what()) + "\nlog: " + log_path_);
     }
     if (opt_.primary && !borrowed_) instance_ = std::make_unique<InstanceServer>(profile_->InstanceName());
-    ui_state_.script_session = borrowed_;
     ui_state_.script_name = opt_.script_name;
 
     // Loads run inside a frame, once the shell is up and the host installed its hooks.
@@ -8813,6 +8812,12 @@ void EditorHost::State::RegisterSimActions() {
                       }
                       return Ok(std::move(out));
                   }});
+    actions_.Add({"sim.apply_loads", "Apply Held Loads", "sim", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value&) {
+                      if (worker_.Threaded()) return ActionResult::Fail("the editor steps this world itself");
+                      worker_.WriteHeldLoads();
+                      return Ok();
+                  }});
 }
 
 void EditorHost::State::RegisterViewActions() {
@@ -10460,7 +10465,6 @@ void EditorHost::State::Frame(bool step_physics) {
     DrainConsoleInbox();
     DrainAgentInbox();
     ServeRemote(now);
-    ui_state_.script_driven = borrowed_ && !step_physics;
     // Open script files follow the disk: clean tabs reload, and run again when asked to.
     if (now - scripts_polled_ >= std::chrono::seconds(1)) {
         scripts_polled_ = now;

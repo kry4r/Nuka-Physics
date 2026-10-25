@@ -457,6 +457,11 @@ summary = "The loads held on the shown environment as its last frame has them."
 kind = "read"
 returns = "a list of {at, target, particle} or {at, target, path, force, torque, stiffness, damping}"
 
+["sim.apply_loads"]
+summary = "Writes the held loads' forces into the world for its next step, for a script that steps the world it lent the editor: call it before each step so a Perturb drag acts. Fails while the editor steps the world."
+kind = "sim"
+returns = "nothing"
+
 ["view.frame_all"]
 summary = "Points the camera so the whole shown world fits the viewport."
 kind = "view"

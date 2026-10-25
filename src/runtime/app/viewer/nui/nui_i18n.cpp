@@ -40,6 +40,7 @@ struct Strings {
     // Read by the UI thread without the lock; only ApplyStrings writes them.
     bool english = true;
     Table merged;
+    Table extension;  // the layers extensions ship, for script panels
     std::unordered_set<std::string, Hash, std::equal_to<>> missing;
 };
 
@@ -52,11 +53,14 @@ bool HasLetters(std::string_view text) {
     return std::any_of(text.begin(), text.end(), [](char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); });
 }
 
+thread_local bool script_text = false;
+
 const std::string* Lookup(std::string_view text) {
     Strings& s = S();
-    const auto it = s.merged.find(text);
-    if (it != s.merged.end()) return &it->second;
-    if (HasLetters(text) && s.missing.find(text) == s.missing.end()) s.missing.emplace(text);
+    const Table& table = script_text ? s.extension : s.merged;
+    const auto it = table.find(text);
+    if (it != table.end()) return &it->second;
+    if (!script_text && HasLetters(text) && s.missing.find(text) == s.missing.end()) s.missing.emplace(text);
     return nullptr;
 }
 
@@ -79,6 +83,10 @@ const char* Tr(const char* text) {
     const std::string* found = Lookup(text);
     return found != nullptr ? found->c_str() : text;
 }
+
+ScriptText::ScriptText(bool on) : was_(script_text) { script_text = on; }
+
+ScriptText::~ScriptText() { script_text = was_; }
 
 std::string TrCopy(const std::string& text) {
     Strings& s = S();
@@ -169,10 +177,14 @@ void ApplyStrings() {
     s.dirty = false;
     s.english = s.locale == "en";
     s.merged.clear();
+    s.extension.clear();
     s.missing.clear();
     for (const Layer& layer : s.layers)
         if (layer.locale == s.locale)
-            for (const auto& [key, text] : layer.strings) s.merged.insert_or_assign(key, text);
+            for (const auto& [key, text] : layer.strings) {
+                s.merged.insert_or_assign(key, text);
+                if (layer.owner != kEditorStrings) s.extension.insert_or_assign(key, text);
+            }
 }
 
 std::vector<std::string> MissingStrings() {
