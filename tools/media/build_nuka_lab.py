@@ -237,6 +237,13 @@ def laboratory(library, marks, cell, cells, origin=(0, 0, 0), plinth=None, deck_
     for i in range(7):
         layout.slab(f"vertical_inset_{i}", (-scale * (0.24 + 0.105 * i), rear + scale * 0.022, scale * 0.53),
                     (scale * 0.009, scale * 0.41, scale * 0.018), scale * 0.004, "edge_metal", True)
+    if deck_friction is not None:
+        # The back wall and its plaque collide like the deck.
+        for name, center, half in (("back_collision", (0, rear + scale * 0.065, scale * 0.56),
+                                    (x * 1.08, scale * 0.06, scale * 0.56)),
+                                   ("plaque_collision", plaque, (scale * 0.35, scale * 0.018, scale * 0.28))):
+            layout.root["children"].append({"name": name, "transform": {"pos": [float(v) for v in center]},
+                "collision_shape": {"type": "box", "half_extents": list(half), "friction_mu": deck_friction}})
     if plinth:
         center, p = np.array(plinth[0]) - origin, plinth[1]
         layout.slab("cabinet_core", center, (p[0] * 0.90, p[1] * 0.89, p[2]), scale * 0.018, "graphite")

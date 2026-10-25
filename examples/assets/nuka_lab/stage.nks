@@ -647,6 +647,44 @@
             "mesh": "lab_geometry.nka#MESH/105",
             "material": "edge_metal"
           }
+        },
+        {
+          "name": "back_collision",
+          "transform": {
+            "pos": [
+              0.0,
+              2.21,
+              1.12
+            ]
+          },
+          "collision_shape": {
+            "type": "box",
+            "half_extents": [
+              2.16,
+              0.12,
+              1.12
+            ],
+            "friction_mu": 1.2
+          }
+        },
+        {
+          "name": "plaque_collision",
+          "transform": {
+            "pos": [
+              1.06,
+              1.994,
+              1.38
+            ]
+          },
+          "collision_shape": {
+            "type": "box",
+            "half_extents": [
+              0.7,
+              0.036,
+              0.56
+            ],
+            "friction_mu": 1.2
+          }
         }
       ]
     },
