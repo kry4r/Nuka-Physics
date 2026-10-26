@@ -550,31 +550,40 @@ __device__ bool WakeDenseRows(const Block& b, DataView data, BlockDescentSolvePa
     return *working > before;
 }
 
+template <typename Block>
+__device__ nk::BlockSolveFailure DenseNewtonDirection(const Block& b, DataView data, BlockDescentSolveParams p,
+    BlockScratch s, uint32_t working, double* gradient, double* inertia, bool* converged) {
+    CountDenseWork(data, p, s, b.env, kWorkNewton);
+    bool assembled = false;
+    if constexpr (Block::kMaxDof <= kRigidBlockDof)
+        assembled = AssembleSmallDenseBlock(b, data, p, s, working, gradient, inertia, converged);
+    else
+        assembled = AssembleDenseBlock(b, data, p, s, working, gradient, inertia, converged);
+    if (!assembled) return nk::BlockSolveFailure::InvalidEquation;
+    if (!*converged) {
+        CountDenseWork(data, p, s, b.env, kWorkFactor);
+        if (!SolveDensePositiveBlock<Block::kMaxDof>(b.matrix, b.force, b.direction, b.dimension, b.stride))
+            return nk::BlockSolveFailure::Factorization;
+    }
+    return nk::BlockSolveFailure::None;
+}
+
 // Newton steps with an exact line search over the working rows from b.velocity; returns the first failure.
 template <typename Block>
 __device__ nk::BlockSolveFailure NewtonDenseBlock(const Block& b, DataView data, BlockDescentSolveParams p,
-                                                  BlockScratch s, uint32_t working) {
+                                                  BlockScratch s, uint32_t working, float* primal) {
     constexpr uint32_t kMaxDof = Block::kMaxDof;
     __shared__ double gradient[kMaxDof];
     __shared__ double inertia[kMaxDof];
     const uint32_t n = b.dimension;
     nk::BlockSolveFailure failure = nk::BlockSolveFailure::None;
+    *primal = FLT_MAX;
     for (uint32_t step = 0u; step < kDenseNewtonSteps; ++step) {
-        CountDenseWork(data, p, s, b.env, kWorkNewton);
         bool converged = false;
-        bool assembled = false;
-        if constexpr (kMaxDof <= kRigidBlockDof)
-            assembled = AssembleSmallDenseBlock(b, data, p, s, working, gradient, inertia, &converged);
-        else
-            assembled = AssembleDenseBlock(b, data, p, s, working, gradient, inertia, &converged);
-        if (!assembled) {
-            failure = nk::BlockSolveFailure::InvalidEquation;
-            break;
-        }
-        if (converged) break;
-        CountDenseWork(data, p, s, b.env, kWorkFactor);
-        if (!SolveDensePositiveBlock<kMaxDof>(b.matrix, b.force, b.direction, n, b.stride)) {
-            failure = nk::BlockSolveFailure::Factorization;
+        failure = DenseNewtonDirection(b, data, p, s, working, gradient, inertia, &converged);
+        if (failure != nk::BlockSolveFailure::None) break;
+        if (converged) {
+            *primal = 0.0f;
             break;
         }
         double decrement = 0.0, inertial_slope = 0.0, inertial_curvature = 0.0;
@@ -610,6 +619,9 @@ __device__ nk::BlockSolveFailure NewtonDenseBlock(const Block& b, DataView data,
             failure = nk::BlockSolveFailure::InvalidCandidate;
             break;
         }
+        *primal = 0.0f;
+        for (uint32_t i = threadIdx.x; i < n; i += blockDim.x)
+            if (!rounded) *primal = fmaxf(*primal, static_cast<float>(fabs(alpha * b.direction[i])));
         if (!(alpha > 0.0)) break;
         for (uint32_t i = threadIdx.x; i < n; i += blockDim.x)
             b.velocity[i] = static_cast<float>(static_cast<double>(b.velocity[i]) + alpha * b.direction[i]);
@@ -624,26 +636,56 @@ __device__ nk::BlockSolveFailure NewtonDenseBlock(const Block& b, DataView data,
         __syncthreads();
         if (rounded) break;
     }
+    float unused = 0.0f;
+    MaxDenseBlock2(primal, &unused);
     __syncthreads();
     return failure;
+}
+
+template <typename Block>
+__device__ void MeasureDensePrimal(const Block& b, DataView data, BlockDescentSolveParams p, BlockScratch s,
+                                   uint32_t owner) {
+    __shared__ double gradient[Block::kMaxDof];
+    __shared__ double inertia[Block::kMaxDof];
+    const uint32_t working = ParkDenseRows(b, data, p, s);
+    bool converged = false;
+    const auto failure = DenseNewtonDirection(b, data, p, s, working, gradient, inertia, &converged);
+    float primal = failure == nk::BlockSolveFailure::None ? 0.0f : FLT_MAX;
+    if (failure == nk::BlockSolveFailure::None && !converged)
+        for (uint32_t i = threadIdx.x; i < b.dimension; i += blockDim.x)
+            primal = fmaxf(primal, fabsf(b.direction[i]));
+    float unused = 0.0f;
+    MaxDenseBlock2(&primal, &unused);
+    if (threadIdx.x == 0u) {
+        if (failure != nk::BlockSolveFailure::None) RecordBlockFailure(data, p, s, owner, failure);
+        RaiseResidual(s, b.env, kResidualMomentum, ResidualBits(primal));
+    }
 }
 
 // Leaves the block's final velocity in b.velocity (compact coordinates); returns the first failure.
 template <typename Block>
 __device__ nk::BlockSolveFailure DescendDenseBlock(const Block& b, DataView data, BlockDescentSolveParams p,
-                                                   BlockScratch s) {
+                                                   BlockScratch s, float* primal) {
     for (uint32_t i = threadIdx.x; i < b.dimension; i += blockDim.x) b.velocity[i] = b.Snapshot(i);
     uint32_t working = ParkDenseRows(b, data, p, s);
     nk::BlockSolveFailure failure = nk::BlockSolveFailure::None;
-    do failure = NewtonDenseBlock(b, data, p, s, working);
+    do failure = NewtonDenseBlock(b, data, p, s, working, primal);
     while (failure == nk::BlockSolveFailure::None && WakeDenseRows(b, data, p, s, &working));
     return failure;
 }
 
-// The largest coordinate change of a block's solve, its momentum residual; a failed solve has the largest.
+// Uncoupled blocks stop on their primal residual; shared rows also require the block velocity to settle.
 template <typename Block>
-__device__ uint32_t DenseBlockResidual(const Block& b, nk::BlockSolveFailure failure) {
+__device__ uint32_t DenseBlockResidual(const Block& b, DataView data, BlockDescentSolveParams p,
+                                       BlockScratch s, nk::BlockSolveFailure failure, float primal) {
     uint32_t bits = failure == nk::BlockSolveFailure::None ? 0u : ResidualBits(FLT_MAX);
     for (uint32_t i = 0u; i < b.dimension; ++i) bits = max(bits, ResidualBits(b.velocity[i] - b.Snapshot(i)));
-    return bits;
+    if ((p.telemetry & nk::kTelemetrySweeps) != 0u) {
+        const uint32_t sweep = s.sweep_state[kSweepCount];
+        if (sweep < p.trace_sweeps)
+            atomicMax(reinterpret_cast<uint32_t*>(data.solver_dense_motion_trace) +
+                size_t{b.env} * p.trace_sweeps + sweep, bits);
+    }
+    return failure != nk::BlockSolveFailure::None ? ResidualBits(FLT_MAX)
+        : max(ResidualBits(primal), b.coupled ? bits : 0u);
 }

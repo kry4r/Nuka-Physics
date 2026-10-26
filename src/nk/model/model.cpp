@@ -172,7 +172,7 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
             id == FieldId::VbdForceResidualWork || id == FieldId::PhysicsStageMetrics ||
             id == FieldId::ContactAuditCounts || id == FieldId::ContactAuditMetrics)
             return CheckedProduct({integration_substeps, env_count});
-        if (id == FieldId::SolverSweepTrace || id == FieldId::SolverWorkTrace)
+        if (id == FieldId::SolverSweepTrace || id == FieldId::SolverWorkTrace || id == FieldId::SolverDenseMotionTrace)
             return CheckedProduct({solver_trace_sweeps, env_count});
         if (id == FieldId::OgcSourceOffsets)
             return ogc_contacts_per_env > 0u

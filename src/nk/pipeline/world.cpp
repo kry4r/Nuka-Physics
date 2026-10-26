@@ -970,7 +970,7 @@ phi::Status World::BuildDemanded(uint32_t demand, std::unique_ptr<Pipeline>* out
     if (widen_trace) {
         ModelCapacities demanded = cap;
         demanded.solver_trace_sweeps = trace_sweeps;
-        for (const FieldId field : {FieldId::SolverSweepTrace, FieldId::SolverWorkTrace}) {
+        for (const FieldId field : {FieldId::SolverSweepTrace, FieldId::SolverWorkTrace, FieldId::SolverDenseMotionTrace}) {
             status = data_.AllocateField(bt, field,
                 CheckedProduct({demanded.ElementCount(field), uint64_t{LayoutOf(field).elem_size}}));
             if (status != phi::Status::Ok) return status;

@@ -57,6 +57,7 @@ __global__ void InitializeRigidBlocksKernel(
 struct RigidBlock {
     static constexpr uint32_t kMaxDof = kRigidBlockDof;
     uint32_t index, dimension, begin, end, stride, env;
+    bool coupled;
     const float* mass;
     const float* snapshot;
     const float* free;
@@ -72,16 +73,13 @@ struct RigidBlock {
     }
 };
 
-__global__ void DescendRigidBlocksKernel(
-    DataView data, BlockDescentSolveParams p, BlockScratch s) {
-    const uint32_t body = blockIdx.x;
-    const uint32_t env = body / (p.total_body_count / p.env_count);
-    if (body >= p.total_body_count || s.rigid_dimensions[body] == 0u || !EnvRunning(data, env)) return;
+__device__ RigidBlock LoadRigidBlock(DataView data, BlockDescentSolveParams p, BlockScratch s, uint32_t body) {
     const uint32_t owner = p.total_particle_count + body;
     const size_t base = size_t{body} * kRigidBlockDof;
     RigidBlock b{};
     b.index = body;
-    b.env = env;
+    b.env = body / (p.total_body_count / p.env_count);
+    b.coupled = s.dense_coupled[body] != 0u;
     b.dimension = s.rigid_dimensions[body];
     b.begin = s.offsets[owner];
     b.end = s.offsets[owner + 1u];
@@ -93,10 +91,21 @@ __global__ void DescendRigidBlocksKernel(
     b.matrix = s.rigid_matrix + base * kRigidBlockDof;
     b.force = s.rigid_force + base;
     b.direction = s.rigid_direction + base;
-    const nk::BlockSolveFailure failure = DescendDenseBlock(b, data, p, s);
+    return b;
+}
+
+__global__ void DescendRigidBlocksKernel(
+    DataView data, BlockDescentSolveParams p, BlockScratch s) {
+    const uint32_t body = blockIdx.x;
+    const uint32_t env = body / (p.total_body_count / p.env_count);
+    if (body >= p.total_body_count || s.rigid_dimensions[body] == 0u || !EnvRunning(data, env)) return;
+    const uint32_t owner = p.total_particle_count + body;
+    const auto b = LoadRigidBlock(data, p, s, body);
+    float primal = 0.0f;
+    const nk::BlockSolveFailure failure = DescendDenseBlock(b, data, p, s, &primal);
     if (threadIdx.x != 0u) return;
     if (failure != nk::BlockSolveFailure::None) RecordBlockFailure(data, p, s, owner, failure);
-    RaiseResidual(s, env, kResidualMomentum, DenseBlockResidual(b, failure));
+    RaiseResidual(s, env, kResidualMomentum, DenseBlockResidual(b, data, p, s, failure, primal));
     data.body_linear_velocity[body] = {b.velocity[0], b.velocity[1], b.velocity[2]};
     data.body_angular_velocity[body] = {b.velocity[3], b.velocity[4], b.velocity[5]};
 }

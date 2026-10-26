@@ -82,6 +82,7 @@ class DiagnosticSession:
             "sweep_budget": world.velocity_iterations(),
             "solver_phases": [c.name for c in SolverPhase],
             "solver_work_columns": [c.name for c in SolverWork],
+            "dense_motion_units": "m/s",
             "state_fields": [f.name for f in state_fields],
             "timing_scope": "Host step call wall time; excludes capture and file I/O; not GPU event latency.",
         }
@@ -119,6 +120,7 @@ class DiagnosticSession:
                                          (self.env_count, self.trace_sweeps, len(SolverResidual)))
             sample["work_trace"] = read(Field.SOLVER_WORK_TRACE,
                                         (self.env_count, self.trace_sweeps, len(SolverWork)))
+            sample["dense_motion_trace"] = read(Field.SOLVER_DENSE_MOTION_TRACE, (self.env_count, self.trace_sweeps))
             sample["phase_ns"] = read(Field.SOLVER_PHASE_TIME, (self.env_count, len(SolverPhase)))
         for field in self.state_fields if state_fields is None else state_fields:
             sample["state_" + field.name] = np.asarray(self.world.download_field(field)).copy()
@@ -281,6 +283,9 @@ def iter_record_blocks(root, *, states=False):
             floating.add("sweep_trace")
     if "solver_work_columns" in manifest and manifest["trace_sweeps"]:
         shapes["work_trace"] = environments + (manifest["trace_sweeps"], len(SolverWork))
+    if "dense_motion_units" in manifest and manifest["trace_sweeps"]:
+        shapes["dense_motion_trace"] = environments + (manifest["trace_sweeps"],)
+        floating.add("dense_motion_trace")
     unsigned = shapes.keys() - floating
     required_states = {"state_" + name for name in state_fields}
     state_shapes, columns, paths = {}, None, set()

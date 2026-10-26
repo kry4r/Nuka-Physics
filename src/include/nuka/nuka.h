@@ -868,15 +868,16 @@ typedef enum nuka_state_field_t {
     NUKA_FIELD_UCONTACT_COUNT = 107,
     // READ: per contact slot, four world contact points (xyz each), environment-major.
     NUKA_FIELD_UCONTACT_POINT = 108,
-    // READ: per environment, four float32 final residuals of the latest solve in m/s: contact normal and tangent
-    // natural velocities, other rows' multiplier steps and the block momentum residual. Contact and cloth vertex
-    // residuals are measured under a velocity tolerance, telemetry or contact diagnostics.
+    // READ: per environment, four float32 final residuals in m/s: contact normal, tangent, other rows,
+    // and the maximum of block primal and coupling residuals.
     NUKA_FIELD_SOLVER_RESIDUAL = 109,
     // READ: per environment and sweep, the four SOLVER_RESIDUAL classes after that sweep; filled while
     // sweep telemetry is on, for at most the sweep budget set when it was turned on.
     NUKA_FIELD_SOLVER_SWEEP_TRACE = 110,
     // Per environment and sampled sweep: Newton iterations, line evaluations and factorizations.
-    NUKA_FIELD_SOLVER_WORK_TRACE = 111
+    NUKA_FIELD_SOLVER_WORK_TRACE = 111,
+    // READ: per environment and sampled sweep, the largest dense block velocity change in m/s.
+    NUKA_FIELD_SOLVER_DENSE_MOTION_TRACE = 112
 } nuka_state_field_t;
 
 typedef enum nuka_vbd_element_kind_t {

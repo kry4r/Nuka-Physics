@@ -776,6 +776,7 @@ fields:
   # The four residual classes after each sweep of the last solve, for the first solver_trace_sweeps sweeps.
   - {name: solver_sweep_trace, dtype: f32, per: scalar, count: "solver_trace_sweeps*env_count", elem: 4, arena: scratch, owner: data, flags: [readout]}
   - {name: solver_work_trace, dtype: u32, per: scalar, count: "solver_trace_sweeps*env_count", elem: 3, arena: scratch, owner: data, flags: [readout]}
+  - {name: solver_dense_motion_trace, dtype: f32, per: scalar, count: "solver_trace_sweeps*env_count", arena: scratch, owner: data, flags: [readout]}
   # Vertex colors, row colors, chain rows, chain islands, longest island chain, Schur rows.
   - {name: solver_color_counts, dtype: u32, per: env, elem: 6, arena: scratch, owner: data}
   # Nanoseconds of the last solve per phase while telemetry is on: setup, vertices, dense, grid, coarse,

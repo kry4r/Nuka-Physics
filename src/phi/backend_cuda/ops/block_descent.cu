@@ -47,7 +47,7 @@ constexpr uint32_t kRowAxisLanes = 4u;
 // Loop words of a solve: finished sweeps and whether another sweep runs.
 constexpr uint32_t kSweepCount = 0u, kSweepContinue = 1u, kSweepStateWords = 2u;
 // Residual classes of a sweep in velocity units: the contact normal and tangent multiplier steps, the other
-// rows' multiplier steps and the blocks' momentum (Newton) steps.
+// rows' multiplier steps and the maximum of block primal and coupling residuals.
 constexpr uint32_t kResidualNormal = 0u, kResidualTangent = 1u, kResidualJoint = 2u, kResidualMomentum = 3u,
                    kResidualClasses = 4u;
 // solver_phase_time slots of a timed solve; kPhaseEnd closes its last phase.
@@ -236,6 +236,7 @@ struct DualMomentum {
 
 struct BlockScratch {
     uint32_t* counts;
+    uint32_t* dense_coupled;
     uint32_t* offsets;
     uint32_t* incidence;
     uint32_t* sorted_incidence;
@@ -452,6 +453,7 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     // Tiles factor their blocks and keep their multipliers' momentum in shared memory, without the sweeps' search state.
     const uint64_t sweep_blocks = tile ? 0u : blocks, sweep_envs = tile ? 0u : p.env_count;
     const uint64_t sweep_dofs = tile ? 0u : dofs, sweep_matrix = tile ? 0u : matrix_words;
+    s.dense_coupled = take(tile ? 0u : uint64_t{p.total_body_count} + p.articulation_count);
     s.dual_base = reinterpret_cast<float*>(take(tile ? 0u : rows));
     s.dual_momentum = reinterpret_cast<DualMomentum*>(take(sweep_envs * sizeof(DualMomentum) / sizeof(uint32_t)));
     s.dual_step = take(sweep_envs);
@@ -1200,6 +1202,10 @@ __global__ void CountIncidenceKernel(DataView data, BlockDescentSolveParams p, B
             s.penalty[slot], row.compliance_alpha * scale);
         VisitOwners(row, points, p, [&](uint32_t owner) {
             atomicAdd(s.counts + owner, 1u);
+            const uint32_t dense_first = p.total_particle_count;
+            if (coupling > 0.0 && owner >= dense_first &&
+                owner < dense_first + p.total_body_count + p.articulation_count)
+                atomicOr(s.dense_coupled + owner - dense_first, 1u);
             const uint32_t color = s.owner_cache_color[owner];
             if (color != kNoCacheColor)
                 cache_colors[color / 32u] |= uint32_t{1u} << (color % 32u);
@@ -1538,6 +1544,25 @@ __device__ bool Finite(Vec3 value) {
 #include "phi/backend_cuda/ops/block_descent_dense.cuh"
 #include "phi/backend_cuda/ops/block_descent_articulation.cuh"
 #include "phi/backend_cuda/ops/block_descent_rigid.cuh"
+
+// Dense stationarity is checked at the updated duals only when the sweep could otherwise stop.
+template <uint32_t capacity, bool rigid>
+__global__ void MeasureDensePrimalsKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
+    const uint32_t index = blockIdx.x;
+    const uint32_t owner = p.total_particle_count + (rigid ? 0u : p.total_body_count) + index;
+    const uint32_t env = rigid ? index / (p.total_body_count / p.env_count)
+                               : index / (p.articulation_count / p.env_count);
+    uint32_t largest = 0u;
+    for (uint32_t kind = 0u; kind < kResidualClasses; ++kind)
+        largest = max(largest, s.env_residual[size_t{env} * kResidualClasses + kind]);
+    const uint32_t dimension = rigid ? s.rigid_dimensions[index] : s.articulation_dimensions[index];
+    const bool candidate = __syncthreads_and(EnvRunning(data, env) && dimension != 0u &&
+        __uint_as_float(largest) < p.velocity_tolerance) != 0;
+    if (candidate) {
+        if constexpr (rigid) MeasureDensePrimal(LoadRigidBlock(data, p, s, index), data, p, s, owner);
+        else MeasureDensePrimal(LoadArticulationBlock<capacity>(data, p, s, index), data, p, s, owner);
+    }
+}
 #include "phi/backend_cuda/ops/block_descent_material.cuh"
 #include "phi/backend_cuda/ops/block_descent_grid.cuh"
 #include "phi/backend_cuda/ops/block_descent_coarse.cuh"
@@ -2092,8 +2117,11 @@ __global__ void DualUpdateKernel(DataView data, BlockDescentSolveParams p, Block
             data.lambda[slot + stride] = y.y;
             data.lambda[slot + 2u * stride] = y.z;
         }
-        if (seed && (p.total_grid_count == 0u
-                ? ParticleRowFirstColor(s, p.vertex_blocks.colors, slot) != kNoCacheColor : grid_only)) {
+        const uint32_t dense_color = p.vertex_blocks.colors + 1u;
+        const bool dense = (s.row_cache_colors[size_t{slot} * s.color_words + dense_color / 32u] &
+                            (1u << (dense_color % 32u))) != 0u;
+        if (seed && (dense || (p.total_grid_count == 0u
+                ? ParticleRowFirstColor(s, p.vertex_blocks.colors, slot) != kNoCacheColor : grid_only))) {
             AugmentedRowState seeded{};
             seeded.residual = t.residual;
             seeded.dual = y;
@@ -2737,7 +2765,8 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
         if (cudaGetLastError() != cudaSuccess) return Status::Failed;
     }
     if ((p->telemetry & nk::kTelemetrySweeps) != 0u &&
-        !clear(data.solver_work_trace, size_t{p->env_count} * p->trace_sweeps * kSolverWorkWords * sizeof(uint32_t)))
+        (!clear(data.solver_work_trace, size_t{p->env_count} * p->trace_sweeps * kSolverWorkWords * sizeof(uint32_t)) ||
+         !clear(data.solver_dense_motion_trace, size_t{p->env_count} * p->trace_sweeps * sizeof(float))))
         return Status::Failed;
     if (DenseTileRoute(*p)) {
         if (p->measure_contact_residual != 0u && !clear(s.active_count, sizeof(uint32_t))) return Status::Failed;
@@ -2753,6 +2782,7 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
             size_t{p->vertex_blocks.vertices} * p->env_count * nk::kVbdSolveAuditColumnCount * sizeof(float)))
         return Status::Failed;
     if (!clear(s.counts, size_t{s.blocks + 1u} * sizeof(uint32_t)) ||
+        !clear(s.dense_coupled, size_t{p->total_body_count + p->articulation_count} * sizeof(uint32_t)) ||
         !clear(s.cache_counts, size_t{s.cache_color_count} * sizeof(uint32_t)) ||
         !clear(s.contact_relaxation, size_t{s.rows} * sizeof(nk::augmented::ContactRelaxation)) ||
         !clear(s.active_count, sizeof(uint32_t)) ||
@@ -2970,6 +3000,19 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
              LaunchWork(VertexResidualsKernel, p->vertex_blocks.dynamic_vertices * p->env_count, kThreads / 32u,
                  stream, model, measured, *p, s) != cudaSuccess))
             return Status::Failed;
+        if (p->velocity_tolerance > 0.0f && (p->total_body_count > 0u || p->articulation_count > 0u)) {
+            if (!stamp(kPhaseDense, stream)) return Status::Failed;
+            if (p->articulation_count > 0u) {
+                const auto kernel = p->max_independent_dof <= 32u ? MeasureDensePrimalsKernel<32u, false>
+                    : MeasureDensePrimalsKernel<kMaxArticulationDof, false>;
+                LaunchCuda(kernel, dim3(p->articulation_count), dim3(kThreads), 0u, stream, data, *p, s);
+                if (cudaGetLastError() != cudaSuccess) return Status::Failed;
+            }
+            if (p->total_body_count > 0u)
+                LaunchCuda(MeasureDensePrimalsKernel<kRigidBlockDof, true>, dim3(p->total_body_count),
+                           dim3(kRigidThreads), 0u, stream, data, *p, s);
+            if (cudaGetLastError() != cudaSuccess || !stamp(kPhaseCheck, stream)) return Status::Failed;
+        }
         LaunchCuda(FinishSweepKernel, dim3(1u), dim3(kThreads), 0u, stream, data, *p, s, loop, graph);
         return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
     };

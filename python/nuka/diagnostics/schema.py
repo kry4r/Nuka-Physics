@@ -103,7 +103,7 @@ class SolverResidual(IntEnum):
     CONTACT_NORMAL = 0
     CONTACT_TANGENT = 1
     JOINT = 2
-    MOMENTUM = 3
+    PRIMAL_COUPLING = 3
 
 
 # Phases of SOLVER_PHASE_TIME in nanoseconds.

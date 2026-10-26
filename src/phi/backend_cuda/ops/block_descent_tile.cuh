@@ -265,8 +265,9 @@ struct TileContext {
     // Warps descending the environment together and this warp's place among them.
     uint32_t team;
     uint32_t member;
-    // The largest block coordinate change of the running sweep, its momentum residual.
+    // The sweep's largest block coordinate change and its primal/coupling residual.
     float momentum;
+    float residual;
     bool trace_work;
     uint32_t work[kSolverWorkWords];
     float* fields;
@@ -998,13 +999,16 @@ __device__ void InitializeTile(ArticulationDeviceState state, DataView data, Blo
 }
 
 // Hold the current normal multiplier as the friction radius through the block solve, as LoadLocalTerm.
-__device__ void StartTileBlock(const TileContext& c, uint32_t block) {
+__device__ bool StartTileBlock(const TileContext& c, uint32_t block) {
+    bool coupled = false;
     for (uint32_t k = c.IncidentBegin(block) + c.lane; k < c.incident_end[block]; k += kTileLanes) {
         const uint32_t h = c.incident[k];
+        coupled |= c.Index(kTileOwner, h) != kNoTileBlock && c.Index(kTileOwner + 1u, h) != kNoTileBlock;
         c.Value(kTileNormalBound, h) = c.Value(kTileDual, h);
         c.Store3(kTileMove, h, {});
     }
     __syncwarp();
+    return __any_sync(~0u, coupled);
 }
 
 // The block's moves enter the residuals of the heads it touches.
@@ -1598,6 +1602,23 @@ __device__ float SearchTileLine(TileContext& c, uint32_t block, float inertial_s
     return low;
 }
 
+template <uint32_t kN>
+__device__ void StageTileMass(TileContext& c, const TileBlock& b) {
+    constexpr uint32_t kS = kN + 1u;
+    constexpr uint32_t kSpan = TileSpan<kN>();
+    // Coordinates past the block's carry unit mass and no rows, so their step stays zero.
+    if (b.local != c.staged) {
+        for (uint32_t i = 0u; i < kN; ++i)
+#pragma unroll
+            for (uint32_t r = 0u; r < kSpan; ++r) {
+                const uint32_t j = c.lane + r * kTileLanes;
+                if (j < kN)
+                    c.mass[i * kS + j] = i < b.dimension && j < b.dimension ? b.Mass(i, j) : i == j ? 1.0f : 0.0f;
+            }
+        c.staged = b.local;
+    }
+}
+
 // Newton steps with an exact line search on the block's local augmented Lagrangian, as DescendDenseBlock.
 template <uint32_t kN>
 __device__ void DescendTileBlock(DataView data, BlockDescentSolveParams p, BlockScratch s, TileContext& c,
@@ -1608,17 +1629,8 @@ __device__ void DescendTileBlock(DataView data, BlockDescentSolveParams p, Block
     bool coordinate[kSpan];
 #pragma unroll
     for (uint32_t r = 0u; r < kSpan; ++r) coordinate[r] = c.lane + r * kTileLanes < n;
-    // Coordinates past the block's carry unit mass and no rows, so their step stays zero.
-    if (b.local != c.staged) {
-        for (uint32_t i = 0u; i < kN; ++i)
-#pragma unroll
-            for (uint32_t r = 0u; r < kSpan; ++r) {
-                const uint32_t j = c.lane + r * kTileLanes;
-                if (j < kN) c.mass[i * kS + j] = i < n && coordinate[r] ? b.Mass(i, j) : i == j ? 1.0f : 0.0f;
-            }
-        c.staged = b.local;
-    }
-    StartTileBlock(c, b.local);
+    StageTileMass<kN>(c, b);
+    const bool coupled = StartTileBlock(c, b.local);
     float start[kSpan], free[kSpan], u[kSpan];
 #pragma unroll
     for (uint32_t r = 0u; r < kSpan; ++r) {
@@ -1627,11 +1639,13 @@ __device__ void DescendTileBlock(DataView data, BlockDescentSolveParams p, Block
         u[r] = start[r];
     }
     nk::BlockSolveFailure failure = nk::BlockSolveFailure::None;
+    float primal = FLT_MAX;
     for (uint32_t step = 0u; step < kDenseNewtonSteps; ++step) {
         if (c.trace_work) ++c.work[kWorkNewton];
         float force[kSpan], inertia[kSpan], d[kSpan], mass_step[kSpan];
         bool converged = false;
         failure = TileNewtonDirection<kN>(c, b, u, free, force, inertia, d, &converged);
+        if (converged) primal = 0.0f;
         if (failure != nk::BlockSolveFailure::None || converged) break;
 #pragma unroll
         for (uint32_t r = 0u; r < kSpan; ++r) mass_step[r] = 0.0f;
@@ -1686,6 +1700,10 @@ __device__ void DescendTileBlock(DataView data, BlockDescentSolveParams p, Block
             failure = nk::BlockSolveFailure::InvalidCandidate;
             break;
         }
+        primal = 0.0f;
+#pragma unroll
+        for (uint32_t r = 0u; r < kSpan; ++r)
+            if (coordinate[r] && !rounded) primal = fmaxf(primal, fabsf(alpha * d[r]));
         if (!(alpha > 0.0f)) break;
 #pragma unroll
         for (uint32_t r = 0u; r < kSpan; ++r) u[r] = after[r];
@@ -1706,10 +1724,38 @@ __device__ void DescendTileBlock(DataView data, BlockDescentSolveParams p, Block
     for (uint32_t r = 0u; r < kSpan; ++r)
         if (coordinate[r]) moved = fmaxf(moved, __uint_as_float(ResidualBits(u[r] - start[r])));
     c.momentum = fmaxf(c.momentum, TileWarpMax(moved));
+    if (failure != nk::BlockSolveFailure::None) primal = FLT_MAX;
+    c.residual = fmaxf(c.residual, TileWarpMax(fmaxf(primal, coupled ? moved : 0.0f)));
 #pragma unroll
     for (uint32_t r = 0u; r < kSpan; ++r)
         if (coordinate[r]) b.velocity[c.lane + r * kTileLanes] = u[r];
     __syncwarp();
+}
+
+// The Newton correction at the updated duals measures the primal equation left for the next sweep.
+template <uint32_t kN>
+__device__ void MeasureTilePrimal(DataView data, BlockDescentSolveParams p, BlockScratch s, TileContext& c,
+                                  const TileBlock& b) {
+    constexpr uint32_t kSpan = TileSpan<kN>();
+    StageTileMass<kN>(c, b);
+    StartTileBlock(c, b.local);
+    float u[kSpan], free[kSpan], force[kSpan], inertia[kSpan], direction[kSpan];
+#pragma unroll
+    for (uint32_t r = 0u; r < kSpan; ++r) {
+        const uint32_t i = c.lane + r * kTileLanes;
+        u[r] = i < b.dimension ? b.velocity[i] : 0.0f;
+        free[r] = i < b.dimension ? b.free[i] : 0.0f;
+    }
+    bool converged = false;
+    if (c.trace_work) ++c.work[kWorkNewton];
+    const auto failure = TileNewtonDirection<kN>(c, b, u, free, force, inertia, direction, &converged);
+    float residual = failure == nk::BlockSolveFailure::None ? 0.0f : FLT_MAX;
+    if (failure != nk::BlockSolveFailure::None && c.lane == 0u) RecordTileFailure(data, p, s, c, b.owner, failure);
+#pragma unroll
+    for (uint32_t r = 0u; r < kSpan; ++r)
+        if (failure == nk::BlockSolveFailure::None && !converged && c.lane + r * kTileLanes < b.dimension)
+            residual = fmaxf(residual, fabsf(direction[r]));
+    c.residual = fmaxf(c.residual, TileWarpMax(residual));
 }
 
 // Dual update as DualUpdateKernel at the velocities every block reached in this iteration; position pass
@@ -1914,6 +1960,25 @@ __device__ void DescendTileBlocks(DataView data, BlockDescentSolveParams p, Bloc
     }
 }
 
+template <uint32_t kN>
+__device__ void MeasureTilePrimals(DataView data, BlockDescentSolveParams p, BlockScratch s, TileContext& c) {
+    for (uint32_t pending = c.colors; pending != 0u; pending &= pending - 1u) {
+        const uint32_t color = __ffs(pending) - 1u;
+        const uint32_t before = __shfl_sync(~0u, c.color_stop, (color + kTileColors - 1u) % kTileColors);
+        const uint32_t begin = color == 0u ? 0u : before, end = __shfl_sync(~0u, c.color_stop, color);
+        const bool shared = color + 1u < kTileColors;
+        for (uint32_t k = shared ? begin + c.member : c.member == 0u ? begin : end; k < end;
+             k += shared ? c.team : 1u) {
+            const uint32_t local = c.order[k];
+            const TileBlock b = LoadTileBlock(data, p, s, c, local, false);
+            if (local < c.bodies) MeasureTilePrimal<kRigidBlockDof>(data, p, s, c, b);
+            else MeasureTilePrimal<kN>(data, p, s, c, b);
+        }
+        TeamSync(c);
+    }
+    c.residual = __uint_as_float(TeamMax(c, make_uint4(__float_as_uint(c.residual), 0u, 0u, 0u)).x);
+}
+
 // An environment's velocity sweeps until its residuals pass the tolerance or the budget is spent, as the
 // sweep solve ends each env, then its split-impulse position pass. A team's first warp sets up and finishes.
 template <uint32_t kN>
@@ -1932,27 +1997,36 @@ __device__ void DescendTile(ArticulationDeviceState state, DataView data, BlockD
     while (sweeps < p.iterations) {
         c.iteration = sweeps++;
         c.momentum = 0.0f;
+        c.residual = 0.0f;
         c.trace_work = (p.telemetry & nk::kTelemetrySweeps) != 0u && c.iteration < p.trace_sweeps;
         for (uint32_t kind = 0u; kind < kSolverWorkWords; ++kind) c.work[kind] = 0u;
         DescendTileBlocks<kN>(data, p, s, c, false);
-        if (c.trace_work && c.lane == 0u)
-            for (uint32_t kind = 0u; kind < kSolverWorkWords; ++kind)
-                atomicAdd(data.solver_work_trace +
-                    (size_t{c.env} * p.trace_sweeps + c.iteration) * kSolverWorkWords + kind, c.work[kind]);
-        c.momentum = __uint_as_float(TeamMax(c, make_uint4(__float_as_uint(c.momentum), 0u, 0u, 0u)).x);
+        const uint4 block_residual = TeamMax(c,
+            make_uint4(__float_as_uint(c.momentum), __float_as_uint(c.residual), 0u, 0u));
+        c.momentum = __uint_as_float(block_residual.x);
+        c.residual = __uint_as_float(block_residual.y);
+        if (c.trace_work && c.member == 0u && c.lane == 0u)
+            data.solver_dense_motion_trace[size_t{c.env} * p.trace_sweeps + c.iteration] = c.momentum;
         clock.Stamp(kPhaseDense);
         AdvanceDualMomentum(momentum, step);
         clock.Stamp(kPhaseMomentum);
         const float4 rows = UpdateTileDuals(data, c, momentum.beta);
         step = rows.w;
         clock.Stamp(kPhaseDual);
+        if (fmaxf(fmaxf(rows.x, rows.y), fmaxf(rows.z, c.residual)) < p.velocity_tolerance)
+            MeasureTilePrimals<kN>(data, p, s, c);
+        if (c.trace_work && c.lane == 0u)
+            for (uint32_t kind = 0u; kind < kSolverWorkWords; ++kind)
+                atomicAdd(data.solver_work_trace +
+                    (size_t{c.env} * p.trace_sweeps + c.iteration) * kSolverWorkWords + kind, c.work[kind]);
+        clock.Stamp(kPhaseDense);
         residual = c.lane == kResidualNormal ? rows.x : c.lane == kResidualTangent ? rows.y
-                 : c.lane == kResidualJoint ? rows.z : c.momentum;
+                 : c.lane == kResidualJoint ? rows.z : c.residual;
         if ((p.telemetry & nk::kTelemetrySweeps) != 0u && sweeps <= p.trace_sweeps && c.member == 0u &&
             c.lane < kResidualClasses)
             data.solver_sweep_trace[(size_t{c.env} * p.trace_sweeps + sweeps - 1u) * kResidualClasses + c.lane] =
                 residual;
-        const float largest = fmaxf(fmaxf(rows.x, rows.y), fmaxf(rows.z, c.momentum));
+        const float largest = fmaxf(fmaxf(rows.x, rows.y), fmaxf(rows.z, c.residual));
         clock.Stamp(kPhaseCheck);
         if (largest < p.velocity_tolerance) break;
     }

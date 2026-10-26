@@ -22,6 +22,7 @@ template <uint32_t capacity>
 struct ArticulationBlock {
     static constexpr uint32_t kMaxDof = capacity;
     uint32_t index, dimension, begin, end, stride, env;
+    bool coupled;
     const uint32_t* roots;
     const float* mass;
     const float* snapshot;
@@ -40,16 +41,14 @@ struct ArticulationBlock {
 static_assert(kMaxArticulationDof <= kThreads);
 
 template <uint32_t capacity>
-__global__ void DescendArticulationsKernel(
-    ArticulationDeviceState state, DataView data, BlockDescentSolveParams p, BlockScratch s) {
-    const uint32_t articulation = blockIdx.x;
-    const uint32_t env = articulation / (p.articulation_count / p.env_count);
-    if (articulation >= p.articulation_count || !EnvRunning(data, env)) return;
+__device__ ArticulationBlock<capacity> LoadArticulationBlock(
+    DataView data, BlockDescentSolveParams p, BlockScratch s, uint32_t articulation) {
     const uint32_t owner = p.total_particle_count + p.total_body_count + articulation;
     const size_t base = size_t{articulation} * p.max_dof;
     ArticulationBlock<capacity> b{};
     b.index = articulation;
-    b.env = env;
+    b.env = articulation / (p.articulation_count / p.env_count);
+    b.coupled = s.dense_coupled[p.total_body_count + articulation] != 0u;
     b.dimension = s.articulation_dimensions[articulation];
     b.begin = s.offsets[owner];
     b.end = s.offsets[owner + 1u];
@@ -62,9 +61,23 @@ __global__ void DescendArticulationsKernel(
     b.matrix = s.articulation_matrix + base * p.max_dof;
     b.force = s.articulation_force + base;
     b.direction = s.articulation_direction + base;
+    return b;
+}
+
+template <uint32_t capacity>
+__global__ void DescendArticulationsKernel(
+    ArticulationDeviceState state, DataView data, BlockDescentSolveParams p, BlockScratch s) {
+    const uint32_t articulation = blockIdx.x;
+    const uint32_t env = articulation / (p.articulation_count / p.env_count);
+    if (articulation >= p.articulation_count || !EnvRunning(data, env)) return;
+    const uint32_t owner = p.total_particle_count + p.total_body_count + articulation;
+    const size_t base = size_t{articulation} * p.max_dof;
+    const auto b = LoadArticulationBlock<capacity>(data, p, s, articulation);
     if (b.dimension == 0u) return;
-    const nk::BlockSolveFailure failure = DescendDenseBlock(b, data, p, s);
-    if (threadIdx.x == 0u) RaiseResidual(s, env, kResidualMomentum, DenseBlockResidual(b, failure));
+    float primal = 0.0f;
+    const nk::BlockSolveFailure failure = DescendDenseBlock(b, data, p, s, &primal);
+    if (threadIdx.x == 0u)
+        RaiseResidual(s, env, kResidualMomentum, DenseBlockResidual(b, data, p, s, failure, primal));
     const uint32_t dof = threadIdx.x;
     uint32_t link = 0u, component = 0u;
     const bool located = dof < p.max_dof && ArticulationDofLocation(state, articulation, dof, &link, &component);
