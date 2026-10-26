@@ -761,6 +761,29 @@ public:
         return iterations;
     }
 
+    nb::dict solver_options() const {
+        nuka_solver_options_t options;
+        check(nuka_world_get_solver_options(h_, &options), "nuka_world_get_solver_options");
+        nb::dict result;
+        result["cone"] = options.cone;
+        result["integrator"] = options.integrator;
+        result["impratio"] = options.impratio;
+        result["refsafe"] = options.refsafe != 0u;
+        return result;
+    }
+
+    nb::list contact_profile_shapes() const {
+        uint32_t count;
+        check(nuka_world_get_contact_profile_count(h_, &count), "nuka_world_get_contact_profile_count");
+        nb::list result;
+        for (uint32_t index = 0u; index < count; ++index) {
+            const char* name;
+            check(nuka_world_get_contact_profile_name(h_, index, &name), "nuka_world_get_contact_profile_name");
+            result.append(name);
+        }
+        return result;
+    }
+
     void set_telemetry_mask(uint32_t mask, float alert_velocity) {
         check(nuka_world_set_telemetry_mask(h_, mask, alert_velocity), "nuka_world_set_telemetry_mask");
     }
@@ -2232,6 +2255,13 @@ NB_MODULE(_nuka_ext, m) {
         .value("SOLVER_SWEEP_TRACE", NUKA_FIELD_SOLVER_SWEEP_TRACE)
         .value("SOLVER_WORK_TRACE", NUKA_FIELD_SOLVER_WORK_TRACE)
         .value("SOLVER_DENSE_MOTION_TRACE", NUKA_FIELD_SOLVER_DENSE_MOTION_TRACE)
+        .value("JOINT_LAW_SOURCE", NUKA_FIELD_JOINT_LAW_SOURCE)
+        .value("JOINT_LIMIT_REFERENCE", NUKA_FIELD_JOINT_LIMIT_REFERENCE)
+        .value("JOINT_FRICTION_REFERENCE", NUKA_FIELD_JOINT_FRICTION_REFERENCE)
+        .value("JOINT_LIMIT_MARGIN", NUKA_FIELD_JOINT_LIMIT_MARGIN)
+        .value("BODY_INVWEIGHT0", NUKA_FIELD_BODY_INVWEIGHT0)
+        .value("DOF_INVWEIGHT0", NUKA_FIELD_DOF_INVWEIGHT0)
+        .value("CONTACT_PROFILES", NUKA_FIELD_CONTACT_PROFILES)
         .value("VBD_SOLVE_AUDIT", NUKA_FIELD_VBD_SOLVE_AUDIT)
         .value("UCONTACT_ROW_RANGE", NUKA_FIELD_UCONTACT_ROW_RANGE)
         .value("CONTACT_WARM_START_COUNTS", NUKA_FIELD_CONTACT_WARM_START_COUNTS)
@@ -3261,6 +3291,8 @@ NB_MODULE(_nuka_ext, m) {
         .def("set_velocity_iterations", &World::set_velocity_iterations, nb::arg("iterations"),
              "Set the block-descent iterations of the contact solve (1..65535). Preserves the "
              "timestep and invalidates the execution graph when the value changes.")
+        .def("solver_options", &World::solver_options)
+        .def("contact_profile_shapes", &World::contact_profile_shapes)
         .def("velocity_iterations", &World::velocity_iterations,
              "Block-descent iteration budget of the contact solve.")
         .def("set_telemetry_mask", &World::set_telemetry_mask, nb::arg("mask"), nb::arg("alert_velocity") = 1.0e-3f,

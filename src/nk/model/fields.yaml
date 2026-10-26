@@ -20,7 +20,7 @@ fields:
   - {name: articulation_bias, dtype: f32, per: articulation_dof, arena: scratch, owner: data}
   - {name: m_factor,         dtype: f32,       per: articulation_dof2, arena: scratch, owner: data}
   - {name: particle_pos,  dtype: vec3,      per: particle,     arena: persistent, owner: data}
-  - {name: mat_buckets,   dtype: f32,       per: scalar, count: "num_buckets*16", arena: persistent, owner: data, flags: [param]}
+  - {name: mat_buckets,   dtype: f32,       per: scalar, count: "num_buckets*19*env_count", arena: persistent, owner: data, flags: [param]}
   - {name: mat_index,     dtype: u32,       per: body,         arena: persistent, owner: data,  flags: [param]}
   - {name: link_contact_wrench, dtype: spatial6, per: link,    arena: scratch,    owner: data,  flags: [readout]}
 
@@ -830,3 +830,9 @@ fields:
   - {name: dat_artic_parent, dtype: u32, per: articulation, arena: scratch, owner: data}
   # Solver telemetry ring (nk::TelemetryHeader + records), allocated while a telemetry mask is set.
   - {name: telemetry, dtype: u32, per: scalar, count: "telemetry_words", arena: scratch, owner: data, flags: [readout]}
+  - {name: joint_law_source, dtype: u32, per: link, arena: persistent, owner: model, flags: [param]}
+  - {name: joint_limit_reference, dtype: f32, per: link, elem: 7, arena: persistent, owner: model, flags: [param]}
+  - {name: joint_friction_reference, dtype: f32, per: link, elem: 7, arena: persistent, owner: model, flags: [param]}
+  - {name: joint_limit_margin, dtype: f32, per: link, arena: persistent, owner: model, flags: [param]}
+  - {name: body_invweight0, dtype: f32, per: body, elem: 2, arena: persistent, owner: model, flags: [param]}
+  - {name: dof_invweight0, dtype: f32, per: articulation_dof, arena: persistent, owner: model, flags: [param]}

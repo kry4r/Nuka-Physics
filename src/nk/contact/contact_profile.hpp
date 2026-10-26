@@ -2,10 +2,11 @@
 
 #include <cstdint>
 #include <cstring>
+#include "constraint/solver_contract.hpp"
 
 namespace nuka::nk {
 
-inline constexpr uint32_t kContactProfileSchemaVersion = 1u;
+inline constexpr uint32_t kContactProfileSchemaVersion = 2u;
 inline constexpr uint32_t kContactProfileFlagRefsafe = 1u << 0;
 inline constexpr uint32_t kContactProfileSupportedFlags = kContactProfileFlagRefsafe;
 
@@ -26,7 +27,10 @@ enum ContactProfileLane : uint32_t {
     kContactProfileGap = 13u,
     kContactProfilePriority = 14u,
     kContactProfileCondim = 15u,
-    kContactProfileWordCount = 16u,
+    kContactProfileLawSource = 16u,
+    kContactProfileSpin = 17u,
+    kContactProfileRoll = 18u,
+    kContactProfileWordCount = 19u,
 };
 
 struct ContactProfileV1 {
@@ -41,10 +45,13 @@ struct ContactProfileV1 {
     float gap = 0.0f;
     int32_t priority = 0;
     uint32_t condim = 3u;
+    constraint::LawSource law_source = constraint::LawSource::None;
+    float friction_spin = 0.005f;
+    float friction_roll = 0.0001f;
 };
 
 static_assert(sizeof(ContactProfileV1) == kContactProfileWordCount * sizeof(uint32_t),
-              "ContactProfileV1 must be exactly 16 packed 32-bit words");
+              "ContactProfileV1 must match its packed word count");
 
 inline uint32_t ContactProfileFloatBits(float value) {
     uint32_t bits = 0u;
@@ -73,6 +80,9 @@ inline void PackContactProfile(const ContactProfileV1& profile, float* words) {
     raw[kContactProfileGap] = ContactProfileFloatBits(profile.gap);
     std::memcpy(&raw[kContactProfilePriority], &profile.priority, sizeof(uint32_t));
     raw[kContactProfileCondim] = profile.condim;
+    raw[kContactProfileLawSource] = static_cast<uint32_t>(profile.law_source);
+    raw[kContactProfileSpin] = ContactProfileFloatBits(profile.friction_spin);
+    raw[kContactProfileRoll] = ContactProfileFloatBits(profile.friction_roll);
     std::memcpy(words, raw, sizeof(raw));
 }
 
@@ -93,6 +103,9 @@ inline ContactProfileV1 UnpackContactProfile(const float* words) {
     profile.gap = ContactProfileBitsFloat(raw[kContactProfileGap]);
     std::memcpy(&profile.priority, &raw[kContactProfilePriority], sizeof(uint32_t));
     profile.condim = raw[kContactProfileCondim];
+    profile.law_source = static_cast<constraint::LawSource>(raw[kContactProfileLawSource]);
+    profile.friction_spin = ContactProfileBitsFloat(raw[kContactProfileSpin]);
+    profile.friction_roll = ContactProfileBitsFloat(raw[kContactProfileRoll]);
     return profile;
 }
 

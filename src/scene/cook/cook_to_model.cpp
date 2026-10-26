@@ -158,11 +158,15 @@ bool ResolveAuthoredIC(const SceneIR& scene, uint32_t root_body, uint32_t link_c
     return false;
 }
 
-// Find or append a canonical profile matching cooked contact row `shape_row`.
+// Each cooked shape owns independently writable contact parameters.
 uint32_t BucketFor(const CookedBlob& blob, uint32_t shape_row,
                    std::vector<nk::ModelMaterialBucket>& buckets) {
     nk::ContactProfileV1 profile;
     const auto& cp = blob.contact_params;
+    profile.law_source = cp.law_sources[shape_row];
+    profile.friction_spin = cp.friction_spin[shape_row];
+    profile.friction_roll = cp.friction_roll[shape_row];
+    profile.flags = blob.solver_options.refsafe ? nk::kContactProfileFlagRefsafe : 0u;
     if (shape_row < cp.frictions.size()) profile.mu1 = profile.mu2 = cp.frictions[shape_row];
     if (shape_row < cp.solref0.size()) profile.solref[0] = cp.solref0[shape_row];
     if (shape_row < cp.solref1.size()) profile.solref[1] = cp.solref1[shape_row];
@@ -181,9 +185,6 @@ uint32_t BucketFor(const CookedBlob& blob, uint32_t shape_row,
             std::to_string(profile.condim) + ", friction " + std::to_string(profile.mu1) + ", margin " +
             std::to_string(profile.margin) + ", gap " + std::to_string(profile.gap) +
             ") requires finite values, nonnegative friction, condim 1/3, and nonnegative margin/gap");
-    }
-    for (uint32_t b = 0; b < buckets.size(); ++b) {
-        if (std::memcmp(buckets[b].values, row.values, sizeof(row.values)) == 0) return b;
     }
     buckets.push_back(row);
     return static_cast<uint32_t>(buckets.size() - 1u);
@@ -339,6 +340,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
     CookToModelResult result;
     result.blob = cooked_blob;
     nk::Model& model = result.model;
+    model.solver_options = blob.solver_options;
     SceneMap& smap = result.scene_map;
 
     // 3. Per-env capacities.
@@ -547,6 +549,10 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         m.joint_damping = host.joint_damping;
         m.joint_armature = host.joint_armature;
         m.joint_frictionloss = host.joint_frictionloss;
+        m.joint_law_source.resize(m.link_count, constraint::LawSource::None);
+        m.joint_limit_reference.resize(m.link_count);
+        m.joint_friction_reference.resize(m.link_count);
+        m.joint_limit_margin.resize(m.link_count);
         m.joint_limit_lower.assign(m.link_count, 0.0f);
         m.joint_limit_upper.assign(m.link_count, 0.0f);
         m.joint_limit_flags.assign(m.link_count, 0u);
@@ -569,6 +575,10 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
                     m.joint_limit_flags[link] = blob.joints.limit_flags[joint];
                 }
                 joint_link[joint] = link;
+                m.joint_law_source[link] = blob.joints.law_sources[joint];
+                m.joint_limit_reference[link] = blob.joints.limit_references[joint];
+                m.joint_friction_reference[link] = blob.joints.friction_references[joint];
+                m.joint_limit_margin[link] = blob.joints.limit_margins[joint];
                 break;
             }
         }
@@ -895,6 +905,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
     // first cooked row + piece count for the SceneMap binding.
     model.shapes.reserve(blob.shape_count);
     model.material_buckets.emplace_back(nk::ContactProfileV1{});
+    model.contact_profile_shapes.emplace_back();
     std::vector<uint32_t> body_first_bucket(blob.body_count, 0u);
     std::vector<uint8_t>  body_has_shape(blob.body_count, 0u);
     for (uint32_t s = 0; s < blob.shape_count; ++s) {
@@ -910,6 +921,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         if (s < blob.shapes.mesh_contact_modes.size())
             sh.mesh_contact_mode = blob.shapes.mesh_contact_modes[s];
         sh.material_bucket = BucketFor(blob, s, model.material_buckets);
+        model.contact_profile_shapes.push_back(blob.contact_params.names[s]);
         model.shapes.push_back(sh);
 
         if (sh.body_row < blob.body_count && !body_has_shape[sh.body_row]) {

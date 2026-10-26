@@ -267,6 +267,16 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
         kWireDtypeU32, nk::FieldId::SolverWorkTrace},
     {NUKA_FIELD_SOLVER_DENSE_MOTION_TRACE, nk::LayoutOf(nk::FieldId::SolverDenseMotionTrace).elem_size,
         kWireDtypeF32, nk::FieldId::SolverDenseMotionTrace},
+    {NUKA_FIELD_JOINT_LAW_SOURCE, kStrideU32, kWireDtypeU32, nk::FieldId::JointLawSource},
+    {NUKA_FIELD_JOINT_LIMIT_REFERENCE, nk::LayoutOf(nk::FieldId::JointLimitReference).elem_size,
+        kWireDtypeF32, nk::FieldId::JointLimitReference},
+    {NUKA_FIELD_JOINT_FRICTION_REFERENCE, nk::LayoutOf(nk::FieldId::JointFrictionReference).elem_size,
+        kWireDtypeF32, nk::FieldId::JointFrictionReference},
+    {NUKA_FIELD_JOINT_LIMIT_MARGIN, kStrideF32, kWireDtypeF32, nk::FieldId::JointLimitMargin},
+    {NUKA_FIELD_BODY_INVWEIGHT0, nk::LayoutOf(nk::FieldId::BodyInvweight0).elem_size,
+        kWireDtypeF32, nk::FieldId::BodyInvweight0},
+    {NUKA_FIELD_DOF_INVWEIGHT0, kStrideF32, kWireDtypeF32, nk::FieldId::DofInvweight0},
+    {NUKA_FIELD_CONTACT_PROFILES, kStrideF32, kWireDtypeF32, nk::FieldId::MatBuckets},
 };
 
 inline constexpr size_t kDlpackFieldCount =

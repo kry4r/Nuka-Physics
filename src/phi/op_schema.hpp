@@ -113,6 +113,15 @@ struct ArticulationDynamicsParams {
     uint32_t apply_link_wrench = 0u;
 };
 
+struct ReferenceWeightsParams {
+    uint32_t max_dof;
+    uint32_t articulation_count;
+    uint32_t total_link_count;
+    uint32_t articulations_per_env;
+    uint32_t bodies_per_env;
+    uint32_t total_body_count;
+};
+
 struct IntegrateVelocityParams {
     float    dt;
     float    gravity[3];
@@ -249,6 +258,7 @@ struct ParticleSurfacesParams {
 inline constexpr float kDatRelaxation = 0.9f;
 
 struct OgcDetectParams {
+    uint32_t num_material_buckets;
     uint32_t ogc_body_pairs = 1u;
     float dt = 0.0f;
     float margin = 0.0f;

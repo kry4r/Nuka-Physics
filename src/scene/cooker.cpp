@@ -448,6 +448,7 @@ void PushShapeRow(CookedShapeTable& shapes,
 
     // Parallel contact-param row (copied verbatim except the resolved friction).
     contact_params.contypes.push_back(src.contype);
+    contact_params.names.push_back(src.name);
     contact_params.conaffinities.push_back(src.conaffinity);
     contact_params.groups.push_back(src.collision_group);
     contact_params.solref0.push_back(src.solref[0]);
@@ -456,6 +457,9 @@ void PushShapeRow(CookedShapeTable& shapes,
         contact_params.solimp.push_back(src.solimp[k]);  // flattened, row-major
     }
     contact_params.frictions.push_back(resolved_friction);
+    contact_params.friction_spin.push_back(src.friction_spin);
+    contact_params.friction_roll.push_back(src.friction_roll);
+    contact_params.law_sources.push_back(src.law_source);
     contact_params.condims.push_back(src.condim);
     contact_params.priorities.push_back(src.priority);
     contact_params.solmix.push_back(src.solmix);
@@ -605,6 +609,7 @@ CookedBlob CookScene(const SceneIR& scene) {
 CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
     ValidateJointTopology(scene);
     CookedBlob blob;
+    blob.solver_options = scene.SolverOptions();
 
     const auto& bodies = scene.Bodies();
     blob.body_count = static_cast<uint32_t>(bodies.size());
@@ -674,6 +679,10 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
         blob.joints.armatures.push_back(j.armature);
         blob.joints.initial_positions.push_back(j.initial_position);
         blob.joints.frictionlosses.push_back(j.frictionloss);
+        blob.joints.law_sources.push_back(j.law_source);
+        blob.joints.limit_references.push_back(j.limit_reference);
+        blob.joints.friction_references.push_back(j.friction_reference);
+        blob.joints.limit_margins.push_back(j.limit_margin);
         blob.joints.mimic_sources.push_back(j.mimic_source);
         blob.joints.mimic_multipliers.push_back(j.mimic_multiplier);
         blob.joints.mimic_offsets.push_back(j.mimic_offset);

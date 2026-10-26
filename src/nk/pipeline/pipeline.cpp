@@ -702,6 +702,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     if (cap.ogc_contacts_per_env > 0u &&
         (cap.particle_surfaces_per_env > 0u || cap.mesh_vertex_source_count > 0u)) {
         p_ogc_detect_.dt = cfg.dt;
+        p_ogc_detect_.num_material_buckets = cap.num_material_buckets;
         p_ogc_detect_.ogc_body_pairs = HasMeshContactPairs(model, collision::MeshContactRoute::Ogc);
         p_ogc_detect_.margin = contact_margin;
         p_ogc_detect_.env_count = env_count;

@@ -4,6 +4,7 @@
 // ---------------------------------------------------------------------------
 
 #include "scene/canonical_types.hpp"
+#include "constraint/solver_contract.hpp"
 #include "collision/mesh_surface_types.hpp"
 #include "import/cooker/convex_cover.hpp"
 #include "scene/contact_filter.hpp"   // MergedContactParams (v0.8 C1c)
@@ -41,6 +42,10 @@ struct CookedJointTable {
     std::vector<float>      armatures;
     std::vector<float>      initial_positions;
     std::vector<float>      frictionlosses;
+    std::vector<constraint::LawSource> law_sources;
+    std::vector<constraint::SolverReference> limit_references;
+    std::vector<constraint::SolverReference> friction_references;
+    std::vector<float>      limit_margins;
     std::vector<JointId>    mimic_sources;
     std::vector<float>      mimic_multipliers;
     std::vector<float>      mimic_offsets;
@@ -134,6 +139,7 @@ struct CookedSdfTable {
 // `solimp` is FLATTENED: 5 floats per shape, row-major, so shape `i`'s slice is
 // [i*5, i*5+5). `solref` is split into solref0 (timeconst) + solref1 (dampratio).
 struct CookedContactParamTable {
+    std::vector<std::string> names;
     std::vector<uint32_t> contypes;
     std::vector<uint32_t> conaffinities;
     std::vector<int32_t>  groups;
@@ -141,6 +147,9 @@ struct CookedContactParamTable {
     std::vector<float>    solref1;       // dampratio
     std::vector<float>    solimp;        // FLATTENED: 5 floats per shape (row-major)
     std::vector<float>    frictions;     // RESOLVED per-shape μ
+    std::vector<float>    friction_spin;
+    std::vector<float>    friction_roll;
+    std::vector<constraint::LawSource> law_sources;
     std::vector<uint8_t>  condims;
     std::vector<int32_t>  priorities;
     std::vector<float>    solmix;
@@ -296,6 +305,7 @@ struct CookedMeshReport {
 };
 
 struct CookedBlob {
+    constraint::SolverOptions solver_options;
     uint32_t body_count  = 0;
     uint32_t joint_count = 0;
     uint32_t shape_count = 0;

@@ -368,6 +368,77 @@ __device__ void PrepareArticulationKinematics(ArticulationDeviceState state,
     }
 }
 
+__global__ void BodyReferenceWeightsKernel(ModelView model, DataView data, uint32_t count) {
+    for (uint32_t body = blockIdx.x * blockDim.x + threadIdx.x; body < count;
+         body += blockDim.x * gridDim.x) {
+        const auto inertia = data.body_inv_inertia[body];
+        model.body_invweight0[2u * body] = data.body_inv_mass[body];
+        model.body_invweight0[2u * body + 1u] = (inertia.x + inertia.y + inertia.z) / 3.0f;
+    }
+}
+
+__global__ void ArticulationReferenceWeightsKernel(ArticulationDeviceState state, ModelView model,
+    DataView data, ArticulationTreeView tree, ReferenceWeightsParams p) {
+    const uint32_t articulation = blockIdx.x;
+    const uint32_t offset = state.articulation_link_offset[articulation];
+    const uint32_t count = state.articulation_link_count[articulation];
+    const uint32_t dof = LocalDofIndexDevice(state, offset, offset + count);
+    const auto workspace = CrbaWorkspaceFor(data.crba_scratch, articulation, p.max_dof);
+    float* const row = workspace.Values(CrbaVector::Moment);
+    float* const solution = workspace.Values(CrbaVector::QdotWork);
+    float* const factor = data.m_factor + size_t{articulation} * p.max_dof * p.max_dof;
+    float* const diagonal = model.dof_invweight0 + size_t{articulation} * p.max_dof;
+    PrepareArticulationKinematics(state, data.link_wrench, 0u, tree);
+    ComputeArticulationMass(state, p.max_dof,
+        reinterpret_cast<LinkSpatialInertia*>(data.link_composite_inertia), data.m, nullptr, 0.0f, tree);
+    __syncthreads();
+    FactorMass(data.m + size_t{articulation} * p.max_dof * p.max_dof, factor, dof, p.max_dof);
+    if (threadIdx.x == 0u) {
+        for (uint32_t d = 0u; d < dof; ++d) {
+            for (uint32_t i = 0u; i < dof; ++i) solution[i] = i == d ? 1.0f : 0.0f;
+            SolveMass(factor, solution, dof, p.max_dof);
+            diagonal[d] = solution[d];
+        }
+        if (state.joint_type[offset] == ArticulationJointType::FloatingBase) {
+            const float rotation = (diagonal[0] + diagonal[1] + diagonal[2]) / 3.0f;
+            const float translation = (diagonal[3] + diagonal[4] + diagonal[5]) / 3.0f;
+            for (uint32_t i = 0u; i < 3u; ++i) {
+                diagonal[i] = rotation;
+                diagonal[i + 3u] = translation;
+            }
+        }
+        for (uint32_t local = 0u; local < count; ++local) {
+            const uint32_t link = offset + local;
+            const uint32_t body = (articulation / p.articulations_per_env) * p.bodies_per_env +
+                state.link_body[link];
+            const auto pose = state.link_pose[link];
+            const auto point = mg::Add(pose.position,
+                mg::RotateByQuatNormalized(pose.rotation, state.link_inertial_frame[link].position));
+            float weight[2] = {};
+            for (uint32_t axis = 0u; axis < 6u; ++axis) {
+                for (uint32_t d = 0u; d < dof; ++d) row[d] = 0.0f;
+                const math::Vec3 unit{axis % 3u == 0u ? 1.0f : 0.0f,
+                                     axis % 3u == 1u ? 1.0f : 0.0f,
+                                     axis % 3u == 2u ? 1.0f : 0.0f};
+                uint32_t walk = link;
+                while (walk != kInvalidLink) {
+                    if (JointDofCountDevice(state.joint_type[walk]) != 0u)
+                        AccumulateChainJointForce(state, articulation, walk,
+                            LocalDofIndexDevice(state, offset, walk), p.max_dof, point,
+                            axis < 3u ? unit : math::Vec3{}, axis < 3u ? math::Vec3{} : unit, row);
+                    const uint32_t parent = state.parent_link[walk];
+                    walk = parent == kInvalidLink ? kInvalidLink : offset + parent;
+                }
+                for (uint32_t d = 0u; d < dof; ++d) solution[d] = row[d];
+                SolveMass(factor, solution, dof, p.max_dof);
+                for (uint32_t d = 0u; d < dof; ++d) weight[axis / 3u] += row[d] * solution[d];
+            }
+            model.body_invweight0[2u * body] = weight[0] / 3.0f;
+            model.body_invweight0[2u * body + 1u] = weight[1] / 3.0f;
+        }
+    }
+}
+
 // One articulation owns the kinematics, bias, mass factor and unconstrained velocity update.
 __global__ void ArticulationDynamicsKernel(ArticulationDeviceState state, DataView data,
     ArticulationTreeView tree, ArticulationDynamicsParams p) {
@@ -1390,6 +1461,20 @@ Status OpArticulationDynamics(const ModelView& model, const DataView& data,
     return LaunchOk(stream);
 }
 
+Status OpReferenceWeights(const ModelView& model, const DataView& data,
+    const void* params, cudaStream_t stream) {
+    const auto& p = *static_cast<const ReferenceWeightsParams*>(params);
+    if (p.total_body_count > 0u)
+        LaunchCuda(BodyReferenceWeightsKernel, dim3((p.total_body_count + 127u) / 128u), dim3(128u),
+            0u, stream, model, data, p.total_body_count);
+    if (p.total_link_count > 0u) {
+        const auto state = MakeArticulationDeviceState(model, data, p.total_link_count, p.articulation_count);
+        LaunchCuda(ArticulationReferenceWeightsKernel, dim3(p.articulation_count), dim3(32u), 0u,
+            stream, state, model, data, MakeArticulationTreeView(model), p);
+    }
+    return LaunchOk(stream);
+}
+
 Status OpIntegrateVelocity(const ModelView& model, const DataView& data,
                            const void* params, cudaStream_t stream) {
     const auto* p = static_cast<const IntegrateVelocityParams*>(params);
@@ -1523,6 +1608,7 @@ void RegisterNkAbaOps() {
     SetCudaOp(NkOp::ApplyDynamicsDrives, &OpApplyDynamicsDrives);
     SetCudaOp(NkOp::ReadoutDrives, &OpReadoutDrives);
     SetCudaOp(NkOp::ArticulationDynamics, &OpArticulationDynamics);
+    SetCudaOp(NkOp::ReferenceWeights, &OpReferenceWeights);
     SetCudaOp(NkOp::IntegrateVelocity, &OpIntegrateVelocity);
     SetCudaOp(NkOp::FkWorldPoses, &OpFkWorldPoses);
     SetCudaOp(NkOp::FkLinkVelocities, &OpFkLinkVelocities);

@@ -179,6 +179,10 @@ struct ModelArticulation {
     std::vector<float>            joint_damping;
     std::vector<float>            joint_armature;
     std::vector<float>            joint_frictionloss;    // MuJoCo joint dry friction bound
+    std::vector<constraint::LawSource> joint_law_source;
+    std::vector<constraint::SolverReference> joint_limit_reference;
+    std::vector<constraint::SolverReference> joint_friction_reference;
+    std::vector<float>            joint_limit_margin;
     std::vector<float>            joint_limit_lower;
     std::vector<float>            joint_limit_upper;
     std::vector<uint8_t>          joint_limit_flags;     // bit0 lower, bit1 upper
@@ -324,6 +328,7 @@ struct HeightfieldData {
 
 class Model {
 public:
+    constraint::SolverOptions solver_options;
     Model() = default;
     std::vector<sensor::StateSensorDesc> state_sensors;
 
@@ -332,6 +337,7 @@ public:
     ModelArticulation               articulation;       // the per-env template.
     std::vector<ModelShape>         shapes;             // cooked shape rows (per env).
     std::vector<ModelMaterialBucket> material_buckets;  // (num_buckets) bucket table.
+    std::vector<std::string> contact_profile_shapes;
     std::vector<uint32_t>           body_material_bucket;  // per body-row bucket index.
     std::vector<MpmMaterial>        mpm_materials;      // (mpm_material_count) MPM table.
 

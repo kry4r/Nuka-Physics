@@ -746,6 +746,26 @@ nuka_result_t nuka_world_get_velocity_iterations(nuka_world_handle world, uint32
     return NUKA_RESULT_OK;
 }
 
+nuka_result_t nuka_world_get_solver_options(nuka_world_handle world, nuka_solver_options_t* out) {
+    const auto* record = nuka::c_abi::WorldTable().Get(world);
+    const auto& options = record->world->GetModel().solver_options;
+    *out = {static_cast<uint32_t>(options.cone), static_cast<uint32_t>(options.integrator),
+            options.impratio, options.refsafe ? 1u : 0u};
+    return NUKA_RESULT_OK;
+}
+
+nuka_result_t nuka_world_get_contact_profile_count(nuka_world_handle world, uint32_t* out) {
+    const auto* record = nuka::c_abi::WorldTable().Get(world);
+    *out = static_cast<uint32_t>(record->world->GetModel().contact_profile_shapes.size());
+    return NUKA_RESULT_OK;
+}
+
+nuka_result_t nuka_world_get_contact_profile_name(nuka_world_handle world, uint32_t index, const char** out) {
+    const auto* record = nuka::c_abi::WorldTable().Get(world);
+    *out = record->world->GetModel().contact_profile_shapes[index].c_str();
+    return NUKA_RESULT_OK;
+}
+
 static_assert(sizeof(nuka_telemetry_record_t) == sizeof(nuka::nk::TelemetryRecord) &&
               offsetof(nuka_telemetry_record_t, sample_residual) == offsetof(nuka::nk::TelemetryRecord, sample_residual) &&
               NUKA_TELEMETRY_SAMPLES == nuka::nk::kTelemetrySamples, "telemetry record ABI");

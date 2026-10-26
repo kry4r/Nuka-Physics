@@ -287,6 +287,18 @@ nuka_result_t nuka_world_set_gravity_z(nuka_world_handle world, float gravity_z)
 nuka_result_t nuka_world_set_velocity_iterations(nuka_world_handle world, uint32_t iterations);
 nuka_result_t nuka_world_get_velocity_iterations(nuka_world_handle world, uint32_t* out_iterations);
 
+typedef struct nuka_solver_options_t {
+    uint32_t cone;
+    uint32_t integrator;
+    float impratio;
+    uint32_t refsafe;
+} nuka_solver_options_t;
+
+nuka_result_t nuka_world_get_solver_options(nuka_world_handle world, nuka_solver_options_t* out);
+nuka_result_t nuka_world_get_contact_profile_count(nuka_world_handle world, uint32_t* out);
+// The shape name remains valid until the world is rebuilt or destroyed.
+nuka_result_t nuka_world_get_contact_profile_name(nuka_world_handle world, uint32_t index, const char** out);
+
 typedef enum nuka_param_type_t {
     NUKA_PARAM_F32 = 0,
     NUKA_PARAM_U32 = 1
@@ -877,7 +889,14 @@ typedef enum nuka_state_field_t {
     // Per environment and sampled sweep: Newton iterations, line evaluations and factorizations.
     NUKA_FIELD_SOLVER_WORK_TRACE = 111,
     // READ: per environment and sampled sweep, the largest dense block velocity change in m/s.
-    NUKA_FIELD_SOLVER_DENSE_MOTION_TRACE = 112
+    NUKA_FIELD_SOLVER_DENSE_MOTION_TRACE = 112,
+    NUKA_FIELD_JOINT_LAW_SOURCE = 113,
+    NUKA_FIELD_JOINT_LIMIT_REFERENCE = 114,
+    NUKA_FIELD_JOINT_FRICTION_REFERENCE = 115,
+    NUKA_FIELD_JOINT_LIMIT_MARGIN = 116,
+    NUKA_FIELD_BODY_INVWEIGHT0 = 117,
+    NUKA_FIELD_DOF_INVWEIGHT0 = 118,
+    NUKA_FIELD_CONTACT_PROFILES = 119
 } nuka_state_field_t;
 
 typedef enum nuka_vbd_element_kind_t {

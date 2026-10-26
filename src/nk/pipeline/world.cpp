@@ -494,23 +494,20 @@ bool World::SeedInitialState() {
         }
     }
 
-    // Material bucket table (global; data-owned param field). Seeded for EVERY
-    // world that has buckets — including articulation-less (bodies/particles-
-    // only) worlds, which return early below. (Review fix: this block used to
-    // sit below the L==0 early return, silently skipping the bucket seed for
-    // any world without an articulation — the M5-binding-bug class.)
+    // Each environment starts with the cooked shape profiles and owns subsequent parameter writes.
     if (cap.num_material_buckets > 0 && !model_.material_buckets.empty()) {
         const uint32_t stride = ModelMaterialBucket::kValueCount;
-        std::vector<float> host(static_cast<size_t>(cap.num_material_buckets) * stride,
+        std::vector<float> host(static_cast<size_t>(cap.num_material_buckets) * stride * E,
                                 0.0f);
         for (uint32_t b = 0; b < cap.num_material_buckets &&
                              b < model_.material_buckets.size(); ++b) {
             ModelMaterialBucket canonical;
             if (!CanonicalizeContactProfileForUpload(model_.material_buckets[b], &canonical))
                 return false;
-            for (uint32_t k = 0u; k < stride; ++k) {
-                host[static_cast<size_t>(b) * stride + k] = canonical.values[k];
-            }
+            for (uint32_t env = 0u; env < E; ++env)
+                for (uint32_t k = 0u; k < stride; ++k)
+                    host[(static_cast<size_t>(env) * cap.num_material_buckets + b) * stride + k] =
+                        canonical.values[k];
         }
         if (!data_.UploadField(FieldId::MatBuckets, host.data(),
                                host.size() * sizeof(float))) {
@@ -631,6 +628,9 @@ bool World::SeedInitialState() {
     }
     // Creation and reset expose the same FK and collision proxy poses.
     if (RefreshPoses(0u) != phi::Status::Ok) return false;
+    const phi::ReferenceWeightsParams weights{cap.dofs_per_env, cap.articulations_per_env * E,
+        L * E, cap.articulations_per_env, cap.bodies_per_env, total_body_count};
+    if (DispatchOp(phi::NkOp::ReferenceWeights, &weights) != phi::Status::Ok) return false;
     return DispatchOp(phi::NkOp::SnapshotState, &snapshot_params_) == phi::Status::Ok;
 }
 

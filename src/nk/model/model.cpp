@@ -234,7 +234,7 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         // Unresolved fields are rejected instead of allocating a smaller buffer.
         if (id == FieldId::MatBuckets) {
             return static_cast<uint64_t>(num_material_buckets) *
-                   ModelMaterialBucket::kValueCount;
+                   ModelMaterialBucket::kValueCount * env_count;
         }
         if (id == FieldId::FootShape) return uint64_t{foot_shape_count} * 5u;
         // L1-c: FieldId::UnionSlots staging size was DELETED with the field.
@@ -528,6 +528,18 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             break;
         case FieldId::JointFrictionloss:
             StampPerLink(dst, a.joint_frictionloss, L, E, sizeof(float));
+            break;
+        case FieldId::JointLawSource:
+            StampPerLink(dst, a.joint_law_source, L, E, sizeof(uint32_t));
+            break;
+        case FieldId::JointLimitReference:
+            StampPerLink(dst, a.joint_limit_reference, L, E, sizeof(constraint::SolverReference));
+            break;
+        case FieldId::JointFrictionReference:
+            StampPerLink(dst, a.joint_friction_reference, L, E, sizeof(constraint::SolverReference));
+            break;
+        case FieldId::JointLimitMargin:
+            StampPerLink(dst, a.joint_limit_margin, L, E, sizeof(float));
             break;
         case FieldId::JointLimitLower:
             StampPerLink(dst, a.joint_limit_lower, L, E, sizeof(float));
@@ -1103,6 +1115,12 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::JointDamping:          v.joint_damping = static_cast<float*>(p); break;
         case FieldId::JointArmature:         v.joint_armature = static_cast<float*>(p); break;
         case FieldId::JointFrictionloss:     v.joint_frictionloss = static_cast<float*>(p); break;
+        case FieldId::JointLawSource:       v.joint_law_source = static_cast<uint32_t*>(p); break;
+        case FieldId::JointLimitReference:  v.joint_limit_reference = static_cast<float*>(p); break;
+        case FieldId::JointFrictionReference: v.joint_friction_reference = static_cast<float*>(p); break;
+        case FieldId::JointLimitMargin:     v.joint_limit_margin = static_cast<float*>(p); break;
+        case FieldId::BodyInvweight0:       v.body_invweight0 = static_cast<float*>(p); break;
+        case FieldId::DofInvweight0:        v.dof_invweight0 = static_cast<float*>(p); break;
         case FieldId::JointLimitLower:       v.joint_limit_lower = static_cast<float*>(p); break;
         case FieldId::JointLimitUpper:       v.joint_limit_upper = static_cast<float*>(p); break;
         case FieldId::JointLimitFlags:       v.joint_limit_flags = static_cast<uint8_t*>(p); break;
@@ -1834,10 +1852,12 @@ namespace {
 // included). Centralized so the move ctor and move assignment cannot drift.
 void MoveModelMembers(Model& dst, Model&& src) {
     dst.capacities = std::move(src.capacities);
+    dst.solver_options = src.solver_options;
     dst.articulation = std::move(src.articulation);
     dst.state_sensors = std::move(src.state_sensors);
     dst.shapes = std::move(src.shapes);
     dst.material_buckets = std::move(src.material_buckets);
+    dst.contact_profile_shapes = std::move(src.contact_profile_shapes);
     dst.body_material_bucket = std::move(src.body_material_bucket);
     dst.feet = std::move(src.feet);
     dst.hold_drives = std::move(src.hold_drives);

@@ -100,6 +100,9 @@ struct MjcfJointDefaults {
     float damping = 0.0f;
     float armature = 0.0f;
     float frictionloss = 0.0f;
+    constraint::SolverReference limit_reference;
+    constraint::SolverReference friction_reference;
+    float limit_margin = 0.0f;
 };
 
 struct MjcfGeneralDefaults {
@@ -141,7 +144,7 @@ struct MjcfGeomDefaults : MjcfFrameDefaults {
     bool has_gap = false;           float gap = 0.0f;
     bool has_solref = false;        float solref[2] = {0.02f, 1.0f};
     bool has_solimp = false;        float solimp[5] = {0.9f, 0.95f, 0.001f, 0.5f, 2.0f};
-    bool has_friction = false;      float friction_mu = 1.0f;  // first component only
+    float friction[3] = {1.0f, 0.005f, 0.0001f};
     float density = 1000.0f;
     float mass = -1.0f;  // negative: the geom's mass comes from its density
 };
@@ -305,6 +308,11 @@ void ApplyJointDefault(tinyxml2::XMLElement* joint_elem, MjcfDefaultClass* defau
     joint_elem->QueryFloatAttribute("damping", &defaults->joint.damping);
     joint_elem->QueryFloatAttribute("armature", &defaults->joint.armature);
     joint_elem->QueryFloatAttribute("frictionloss", &defaults->joint.frictionloss);
+    joint_elem->QueryFloatAttribute("margin", &defaults->joint.limit_margin);
+    ParseFloatList(joint_elem->Attribute("solreflimit"), defaults->joint.limit_reference.solref, 2);
+    ParseFloatList(joint_elem->Attribute("solimplimit"), defaults->joint.limit_reference.solimp, 5);
+    ParseFloatList(joint_elem->Attribute("solreffriction"), defaults->joint.friction_reference.solref, 2);
+    ParseFloatList(joint_elem->Attribute("solimpfriction"), defaults->joint.friction_reference.solimp, 5);
 }
 
 void ApplyGeneralDefault(tinyxml2::XMLElement* general_elem, MjcfDefaultClass* defaults) {
@@ -404,9 +412,7 @@ void ApplyGeomDefault(const tinyxml2::XMLElement* geom_elem, MjcfDefaultClass* d
         ParseFloatList(geom_elem->Attribute("solimp"), g.solimp, 5) > 0) {
         g.has_solimp = true;
     }
-    if (ParseFrictionFirst(geom_elem->Attribute("friction"), g.friction_mu)) {
-        g.has_friction = true;
-    }
+    ParseFloatList(geom_elem->Attribute("friction"), g.friction, 3);
     geom_elem->QueryFloatAttribute("density", &g.density);
     geom_elem->QueryFloatAttribute("mass", &g.mass);
 }
@@ -770,6 +776,7 @@ void ParseGeoms(tinyxml2::XMLElement* body_elem,
          geom = geom->NextSiblingElement("geom")) {
 
         scene::CollisionShapeRecord shape;
+        shape.law_source = constraint::LawSource::MuJoCo;
         shape.body_id = body_id;
         shape.name = geom->Attribute("name") ? geom->Attribute("name") : "";
 
@@ -968,9 +975,9 @@ void ParseGeoms(tinyxml2::XMLElement* body_elem,
         if (gd.has_solimp) {
             for (int k = 0; k < 5; ++k) { shape.solimp[k] = gd.solimp[k]; }
         }
-        // friction_mu stays the -1 "inherit material μ" sentinel unless the
-        // default class explicitly set a friction; only friction[0] is kept.
-        if (gd.has_friction)    { shape.friction_mu = gd.friction_mu; }
+        shape.friction_mu = gd.friction[0];
+        shape.friction_spin = gd.friction[1];
+        shape.friction_roll = gd.friction[2];
 
         // The geom's own explicit attrs override the resolved class default.
         // QueryUnsignedAttribute/QueryIntAttribute/QueryFloatAttribute write the
@@ -995,11 +1002,11 @@ void ParseGeoms(tinyxml2::XMLElement* body_elem,
         // entries, so a partial list does not zero the trailing defaults).
         ParseFloatList(geom->Attribute("solref"), shape.solref, 2);
         ParseFloatList(geom->Attribute("solimp"), shape.solimp, 5);
-        // friction: take ONLY the first (isotropic tangential) component;
-        // spin/roll (and any further) friction are DROPPED. Set the per-shape μ
-        // override only when friction is explicitly present here (so an
-        // unspecified friction keeps the -1 sentinel for the cooker to resolve).
-        ParseFrictionFirst(geom->Attribute("friction"), shape.friction_mu);
+        float friction[3] = {shape.friction_mu, shape.friction_spin, shape.friction_roll};
+        ParseFloatList(geom->Attribute("friction"), friction, 3);
+        shape.friction_mu = friction[0];
+        shape.friction_spin = friction[1];
+        shape.friction_roll = friction[2];
 
         float density = gd.density;
         float geom_mass = gd.mass;
@@ -1167,6 +1174,10 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         jrec.damping = defaults.joint.damping;
         jrec.armature = defaults.joint.armature;
         jrec.frictionloss = defaults.joint.frictionloss;
+        jrec.law_source = constraint::LawSource::MuJoCo;
+        jrec.limit_reference = defaults.joint.limit_reference;
+        jrec.friction_reference = defaults.joint.friction_reference;
+        jrec.limit_margin = defaults.joint.limit_margin;
         // Nuka extension: author the cooked q0 explicitly. MJCF keyframes are
         // intentionally not imported, so this keeps initial FK/colliders aligned
         // before the first physics step without changing MuJoCo joint semantics.
@@ -1175,6 +1186,11 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         joint->QueryFloatAttribute("damping", &jrec.damping);
         joint->QueryFloatAttribute("armature", &jrec.armature);
         joint->QueryFloatAttribute("frictionloss", &jrec.frictionloss);
+        joint->QueryFloatAttribute("margin", &jrec.limit_margin);
+        ParseFloatList(joint->Attribute("solreflimit"), jrec.limit_reference.solref, 2);
+        ParseFloatList(joint->Attribute("solimplimit"), jrec.limit_reference.solimp, 5);
+        ParseFloatList(joint->Attribute("solreffriction"), jrec.friction_reference.solref, 2);
+        ParseFloatList(joint->Attribute("solimpfriction"), jrec.friction_reference.solimp, 5);
         if (joint->Attribute("type")) {
             jrec.type = MjcfJointType(joint->Attribute("type"));
         }
@@ -1605,6 +1621,25 @@ scene::SceneIR LoadMjcf(const std::string& path) {
 
     scene::SceneIR scene;
     MjcfParseContext context;
+
+    if (const auto* option = mujoco->FirstChildElement("option")) {
+        auto& solver = scene.SolverOptionsMut();
+        if (const char* cone = option->Attribute("cone"))
+            solver.cone = std::unordered_map<std::string, constraint::FrictionCone>{
+                {"elliptic", constraint::FrictionCone::Elliptic},
+                {"pyramidal", constraint::FrictionCone::Pyramidal}}.at(cone);
+        option->QueryFloatAttribute("impratio", &solver.impratio);
+        if (const char* integrator = option->Attribute("integrator")) {
+            solver.integrator = std::unordered_map<std::string, constraint::Integrator>{
+                {"Euler", constraint::Integrator::Euler}, {"RK4", constraint::Integrator::Rk4},
+                {"implicit", constraint::Integrator::Implicit},
+                {"implicitfast", constraint::Integrator::ImplicitFast}}.at(integrator);
+        }
+        if (const auto* flag = option->FirstChildElement("flag"))
+            if (const char* refsafe = flag->Attribute("refsafe"))
+                solver.refsafe = std::unordered_map<std::string, bool>{
+                    {"enable", true}, {"disable", false}}.at(refsafe);
+    }
 
     if (const auto* compiler = mujoco->FirstChildElement("compiler")) {
         if (const char* angle = compiler->Attribute("angle")) {

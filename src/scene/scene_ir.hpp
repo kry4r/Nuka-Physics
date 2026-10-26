@@ -21,6 +21,7 @@
 
 #include "scene/asset/asset_ref.hpp"
 #include "scene/canonical_types.hpp"
+#include "constraint/solver_contract.hpp"
 #include "scene/cook/settle_spec.hpp"   // SettleSpec (plain data; persisted IC seam)
 #include "scene/ecs/entity.hpp"
 #include "scene/ecs/registry.hpp"
@@ -108,6 +109,9 @@ struct CollisionShapeRecord {
     float    solref[2]        = {0.02f, 1.0f};                     // timeconst, dampratio
     float    solimp[5]        = {0.9f, 0.95f, 0.001f, 0.5f, 2.0f}; // dmin,dmax,width,mid,power
     float    friction_mu      = -1.0f;   // SENTINEL: <0 => inherit material μ; >=0 => explicit per-shape override
+    float    friction_spin    = 0.005f;
+    float    friction_roll    = 0.0001f;
+    constraint::LawSource law_source = constraint::LawSource::None;
     int32_t  priority         = 0;
     float    solmix           = 1.0f;
     float    margin           = 0.0f;
@@ -133,6 +137,10 @@ struct JointRecord {
     float stiffness                        = 0.0f;
     float initial_position                 = 0.0f;
     float frictionloss                     = 0.0f;   // MuJoCo joint dry friction
+    constraint::LawSource law_source       = constraint::LawSource::None;
+    constraint::SolverReference limit_reference;
+    constraint::SolverReference friction_reference;
+    float limit_margin                     = 0.0f;
     JointId mimic_source                   = kInvalidJoint;
     float mimic_multiplier                 = 1.0f;
     float mimic_offset                     = 0.0f;
@@ -703,6 +711,8 @@ public:
     cook::SettleSpec&            SettleMut() { return settle_; }
     const EnvironmentRecord&     Environment() const { return environment_; }
     EnvironmentRecord&           EnvironmentMut() { return environment_; }
+    const constraint::SolverOptions& SolverOptions() const { return solver_options_; }
+    constraint::SolverOptions& SolverOptionsMut() { return solver_options_; }
     const std::vector<SourceRecord>& Sources() const { return sources_; }
     std::vector<SourceRecord>&       SourcesMut() { return sources_; }
 
@@ -763,6 +773,7 @@ private:
     cook::SettleSpec   settle_;
     std::vector<TerrainRecord> terrain_;
     EnvironmentRecord  environment_;
+    constraint::SolverOptions solver_options_;
     std::vector<SourceRecord> sources_;
 
     // -- facade state -------------------------------------------------------

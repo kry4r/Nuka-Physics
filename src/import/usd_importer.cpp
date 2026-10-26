@@ -1867,6 +1867,10 @@ bool SceneBuilder::SizePrimitive(const PrimData& prim, const Placement& placemen
 
 // MjcCollisionAPI contact parameters, copied as the MJCF importer copies a geom's.
 void SceneBuilder::ReadContact(const PrimData& prim, scene::CollisionShapeRecord& shape) const {
+    for (const auto* name : {"mjc:condim", "mjc:priority", "mjc:solmix", "mjc:margin", "mjc:gap",
+                             "mjc:solref", "mjc:solimp", "mjc:friction"})
+        if (prim.prim.GetAttribute(pxr::TfToken(name)).HasAuthoredValueOpinion())
+            shape.law_source = constraint::LawSource::MuJoCo;
     int condim = 0;
     if (Read(prim.prim, "mjc:condim", condim)) {
         shape.condim = static_cast<uint8_t>(condim);
@@ -1882,6 +1886,11 @@ void SceneBuilder::ReadContact(const PrimData& prim, scene::CollisionShapeRecord
         shape.gap = F(length * units_.meters);
     }
     pxr::VtArray<double> values;
+    if (Read(prim.prim, "mjc:friction", values)) {
+        shape.friction_mu = F(values[0]);
+        shape.friction_spin = F(values[1]);
+        shape.friction_roll = F(values[2]);
+    }
     if (Read(prim.prim, "mjc:solref", values)) {
         for (size_t k = 0; k < std::min<size_t>(values.size(), 2u); ++k) {
             shape.solref[k] = F(values[k]);

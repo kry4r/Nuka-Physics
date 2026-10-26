@@ -45,6 +45,7 @@ SceneIR::SceneIR(const SceneIR& other)
       settle_(other.settle_),
       terrain_(other.terrain_),
       environment_(other.environment_),
+      solver_options_(other.solver_options_),
       sources_(other.sources_) {
     // initial_state_ / settle_ / terrain_ / environment_ / sources_ are authored metadata,
     // NOT projected from records, so they must be copied explicitly (RebuildFacade
@@ -72,6 +73,7 @@ SceneIR& SceneIR::operator=(const SceneIR& other) {
     settle_        = other.settle_;
     terrain_       = other.terrain_;
     environment_   = other.environment_;
+    solver_options_ = other.solver_options_;
     sources_       = other.sources_;
     RebuildFacade();
     return *this;

@@ -151,9 +151,9 @@ __global__ void OgcBodyQueryKernel(OgcDetectParams p, ModelView model, DataView 
 }
 
 __device__ float OgcBodyFriction(const ModelView& model, const DataView& data,
-                                 uint32_t body) {
+                                 uint32_t body, uint32_t env, uint32_t profiles_per_env) {
     const auto shape = nkops::LoadPrimShape(model.shape_table, body);
-    return data.mat_buckets[size_t{shape.contact_profile_index} *
+    return data.mat_buckets[(size_t{env} * profiles_per_env + shape.contact_profile_index) *
                             nk::kContactProfileWordCount + nk::kContactProfileMu1];
 }
 
@@ -323,7 +323,7 @@ __device__ OgcSurface OgcLoadSurface(const OgcDetectParams& p, const ModelView& 
         out.vertex_faces = {model.mesh_vertex_triangle_offsets, model.mesh_vertex_triangles};
         out.vertex_edges = {model.mesh_vertex_edge_offsets, model.mesh_vertex_edges};
         out.speed = data.dat_body_speed[size_t{env} * p.bodies_per_env + out.owner];
-        out.friction = OgcBodyFriction(model, data, out.owner);
+        out.friction = OgcBodyFriction(model, data, out.owner, env, p.num_material_buckets);
     }
     return out;
 }

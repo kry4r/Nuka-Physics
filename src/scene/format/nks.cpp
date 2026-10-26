@@ -428,6 +428,9 @@ Value SaveShape(const CollisionShapeRecord& s, MeshSink& sink, bool is_visual) {
     o.Set("solref", FloatArray(s.solref, 2));
     o.Set("solimp", FloatArray(s.solimp, 5));
     o.Set("friction_mu", Value::Float(s.friction_mu));
+    o.Set("friction_spin", Value::Float(s.friction_spin));
+    o.Set("friction_roll", Value::Float(s.friction_roll));
+    o.Set("law_source", Value::Int(static_cast<uint32_t>(s.law_source)));
     o.Set("priority", Value::Int(s.priority));
     o.Set("solmix", Value::Float(s.solmix));
     o.Set("margin", Value::Float(s.margin));
@@ -491,6 +494,12 @@ Value SaveJoint(const JointRecord& j) {
     o.Set("stiffness", Value::Float(j.stiffness));
     o.Set("initial_position", Value::Float(j.initial_position));
     o.Set("frictionloss", Value::Float(j.frictionloss));
+    o.Set("law_source", Value::Int(static_cast<uint32_t>(j.law_source)));
+    o.Set("solreflimit", FloatArray(j.limit_reference.solref, 2));
+    o.Set("solimplimit", FloatArray(j.limit_reference.solimp, 5));
+    o.Set("solreffriction", FloatArray(j.friction_reference.solref, 2));
+    o.Set("solimpfriction", FloatArray(j.friction_reference.solimp, 5));
+    o.Set("limit_margin", Value::Float(j.limit_margin));
     if (j.mimic_source != kInvalidJoint) {
         Value mimic = Value::Object();
         mimic.Set("source_joint", Value::Int(j.mimic_source));
@@ -1111,6 +1120,12 @@ void Save(const SceneIR& scene, const std::string& nks_path, const SaveOptions& 
 
     Value root = Value::Object();
     root.Set("nks_version", Value::Int(1));
+    Value solver = Value::Object();
+    solver.Set("cone", Value::Int(static_cast<uint32_t>(scene.SolverOptions().cone)));
+    solver.Set("integrator", Value::Int(static_cast<uint32_t>(scene.SolverOptions().integrator)));
+    solver.Set("impratio", Value::Float(scene.SolverOptions().impratio));
+    solver.Set("refsafe", Value::Bool(scene.SolverOptions().refsafe));
+    root.Set("solver", std::move(solver));
 
     // -- split materials (keyed by name) ------------------------------------
     {
@@ -1317,6 +1332,13 @@ SceneIR ApplyImports(SceneIR scene, const Value& imports,
 
 void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& base_dir,
               const std::string& nka_path) {
+    if (const Value* solver = root.Find("solver")) {
+        auto& options = scene.SolverOptionsMut();
+        options.cone = static_cast<constraint::FrictionCone>(solver->At("cone").AsInt());
+        options.integrator = static_cast<constraint::Integrator>(solver->At("integrator").AsInt());
+        options.impratio = solver->At("impratio").AsFloat();
+        options.refsafe = solver->At("refsafe").AsBool();
+    }
     std::unordered_map<std::string, NkaFile> containers;
     auto mesh_ref = [&](const Value& value) {
         AssetRef ref = ParseAssetRef(value.AsString());
@@ -1498,6 +1520,10 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             if (const Value* v = s->Find("solimp"))
                 for (int k = 0; k < 5; ++k) rec.solimp[k] = FloatAt(*v, k, "solimp");
             if (const Value* v = s->Find("friction_mu")) rec.friction_mu = v->AsFloat();
+            if (const Value* v = s->Find("friction_spin")) rec.friction_spin = v->AsFloat();
+            if (const Value* v = s->Find("friction_roll")) rec.friction_roll = v->AsFloat();
+            if (const Value* v = s->Find("law_source"))
+                rec.law_source = static_cast<constraint::LawSource>(v->AsInt());
             if (const Value* v = s->Find("priority")) rec.priority = static_cast<int32_t>(v->AsInt());
             if (const Value* v = s->Find("solmix")) rec.solmix = v->AsFloat();
             if (const Value* v = s->Find("margin")) rec.margin = v->AsFloat();
@@ -1599,6 +1625,17 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             rec.initial_position = j->At("initial_position").AsFloat();
             // Backward-compatible: a pre-frictionloss .nks lacks the key -> 0.
             if (const Value* fl = j->Find("frictionloss")) rec.frictionloss = fl->AsFloat();
+            if (const Value* v = j->Find("law_source"))
+                rec.law_source = static_cast<constraint::LawSource>(v->AsInt());
+            if (const Value* v = j->Find("solreflimit"))
+                for (int k = 0; k < 2; ++k) rec.limit_reference.solref[k] = FloatAt(*v, k, "solreflimit");
+            if (const Value* v = j->Find("solimplimit"))
+                for (int k = 0; k < 5; ++k) rec.limit_reference.solimp[k] = FloatAt(*v, k, "solimplimit");
+            if (const Value* v = j->Find("solreffriction"))
+                for (int k = 0; k < 2; ++k) rec.friction_reference.solref[k] = FloatAt(*v, k, "solreffriction");
+            if (const Value* v = j->Find("solimpfriction"))
+                for (int k = 0; k < 5; ++k) rec.friction_reference.solimp[k] = FloatAt(*v, k, "solimpfriction");
+            if (const Value* v = j->Find("limit_margin")) rec.limit_margin = v->AsFloat();
             if (const Value* mimic = j->Find("mimic")) {
                 rec.mimic_source = OffsetId(
                     static_cast<JointId>(mimic->At("source_joint").AsInt()), joint_offset);

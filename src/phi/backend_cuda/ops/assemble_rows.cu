@@ -32,7 +32,7 @@ constexpr uint32_t kInvalidLink = ~0u;
 constexpr float kFltMax = 3.402823466e+38f;
 
 // ContactProfileV1 is a packed mutable table. Cook and world upload validate it;
-// assembly consumes the canonical 16-word records through each collidable row.
+// Assembly consumes the canonical records through each collidable row.
 constexpr uint64_t kContactProfileHashDomain = 0x4e554b4150524f46ull;
 
 __device__ scene::ContactParamsIn DefaultProfile(float mu, float solref0,
@@ -503,9 +503,11 @@ __global__ void EmitPairDrivenRowsKernel(
     const scene::ContactParamsIn default_profile =
         DefaultProfile(default_mu, solref0, solref1, default_solimp);
     scene::ContactParamsIn side_a = ReadContactProfile(
-        mat_buckets, num_material_buckets, profile_a, default_profile);
+        mat_buckets + size_t{env} * num_material_buckets * nk::kContactProfileWordCount,
+        num_material_buckets, profile_a, default_profile);
     scene::ContactParamsIn side_b = ReadContactProfile(
-        mat_buckets, num_material_buckets, profile_b, default_profile);
+        mat_buckets + size_t{env} * num_material_buckets * nk::kContactProfileWordCount,
+        num_material_buckets, profile_b, default_profile);
     if (kind_a == kNkSideParticle)
         side_a = DefaultProfile(particle_friction[part_a - env * particles_per_env],
                                 solref0, solref1, default_solimp);
