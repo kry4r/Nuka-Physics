@@ -851,8 +851,8 @@ typedef enum nuka_state_field_t {
     // READ: per link, the untruncated joint speed of the last DAT pass and the detection bound.
     NUKA_FIELD_DAT_JOINT_MOTION = 97,
     NUKA_FIELD_DAT_JOINT_RATE = 98,
-    // READ: per environment, eight uint64 nanoseconds of the latest solve while telemetry is on: setup,
-    // vertex, dense block, grid, coarse, acceleration, dual update and convergence check phases.
+    // READ: per environment, uint64 nanoseconds for eight solve phases, then five tile setup subphases:
+    // mass response, incidence, coloring, Jacobian loading and initial residual; setup includes its subphases.
     NUKA_FIELD_SOLVER_PHASE_TIME = 99,
     // READ: per VBD vertex, twenty float32 columns from the last solve call, environment-major.
     NUKA_FIELD_VBD_SOLVE_AUDIT = 100,
@@ -874,7 +874,9 @@ typedef enum nuka_state_field_t {
     NUKA_FIELD_SOLVER_RESIDUAL = 109,
     // READ: per environment and sweep, the four SOLVER_RESIDUAL classes after that sweep; filled while
     // sweep telemetry is on, for at most the sweep budget set when it was turned on.
-    NUKA_FIELD_SOLVER_SWEEP_TRACE = 110
+    NUKA_FIELD_SOLVER_SWEEP_TRACE = 110,
+    // Per environment and sampled sweep: Newton iterations, line evaluations and factorizations.
+    NUKA_FIELD_SOLVER_WORK_TRACE = 111
 } nuka_state_field_t;
 
 typedef enum nuka_vbd_element_kind_t {

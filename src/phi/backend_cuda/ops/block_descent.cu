@@ -38,7 +38,9 @@ constexpr uint32_t kRigidBlockDof = 6u;
 // A rigid body solves all its rows in one CTA, so it takes a wider one than the other blocks.
 constexpr uint32_t kRigidThreads = 256u;
 constexpr uint32_t kSolverCountWords = 6u;
-constexpr uint32_t kSolverPhaseWords = 8u;
+constexpr uint32_t kSolverPhaseWords = 13u;
+constexpr uint32_t kSolverWorkWords = 3u;
+constexpr uint32_t kWorkNewton = 0u, kWorkLine = 1u, kWorkFactor = 2u;
 constexpr uint32_t kNoCacheColor = ~0u;
 constexpr uint32_t kAllCacheColors = ~0u;
 constexpr uint32_t kRowAxisLanes = 4u;
@@ -50,7 +52,9 @@ constexpr uint32_t kResidualNormal = 0u, kResidualTangent = 1u, kResidualJoint =
                    kResidualClasses = 4u;
 // solver_phase_time slots of a timed solve; kPhaseEnd closes its last phase.
 constexpr uint32_t kPhaseSetup = 0u, kPhaseVertices = 1u, kPhaseDense = 2u, kPhaseGrid = 3u, kPhaseCoarse = 4u,
-                   kPhaseMomentum = 5u, kPhaseDual = 6u, kPhaseCheck = 7u, kPhaseEnd = kSolverPhaseWords;
+                   kPhaseMomentum = 5u, kPhaseDual = 6u, kPhaseCheck = 7u,
+                   kPhaseSetupMass = 8u, kPhaseSetupIncidence = 9u, kPhaseSetupColoring = 10u,
+                   kPhaseSetupJacobian = 11u, kPhaseSetupResidual = 12u, kPhaseEnd = kSolverPhaseWords;
 constexpr uint32_t kPointJacobianAxes = 3u;
 constexpr uint32_t kPointJacobianComponents = 3u;
 constexpr uint32_t kPointJacobianWords = kPointJacobianAxes * kPointJacobianComponents;
@@ -2732,6 +2736,9 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
         LaunchCuda(OpenTelemetryKernel, dim3(1u), dim3(kThreads), 0u, stream, data);
         if (cudaGetLastError() != cudaSuccess) return Status::Failed;
     }
+    if ((p->telemetry & nk::kTelemetrySweeps) != 0u &&
+        !clear(data.solver_work_trace, size_t{p->env_count} * p->trace_sweeps * kSolverWorkWords * sizeof(uint32_t)))
+        return Status::Failed;
     if (DenseTileRoute(*p)) {
         if (p->measure_contact_residual != 0u && !clear(s.active_count, sizeof(uint32_t))) return Status::Failed;
         if (!clear(s.tile_next, sizeof(uint32_t))) return Status::Failed;

@@ -263,6 +263,8 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
         kWireDtypeF32, nk::FieldId::SolverResidual},
     {NUKA_FIELD_SOLVER_SWEEP_TRACE, nk::LayoutOf(nk::FieldId::SolverSweepTrace).elem_size,
         kWireDtypeF32, nk::FieldId::SolverSweepTrace},
+    {NUKA_FIELD_SOLVER_WORK_TRACE, nk::LayoutOf(nk::FieldId::SolverWorkTrace).elem_size,
+        kWireDtypeU32, nk::FieldId::SolverWorkTrace},
 };
 
 inline constexpr size_t kDlpackFieldCount =

@@ -56,7 +56,7 @@ __global__ void InitializeRigidBlocksKernel(
 
 struct RigidBlock {
     static constexpr uint32_t kMaxDof = kRigidBlockDof;
-    uint32_t index, dimension, begin, end, stride;
+    uint32_t index, dimension, begin, end, stride, env;
     const float* mass;
     const float* snapshot;
     const float* free;
@@ -81,6 +81,7 @@ __global__ void DescendRigidBlocksKernel(
     const size_t base = size_t{body} * kRigidBlockDof;
     RigidBlock b{};
     b.index = body;
+    b.env = env;
     b.dimension = s.rigid_dimensions[body];
     b.begin = s.offsets[owner];
     b.end = s.offsets[owner + 1u];

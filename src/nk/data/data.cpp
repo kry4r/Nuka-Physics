@@ -233,6 +233,7 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::VbdVelocitySweepCount: v.vbd_velocity_sweep_count = static_cast<uint32_t*>(p); break;
         case FieldId::SolverResidual: v.solver_residual = static_cast<float*>(p); break;
         case FieldId::SolverSweepTrace: v.solver_sweep_trace = static_cast<float*>(p); break;
+        case FieldId::SolverWorkTrace: v.solver_work_trace = static_cast<uint32_t*>(p); break;
         case FieldId::VbdSolveMetrics: v.vbd_solve_metrics = static_cast<uint64_t*>(p); break;
         case FieldId::VbdSolveAudit: v.vbd_solve_audit = static_cast<float*>(p); break;
         case FieldId::SolverColorCounts: v.solver_color_counts = static_cast<uint32_t*>(p); break;

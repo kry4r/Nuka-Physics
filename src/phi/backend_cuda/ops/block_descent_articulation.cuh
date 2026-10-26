@@ -21,7 +21,7 @@ __global__ void InitializeArticulationBlocksKernel(
 template <uint32_t capacity>
 struct ArticulationBlock {
     static constexpr uint32_t kMaxDof = capacity;
-    uint32_t index, dimension, begin, end, stride;
+    uint32_t index, dimension, begin, end, stride, env;
     const uint32_t* roots;
     const float* mass;
     const float* snapshot;
@@ -49,6 +49,7 @@ __global__ void DescendArticulationsKernel(
     const size_t base = size_t{articulation} * p.max_dof;
     ArticulationBlock<capacity> b{};
     b.index = articulation;
+    b.env = env;
     b.dimension = s.articulation_dimensions[articulation];
     b.begin = s.offsets[owner];
     b.end = s.offsets[owner + 1u];

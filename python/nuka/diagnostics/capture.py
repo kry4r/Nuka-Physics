@@ -9,7 +9,7 @@ import numpy as np
 
 from .._nuka_ext import Field
 from ..energy import EnergyColumn, EnergyLedgerSampler
-from .schema import (AuditCount, AuditMetric, DiagnosticThresholds, SolverPhase, SolverResidual, Stage,
+from .schema import (AuditCount, AuditMetric, DiagnosticThresholds, SolverPhase, SolverResidual, SolverWork, Stage,
                      StageColumn, VbdSolveAuditColumn, stage_units, vbd_solve_audit_units)
 
 
@@ -81,6 +81,7 @@ class DiagnosticSession:
             "solver_residual_units": "m/s", "trace_sweeps": self.trace_sweeps,
             "sweep_budget": world.velocity_iterations(),
             "solver_phases": [c.name for c in SolverPhase],
+            "solver_work_columns": [c.name for c in SolverWork],
             "state_fields": [f.name for f in state_fields],
             "timing_scope": "Host step call wall time; excludes capture and file I/O; not GPU event latency.",
         }
@@ -116,6 +117,8 @@ class DiagnosticSession:
         if self.trace_sweeps:
             sample["sweep_trace"] = read(Field.SOLVER_SWEEP_TRACE,
                                          (self.env_count, self.trace_sweeps, len(SolverResidual)))
+            sample["work_trace"] = read(Field.SOLVER_WORK_TRACE,
+                                        (self.env_count, self.trace_sweeps, len(SolverWork)))
             sample["phase_ns"] = read(Field.SOLVER_PHASE_TIME, (self.env_count, len(SolverPhase)))
         for field in self.state_fields if state_fields is None else state_fields:
             sample["state_" + field.name] = np.asarray(self.world.download_field(field)).copy()
@@ -276,6 +279,8 @@ def iter_record_blocks(root, *, states=False):
             shapes["sweep_trace"] = environments + (manifest["trace_sweeps"], len(SolverResidual))
             shapes["phase_ns"] = environments + (len(SolverPhase),)
             floating.add("sweep_trace")
+    if "solver_work_columns" in manifest and manifest["trace_sweeps"]:
+        shapes["work_trace"] = environments + (manifest["trace_sweeps"], len(SolverWork))
     unsigned = shapes.keys() - floating
     required_states = {"state_" + name for name in state_fields}
     state_shapes, columns, paths = {}, None, set()

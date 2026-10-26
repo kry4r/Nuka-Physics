@@ -1,5 +1,14 @@
 #pragma once
 
+__device__ void CountDenseWork(DataView data, BlockDescentSolveParams p, BlockScratch s,
+                                uint32_t env, uint32_t kind) {
+    if ((p.telemetry & nk::kTelemetrySweeps) != 0u && threadIdx.x == 0u) {
+        const uint32_t sweep = s.sweep_state[kSweepCount];
+        if (sweep < p.trace_sweeps)
+            atomicAdd(data.solver_work_trace + (size_t{env} * p.trace_sweeps + sweep) * kSolverWorkWords + kind, 1u);
+    }
+}
+
 // Dense blocks (articulations, rigid bodies) minimize their convex local augmented Lagrangian with
 // Newton steps and an exact line search, so stiff rows that activate along a step enter the next Hessian.
 constexpr uint32_t kDenseNewtonSteps = 16u;
@@ -414,6 +423,7 @@ __device__ double SearchDenseLine(const Block& b, DataView data, BlockDescentSol
                                   BlockScratch s, uint32_t working, double inertial_slope,
                                   double inertial_curvature) {
     double slope = 0.0, curvature = 0.0, magnitude = 0.0;
+    CountDenseWork(data, p, s, b.env, kWorkLine);
     DenseLineDerivatives(b, data, p, s, working, 0.0, inertial_slope, inertial_curvature, &slope, &curvature,
                          &magnitude);
     const double initial = slope;
@@ -421,6 +431,7 @@ __device__ double SearchDenseLine(const Block& b, DataView data, BlockDescentSol
     double low = 0.0, high = 0.0, alpha = 1.0;
     bool bounded = false;
     for (uint32_t step = 0u; step < kDenseLineSearchSteps; ++step) {
+        CountDenseWork(data, p, s, b.env, kWorkLine);
         DenseLineDerivatives(b, data, p, s, working, alpha, inertial_slope, inertial_curvature, &slope, &curvature,
                              &magnitude);
         if (!isfinite(slope) || !isfinite(curvature)) {
@@ -549,6 +560,7 @@ __device__ nk::BlockSolveFailure NewtonDenseBlock(const Block& b, DataView data,
     const uint32_t n = b.dimension;
     nk::BlockSolveFailure failure = nk::BlockSolveFailure::None;
     for (uint32_t step = 0u; step < kDenseNewtonSteps; ++step) {
+        CountDenseWork(data, p, s, b.env, kWorkNewton);
         bool converged = false;
         bool assembled = false;
         if constexpr (kMaxDof <= kRigidBlockDof)
@@ -560,6 +572,7 @@ __device__ nk::BlockSolveFailure NewtonDenseBlock(const Block& b, DataView data,
             break;
         }
         if (converged) break;
+        CountDenseWork(data, p, s, b.env, kWorkFactor);
         if (!SolveDensePositiveBlock<kMaxDof>(b.matrix, b.force, b.direction, n, b.stride)) {
             failure = nk::BlockSolveFailure::Factorization;
             break;

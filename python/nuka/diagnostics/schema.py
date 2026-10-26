@@ -116,6 +116,17 @@ class SolverPhase(IntEnum):
     MOMENTUM = 5
     DUAL = 6
     CHECK = 7
+    SETUP_MASS_RESPONSE = 8
+    SETUP_INCIDENCE = 9
+    SETUP_COLORING = 10
+    SETUP_JACOBIAN = 11
+    SETUP_RESIDUAL = 12
+
+
+class SolverWork(IntEnum):
+    NEWTON_ITERATIONS = 0
+    LINE_EVALUATIONS = 1
+    FACTORIZATIONS = 2
 
 
 def vbd_solve_audit_units(column):
