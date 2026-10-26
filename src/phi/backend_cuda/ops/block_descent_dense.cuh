@@ -128,7 +128,7 @@ __device__ bool AssembleDenseBlock(const Block& b, DataView data, BlockDescentSo
     constexpr uint32_t kEntries = (kMaxDof * (kMaxDof + 1u) / 2u + kThreads - 1u) / kThreads;
     static_assert(kMaxDof <= kThreads && kMaxDof <= 0xffffu);
     __shared__ float jacobian[kDenseTileRows][3][kMaxDof];
-    __shared__ float response[kDenseTileRows][7];
+    __shared__ float response[kDenseTileRows][9];
     __shared__ float noise[kDenseTileRows][3];
     __shared__ uint32_t tile_slot[kDenseTileRows];
     __shared__ uint32_t tile_axes[kDenseTileRows];
@@ -181,6 +181,8 @@ __device__ bool AssembleDenseBlock(const Block& b, DataView data, BlockDescentSo
             r[4] = c.yy;
             r[5] = c.zz;
             r[6] = c.yz;
+            r[7] = c.xy;
+            r[8] = c.xz;
             // A rounding of the residual or move changes the impulse by the curvature times it.
             noise[threadIdx.x][0] = fabsf(f.x) + c.xx * (fabsf(term.residual.x) + fabsf(move.x));
             noise[threadIdx.x][1] = fabsf(f.y) + c.yy * (fabsf(term.residual.y) + fabsf(move.y));
@@ -201,6 +203,7 @@ __device__ bool AssembleDenseBlock(const Block& b, DataView data, BlockDescentSo
         for (uint32_t r = 0u; r < count; ++r) {
             const float cxx = response[r][3], cyy = response[r][4];
             const float czz = response[r][5], cyz = response[r][6];
+            const float cxy = response[r][7], cxz = response[r][8];
             const bool tangent = tile_axes[r] > 1u;
 #pragma unroll
             for (uint32_t q = 0u; q < kEntries; ++q) {
@@ -210,7 +213,9 @@ __device__ bool AssembleDenseBlock(const Block& b, DataView data, BlockDescentSo
                 if (tangent)
                     value += jacobian[r][1][i] * cyy * jacobian[r][1][j] +
                              jacobian[r][2][i] * czz * jacobian[r][2][j] +
-                             cyz * (jacobian[r][1][i] * jacobian[r][2][j] + jacobian[r][2][i] * jacobian[r][1][j]);
+                             cyz * (jacobian[r][1][i] * jacobian[r][2][j] + jacobian[r][2][i] * jacobian[r][1][j]) +
+                             cxy * (jacobian[r][0][i] * jacobian[r][1][j] + jacobian[r][1][i] * jacobian[r][0][j]) +
+                             cxz * (jacobian[r][0][i] * jacobian[r][2][j] + jacobian[r][2][i] * jacobian[r][0][j]);
                 h[q] += value;
             }
             if (threadIdx.x < n) {
@@ -285,7 +290,9 @@ __device__ bool AssembleSmallDenseBlock(const Block& b, DataView data, BlockDesc
                 float value = jacobian[0][i] * c.xx * jacobian[0][j];
                 if (axes > 1u)
                     value += jacobian[1][i] * c.yy * jacobian[1][j] + jacobian[2][i] * c.zz * jacobian[2][j] +
-                             c.yz * (jacobian[1][i] * jacobian[2][j] + jacobian[2][i] * jacobian[1][j]);
+                             c.yz * (jacobian[1][i] * jacobian[2][j] + jacobian[2][i] * jacobian[1][j]) +
+                             c.xy * (jacobian[0][i] * jacobian[1][j] + jacobian[1][i] * jacobian[0][j]) +
+                             c.xz * (jacobian[0][i] * jacobian[2][j] + jacobian[2][i] * jacobian[0][j]);
                 sums[e] += value;
             }
             for (uint32_t axis = 0u; axis < axes; ++axis) {
@@ -408,7 +415,9 @@ __device__ void DenseLineDerivatives(const Block& b, DataView data, BlockDescent
         row_curvature += static_cast<double>(c.xx) * step.x * step.x +
                          static_cast<double>(c.yy) * step.y * step.y +
                          static_cast<double>(c.zz) * step.z * step.z +
-                         2.0 * static_cast<double>(c.yz) * step.y * step.z;
+                         2.0 * static_cast<double>(c.yz) * step.y * step.z +
+                         2.0 * static_cast<double>(c.xy) * step.x * step.y +
+                         2.0 * static_cast<double>(c.xz) * step.x * step.z;
     }
     SumDenseBlock3(&row_slope, &row_curvature, &row_magnitude);
     *slope = inertial_slope + alpha * inertial_curvature - row_slope;
@@ -477,7 +486,7 @@ __device__ uint32_t AppendDenseRows(BlockScratch s, size_t base, bool flag, size
 // no radius; 0 when the row may act at once.
 __device__ float DenseRowSlack(DataView data, BlockDescentSolveParams p, BlockScratch s, uint32_t slot) {
     const LocalTerm t = LoadLocalTerm(data, p, s, slot, ~0u, true);
-    if (t.contact && !(t.radius <= 0.0f)) return 0.0f;
+    if (t.elliptic || (t.contact && !(t.radius <= 0.0f))) return 0.0f;
     if (t.penalty <= 0.0f) return INFINITY;
     const double k = t.response.residual_scale;
     const double x = t.response.dual_scale * t.dual.x + k * t.residual.x;

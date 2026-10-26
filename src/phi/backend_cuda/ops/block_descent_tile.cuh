@@ -75,7 +75,7 @@ constexpr uint32_t kTileStageRows = kTileChunkRows / 2u;
 // and its staged rows.
 template <uint32_t kN>
 __host__ __device__ constexpr uint32_t TileWarpFloats() {
-    return 2u * kN * (kN + 1u) + (TileSpan<kN>() > 1u ? kTileChunkRows * 6u + kTileStageRows * kN : 0u);
+    return 2u * kN * (kN + 1u) + (TileSpan<kN>() > 1u ? kTileChunkRows * 8u + kTileStageRows * kN : 0u);
 }
 
 // Warps per block of the tile kernel: up to kTileWarps whose shared buffers fit the 48 KiB of shared
@@ -130,7 +130,7 @@ struct TileChunkWork {
 struct TileBuffers {
     float* factor;
     float4* terms;
-    uint2* rows;
+    uint4* rows;
     float* stage;
 };
 
@@ -138,7 +138,7 @@ template <uint32_t kN>
 __device__ __forceinline__ TileBuffers TileBuffersAt(float* mass) {
     float* const factor = mass + kN * (kN + 1u);
     float4* const terms = reinterpret_cast<float4*>(factor + kN * (kN + 1u));
-    uint2* const rows = reinterpret_cast<uint2*>(terms + kTileChunkRows);
+    uint4* const rows = reinterpret_cast<uint4*>(terms + kTileChunkRows);
     return {factor, terms, rows, reinterpret_cast<float*>(rows + kTileChunkRows)};
 }
 
@@ -160,7 +160,9 @@ __device__ void AssembleTileChunk(const TileChunkWork& work, const TileBuffers& 
             const auto term = at.terms[t];
             const float* self = at.stage + (t - begin) * kN;
             const float* partner = at.stage + (at.rows[t].y - begin) * kN;
-            const float weighted = self[i] * term.x + partner[i] * term.y;
+            const float* other = at.stage + (at.rows[t].z - begin) * kN;
+            const float weighted = (self[i] * term.x + partner[i] * term.y) +
+                                   other[i] * __uint_as_float(at.rows[t].w);
             value = fmaf(weighted, self[j], value);
         }
         at.factor[i * (kN + 1u) + j] = value;
@@ -286,7 +288,7 @@ struct TileContext {
     uint4* team_share;
     float* mass;
     float* factor;
-    uint2* chunk_rows;
+    uint4* chunk_rows;
     float4* chunk_terms;
     float* stage;
     TileChunkWork* chunk_work;
@@ -432,6 +434,8 @@ struct TileHead {
     uint32_t axes;
     float rho;
     float compliance;
+    Vec3 cone_compliance;
+    bool elliptic;
     float lower;
     float upper;
     float mu_first;
@@ -449,6 +453,8 @@ __device__ TileHead LoadTileHead(const TileContext& c, uint32_t h) {
     t.axes = c.Index(kTileAxes, h);
     t.rho = c.Value(kTileRho, h);
     t.compliance = c.Value(kTileCompliance, h);
+    t.cone_compliance = {t.compliance, c.Value(kTileTangentCompliance, h), c.Value(kTileTangentCompliance + 1u, h)};
+    t.elliptic = c.Index(kTileElliptic, h) != 0u;
     t.lower = c.Value(kTileLower, h);
     t.upper = c.Value(kTileUpper, h);
     t.mu_first = c.Value(kTileMuFirst, h);
@@ -468,6 +474,8 @@ __device__ LocalTerm TileLocalTerm(const TileHead& t) {
     term.dual = t.dual;
     term.penalty = t.rho;
     term.compliance = t.compliance;
+    term.cone_compliance = t.cone_compliance;
+    term.elliptic = t.elliptic;
     term.lower = t.lower;
     term.upper = t.upper;
     term.mu_first = t.mu_first;
@@ -575,6 +583,9 @@ __device__ void InitializeTileHead(DataView data, BlockDescentSolveParams p, Blo
     c.Index(kTileOwner + 1u, h) = other == owner ? kNoTileBlock : other;
     c.Value(kTileRho, h) = rho;
     c.Value(kTileCompliance, h) = compliance;
+    c.Index(kTileElliptic, h) = axes == 3u && (row.flags & nk::nk_row_flags::kMuJoCo) != 0u;
+    c.Value(kTileTangentCompliance, h) = axes == 3u ? rows[slot + stride].compliance_alpha : 0.0f;
+    c.Value(kTileTangentCompliance + 1u, h) = axes == 3u ? rows[slot + 2u * stride].compliance_alpha : 0.0f;
     c.Value(kTileLower, h) = row.lower;
     c.Value(kTileUpper, h) = row.upper;
     c.Value(kTileMuFirst, h) = row.mu;
@@ -1026,6 +1037,7 @@ __device__ void EndTileBlock(const TileContext& c, uint32_t block) {
 __device__ bool TileResponseContributes(Vec3 f, SymmetricMat3 curvature, Vec3 noise) {
     return f.x != 0.0f || f.y != 0.0f || f.z != 0.0f || curvature.xx != 0.0f ||
            curvature.yy != 0.0f || curvature.zz != 0.0f || curvature.yz != 0.0f ||
+           curvature.xy != 0.0f || curvature.xz != 0.0f ||
            noise.x != 0.0f || noise.y != 0.0f || noise.z != 0.0f;
 }
 
@@ -1112,12 +1124,15 @@ __device__ bool AssembleTileBlock(const TileContext& c, const TileBlock& b, floa
             const float fy = __shfl_sync(~0u, f.y, source), fz = __shfl_sync(~0u, f.z, source);
             const float cyy = __shfl_sync(~0u, curvature.yy, source), czz = __shfl_sync(~0u, curvature.zz, source);
             const float cyz = __shfl_sync(~0u, curvature.yz, source);
+            const float cxy = __shfl_sync(~0u, curvature.xy, source), cxz = __shfl_sync(~0u, curvature.xz, source);
             const float ny = __shfl_sync(~0u, noise.y, source), nz = __shfl_sync(~0u, noise.z, source);
             const float j1 = staged ? jacobian[c.width] : 0.0f, j2 = staged ? jacobian[2u * c.width] : 0.0f;
             TileAddProduct(g, j1, fy);
             TileAddProduct(g, j2, fz);
             scale += fabsf(j1) * ny + fabsf(j2) * nz;
-            const float a0 = j0 * cxx, a1 = j1 * cyy + j2 * cyz, a2 = j2 * czz + j1 * cyz;
+            const float a0 = (j0 * cxx + j1 * cxy) + j2 * cxz;
+            const float a1 = (j1 * cyy + j2 * cyz) + j0 * cxy;
+            const float a2 = (j2 * czz + j1 * cyz) + j0 * cxz;
 #pragma unroll
             for (uint32_t k = 0u; k < kN; ++k)
                 h[k] += a0 * __shfl_sync(~0u, j0, k) + a1 * __shfl_sync(~0u, j1, k) + a2 * __shfl_sync(~0u, j2, k);
@@ -1269,8 +1284,7 @@ __device__ bool AssembleWideTileBlock(const TileContext& c, const TileBlock& b, 
                 scale[r] += fabsf(v) * nx;
             }
         }
-        // The chunk's Jacobian rows on the block in head order, each with the list position of the other
-        // tangent axis's row, and its axis's curvature, coupling to that row, force and noise.
+        // Each Jacobian row carries its two cross-curvature partners, diagonal, force and noise.
         const uint32_t count = contributes && unit == ~0u ? axes : 0u;
         uint32_t through = count;
         for (uint32_t offset = 1u; offset < kTileLanes; offset <<= 1u) {
@@ -1282,9 +1296,12 @@ __device__ bool AssembleWideTileBlock(const TileContext& c, const TileBlock& b, 
         __syncwarp();
         for (uint32_t axis = 0u; axis < count; ++axis) {
             const uint32_t at = through - count + axis;
-            c.chunk_rows[at] = {first + axis, axis == 0u ? at : axis == 1u ? at + 1u : at - 1u};
+            const uint32_t base = through - count;
+            c.chunk_rows[at] = {first + axis, count == 1u ? at : axis == 0u ? base + 1u : axis == 1u ? base + 2u : base + 1u,
+                                count == 1u ? at : axis == 0u ? base + 2u : base,
+                                __float_as_uint(axis == 1u ? curvature.xy : curvature.xz)};
             c.chunk_terms[at] = {axis == 0u ? curvature.xx : axis == 1u ? curvature.yy : curvature.zz,
-                                 axis == 0u ? 0.0f : curvature.yz, AxisComponent(f, axis), AxisComponent(noise, axis)};
+                                 axis == 0u ? curvature.xy : curvature.yz, AxisComponent(f, axis), AxisComponent(noise, axis)};
         }
         // Half of the chunk's heads stage together, keeping each tangent pair in one shared batch.
         for (uint32_t part = 0u; part < 2u; ++part) {
@@ -1550,7 +1567,8 @@ __device__ void TileLineDerivatives(const TileContext& c, uint32_t block, float 
         TileAddProduct(row_slope, f.z, t.step.z);
         row_magnitude += fabsf(f.x * t.step.x) + fabsf(f.y * t.step.y) + fabsf(f.z * t.step.z);
         row_curvature += response.xx * t.step.x * t.step.x + response.yy * t.step.y * t.step.y +
-                         response.zz * t.step.z * t.step.z + 2.0f * response.yz * t.step.y * t.step.z;
+                         response.zz * t.step.z * t.step.z + 2.0f * response.yz * t.step.y * t.step.z +
+                         2.0f * response.xy * t.step.x * t.step.y + 2.0f * response.xz * t.step.x * t.step.z;
     }
     TileSum total{-row_slope.value, -row_slope.error};
     if (c.lane == 0u) {
@@ -1770,10 +1788,15 @@ __device__ float4 UpdateTileDuals(DataView data, const TileContext& c, float bet
         const float normal = nk::augmented::EvaluateScalarImpulse(t.dual.x, t.rho, t.residual.x, t.compliance,
                                                                   t.lower, t.upper, t.response).impulse;
         nk::augmented::ContactRelaxation relaxation{c.Load3(kTileRelaxationStep, h), c.Value(kTileRelaxationWeight, h)};
-        const Vec3 dual = ProjectRowDual(t.dual, normal, t.rho, t.residual, contact, t.mu_first, t.mu_second,
-                                         &relaxation);
-        const float2 step = MultiplierSteps(t.dual, dual, t.response.residual_scale, t.rho,
+        const Vec3 dual = t.elliptic
+            ? nk::augmented::EvaluateEllipticImpulse(t.dual, t.rho, t.residual, t.cone_compliance, t.mu_first).impulse
+            : ProjectRowDual(t.dual, normal, t.rho, t.residual, contact, t.mu_first, t.mu_second, &relaxation);
+        float2 step = MultiplierSteps(t.dual, dual, t.response.residual_scale, t.response.dual_scale, t.rho,
                                             contact ? t.mu_first : 0.0f, contact ? t.mu_second : 0.0f);
+        if (t.elliptic) {
+            const Vec3 delta = nk::augmented::EllipticMultiplierStep(t.dual, dual, t.rho, t.cone_compliance);
+            step = {delta.x, fmaxf(delta.y, delta.z)};
+        }
         steps[kResidualMomentum] = max(steps[kResidualMomentum], ResidualBits(fmaxf(step.x, step.y)));
         if (!contact) steps[kResidualJoint] = max(steps[kResidualJoint], ResidualBits(step.x));
         if (contact) {
@@ -1783,15 +1806,22 @@ __device__ float4 UpdateTileDuals(DataView data, const TileContext& c, float bet
             data.lambda[slot + 2u * stride] = dual.z;
             // Natural velocities without the contact response: a loaded normal must not move, a free one must
             // not approach; friction must not drive its own axis, and inside the cone the slip is the tangent step.
-            const Vec3 v{-t.residual.x + t.compliance * dual.x, -t.residual.y, -t.residual.z};
-            steps[kResidualNormal] = max(steps[kResidualNormal],
-                                         ResidualBits(dual.x > 0.0f ? fabsf(v.x) : fmaxf(-v.x, 0.0f)));
-            steps[kResidualTangent] = max(steps[kResidualTangent],
-                ResidualBits(fmaxf(step.y, fmaxf(Along(dual.y, v.y), Along(dual.z, v.z)))));
+            if (t.elliptic) {
+                steps[kResidualNormal] = max(steps[kResidualNormal], ResidualBits(step.x));
+                steps[kResidualTangent] = max(steps[kResidualTangent], ResidualBits(step.y));
+            } else {
+                const Vec3 v{-t.residual.x + t.compliance * dual.x, -t.residual.y, -t.residual.z};
+                steps[kResidualNormal] = max(steps[kResidualNormal],
+                                             ResidualBits(dual.x > 0.0f ? fabsf(v.x) : fmaxf(-v.x, 0.0f)));
+                steps[kResidualTangent] = max(steps[kResidualTangent],
+                    ResidualBits(fmaxf(step.y, fmaxf(Along(dual.y, v.y), Along(dual.z, v.z)))));
+            }
         }
         if (velocity) data.lambda[slot] = dual.x;
         // The blocks descend against the extrapolated multipliers; data.lambda keeps the unextrapolated ones.
-        c.Store3(kTileDual, h, ExtrapolateDual(c.Load3(kTileBase, h), dual, beta, t.lower, t.upper, contact,
+        const bool extrapolate = t.elliptic ? nk::augmented::EllipticFraction(t.rho, t.cone_compliance) < 1.0f
+                                            : contact || t.response.dual_scale != 0.0f;
+        c.Store3(kTileDual, h, ExtrapolateDual(c.Load3(kTileBase, h), dual, extrapolate ? beta : 0.0f, t.lower, t.upper, contact,
                                                t.mu_first, t.mu_second));
         c.Store3(kTileBase, h, dual);
     }
@@ -1891,6 +1921,7 @@ __device__ uint32_t InitializeTilePositions(DataView data, BlockDescentSolvePara
         if (!position) c.Index(kTileOwner, h) = c.Index(kTileOwner + 1u, h) = kNoTileBlock;
         coupled |= c.Index(kTileOwner, h) != kNoTileBlock && c.Index(kTileOwner + 1u, h) != kNoTileBlock;
         c.Index(kTileAxes, h) = 1u;
+        c.Index(kTileElliptic, h) = 0u;
         c.Value(kTileCompliance, h) = 0.0f;
         c.Value(kTileLower, h) = 0.0f;
         c.Value(kTileUpper, h) = FLT_MAX;

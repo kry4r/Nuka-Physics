@@ -280,8 +280,8 @@ __global__ void PairDrivenNarrowphaseKernel(
         const float* profile_a = profiles + size_t{sa.contact_profile_index} * nk::kContactProfileWordCount;
         const float* profile_b = profiles + size_t{sb.contact_profile_index} * nk::kContactProfileWordCount;
         if (law == nk::kContactLawCompliant)
-            query_margin = fmaxf(profile_a[nk::kContactProfileMargin], profile_b[nk::kContactProfileMargin]) +
-                           fmaxf(profile_a[nk::kContactProfileGap], profile_b[nk::kContactProfileGap]);
+            query_margin = profile_a[nk::kContactProfileMargin] + profile_b[nk::kContactProfileMargin] +
+                           profile_a[nk::kContactProfileGap] + profile_b[nk::kContactProfileGap];
         const auto route = RouteMeshContact(sa.kind, sb.kind, mesh_contact_mode[a],
                                             mesh_contact_mode[b]);
         if (!kConvex && route == MeshContactRoute::Ogc) atomicAdd(&mesh_ogc_pair_count[env], 1u);

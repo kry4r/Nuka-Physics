@@ -40,6 +40,65 @@ struct TangentTerm {
     double potential = 0.0;
 };
 
+NUKA_AUGMENTED_HD inline float EllipticFraction(float cap, math::Vec3 compliance) {
+    return fminf(1.0f, cap * fminf(compliance.x, fminf(compliance.y, compliance.z)));
+}
+
+// The compliance metric preserves the cone's circular cross section after scaling.
+NUKA_AUGMENTED_HD inline TangentTerm EvaluateEllipticImpulse(
+    math::Vec3 dual, float cap, math::Vec3 residual, math::Vec3 compliance, float mu_first) {
+    const float gamma = EllipticFraction(cap, compliance);
+    const float s = 1.0f - gamma;
+    const math::Vec3 k{gamma / compliance.x, gamma / compliance.y, gamma / compliance.z};
+    const math::Vec3 x{fmaf(k.x, residual.x, s * dual.x), fmaf(k.y, residual.y, s * dual.y),
+                       fmaf(k.z, residual.z, s * dual.z)};
+    const math::Vec3 root{sqrtf(compliance.x), sqrtf(compliance.y), sqrtf(compliance.z)};
+    const float m = mu_first * root.y / root.x;
+    const float p = root.x * x.x, q1 = root.y * x.y, q2 = root.z * x.z;
+    const float t = hypotf(q1, q2);
+    if (t <= m * p) return {x, {k.x, k.y, k.z, 0.0f, 0.0f, 0.0f}, 0.0};
+    if (m * t + p <= 0.0f) return {};
+    const float a = 1.0f / (1.0f + m * m);
+    const float projected = (p + m * t) * a;
+    const float u1 = q1 / t, u2 = q2 / t;
+    const float b = m * projected / t, along = m * m * a;
+    return {{projected / root.x, m * projected * u1 / root.y, m * projected * u2 / root.z},
+            {k.x * a, k.y * (along * u1 * u1 + b * u2 * u2),
+             k.z * (along * u2 * u2 + b * u1 * u1),
+             gamma * m * a * u1 / (root.x * root.y),
+             gamma * m * a * u2 / (root.x * root.z),
+             gamma * (along - b) * u1 * u2 / (root.y * root.z)}, 0.0};
+}
+
+NUKA_AUGMENTED_HD inline double EllipticPotential(double p, double q1, double q2, double m, double gamma) {
+    const double t = sqrt(q1 * q1 + q2 * q2);
+    if (t <= m * p) return 0.5 * (p * p + t * t) / gamma;
+    if (m * t + p <= 0.0) return 0.0;
+    const double projected = p + m * t;
+    return 0.5 * projected * projected / ((1.0 + m * m) * gamma);
+}
+
+// Both cone potentials and their difference use double precision during line search.
+NUKA_AUGMENTED_HD inline float EllipticPotentialChange(
+    math::Vec3 dual, float cap, math::Vec3 residual, math::Vec3 drop, math::Vec3 compliance, float mu_first) {
+    const double gamma = EllipticFraction(cap, compliance), s = 1.0 - gamma;
+    const double rx = sqrt(double(compliance.x)), ry = sqrt(double(compliance.y)), rz = sqrt(double(compliance.z));
+    const double p = rx * (s * dual.x + gamma / compliance.x * residual.x);
+    const double q1 = ry * (s * dual.y + gamma / compliance.y * residual.y);
+    const double q2 = rz * (s * dual.z + gamma / compliance.z * residual.z);
+    const double m = double(mu_first) * ry / rx;
+    return float(EllipticPotential(p - gamma / rx * drop.x, q1 - gamma / ry * drop.y,
+                                  q2 - gamma / rz * drop.z, m, gamma) - EllipticPotential(p, q1, q2, m, gamma));
+}
+
+NUKA_AUGMENTED_HD inline math::Vec3 EllipticMultiplierStep(
+    math::Vec3 dual, math::Vec3 next, float cap, math::Vec3 compliance) {
+    const float gamma = EllipticFraction(cap, compliance);
+    if (gamma == 1.0f) return {};
+    return {fabsf(next.x - dual.x) * compliance.x / gamma,
+            fabsf(next.y - dual.y) * compliance.y / gamma, fabsf(next.z - dual.z) * compliance.z / gamma};
+}
+
 // A contact multiplier's last unrelaxed step and the weight it took; weight 0 marks no last step.
 struct ContactRelaxation {
     math::Vec3 step{};

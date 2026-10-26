@@ -198,7 +198,8 @@ constexpr uint32_t kTileSlot = 0u, kTileStride = 1u, kTileAxes = 2u, kTileOwner 
                    kTileRelaxationStep = kTileResidualScale + 1u,
                    kTileRelaxationWeight = kTileRelaxationStep + 3u,
                    kTileBase = kTileRelaxationWeight + 1u,
-                   kTileFields = kTileBase + 3u;
+                   kTileElliptic = kTileBase + 3u, kTileTangentCompliance = kTileElliptic + 1u,
+                   kTileFields = kTileTangentCompliance + 2u;
 
 bool DenseTileRoute(const BlockDescentSolveParams& p) {
     return BlockDescentTileRoute(p.total_particle_count, p.total_grid_count,
@@ -640,8 +641,9 @@ __device__ void RaiseWarpResidual(BlockScratch s, uint32_t env, uint32_t kind, u
 
 // A row's multiplier steps at its dual update in velocity units: the normal (or scalar) step over its residual
 // scale, the tangent steps over their cone penalties rho mu^2, which is the slip velocity inside the cone.
-__device__ float2 MultiplierSteps(Vec3 dual, Vec3 next, float scale, float rho, float mu_first, float mu_second) {
-    const float normal = scale > 0.0f ? fabsf(next.x - dual.x) / scale : 0.0f;
+__device__ float2 MultiplierSteps(Vec3 dual, Vec3 next, float scale, float dual_scale, float rho,
+                                  float mu_first, float mu_second) {
+    const float normal = scale > 0.0f && dual_scale != 0.0f ? fabsf(next.x - dual.x) / scale : 0.0f;
     const float first = mu_first > 0.0f && rho > 0.0f ? (next.y - dual.y) / (rho * mu_first * mu_first) : 0.0f;
     const float second = mu_second > 0.0f && rho > 0.0f ? (next.z - dual.z) / (rho * mu_second * mu_second) : 0.0f;
     return {normal, hypotf(first, second)};
@@ -1332,6 +1334,7 @@ struct LocalTerm {
     Vec3 dual;
     float penalty;
     float compliance;
+    Vec3 cone_compliance;
     float lower;
     float upper;
     float mu_first;
@@ -1340,6 +1343,7 @@ struct LocalTerm {
     // Friction cone radius held through a block solve: the normal multiplier, or a tile's block-start bound.
     float radius;
     bool contact;
+    bool elliptic;
     nk::augmented::ScalarResponse response;
 };
 
@@ -1404,12 +1408,15 @@ __device__ LocalTerm LoadLocalTerm(DataView data, BlockDescentSolveParams p, Blo
     }
     LocalTerm t{};
     t.contact = (normal.flags & nk::nk_row_flags::kBlockNormal) != 0u;
+    t.elliptic = t.contact && (normal.flags & nk::nk_row_flags::kMuJoCo) != 0u;
     t.penalty = s.penalty[slot];
     t.lower = normal.lower;
     t.upper = normal.upper;
     t.mu_first = normal.mu;
     t.mu_second = normal.friction_secondary;
     t.compliance = normal.compliance_alpha;
+    t.cone_compliance = {t.compliance, t.contact ? rows[slot + normal.group_normal_count].compliance_alpha : 0.0f,
+                         t.contact ? rows[slot + 2u * normal.group_normal_count].compliance_alpha : 0.0f};
     for (uint32_t axis = 0u; axis < (t.contact ? 3u : 1u); ++axis) {
         const uint32_t row_slot = slot + axis * normal.group_normal_count;
         const NkRow row = rows[row_slot];
@@ -1433,19 +1440,28 @@ __device__ LocalTerm LoadPointLocalTerm(DataView data, BlockDescentSolveParams p
     return term;
 }
 
-// Folds a row's impulse and its curvature (xx, yy, zz, yz used) into a point block.
+// Folds a row's impulse and full symmetric curvature into a point block.
 __device__ void AddLocalResponse(const Vec3* jacobian, Vec3 f, const SymmetricMat3& c,
                                  Vec3* impulse, SymmetricMat3* curvature) {
     *impulse += jacobian[0] * f.x + jacobian[1] * f.y + jacobian[2] * f.z;
-    AddOuter(*curvature, jacobian[0], c.xx);
-    AddOuter(*curvature, jacobian[1], c.yy - c.yz);
-    AddOuter(*curvature, jacobian[2], c.zz - c.yz);
+    AddOuter(*curvature, jacobian[0], c.xx - c.xy - c.xz);
+    AddOuter(*curvature, jacobian[1], c.yy - c.yz - c.xy);
+    AddOuter(*curvature, jacobian[2], c.zz - c.yz - c.xz);
     AddOuter(*curvature, jacobian[1] + jacobian[2], c.yz);
+    AddOuter(*curvature, jacobian[0] + jacobian[1], c.xy);
+    AddOuter(*curvature, jacobian[0] + jacobian[2], c.xz);
 }
 
 // EvaluateAugmentedResponse given the normal term `n` already evaluated at the residual less row_move.x.
 __device__ void EvaluateAugmentedResponse(const LocalTerm& t, const nk::augmented::ScalarTerm& n, Vec3 row_move,
                                           Vec3* impulse, SymmetricMat3* curvature) {
+    if (t.elliptic) {
+        const auto f = nk::augmented::EvaluateEllipticImpulse(t.dual, t.penalty, t.residual - row_move,
+                                                             t.cone_compliance, t.mu_first);
+        *impulse = f.impulse;
+        *curvature = f.curvature;
+        return;
+    }
     *impulse = {n.impulse, 0.0f, 0.0f};
     *curvature = {n.curvature, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     if (!t.contact) return;
@@ -1478,6 +1494,9 @@ __device__ void EvaluateLocalResponse(const LocalTerm& t, Vec3 move, Vec3* impul
 // The row potential change as its residual drops by `drop`, integrated along it instead of subtracted.
 template <typename Response>
 __device__ float EvaluateDropChange(const LocalTerm& t, Vec3 drop, const Response& response) {
+    if (t.elliptic)
+        return nk::augmented::EllipticPotentialChange(t.dual, t.penalty, t.residual, drop,
+                                                      t.cone_compliance, t.mu_first);
     float change = nk::augmented::ScalarPotentialChange(t.dual.x, t.penalty, t.residual.x, drop.x,
         t.compliance, t.lower, t.upper, response);
     if (t.contact)
@@ -1498,7 +1517,7 @@ __device__ float EvaluateLocalChange(const LocalTerm& t, Vec3 move) {
 // One point incidence's row response at the block rate.
 struct PointRowSample {
     Vec3 impulse;
-    float curvature[4];
+    float curvature[6];
 };
 
 __device__ PointRowSample SamplePointRow(DataView data, BlockDescentSolveParams p, BlockScratch s,
@@ -1515,6 +1534,8 @@ __device__ PointRowSample SamplePointRow(DataView data, BlockDescentSolveParams 
     sample.curvature[1] = c.yy;
     sample.curvature[2] = c.zz;
     sample.curvature[3] = c.yz;
+    sample.curvature[4] = c.xy;
+    sample.curvature[5] = c.xz;
     return sample;
 }
 
@@ -1524,7 +1545,7 @@ __device__ void AddPointRowSample(BlockScratch s, size_t at, const PointRowSampl
     for (uint32_t axis = 0u; axis < kPointJacobianAxes; ++axis)
         jacobian[axis] = LoadPointIncidenceJacobian(s, at, axis);
     const SymmetricMat3 c{sample.curvature[0], sample.curvature[1], sample.curvature[2],
-                          0.0f, 0.0f, sample.curvature[3]};
+                          sample.curvature[4], sample.curvature[5], sample.curvature[3]};
     AddLocalResponse(jacobian, sample.impulse, c, impulse, curvature);
 }
 
@@ -1660,7 +1681,7 @@ constexpr uint32_t kDescendTileElements = 384u;
 constexpr uint32_t kDescendTileRows = 256u;
 constexpr uint32_t kDescendElementKinds = 4u;
 constexpr uint32_t kElementSampleWords = 9u;
-constexpr uint32_t kRowSampleWords = 7u;
+constexpr uint32_t kRowSampleWords = 9u;
 constexpr uint32_t kDescendSolveWords = 12u;
 static_assert(kDescendTileVertices * kDescendSolveWords <= kDescendTileRows);
 
@@ -1823,7 +1844,7 @@ __global__ void DescendParticlesKernel(ModelView model, DataView data, BlockDesc
                 const PointRowSample row = SamplePointRow(data, p, s, v.row_begin + k - v.row_first);
                 float* sample = row_samples[k];
                 SetTileVec3(sample, row.impulse);
-                for (uint32_t c = 0u; c < 4u; ++c) sample[3u + c] = row.curvature[c];
+                for (uint32_t c = 0u; c < 6u; ++c) sample[3u + c] = row.curvature[c];
             }
         }
         __syncthreads();
@@ -1859,7 +1880,7 @@ __global__ void DescendParticlesKernel(ModelView model, DataView data, BlockDesc
                 if (dense_rows) {
                     const uint32_t k = v.row_first + (at - begin);
                     row.impulse = TileVec3(row_samples[k]);
-                    for (uint32_t c = 0u; c < 4u; ++c) row.curvature[c] = row_samples[k][3u + c];
+                    for (uint32_t c = 0u; c < 6u; ++c) row.curvature[c] = row_samples[k][3u + c];
                 } else {
                     row = SamplePointRow(data, p, s, at);
                 }
@@ -2081,8 +2102,10 @@ __global__ void DualUpdateKernel(DataView data, BlockDescentSolveParams p, Block
             current.normal_bound = AugmentedRowBound(s, rows[slot], slot, current);
         const LocalTerm t = LoadLocalTerm(data, p, s, slot, ~0u, false, &current);
         const uint32_t stride = rows[slot].group_normal_count;
-        const Vec3 next = ProjectRowDual(t.dual, t.normal_bound, t.penalty, t.residual, t.contact, t.mu_first,
-                                         t.mu_second, s.contact_relaxation + slot);
+        const Vec3 next = t.elliptic
+            ? nk::augmented::EvaluateEllipticImpulse(t.dual, t.penalty, t.residual, t.cone_compliance, t.mu_first).impulse
+            : ProjectRowDual(t.dual, t.normal_bound, t.penalty, t.residual, t.contact, t.mu_first,
+                             t.mu_second, s.contact_relaxation + slot);
         if (row_env != env && env != ~0u) {
             RaiseResidual(s, env, kResidualJoint, joint);
             atomicMax(s.dual_step + env, step);
@@ -2090,14 +2113,21 @@ __global__ void DualUpdateKernel(DataView data, BlockDescentSolveParams p, Block
         }
         env = row_env;
         // Every row's multiplier step drives the momentum restart; a non-contact row's is its residual too.
-        const float2 change = MultiplierSteps(t.dual, next, static_cast<float>(t.response.residual_scale),
-            t.penalty, t.contact ? t.mu_first : 0.0f, t.contact ? t.mu_second : 0.0f);
+        float2 change = MultiplierSteps(t.dual, next, static_cast<float>(t.response.residual_scale),
+            static_cast<float>(t.response.dual_scale), t.penalty,
+            t.contact ? t.mu_first : 0.0f, t.contact ? t.mu_second : 0.0f);
+        if (t.elliptic) {
+            const Vec3 delta = nk::augmented::EllipticMultiplierStep(t.dual, next, t.penalty, t.cone_compliance);
+            change = {delta.x, fmaxf(delta.y, delta.z)};
+        }
         if (!t.contact) joint = max(joint, ResidualBits(change.x));
         step = max(step, ResidualBits(fmaxf(change.x, change.y)));
         // The primal reads the extrapolated multipliers; the unextrapolated ones stay in dual_base.
         const Vec3 base{s.dual_base[slot], t.contact ? s.dual_base[slot + stride] : 0.0f,
                         t.contact ? s.dual_base[slot + 2u * stride] : 0.0f};
-        const Vec3 y = ExtrapolateDual(base, next, s.dual_momentum[row_env].beta, t.lower, t.upper, t.contact,
+        const bool extrapolate = t.elliptic ? nk::augmented::EllipticFraction(t.penalty, t.cone_compliance) < 1.0f
+                                            : t.contact || t.response.dual_scale != 0.0;
+        const Vec3 y = ExtrapolateDual(base, next, extrapolate ? s.dual_momentum[row_env].beta : 0.0f, t.lower, t.upper, t.contact,
                                        t.mu_first, t.mu_second);
         s.dual_base[slot] = next.x;
         data.lambda[slot] = y.x;
@@ -2225,6 +2255,28 @@ __device__ constraint::CoulombContactResidual ContactRowResidual(DataView data, 
                                                                  BlockScratch s, uint32_t slot, const NkRow& row,
                                                                  float2* rates = nullptr) {
     const LocalTerm t = LoadLocalTerm(data, p, s, slot, ~0u, false);
+    if (t.elliptic) {
+        const auto f = nk::augmented::EvaluateEllipticImpulse(t.dual, t.penalty, t.residual,
+                                                             t.cone_compliance, t.mu_first);
+        const Vec3 delta = nk::augmented::EllipticMultiplierStep(t.dual, f.impulse, t.penalty, t.cone_compliance);
+        const Vec3 v{-t.residual.x + t.cone_compliance.x * t.dual.x,
+                     -t.residual.y + t.cone_compliance.y * t.dual.y,
+                     -t.residual.z + t.cone_compliance.z * t.dual.z};
+        const float support = hypotf(t.mu_first * v.y, t.mu_second * v.z);
+        const double tangent_work = double(t.dual.y) * v.y + double(t.dual.z) * v.z;
+        constraint::CoulombContactResidual result;
+        result.normal_natural_velocity = delta.x;
+        result.tangent_natural_velocity = fmaxf(delta.y, delta.z);
+        result.normal_velocity_violation = fmaxf(support - v.x, 0.0f);
+        result.normal_impulse_violation = fmaxf(-t.dual.x, 0.0f);
+        result.normal_complementarity = float(fabs(double(t.dual.x) * v.x + tangent_work));
+        result.friction_impulse_violation = fmaxf(hypotf(t.dual.y / t.mu_first, t.dual.z / t.mu_second) - t.dual.x, 0.0f);
+        result.friction_power_violation = float(fmax(tangent_work, 0.0));
+        result.friction_dissipation_work = float(fabs(tangent_work + double(t.dual.x) * support));
+        result.valid = result.Finite();
+        if (rates != nullptr) *rates = {delta.x, fmaxf(delta.y, delta.z)};
+        return result;
+    }
     const Vec3 velocity{-t.residual.x + t.compliance * t.dual.x, -t.residual.y, -t.residual.z};
     if (rates != nullptr)
         *rates = {Along(t.dual.x, velocity.x), fmaxf(Along(t.dual.y, velocity.y), Along(t.dual.z, velocity.z))};
@@ -2251,6 +2303,15 @@ __global__ void ContactResidualsKernel(DataView data, BlockDescentSolveParams p,
         }
         env = row_env;
         if (prune && Past(p, s, env, kResidualNormal, normal) && Past(p, s, env, kResidualTangent, tangent)) continue;
+        if (row.flags & nk::nk_row_flags::kMuJoCo) {
+            const LocalTerm t = LoadLocalTerm(data, p, s, slot, ~0u, false);
+            const auto f = nk::augmented::EvaluateEllipticImpulse(t.dual, t.penalty, t.residual,
+                                                                  t.cone_compliance, t.mu_first);
+            const Vec3 delta = nk::augmented::EllipticMultiplierStep(t.dual, f.impulse, t.penalty, t.cone_compliance);
+            normal = max(normal, ResidualBits(delta.x));
+            tangent = max(tangent, ResidualBits(fmaxf(delta.y, delta.z)));
+            continue;
+        }
         float2 rates{};
         const auto residual = ContactRowResidual(data, p, s, slot, row, &rates);
         normal = max(normal, ResidualBits(residual.valid ? fmaxf(residual.normal_natural_velocity, rates.x) : FLT_MAX));
@@ -2318,12 +2379,16 @@ __global__ void MeasureWorstRowsKernel(DataView data, BlockDescentSolveParams p,
         if (packed == 0u) continue;
         const uint32_t slot = ~static_cast<uint32_t>(packed);
         const LocalTerm t = LoadLocalTerm(data, p, s, slot, ~0u, false);
-        const Vec3 velocity{-t.residual.x + t.compliance * t.dual.x, -t.residual.y, -t.residual.z};
-        const auto f = nk::augmented::EvaluateTangent(t.dual, t.penalty, {0.0f, t.residual.y, t.residual.z},
-                                                      t.normal_bound, t.mu_first, t.mu_second);
+        const Vec3 velocity{-t.residual.x + t.compliance * t.dual.x,
+                            -t.residual.y + (t.elliptic ? t.cone_compliance.y * t.dual.y : 0.0f),
+                            -t.residual.z + (t.elliptic ? t.cone_compliance.z * t.dual.z : 0.0f)};
+        const auto f = t.elliptic
+            ? nk::augmented::EvaluateEllipticImpulse(t.dual, t.penalty, t.residual, t.cone_compliance, t.mu_first)
+            : nk::augmented::EvaluateTangent(t.dual, t.penalty, {0.0f, t.residual.y, t.residual.z},
+                                             t.normal_bound, t.mu_first, t.mu_second);
         const SymmetricMat3& w = data.row_contact_response[slot];
         const float terms[kColumns] = {t.dual.x, t.dual.y, t.dual.z, velocity.x, velocity.y, velocity.z,
-            t.normal_bound, f.impulse.y, f.impulse.z, t.penalty, t.compliance, w.xx, w.yy, w.zz, w.xy, w.xz,
+            t.elliptic ? f.impulse.x : t.normal_bound, f.impulse.y, f.impulse.z, t.penalty, t.compliance, w.xx, w.yy, w.zz, w.xy, w.xz,
             w.yz, t.mu_first, t.mu_second, __uint_as_float(slot)};
         for (uint32_t column = 0u; column < kColumns; ++column)
             data.contact_solve_worst_terms[size_t{item} * kColumns + column] = terms[column];

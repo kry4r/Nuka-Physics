@@ -58,6 +58,8 @@ __device__ scene::ContactParamsIn ReadContactProfile(
     scene::ContactParamsIn out;
     out.mu1 = w[nk::kContactProfileMu1];
     out.mu2 = w[nk::kContactProfileMu2];
+    out.friction_spin = w[nk::kContactProfileSpin];
+    out.friction_roll = w[nk::kContactProfileRoll];
     out.solref[0] = w[nk::kContactProfileSolref0];
     out.solref[1] = w[nk::kContactProfileSolref1];
     for (uint32_t i = 0u; i < 5u; ++i) out.solimp[i] = w[nk::kContactProfileSolimp0 + i];
@@ -81,6 +83,8 @@ __device__ uint64_t HashMergedContactProfile(const scene::MergedContactParams& p
     hash = HashContactProfileWord(hash, nk::kContactProfileFlagRefsafe);
     hash = HashContactProfileWord(hash, __float_as_uint(p.mu1));
     hash = HashContactProfileWord(hash, __float_as_uint(p.mu2));
+    hash = HashContactProfileWord(hash, __float_as_uint(p.friction_spin));
+    hash = HashContactProfileWord(hash, __float_as_uint(p.friction_roll));
     for (uint32_t i = 0u; i < 2u; ++i) hash = HashContactProfileWord(hash, __float_as_uint(p.solref[i]));
     for (uint32_t i = 0u; i < 5u; ++i) hash = HashContactProfileWord(hash, __float_as_uint(p.solimp[i]));
     hash = HashContactProfileWord(hash, __float_as_uint(p.margin));
@@ -396,6 +400,7 @@ __global__ void EmitPairDrivenRowsKernel(
     const uint32_t* __restrict__ body_to_link,
     const uint32_t* __restrict__ body_to_articulation,
     const uint32_t* __restrict__ body_collidable_body,
+    const uint32_t* __restrict__ link_body,
     const float* __restrict__ body_invweight0,
     const float* __restrict__ mat_buckets,
     uint32_t num_material_buckets,
@@ -543,7 +548,9 @@ __global__ void EmitPairDrivenRowsKernel(
     const float* solimp = merged.solimp;
     const float mu1 = merged.mu1;
     const float mu2 = merged.mu2;
-    const float invweight = mujoco ? body_invweight0[2u * body_a] + body_invweight0[2u * body_b] : 0.0f;
+    const uint32_t weight_body_a = kind_a == kNkSideArtic ? env * bodies_per_env + link_body[link_a] : body_a;
+    const uint32_t weight_body_b = kind_b == kNkSideArtic ? env * bodies_per_env + link_body[link_b] : body_b;
+    const float invweight = mujoco ? body_invweight0[2u * weight_body_a] + body_invweight0[2u * weight_body_b] : 0.0f;
     const bool pyramidal = mujoco && cone == 0u && merged.condim == 3u;
     contact_material[gid] = n_active > 0u ? HashMergedContactProfile(merged) : 0u;
     if (n_active > 0u && velocity_only)
@@ -1491,6 +1498,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    static_cast<const uint32_t*>(model.body_to_link),
                    static_cast<const uint32_t*>(model.body_to_articulation),
                    static_cast<const uint32_t*>(model.body_collidable_body),
+                   model.link_body,
                    model.body_invweight0,
                    static_cast<const float*>(data.mat_buckets),
                    p->num_material_buckets, data.contact_material,
