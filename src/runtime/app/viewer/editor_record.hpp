@@ -16,18 +16,19 @@
 
 namespace nuka::runtime::app::viewer {
 
-// Encodes presented frames at a fixed rate. A frame stays in the video until the next one is due,
-// so the video keeps wall-clock time whatever rate the editor draws at.
+// Records wall-clock time or one video frame per presented frame.
 class FrameRecorder {
 public:
     struct Settings {
         std::string file;                  // the video it writes
         std::string codec = "h264_nvenc";  // or libx264
         double fps = 30.0;
+        bool fixed_frames = false;
         int quality = 18;                  // constant quality, lower is better
     };
     struct Totals {
         std::string file;
+        std::string timing = "wall";
         uint64_t frames = 0u;   // video frames written
         uint64_t dropped = 0u;  // presented frames lost to a full queue or a changed window size
         double seconds = 0.0;

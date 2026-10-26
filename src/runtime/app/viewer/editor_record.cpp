@@ -12,7 +12,7 @@
 namespace nuka::runtime::app::viewer {
 namespace {
 
-// Presented frames waiting for ffmpeg; past this the newest queued frame stays on longer instead.
+// Presented frames waiting for ffmpeg to encode them.
 constexpr size_t kQueueFrames = 8u;
 
 std::string LogPath(const std::string& file) { return file + ".log"; }
@@ -38,6 +38,7 @@ void FrameRecorder::Start(Settings settings) {
     settings_ = std::move(settings);
     totals_ = Totals{};
     totals_.file = settings_.file;
+    totals_.timing = settings_.fixed_frames ? "frames" : "wall";
     queue_.clear();
     due_ = 0u;
     closing_ = false;
@@ -86,8 +87,13 @@ void FrameRecorder::Push(const uint8_t* pixels, uint32_t width, uint32_t height,
         ++totals_.dropped;
         return;
     }
+    if (settings_.fixed_frames) {
+        wake_.wait(lock, [this] { return queue_.size() < kQueueFrames || failed_; });
+        if (failed_) return;
+    }
     const double elapsed = std::chrono::duration<double>(Clock::now() - start_).count();
-    const uint64_t due = static_cast<uint64_t>(std::floor(elapsed * settings_.fps)) + 1u;
+    const uint64_t due = settings_.fixed_frames ? due_ + 1u :
+                         static_cast<uint64_t>(std::floor(elapsed * settings_.fps)) + 1u;
     if (due <= due_) return;
     const uint64_t repeat = due - due_;
     due_ = due;
@@ -121,6 +127,7 @@ void FrameRecorder::Write() {
             if (queue_.empty()) return;
             frame = std::move(queue_.front());
             queue_.pop_front();
+            wake_.notify_all();
         }
         bool ok = true;
         for (uint64_t i = 0u; i < frame.repeat && ok; ++i)
@@ -129,6 +136,7 @@ void FrameRecorder::Write() {
         if (!ok) {
             failed_ = true;
             queue_.clear();
+            wake_.notify_all();
             return;
         }
         totals_.frames += frame.repeat;

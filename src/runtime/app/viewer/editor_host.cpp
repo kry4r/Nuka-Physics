@@ -8947,6 +8947,7 @@ void EditorHost::State::RegisterViewActions() {
     const auto recording = [](const FrameRecorder::Totals& t, bool on) {
         json::Value out = Object({{"on", json::Value::Bool(on)},
                                   {"file", json::Value::Str(t.file)},
+                                  {"timing", json::Value::Str(t.timing)},
                                   {"frames", json::Value::Int(static_cast<int64_t>(t.frames))},
                                   {"dropped", json::Value::Int(static_cast<int64_t>(t.dropped))},
                                   {"seconds", json::Value::Float(t.seconds)},
@@ -8955,8 +8956,7 @@ void EditorHost::State::RegisterViewActions() {
         if (!t.error.empty()) out.Set("error", json::Value::Str(t.error));
         return out;
     };
-    // {on, file, fps, codec, quality}: every presented frame, the UI included, goes into an mp4 that
-    // ffmpeg from the PATH encodes; turning it off returns what was written.
+    // Window recordings include the UI; timing selects wall-clock time or one frame per presentation.
     actions_.Add({"view.record", "Record Window", "view", "", ShortcutScope::Global, {},
                   [this] { return recorder_.Recording(); },
                   [this, recording](const json::Value& args) {
@@ -8973,6 +8973,10 @@ void EditorHost::State::RegisterViewActions() {
                       FrameRecorder::Settings s;
                       s.fps = NumArg(args, "fps", 30.0);
                       s.quality = static_cast<int>(NumArg(args, "quality", 18.0));
+                      const std::string timing = StrArg(args, "timing", "wall");
+                      if (timing != "wall" && timing != "frames")
+                          return ActionResult::Fail("timing is wall or frames");
+                      s.fixed_frames = timing == "frames";
                       const std::string codec = StrArg(args, "codec", "nvenc");
                       if (codec != "nvenc" && codec != "x264") return ActionResult::Fail("the codec is nvenc or x264");
                       if (!(s.fps >= 1.0 && s.fps <= 120.0) || s.quality < 0 || s.quality > 51)

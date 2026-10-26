@@ -170,6 +170,7 @@ This page is generated from assets/editor/actions.toml by tools/skill_actions.py
 - `sim.grab_particle` {particle, target?} [sim]: Holds one environment particle (cloth or MPM) kinematic at `target`, where it is by default.
 - `sim.release` {path?, particle?} [sim]: Lets go of the load on `path`, the held `particle`, or with neither every load.
 - `sim.loads` [read]: The loads held on the shown environment as its last frame has them.
+- `sim.apply_loads` [sim]: Writes the held loads' forces into the world for its next step, for a script that steps the world it lent the editor: call it before each step so a Perturb drag acts.
 - `solver.telemetry` {mask?, alert?} [sim]: Records solver telemetry each step: per-step residuals, sweep counts and capped steps.
 - `solver.heatmap` {on?} [view]: Colours the solver's per-vertex residuals over the scene; the heatmap needs the per-vertex channel and turns it on.
 - `solver.set_iterations` {n} [sim]: Sets the solver's sweep budget per step, live.
@@ -241,7 +242,7 @@ This page is generated from assets/editor/actions.toml by tools/skill_actions.py
 - `view.fog` {on?} [view]: Fades distant geometry into the sky in the Lit view; `on` sets it, else it toggles.
 - `view.ground_grid` {mode?} [view]: The Lit view's ground grid: mode auto (under scenes without a floor), on or off; a bare call flips what is shown.
 - `view.screenshot` {path?} [file]: Writes the next drawn frame, the whole window, as a PPM.
-- `view.record` {on?, file?, fps?, codec?, quality?} [file]: Records the whole window, the UI included, into an mp4: each presented frame goes to ffmpeg from the PATH and stays on until the next one is due, so the video keeps wall-clock time.
+- `view.record` {on?, file?, fps?, timing?, codec?, quality?} [file]: Records the whole window, the UI included, into an mp4 through ffmpeg from the PATH, using wall-clock timing or one frame per presentation.
 - `view.record_status` [read]: The recording in progress, or the last one: its file, the video frames written so far, presented frames dropped, seconds of video and the frame size.
 - `view.project` {point} [read]: Where a world point shows in the window, in the window points ui.pointer takes, and whether it falls inside the viewport.
 - `view.stats` [read]: The editor's frame timings: frame count, frames per second, frame and UI time percentiles, the physics tick, how snapshots reach the renderer, whether it plays, the view mode and the viewport's pixel rectangle.

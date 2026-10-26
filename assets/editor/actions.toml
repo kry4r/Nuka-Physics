@@ -519,20 +519,21 @@ args.path = 'string, the .ppm to write, default "nuka_screenshot.ppm"'
 returns = "{path}"
 
 ["view.record"]
-summary = "Records the whole window, the UI included, into an mp4: each presented frame goes to ffmpeg from the PATH and stays on until the next one is due, so the video keeps wall-clock time. Turning it off waits for ffmpeg to finish the file. Fails on a surface that cannot be read back."
+summary = "Records the whole window, the UI included, into an mp4 through ffmpeg from the PATH, using wall-clock timing or one frame per presentation. Turning it off waits for ffmpeg to finish the file. Fails on a surface that cannot be read back."
 kind = "file"
 args.on = "bool, start or stop, default: toggles"
 args.file = "string, the .mp4 to write, default recordings/nuka-<time>.mp4 in the editor's profile"
 args.fps = "number, video frames a second, 1 to 120, default 30"
+args.timing = "string, wall keeps wall-clock time; frames writes every presentation and waits for the encoder, default wall"
 args.codec = 'string, nvenc (NVIDIA hardware) or x264, default "nvenc"'
 args.quality = "int, constant quality 0 to 51, lower is better, default 18"
-returns = "{on, file} when it starts; {on: false, file, frames, dropped, seconds, width, height} when it stops"
+returns = "{on, file, timing, frames, dropped, seconds, width, height}; error also appears when ffmpeg fails"
 example = '{"on": true, "file": "C:/videos/walk.mp4", "fps": 30}'
 
 ["view.record_status"]
 summary = "The recording in progress, or the last one: its file, the video frames written so far, presented frames dropped, seconds of video and the frame size."
 kind = "read"
-returns = "{on, file, frames, dropped, seconds, width, height, error}; error only when ffmpeg failed"
+returns = "{on, file, timing, frames, dropped, seconds, width, height, error}; error only when ffmpeg failed"
 
 ["view.project"]
 summary = "Where a world point shows in the window, in the window points ui.pointer takes, and whether it falls inside the viewport."
