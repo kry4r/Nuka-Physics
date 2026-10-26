@@ -47,13 +47,19 @@ NUKA_COLLISION_HD inline bool IsConvexShape(uint32_t kind) {
            kind == kShapeCylinder;
 }
 
+NUKA_COLLISION_HD inline bool IsMeshShape(uint32_t kind) {
+    return kind == kShapeConvexHull || kind == kShapeSdfMesh;
+}
+
 NUKA_COLLISION_HD inline MeshContactRoute RouteMeshContact(
     uint32_t kind_a, uint32_t kind_b, uint8_t mode_a, uint8_t mode_b) {
-    const bool mesh_a = kind_a == kShapeConvexHull || kind_a == kShapeSdfMesh;
-    const bool mesh_b = kind_b == kShapeConvexHull || kind_b == kShapeSdfMesh;
+    const bool mesh_a = IsMeshShape(kind_a);
+    const bool mesh_b = IsMeshShape(kind_b);
     if (mesh_a && mesh_b && mode_a == 1u && mode_b == 1u) return MeshContactRoute::Sdf;
     if (IsConvexShape(kind_a) && IsConvexShape(kind_b)) return MeshContactRoute::Analytic;
     if (!mesh_a && !mesh_b) return MeshContactRoute::Analytic;
+    // A mesh meets the plane half-space at its vertices, convex or not.
+    if (kind_a == kShapePlane || kind_b == kShapePlane) return MeshContactRoute::Analytic;
     // Rounded primitives query the mesh surface without a tessellated source shape.
     if (kind_a == kShapeSphere || kind_a == kShapeCapsule ||
         kind_b == kShapeSphere || kind_b == kShapeCapsule) return MeshContactRoute::Sdf;
@@ -67,6 +73,13 @@ NUKA_COLLISION_HD inline bool HasAnalyticManifold(uint32_t a, uint32_t b) {
            (a == kShapeCapsule && (b == kShapeCapsule || b == kShapePlane)) ||
            (a == kShapeBox && (b == kShapeBox || b == kShapePlane)) ||
            (b == kShapeCylinder && (a == kShapeSphere || a == kShapePlane));
+}
+
+// Analytic-route pairs without a closed-form manifold take the warp convex narrowphase.
+NUKA_COLLISION_HD inline bool TakesConvexManifold(uint32_t a, uint32_t b) {
+    if (HasAnalyticManifold(a, b)) return false;
+    if (a == kShapePlane || b == kShapePlane) return IsMeshShape(a) || IsMeshShape(b);
+    return IsConvexShape(a) && IsConvexShape(b);
 }
 
 }  // namespace nuka::collision

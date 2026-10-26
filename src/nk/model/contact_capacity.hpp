@@ -74,7 +74,7 @@ inline bool ConvexContactPairs(const Model& model) {
                                    (uint64_t{a} << 32u) | b)) continue;
             if (RouteMeshContact(sa.kind, sb.kind, sa.mesh_contact_mode, sb.mesh_contact_mode) ==
                     MeshContactRoute::Analytic &&
-                !HasAnalyticManifold(sa.kind, sb.kind) && IsConvexShape(sa.kind) && IsConvexShape(sb.kind))
+                TakesConvexManifold(sa.kind, sb.kind))
                 return true;
         }
     }

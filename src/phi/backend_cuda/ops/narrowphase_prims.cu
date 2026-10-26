@@ -1,5 +1,6 @@
 
 
+#include <cfloat>
 #include <cuda_runtime.h>
 
 #include "collision/analytical_manifold.hpp"   
@@ -102,6 +103,55 @@ __device__ bool DispatchAnalyticPair(uint32_t ka, const amf::PrimParams& a,
     return false;
 }
 
+// Mesh vertices inside the query band meet the plane; the deepest one and the band's tangent
+// extremes span the manifold. Features are vertex index + 1.
+__device__ void HullPlanePair(const cvx::ConvexHullView& hull, const amf::PrimParams& plane,
+                              bool hull_first, float separation, float query, ContactManifold* out,
+                              math::Vec3* witness_a, math::Vec3* witness_b) {
+    constexpr uint32_t kKeys = 9u;
+    const math::Vec3 n = amf::Norm(plane.frame.cz, math::Vec3::UnitZ());
+    const math::Vec3 t = amf::Norm(plane.frame.cx, math::Vec3::UnitX());
+    const math::Vec3 s = n.Cross(t);
+    const math::Vec3 axes[kKeys] = {-n, t, -t, s, -s, t + s, t - s, s - t, -t - s};
+    float best[kKeys];
+    uint32_t index[kKeys];
+    for (uint32_t k = 0u; k < kKeys; ++k) { best[k] = -FLT_MAX; index[k] = ~0u; }
+    const uint32_t lane = threadIdx.x % kWarp;
+    for (uint32_t i = lane; i < hull.vcount; i += kWarp) {
+        const math::Vec3 v = hull.Vertex(i) - plane.frame.t;
+        if (!(v.Dot(n) < query)) continue;
+        for (uint32_t k = 0u; k < kKeys; ++k) {
+            const float key = v.Dot(axes[k]);
+            if (key > best[k]) { best[k] = key; index[k] = i; }
+        }
+    }
+    for (uint32_t k = 0u; k < kKeys; ++k) {
+        for (uint32_t offset = kWarp / 2u; offset > 0u; offset >>= 1u) {
+            const float other = __shfl_down_sync(~0u, best[k], offset);
+            const uint32_t at = __shfl_down_sync(~0u, index[k], offset);
+            if (other > best[k] || (other == best[k] && at < index[k])) { best[k] = other; index[k] = at; }
+        }
+    }
+    if (lane != 0u || index[0] == ~0u) return;
+    amf::ManifoldPointCand cand[kKeys];
+    int count = 0;
+    for (uint32_t k = 0u; k < kKeys; ++k) {
+        bool seen = false;
+        for (int j = 0; j < count; ++j) seen |= cand[j].feature == index[k] + 1u;
+        if (seen) continue;
+        const math::Vec3 v = hull.Vertex(index[k]);
+        const float d = (v - plane.frame.t).Dot(n);
+        cand[count++] = {v - n * (0.5f * d), separation - d, index[k] + 1u};
+    }
+    amf::ReduceAndEmitSpread(cand, count, hull_first ? n : -n, out);
+    for (uint32_t i = 0u; i < out->point_count; ++i) {
+        const math::Vec3 v = hull.Vertex(static_cast<uint32_t>(out->points[i].stable_key) - 1u);
+        const math::Vec3 foot = v - n * (v - plane.frame.t).Dot(n);
+        witness_a[i] = hull_first ? v : foot;
+        witness_b[i] = hull_first ? foot : v;
+    }
+}
+
 __device__ void DispatchConvexPair(uint32_t ka, const amf::PrimParams& a,
                                   uint32_t kb, const amf::PrimParams& b,
                                   const float* hull_verts,
@@ -110,6 +160,15 @@ __device__ void DispatchConvexPair(uint32_t ka, const amf::PrimParams& a,
                                   float separation, float query, ContactManifold* out,
                                   math::Vec3* witness_a, math::Vec3* witness_b,
                                   cvx::ConvexWorkspace& workspace) {
+    if (ka == kKindPlane || kb == kKindPlane) {
+        const bool hull_first = kb == kKindPlane;
+        cvx::ConvexHullView hull;
+        hull.verts = hull_verts + static_cast<size_t>(hull_first ? hull_off_a : hull_off_b) * 3u;
+        hull.vcount = hull_first ? hull_cnt_a : hull_cnt_b;
+        hull.frame = (hull_first ? a : b).frame;
+        HullPlanePair(hull, hull_first ? b : a, hull_first, separation, query, out, witness_a, witness_b);
+        return;
+    }
     cvx::ConvexHullView ha, hb;
     cvx::SupportProxy A, B;
     if (MakeSupportProxy(ka, a, hull_verts, hull_off_a, hull_cnt_a, &ha, &A) &&
@@ -212,8 +271,7 @@ __global__ void PairDrivenNarrowphaseKernel(
         if (!kConvex && route == MeshContactRoute::Sdf) atomicAdd(&mesh_sdf_pair_count[env], 1u);
         if (kConvex)
             convex = route == MeshContactRoute::Analytic &&
-                     !::nuka::collision::HasAnalyticManifold(sa.kind, sb.kind) &&
-                     ::nuka::collision::IsConvexShape(sa.kind) && ::nuka::collision::IsConvexShape(sb.kind);
+                     ::nuka::collision::TakesConvexManifold(sa.kind, sb.kind);
         else if (route == MeshContactRoute::Analytic) {
             const math::Transform xa = body_pose[env * bodies_per_env + a];
             const math::Transform xb = body_pose[env * bodies_per_env + b];
