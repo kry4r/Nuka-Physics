@@ -145,6 +145,20 @@ __host__ __device__ constexpr uint32_t TileThreads() {
     return TileSpan<kN>() > 1u ? kRigidThreads : TileWarps<kN>() * kTileLanes;
 }
 
+// Warps of a team: up to kTileTeamWarps whose shared buffers fit as TileWarps; a wide tile descends alone.
+template <uint32_t kN>
+__host__ __device__ constexpr uint32_t TileTeamWarps() {
+    const uint32_t fit = 48u * 1024u / (TileWarpFloats<kN>() * uint32_t{sizeof(float)});
+    return TileSpan<kN>() > 1u ? 1u : fit < kTileTeamWarps ? fit : kTileTeamWarps;
+}
+
+// Threads of the tile kernel's largest block, alone or in teams.
+template <uint32_t kN>
+__host__ __device__ constexpr uint32_t TileBoundThreads() {
+    constexpr uint32_t team = TileTeamWarps<kN>() * kTileLanes;
+    return TileThreads<kN>() > team ? TileThreads<kN>() : team;
+}
+
 struct TileContext {
     uint32_t env;
     uint32_t lane;
@@ -157,6 +171,9 @@ struct TileContext {
     uint32_t capacity;
     uint32_t staged;
     uint32_t width;
+    // Warps descending the environment together and this warp's place among them.
+    uint32_t team;
+    uint32_t member;
     // The largest block coordinate change of the running sweep, its momentum residual.
     float momentum;
     float* fields;
@@ -164,6 +181,15 @@ struct TileContext {
     // Each block's heads in head order run from its predecessor's incident_end to its own.
     uint32_t* incident_end;
     uint32_t* incident;
+    // Each block's color, the blocks in color order and each color's end in that order.
+    uint32_t* color;
+    uint32_t* order;
+    uint32_t* color_end;
+    // Lane k holds color k's end in the order; `colors` marks the colors that hold blocks.
+    uint32_t color_stop;
+    uint32_t colors;
+    // One slot per team warp for the team's exchanges.
+    uint4* team_share;
     float* mass;
     float* factor;
     uint2* chunk_rows;
@@ -197,6 +223,36 @@ struct TileContext {
         return block == 0u ? 0u : incident_end[block - 1u];
     }
 };
+
+// Barrier over the warps descending one environment; a lone warp only converges.
+__device__ __forceinline__ void TeamSync(const TileContext& c) {
+    if (c.team > 1u) __syncthreads();
+    else __syncwarp();
+}
+
+// The team's largest of each warp-uniform component; residual bits order as their nonnegative floats.
+__device__ uint4 TeamMax(const TileContext& c, uint4 value) {
+    if (c.team == 1u) return value;
+    if (c.lane == 0u) c.team_share[c.member] = value;
+    __syncthreads();
+    for (uint32_t member = 0u; member < c.team; ++member) {
+        const uint4 other = c.team_share[member];
+        value = make_uint4(max(value.x, other.x), max(value.y, other.y), max(value.z, other.z),
+                           max(value.w, other.w));
+    }
+    __syncthreads();
+    return value;
+}
+
+// The first warp's warp-uniform value, across the team.
+__device__ uint32_t TeamBroadcast(const TileContext& c, uint32_t value) {
+    if (c.team == 1u) return value;
+    if (c.member == 0u && c.lane == 0u) c.team_share[0].x = value;
+    __syncthreads();
+    value = c.team_share[0].x;
+    __syncthreads();
+    return value;
+}
 
 // A tile block's coordinates: a rigid body's six, or an articulation's compact (mimic root) ones.
 struct TileBlock {
@@ -458,6 +514,21 @@ __device__ void ExecuteTileWork(DataView data, BlockDescentSolveParams p, BlockS
 // sides share a block lists once.
 __device__ void IndexTileIncidence(const TileContext& c) {
     const uint32_t blocks = c.bodies + c.articulations;
+    // One block lists every head that still moves it, in head order.
+    if (blocks == 1u) {
+        uint32_t listed = 0u;
+        for (uint32_t base = 0u; base < c.heads; base += kTileLanes) {
+            const uint32_t h = base + c.lane;
+            const bool moves = h < c.heads &&
+                (c.Index(kTileOwner, h) != kNoTileBlock || c.Index(kTileOwner + 1u, h) != kNoTileBlock);
+            const uint32_t mask = __ballot_sync(~0u, moves);
+            if (moves) c.incident[listed + __popc(mask & ((1u << c.lane) - 1u))] = h;
+            listed += __popc(mask);
+        }
+        if (c.lane == 0u) c.incident_end[0] = listed;
+        __syncwarp();
+        return;
+    }
     for (uint32_t block = c.lane; block < blocks; block += kTileLanes) c.incident_end[block] = 0u;
     __syncwarp();
     for (uint32_t h = c.lane; h < c.heads; h += kTileLanes)
@@ -503,6 +574,58 @@ __device__ void IndexTileIncidence(const TileContext& c) {
         }
         __syncwarp();
     }
+}
+
+// Greedy colors in block order, each moving block taking the least color no lower neighbor holds, so a
+// color's blocks share no head; past the last free color a block joins the last, which descends in order.
+__device__ void ColorTileBlocks(BlockScratch s, const TileContext& c) {
+    const uint32_t blocks = c.bodies + c.articulations;
+    for (uint32_t block = 0u; block < blocks; ++block) {
+        uint32_t taken = 0u;
+        for (uint32_t k = c.IncidentBegin(block) + c.lane; k < c.incident_end[block]; k += kTileLanes) {
+            const uint32_t h = c.incident[k];
+            const uint32_t first = c.Index(kTileOwner, h);
+            const uint32_t other = first == block ? c.Index(kTileOwner + 1u, h) : first;
+            if (other < block) taken |= 1u << c.color[other];
+        }
+        taken = __reduce_or_sync(~0u, taken);
+        const bool moving = block < c.bodies ? s.rigid_dimensions[c.first_body + block] != 0u
+                                             : s.articulation_dimensions[c.first_articulation + block - c.bodies] != 0u;
+        if (c.lane == 0u)
+            c.color[block] = moving ? min(static_cast<uint32_t>(__ffs(~taken)) - 1u, kTileColors - 1u) : kNoTileColor;
+        __syncwarp();
+    }
+    c.color_end[c.lane] = 0u;
+    __syncwarp();
+    for (uint32_t block = c.lane; block < blocks; block += kTileLanes)
+        if (c.color[block] != kNoTileColor) atomicAdd(c.color_end + c.color[block], 1u);
+    __syncwarp();
+    const uint32_t count = c.color_end[c.lane];
+    uint32_t through = count;
+    for (uint32_t offset = 1u; offset < kTileLanes; offset <<= 1u) {
+        const uint32_t other = __shfl_up_sync(~0u, through, offset);
+        if (c.lane >= offset) through += other;
+    }
+    c.color_end[c.lane] = through - count;
+    __syncwarp();
+    // Each color's cursor starts at its blocks and ends at its end; a chunk's lanes place blocks in lane order.
+    for (uint32_t base = 0u; base < blocks; base += kTileLanes) {
+        const uint32_t block = base + c.lane;
+        const uint32_t color = block < blocks ? c.color[block] : kNoTileColor;
+        const uint32_t peers = __match_any_sync(~0u, color);
+        const uint32_t before = __popc(peers & ((1u << c.lane) - 1u));
+        if (color != kNoTileColor) c.order[c.color_end[color] + before] = block;
+        __syncwarp();
+        if (color != kNoTileColor && before == 0u) c.color_end[color] += __popc(peers);
+        __syncwarp();
+    }
+}
+
+// A warp's copy of the color ends, a lane per color.
+__device__ void LoadTileColors(TileContext& c) {
+    c.color_stop = c.color_end[c.lane];
+    const uint32_t start = __shfl_up_sync(~0u, c.color_stop, 1u);
+    c.colors = __ballot_sync(~0u, c.color_stop != (c.lane == 0u ? 0u : start));
 }
 
 // Jacobians on moving blocks and residuals at free velocities, including kinematic sides. Single-coordinate
@@ -745,6 +868,7 @@ __device__ void InitializeTile(ArticulationDeviceState state, DataView data, Blo
         __syncwarp();
     }
     IndexTileIncidence(c);
+    ColorTileBlocks(s, c);
     if (p.measure_contact_residual != 0u) {
         for (uint32_t base = 0u; base < heads; base += kTileLanes) {
             uint32_t at = 0u;
@@ -1477,10 +1601,10 @@ __device__ void DescendTileBlock(DataView data, BlockDescentSolveParams p, Block
 
 // Dual update as DualUpdateKernel at the velocities every block reached in this iteration; position pass
 // impulses stay in the tile. Returns the contact normal, contact tangent and other rows' residuals, then the
-// largest multiplier step.
+// largest multiplier step. A team's warps take alternate warps of heads.
 __device__ float4 UpdateTileDuals(DataView data, const TileContext& c, float beta, bool velocity = true) {
     uint32_t steps[kResidualClasses] = {0u, 0u, 0u, 0u};
-    for (uint32_t h = c.lane; h < c.heads; h += kTileLanes) {
+    for (uint32_t h = c.member * kTileLanes + c.lane; h < c.heads; h += c.team * kTileLanes) {
         const TileHead t = LoadTileHead(c, h);
         const uint32_t slot = c.Index(kTileSlot, h);
         const uint32_t stride = c.Index(kTileStride, h);
@@ -1514,10 +1638,12 @@ __device__ float4 UpdateTileDuals(DataView data, const TileContext& c, float bet
         c.Store3(kTileBase, h, dual);
     }
     __syncwarp();
-    return {__uint_as_float(__reduce_max_sync(~0u, steps[kResidualNormal])),
-            __uint_as_float(__reduce_max_sync(~0u, steps[kResidualTangent])),
-            __uint_as_float(__reduce_max_sync(~0u, steps[kResidualJoint])),
-            __uint_as_float(__reduce_max_sync(~0u, steps[kResidualMomentum]))};
+    const uint4 largest = TeamMax(c, make_uint4(__reduce_max_sync(~0u, steps[kResidualNormal]),
+                                                __reduce_max_sync(~0u, steps[kResidualTangent]),
+                                                __reduce_max_sync(~0u, steps[kResidualJoint]),
+                                                __reduce_max_sync(~0u, steps[kResidualMomentum])));
+    return {__uint_as_float(largest.x), __uint_as_float(largest.y), __uint_as_float(largest.z),
+            __uint_as_float(largest.w)};
 }
 
 // Final velocities as the tails of DescendArticulationsKernel and DescendRigidBlocksKernel, then the
@@ -1654,21 +1780,24 @@ __device__ void FinishTilePositions(ArticulationDeviceState state, DataView data
     }
 }
 
-// One Gauss-Seidel pass over the tile's blocks.
+// One Gauss-Seidel pass over the tile's blocks in color order. A color's blocks share no head, so a team's
+// warps take alternate ones; the last color may hold neighbors, so its first warp descends it in order.
 template <uint32_t kN>
 __device__ void DescendTileBlocks(DataView data, BlockDescentSolveParams p, BlockScratch s, TileContext& c,
                                   bool position) {
-    for (uint32_t base = 0u; base < c.bodies + c.articulations; base += kTileLanes) {
-        const uint32_t own = base + c.lane;
-        const uint32_t dimension = own < c.bodies ? s.rigid_dimensions[c.first_body + own]
-            : own < c.bodies + c.articulations
-                ? s.articulation_dimensions[c.first_articulation + own - c.bodies] : 0u;
-        for (uint32_t pending = __ballot_sync(~0u, dimension != 0u); pending != 0u; pending &= pending - 1u) {
-            const uint32_t local = base + __ffs(pending) - 1u;
+    for (uint32_t pending = c.colors; pending != 0u; pending &= pending - 1u) {
+        const uint32_t color = __ffs(pending) - 1u;
+        const uint32_t before = __shfl_sync(~0u, c.color_stop, (color + kTileColors - 1u) % kTileColors);
+        const uint32_t begin = color == 0u ? 0u : before, end = __shfl_sync(~0u, c.color_stop, color);
+        const bool shared = color + 1u < kTileColors;
+        for (uint32_t k = shared ? begin + c.member : c.member == 0u ? begin : end; k < end;
+             k += shared ? c.team : 1u) {
+            const uint32_t local = c.order[k];
             const TileBlock b = LoadTileBlock(data, p, s, c, local, position);
             if (local < c.bodies) DescendTileBlock<kRigidBlockDof>(data, p, s, c, b);
             else DescendTileBlock<kN>(data, p, s, c, b);
         }
+        TeamSync(c);
     }
 }
 
@@ -1687,12 +1816,14 @@ struct TilePhaseClock {
 };
 
 // An environment's velocity sweeps until its residuals pass the tolerance or the budget is spent, as the
-// sweep solve ends each env, then its split-impulse position pass.
+// sweep solve ends each env, then its split-impulse position pass. A team's first warp sets up and finishes.
 template <uint32_t kN>
 __device__ void DescendTile(ArticulationDeviceState state, DataView data, BlockDescentSolveParams p, BlockScratch s,
                             TileContext& c) {
     TilePhaseClock clock(p.telemetry != 0u);
-    InitializeTile<kN>(state, data, p, s, c);
+    if (c.member == 0u) InitializeTile<kN>(state, data, p, s, c);
+    c.heads = TeamBroadcast(c, c.heads);
+    LoadTileColors(c);
     clock.Stamp(kPhaseSetup);
     // Lane k holds the residual of class k.
     float residual = 0.0f;
@@ -1703,6 +1834,7 @@ __device__ void DescendTile(ArticulationDeviceState state, DataView data, BlockD
         c.iteration = sweeps++;
         c.momentum = 0.0f;
         DescendTileBlocks<kN>(data, p, s, c, false);
+        c.momentum = __uint_as_float(TeamMax(c, make_uint4(__float_as_uint(c.momentum), 0u, 0u, 0u)).x);
         clock.Stamp(kPhaseDense);
         AdvanceDualMomentum(momentum, step);
         clock.Stamp(kPhaseMomentum);
@@ -1711,28 +1843,32 @@ __device__ void DescendTile(ArticulationDeviceState state, DataView data, BlockD
         clock.Stamp(kPhaseDual);
         residual = c.lane == kResidualNormal ? rows.x : c.lane == kResidualTangent ? rows.y
                  : c.lane == kResidualJoint ? rows.z : c.momentum;
-        if ((p.telemetry & nk::kTelemetrySweeps) != 0u && sweeps <= p.trace_sweeps && c.lane < kResidualClasses)
+        if ((p.telemetry & nk::kTelemetrySweeps) != 0u && sweeps <= p.trace_sweeps && c.member == 0u &&
+            c.lane < kResidualClasses)
             data.solver_sweep_trace[(size_t{c.env} * p.trace_sweeps + sweeps - 1u) * kResidualClasses + c.lane] =
                 residual;
         const float largest = fmaxf(fmaxf(rows.x, rows.y), fmaxf(rows.z, c.momentum));
         clock.Stamp(kPhaseCheck);
         if (largest < p.velocity_tolerance) break;
     }
-    if (c.lane < kResidualClasses) data.solver_residual[c.env * kResidualClasses + c.lane] = residual;
-    if (c.lane == 0u) data.vbd_velocity_sweep_count[c.env] = sweeps;
-    FinishTile<kN>(state, data, p, s, c);
+    if (c.member == 0u) {
+        if (c.lane < kResidualClasses) data.solver_residual[c.env * kResidualClasses + c.lane] = residual;
+        if (c.lane == 0u) data.vbd_velocity_sweep_count[c.env] = sweeps;
+        FinishTile<kN>(state, data, p, s, c);
+    }
     if (p.position_iterations != 0u) {
-        const uint32_t positions = InitializeTilePositions(data, p, s, c);
+        const uint32_t positions = TeamBroadcast(c, c.member == 0u ? InitializeTilePositions(data, p, s, c) : 0u);
         for (uint32_t iteration = 0u; iteration < positions; ++iteration) {
             c.iteration = sweeps + iteration;
             DescendTileBlocks<kN>(data, p, s, c, true);
             if (iteration + 1u < positions) UpdateTileDuals(data, c, 0.0f, false);
         }
-        FinishTilePositions(state, data, p, s, c);
+        if (c.member == 0u) FinishTilePositions(state, data, p, s, c);
     }
     clock.Stamp(kPhaseDense);
-    for (uint32_t phase = c.lane; phase < kSolverPhaseWords; phase += kTileLanes)
-        data.solver_phase_time[c.env * kSolverPhaseWords + phase] = clock.total[phase];
+    if (c.member == 0u)
+        for (uint32_t phase = c.lane; phase < kSolverPhaseWords; phase += kTileLanes)
+            data.solver_phase_time[c.env * kSolverPhaseWords + phase] = clock.total[phase];
 }
 
 constexpr uint32_t kOrderTileThreads = 1024u;
@@ -1765,14 +1901,15 @@ __global__ void __launch_bounds__(kOrderTileThreads) OrderTilesKernel(BlockDesce
         s.tile_order[atomicAdd(offsets + TileCostBucket(s.tile_cost[env]), 1u)] = env;
 }
 
-// Resident tiles take environments in cost order; wide blocks cooperate on Hessian assembly.
-// A tile retains the same ordered block descent and convergence checks at every coordinate width.
+// Resident tiles take environments in cost order, one per warp or one per team of warps; wide blocks
+// cooperate on Hessian assembly. A tile retains the same block order and convergence checks at every width.
 template <uint32_t kN>
-__global__ void __launch_bounds__(TileThreads<kN>()) DescendDenseTilesKernel(
-    ArticulationDeviceState state, DataView data, BlockDescentSolveParams p, BlockScratch s) {
+__global__ void __launch_bounds__(TileBoundThreads<kN>()) DescendDenseTilesKernel(
+    ArticulationDeviceState state, DataView data, BlockDescentSolveParams p, BlockScratch s, uint32_t team) {
     extern __shared__ __align__(16) float tile_shared[];
     __shared__ TileChunkWork chunk_work;
     __shared__ TileContext shared_context;
+    __shared__ uint4 team_share[kTileTeamWarps];
     const uint32_t warp = threadIdx.x / kTileLanes;
     const uint32_t lane = threadIdx.x % kTileLanes;
     if constexpr (TileSpan<kN>() > 1u) {
@@ -1785,11 +1922,17 @@ __global__ void __launch_bounds__(TileThreads<kN>()) DescendDenseTilesKernel(
             }
         }
     }
-    const uint32_t slot = blockIdx.x * TileWarps<kN>() + warp;
+    const uint32_t slot = team > 1u ? blockIdx.x : blockIdx.x * TileWarps<kN>() + warp;
     for (;;) {
         uint32_t ticket = 0u;
-        if (lane == 0u) ticket = atomicAdd(s.tile_next, 1u);
+        if (lane == 0u && warp % team == 0u) ticket = atomicAdd(s.tile_next, 1u);
         ticket = __shfl_sync(~0u, ticket, 0u);
+        if (team > 1u) {
+            if (threadIdx.x == 0u) team_share[0].x = ticket;
+            __syncthreads();
+            ticket = team_share[0].x;
+            __syncthreads();
+        }
         if (ticket >= p.env_count) {
             if constexpr (TileSpan<kN>() > 1u) {
                 if (lane == 0u) chunk_work.stop = true;
@@ -1808,10 +1951,16 @@ __global__ void __launch_bounds__(TileThreads<kN>()) DescendDenseTilesKernel(
         c.capacity = s.tile_head_capacity;
         c.staged = kNoTileBlock;
         c.width = TileJacobianWidth(p);
+        c.team = team;
+        c.member = team > 1u ? warp : 0u;
         c.fields = s.tile_fields + size_t{slot} * kTileFields * c.capacity;
         c.jacobian = s.tile_jacobian + size_t{slot} * s.tile_row_capacity * c.width;
         c.incident_end = s.tile_incidence + size_t{slot} * s.tile_incidence_stride;
         c.incident = c.incident_end + c.bodies + c.articulations;
+        c.color = c.incident + 2u * c.capacity;
+        c.order = c.color + c.bodies + c.articulations;
+        c.color_end = c.order + c.bodies + c.articulations;
+        c.team_share = team_share;
         c.mass = tile_shared + size_t{warp} * TileWarpFloats<kN>();
         c.factor = c.mass + kN * (kN + 1u);
         c.chunk_terms = reinterpret_cast<float4*>(c.factor + kN * (kN + 1u));
@@ -1822,13 +1971,13 @@ __global__ void __launch_bounds__(TileThreads<kN>()) DescendDenseTilesKernel(
         c.iteration = ~0u;
         const long long start = clock64();
         DescendTile<kN>(state, data, p, s, c);
-        if (lane == 0u) s.tile_cost[env] = static_cast<uint32_t>(min(clock64() - start, 0xffffffffll));
+        if (lane == 0u && c.member == 0u) s.tile_cost[env] = static_cast<uint32_t>(min(clock64() - start, 0xffffffffll));
     }
 }
 
 template <uint32_t kN>
-constexpr size_t TileSharedBytes() {
-    return size_t{TileWarps<kN>()} * TileWarpFloats<kN>() * sizeof(float);
+constexpr size_t TileSharedBytes(uint32_t warps = TileWarps<kN>()) {
+    return size_t{warps} * TileWarpFloats<kN>() * sizeof(float);
 }
 
 // Blocks of the tile kernel resident for p's environments, with the cache carveout the launch uses.
@@ -1842,14 +1991,38 @@ cudaError_t TileResidentBlocks(const BlockDescentSolveParams& p, uint32_t* block
                             (p.env_count + warps - 1u) / warps, blocks);
 }
 
+// Warps per environment: the widest team, with at least two blocks per warp, that keeps every environment
+// resident within the slots of one warp per environment; else one warp each.
+template <uint32_t kN>
+cudaError_t TileTeam(const BlockDescentSolveParams& p, uint32_t* team, uint32_t* blocks) {
+    *team = 1u;
+    cudaError_t status = TileResidentBlocks<kN>(p, blocks);
+    if (status != cudaSuccess) return status;
+    const uint32_t per_env = (p.total_body_count + p.articulation_count) / p.env_count;
+    const uint32_t slots = *blocks * TileWarps<kN>();
+    for (uint32_t width = kTileTeamWarps; width > 1u; width /= 2u) {
+        if (width > TileTeamWarps<kN>() || 2u * width > per_env || p.env_count > slots) continue;
+        uint32_t resident = 0u;
+        status = ResidentGridSize(DescendDenseTilesKernel<kN>, width * kTileLanes, TileSharedBytes<kN>(width),
+                                  p.env_count, &resident);
+        if (status != cudaSuccess) return status;
+        if (resident < p.env_count) continue;
+        *team = width;
+        *blocks = p.env_count;
+        return PreferCacheCarveout(DescendDenseTilesKernel<kN>, width * kTileLanes, TileSharedBytes<kN>(width));
+    }
+    return cudaSuccess;
+}
+
 template <uint32_t kN>
 cudaError_t LaunchDenseTiles(ArticulationDeviceState state, DataView data, BlockDescentSolveParams p,
                              BlockScratch s, cudaStream_t stream) {
-    uint32_t blocks = 0u;
-    const cudaError_t status = TileResidentBlocks<kN>(p, &blocks);
+    uint32_t team = 1u, blocks = 0u;
+    const cudaError_t status = TileTeam<kN>(p, &team, &blocks);
     if (status != cudaSuccess) return status;
-    LaunchCuda(DescendDenseTilesKernel<kN>, dim3(blocks), dim3(TileThreads<kN>()), TileSharedBytes<kN>(),
-               stream, state, data, p, s);
+    const uint32_t warps = team > 1u ? team : TileWarps<kN>();
+    LaunchCuda(DescendDenseTilesKernel<kN>, dim3(blocks), dim3(team > 1u ? warps * kTileLanes : TileThreads<kN>()),
+               TileSharedBytes<kN>(warps), stream, state, data, p, s, team);
     return cudaGetLastError();
 }
 

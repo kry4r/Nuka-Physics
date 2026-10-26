@@ -179,6 +179,10 @@ static_assert(sizeof(MultilevelRowTerm) % sizeof(double) == 0u);
 
 constexpr uint32_t kTileLanes = 32u;
 constexpr uint32_t kTileWarps = 4u;
+// Warps that may descend one environment together, and the block colors that order them, one per lane.
+constexpr uint32_t kTileTeamWarps = 8u;
+constexpr uint32_t kTileColors = kTileLanes;
+constexpr uint32_t kNoTileColor = ~0u;
 constexpr uint32_t kTileHeadGroup = 8u;
 // Per-head fields interleaved in groups of eight: indices, coefficients, normal bound, residual, dual,
 // move, step and scalar response of the current block solve, the relaxation and the unextrapolated dual.
@@ -514,9 +518,11 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     if (tile && tile_slots == 0u) return 0u;
     s.tile_fields = reinterpret_cast<float*>(take(tile_slots * kTileFields * s.tile_head_capacity));
     s.tile_jacobian = reinterpret_cast<float*>(take(tile_slots * s.tile_row_capacity * TileJacobianWidth(p)));
-    // A slot's blocks' list ends, then their heads: a head lists on each of its at most two blocks.
+    // A slot's blocks' list ends, then their heads: a head lists on each of its at most two blocks. Then the
+    // block colors, the blocks in color order and each color's end.
     s.tile_incidence_stride = tile
-        ? (p.total_body_count + p.articulation_count) / p.env_count + 2u * s.tile_head_capacity : 0u;
+        ? 3u * ((p.total_body_count + p.articulation_count) / p.env_count) + 2u * s.tile_head_capacity +
+              kTileColors : 0u;
     s.tile_incidence = take(tile_slots * s.tile_incidence_stride);
     s.tile_next = take(tile ? 1u : 0u);
     s.tile_order = take(tile ? p.env_count : 0u);
