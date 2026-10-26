@@ -589,6 +589,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
 
     if (has_collidables) {
         p_np_prim_.contact_margin = contact_margin;
+        p_np_prim_.num_material_buckets = cap.num_material_buckets;
         p_np_prim_.dt = cfg.dt;
         p_np_prim_.max_contacts_per_pair = kMaxContactsPerPair;
         p_np_prim_.ground_height = model.ground_height;

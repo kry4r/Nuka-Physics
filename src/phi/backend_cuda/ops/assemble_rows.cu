@@ -560,10 +560,8 @@ __global__ void EmitPairDrivenRowsKernel(
             point = ucontact_point[mp];
             const bool ogc_slot = slot >= full_row_slot_count &&
                 slot - full_row_slot_count < ogc_slot_count;
-            const bool witnesses = ogc_slot || (speculative &&
-                side_kind_a == nk::kUContactSideBody && side_kind_b == nk::kUContactSideBody);
-            point_a = witnesses ? ucontact_witness_a[mp] : point;
-            point_b = witnesses ? ucontact_witness_b[mp] : point;
+            point_a = ogc_slot ? ucontact_witness_a[mp] : point;
+            point_b = ogc_slot ? ucontact_witness_b[mp] : point;
             mg::ContactTangentBasis(ucontact_normal[mp], &t0, &t1v);
         }
 

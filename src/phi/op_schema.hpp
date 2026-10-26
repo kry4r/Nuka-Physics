@@ -400,6 +400,7 @@ inline constexpr uint32_t kContactFamilyPairDriven = 2u;
 
 struct NarrowphasePrimitivesParams {
     float contact_margin;
+    uint32_t num_material_buckets;
     float dt = 0.0f;
     uint8_t max_contacts_per_pair;
     // first batch (foot sphere x ground plane, the production Go2/H1 path):

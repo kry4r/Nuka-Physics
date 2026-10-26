@@ -9,6 +9,7 @@
 #include "collision/shape_kind.hpp"            
 #include "math/transform.hpp"
 #include "nk/contact/contact_identity.hpp"
+#include "nk/contact/contact_profile.hpp"
 #include "nk/solve/nk_row.hpp"                  
 #include "phi/backend_cuda/launch.cuh"
 #include "phi/backend_cuda/ops/prims_types.cuh"
@@ -215,6 +216,7 @@ __global__ void PairDrivenNarrowphaseKernel(
     const uint32_t* __restrict__ candidate_pairs,   
     const uint32_t* __restrict__ pair_count,        
     const float* __restrict__ shape_table,
+    const float* __restrict__ mat_buckets, uint32_t num_material_buckets,
     const uint8_t* __restrict__ mesh_contact_mode,
     const math::Transform* __restrict__ body_pose,
     const math::Vec3* __restrict__ linear_velocity,
@@ -259,12 +261,21 @@ __global__ void PairDrivenNarrowphaseKernel(
     uint32_t a = 0u, b = 0u;
     PrimShapeDev sa, sb;
     bool convex = false;
+    uint32_t law = ::nuka::nk::kContactLawSpeculative;
 
     if (slot < live && slot < rigid_slot_cap) {
         a = candidate_pairs[static_cast<size_t>(gid) * 2u + 0u];
         b = candidate_pairs[static_cast<size_t>(gid) * 2u + 1u];
         sa = LoadPrimShape(shape_table, a);
         sb = LoadPrimShape(shape_table, b);
+        const float* profiles = mat_buckets + size_t{env} * num_material_buckets * nk::kContactProfileWordCount;
+        const uint32_t source_a = __float_as_uint(profiles[
+            size_t{sa.contact_profile_index} * nk::kContactProfileWordCount + nk::kContactProfileLawSource]);
+        const uint32_t source_b = __float_as_uint(profiles[
+            size_t{sb.contact_profile_index} * nk::kContactProfileWordCount + nk::kContactProfileLawSource]);
+        if (source_a == static_cast<uint32_t>(constraint::LawSource::MuJoCo) ||
+            source_b == static_cast<uint32_t>(constraint::LawSource::MuJoCo))
+            law = nk::kContactLawCompliant;
         const auto route = RouteMeshContact(sa.kind, sb.kind, mesh_contact_mode[a],
                                             mesh_contact_mode[b]);
         if (!kConvex && route == MeshContactRoute::Ogc) atomicAdd(&mesh_ogc_pair_count[env], 1u);
@@ -316,7 +327,7 @@ __global__ void PairDrivenNarrowphaseKernel(
 
     const uint32_t n = m.point_count;
     ucount[gid] = n;
-    ulaw[gid] = kConvex ? ::nuka::nk::kContactLawSpeculative : ::nuka::nk::kContactLawCompliant;
+    ulaw[gid] = law;
 
     for (uint32_t i = 0u; i < 4u; ++i) {
         const size_t at = static_cast<size_t>(gid) * 4u + i;
@@ -406,7 +417,8 @@ Status LaunchPairDrivenNarrowphase(const ModelView& model, const DataView& data,
         LaunchCuda(convex ? PairDrivenNarrowphaseKernel<true> : PairDrivenNarrowphaseKernel<false>,
                    dim3(blocks), dim3(kBlock), 0u, stream,
                    data.candidate_pairs, data.pair_count,
-                   static_cast<const float*>(model.shape_table), model.mesh_contact_mode,
+                   static_cast<const float*>(model.shape_table),
+                   static_cast<const float*>(data.mat_buckets), p.num_material_buckets, model.mesh_contact_mode,
                    static_cast<const math::Transform*>(data.body_pose),
                    data.body_linear_velocity, data.body_angular_velocity,
                    data.body_aabb_lo, data.body_aabb_hi, data.dat_body_motion,
