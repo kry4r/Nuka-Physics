@@ -423,6 +423,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     p_block_descent_.position_beta = cfg.pos_beta;
     p_block_descent_.position_slop = cfg.pos_slop;
     p_block_descent_.position_max_velocity = model.baumgarte_max_velocity;
+    p_block_descent_.velocity_tolerance = split_positions ? phi::kTileVelocityTolerance : 0.0f;
     const char* velocity_tolerance = std::getenv("NUKA_SOLVER_VEL_TOLERANCE");
     if (velocity_tolerance != nullptr) {
         char* end = nullptr;
@@ -448,7 +449,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         ? cap.solver_trace_sweeps : 0u;
     p_block_descent_.measure_contact_residual = cfg.measure_contact_residual ||
         p_block_descent_.measure_vertex_audit != 0u ||
-        p_block_descent_.velocity_tolerance > 0.0f ||
+        (!split_positions && p_block_descent_.velocity_tolerance > 0.0f) ||
         telemetry ||
         (readout_demand & kReadoutPhysicsDiagnostics) != 0u ||
         (diagnostics != nullptr && diagnostics[0] == '1');

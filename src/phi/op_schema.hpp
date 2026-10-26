@@ -640,6 +640,9 @@ inline bool BlockDescentTileRoute(uint32_t particles, uint32_t grid_nodes, uint3
     return particles == 0u && grid_nodes == 0u && blocks > 0u && max_dof <= kMaxArticulationDof;
 }
 
+// A tile environment stops sweeping once every residual class falls below this velocity (m/s).
+inline constexpr float kTileVelocityTolerance = 1.0e-5f;
+
 uint64_t BlockDescentScratchWords(const BlockDescentSolveParams& params);
 
 // Particle modes select material constraints and ownership; all row-coupled particles share integration.
