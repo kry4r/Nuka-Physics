@@ -531,6 +531,8 @@ Status OpNarrowphaseSdf(const ModelView& model, const DataView& data,
     const uint64_t words = PairSampleChunkWords(*p);
     if (words > 0u) {
         if (data.pair_sample_chunks == nullptr) return Status::InvalidArgument;
+        if (cudaMemsetAsync(data.pair_sample_chunks, 0, words * sizeof(uint32_t), stream) != cudaSuccess)
+            return Status::Failed;
         const uint32_t sweeps = (p->max_body_samples + kSurfaceQueryThreads - 1u) / kSurfaceQueryThreads;
         const uint32_t spread = std::clamp(kSampleChunkBlockBudget / (blocks * 2u), 1u, sweeps);
         LaunchCuda(FlagPairSampleChunksKernel, dim3(blocks, 2u, spread), dim3(kSurfaceQueryThreads), 0u,

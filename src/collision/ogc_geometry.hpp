@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cfloat>
+
 #include "collision/mesh_surface.hpp"
 
 #if defined(__CUDACC__)
@@ -15,6 +17,7 @@ struct OgcSegmentPair {
     math::Vec3 b{};
     float weight_a = 0.0f;
     float weight_b = 0.0f;
+    math::Vec3 separation{};
 };
 
 struct OgcTriangleFeature {
@@ -49,23 +52,37 @@ NUKA_OGC_HD inline bool OgcEdgeInterior(math::Vec3 query, math::Vec3 a,
     return projection > 0.0f && projection < length_sq;
 }
 
-NUKA_OGC_HD inline bool OgcOutsideAdjacentFace(math::Vec3 query,
-                                                 math::Vec3 a, math::Vec3 edge,
-                                                 float inverse_length_sq,
-                                                 math::Vec3 opposite) {
-    const math::Vec3 foot = a + edge * ((opposite - a).Dot(edge) * inverse_length_sq);
-    return (query - foot).Dot(foot - opposite) >= 0.0f;
+NUKA_OGC_HD inline bool OgcOutsideAdjacentFace(math::Vec3 q, math::Vec3 edge, math::Vec3 o) {
+    const float value = q.Cross(edge).Dot(o.Cross(edge));
+    const float scale = (fabsf(q.x) + fabsf(q.y) + fabsf(q.z)) *
+        (fabsf(o.x) + fabsf(o.y) + fabsf(o.z));
+    const float edge_scale = fabsf(edge.x) + fabsf(edge.y) + fabsf(edge.z);
+    const float error = 64.0f * FLT_EPSILON * scale * edge_scale * edge_scale;
+    if (fabsf(value) > error) return value < 0.0f;
+    // Relative double projections resolve a nearly coplanar Voronoi boundary without a rounded world-space foot.
+    const double ux = double(q.y) * edge.z - double(q.z) * edge.y;
+    const double uy = double(q.z) * edge.x - double(q.x) * edge.z;
+    const double uz = double(q.x) * edge.y - double(q.y) * edge.x;
+    const double vx = double(o.y) * edge.z - double(o.z) * edge.y;
+    const double vy = double(o.z) * edge.x - double(o.x) * edge.z;
+    const double vz = double(o.x) * edge.y - double(o.y) * edge.x;
+    return ux * vx + uy * vy + uz * vz <= 0.0;
+}
+
+// Closest-segment queries retain their relative coordinates through the feasibility predicates.
+NUKA_OGC_HD inline bool OgcEdgeFeasibleRelative(math::Vec3 query, math::Vec3 edge,
+                                                math::Vec3 opposite0, math::Vec3 opposite1,
+                                                bool has_opposite1) {
+    const float projection = query.Dot(edge), length_sq = edge.LengthSq();
+    if (!(projection > 0.0f && projection < length_sq)) return false;
+    return OgcOutsideAdjacentFace(query, edge, opposite0) &&
+        (!has_opposite1 || OgcOutsideAdjacentFace(query, edge, opposite1));
 }
 
 NUKA_OGC_HD inline bool OgcEdgeFeasible(math::Vec3 query, math::Vec3 a,
                                           math::Vec3 b, math::Vec3 opposite0,
                                           math::Vec3 opposite1, bool has_opposite1) {
-    if (!OgcEdgeInterior(query, a, b)) return false;
-    const math::Vec3 edge = b - a;
-    const float inverse_length_sq = 1.0f / edge.LengthSq();
-    return OgcOutsideAdjacentFace(query, a, edge, inverse_length_sq, opposite0) &&
-           (!has_opposite1 || OgcOutsideAdjacentFace(query, a, edge,
-                                                      inverse_length_sq, opposite1));
+    return OgcEdgeFeasibleRelative(query - a, b - a, opposite0 - a, opposite1 - a, has_opposite1);
 }
 
 NUKA_OGC_HD inline bool OgcWireVertexFeasible(math::Vec3 query,
@@ -206,15 +223,16 @@ NUKA_OGC_HD inline OgcSegmentPair OgcClosestSegments(
     const float a = u.Dot(u), b = u.Dot(v), c = v.Dot(v);
     const float d = u.Dot(w), e = v.Dot(w);
     float s = 0.0f, t = 0.0f;
-    if (a <= 0.0f && c <= 0.0f) return {a0, b0, s, t};
+    if (a <= 0.0f && c <= 0.0f) return {a0, b0, s, t, w};
     if (a <= 0.0f) {
         t = fmaxf(0.0f, fminf(1.0f, e / c));
     } else if (c <= 0.0f) {
         s = fmaxf(0.0f, fminf(1.0f, -d / a));
     } else {
-        const float determinant = a * c - b * b;
+        const math::Vec3 cross = u.Cross(v);
+        const float determinant = cross.LengthSq();
         if (determinant > 0.0f)
-            s = fmaxf(0.0f, fminf(1.0f, (b * e - c * d) / determinant));
+            s = fmaxf(0.0f, fminf(1.0f, v.Cross(w).Dot(cross) / determinant));
         t = (b * s + e) / c;
         if (t < 0.0f) {
             t = 0.0f;
@@ -224,7 +242,7 @@ NUKA_OGC_HD inline OgcSegmentPair OgcClosestSegments(
             s = fmaxf(0.0f, fminf(1.0f, (b - d) / a));
         }
     }
-    return {a0 + u * s, b0 + v * t, s, t};
+    return {a0 + u * s, b0 + v * t, s, t, w + u * s - v * t};
 }
 
 // Pairs farther apart than `reach` return infeasible before the endpoint feasibility tests.
@@ -252,7 +270,7 @@ NUKA_OGC_HD inline OgcEdgePair OgcEdgeContact(
     result.point_b = pair.b;
     result.weight_a = pair.weight_a;
     result.weight_b = pair.weight_b;
-    const math::Vec3 separation = pair.a - pair.b;
+    const math::Vec3 separation = pair.separation;
     result.distance = sqrtf(separation.LengthSq());
     const math::Vec3 cross = (a1 - a0).Cross(b1 - b0);
     const float cross_length = sqrtf(cross.LengthSq());
@@ -265,14 +283,16 @@ NUKA_OGC_HD inline OgcEdgePair OgcEdgeContact(
     const bool a_interior = ea.opposite0 == ~0u ||
         (ea.opposite0 < info_a.vertex_count &&
          (ea.opposite1 == ~0u || ea.opposite1 < info_a.vertex_count) &&
-         OgcEdgeFeasible(pair.b, a0, a1, MeshSurfaceVertex(surface_a, info_a, ea.opposite0),
-             ea.opposite1 == ~0u ? math::Vec3{} : MeshSurfaceVertex(surface_a, info_a, ea.opposite1),
+         OgcEdgeFeasibleRelative((b0 - a0) + (b1 - b0) * pair.weight_b, a1 - a0,
+             MeshSurfaceVertex(surface_a, info_a, ea.opposite0) - a0,
+             ea.opposite1 == ~0u ? math::Vec3{} : MeshSurfaceVertex(surface_a, info_a, ea.opposite1) - a0,
              ea.opposite1 != ~0u));
     const bool b_interior = eb.opposite0 == ~0u ||
         (eb.opposite0 < info_b.vertex_count &&
          (eb.opposite1 == ~0u || eb.opposite1 < info_b.vertex_count) &&
-         OgcEdgeFeasible(pair.a, b0, b1, MeshSurfaceVertex(surface_b, info_b, eb.opposite0),
-             eb.opposite1 == ~0u ? math::Vec3{} : MeshSurfaceVertex(surface_b, info_b, eb.opposite1),
+         OgcEdgeFeasibleRelative((a0 - b0) + (a1 - a0) * pair.weight_a, b1 - b0,
+             MeshSurfaceVertex(surface_b, info_b, eb.opposite0) - b0,
+             eb.opposite1 == ~0u ? math::Vec3{} : MeshSurfaceVertex(surface_b, info_b, eb.opposite1) - b0,
              eb.opposite1 != ~0u));
     const bool a_feasible = pair.weight_a > 0.0f && pair.weight_a < 1.0f
         ? a_interior : OgcWireVertexFeasible(surface_a, info_a, edges_a, incidence_a,

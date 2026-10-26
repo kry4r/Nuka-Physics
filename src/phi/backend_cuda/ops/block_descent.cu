@@ -204,10 +204,11 @@ uint32_t TileHeadCapacity(const BlockDescentSolveParams& p) {
     return (heads + kTileLanes - 1u) / kTileLanes * kTileLanes;
 }
 
-// Coordinates of a tile block: the articulation's rounded up to four within a warp and the largest articulation's
-// past it, and at least a rigid body's six.
+// Tiles follow independent coordinates, rounded to the assembly's four- or sixteen-column batches.
 uint32_t TileWidth(const BlockDescentSolveParams& p) {
-    return p.max_dof <= kTileLanes ? std::max(8u, (p.max_dof + 3u) & ~3u) : kMaxArticulationDof;
+    const uint32_t coordinates = std::max(kRigidBlockDof, p.max_independent_dof);
+    return coordinates <= kTileLanes ? std::max(8u, (coordinates + 3u) & ~3u)
+                                     : (coordinates + 15u) & ~15u;
 }
 
 __host__ __device__ uint32_t TileJacobianWidth(const BlockDescentSolveParams& p) {

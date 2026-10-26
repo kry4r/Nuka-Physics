@@ -37,7 +37,6 @@ constexpr uint32_t kKindCylinder    = ::nuka::collision::kShapeCylinder;
 
 constexpr int kMaxCand = 32;
 
-constexpr float kHeightfieldPrismExtrudePad = 1.0f;
 
 struct Cand {
     Vec3  pos;
@@ -441,8 +440,7 @@ __global__ void NarrowphaseHeightfieldKernel(
     Cand* cand = workspace.candidates;
     int ncand = 0;
 
-    const float extrude =
-        (range > 0.0f ? range : 0.0f) + kHeightfieldPrismExtrudePad;
+    const float extrude = collision::HeightfieldPrismExtrusion(range);
 
     for (int r = r_lo; r <= r_hi; ++r) {
         for (int c = c_lo; c <= c_hi; ++c) {

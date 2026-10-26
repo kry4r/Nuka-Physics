@@ -56,6 +56,12 @@ struct DatSweptPrimitive {
     uint32_t count = 0u;
 };
 
+// Joint interpolation bounds the second derivative by 3 * turn * speed.
+// Linear interpolation deviates by at most one eighth of that bound.
+NUKA_DAT_HD inline float DatChordDeviation(float speed, float turn) {
+    return 0.375f * turn * speed;
+}
+
 // Float intervals decide the certificate below when they clear its threshold by a slack that
 // bounds every float and double rounding difference; -1 leaves the decision to double precision.
 NUKA_DAT_HD inline int DatSweptAxisFilter(math::Vec3 axis, const DatSweptPrimitive& a,
@@ -201,13 +207,22 @@ NUKA_DAT_HD inline void DatConsiderAxis(math::Vec3 axis,
 
 // A negative floor keeps the signed overlap of intersecting primitives.
 NUKA_DAT_HD inline DatSeparator DatFindSeparator(const DatPrimitive& a,
-                                                 const DatPrimitive& b, float floor = 0.0f) {
+                                                 const DatPrimitive& b, float floor = 0.0f,
+                                                 float sufficient_gap = FLT_MAX) {
     DatSeparator result;
     result.gap = floor;
     if (!DatPrimitiveValid(a) || !DatPrimitiveValid(b)) return result;
+    if (a.count == kDatPrimitiveVertices)
+        DatConsiderAxis((a.vertex[1] - a.vertex[0]).Cross(a.vertex[2] - a.vertex[0]), a, b, &result);
+    if (result.gap > sufficient_gap) return result;
+    if (b.count == kDatPrimitiveVertices)
+        DatConsiderAxis((b.vertex[1] - b.vertex[0]).Cross(b.vertex[2] - b.vertex[0]), a, b, &result);
+    if (result.gap > sufficient_gap) return result;
     for (uint32_t i = 0u; i < a.count; ++i)
-        for (uint32_t j = 0u; j < b.count; ++j)
+        for (uint32_t j = 0u; j < b.count; ++j) {
             DatConsiderAxis(a.vertex[i] - b.vertex[j], a, b, &result);
+            if (result.gap > sufficient_gap) return result;
+        }
     const uint32_t edges_a = a.count == 1u ? 0u : a.count == 2u ? 1u : a.count;
     const uint32_t edges_b = b.count == 1u ? 0u : b.count == 2u ? 1u : b.count;
     for (uint32_t i = 0u; i < edges_a; ++i) {
@@ -215,10 +230,12 @@ NUKA_DAT_HD inline DatSeparator DatFindSeparator(const DatPrimitive& a,
         for (uint32_t j = 0u; j < b.count; ++j) {
             const math::Vec3 offset = a.vertex[i] - b.vertex[j];
             DatConsiderAxis(edge.Cross(offset.Cross(edge)), a, b, &result);
+            if (result.gap > sufficient_gap) return result;
         }
         for (uint32_t j = 0u; j < edges_b; ++j) {
             const math::Vec3 other = b.vertex[(j + 1u) % b.count] - b.vertex[j];
             DatConsiderAxis(edge.Cross(other), a, b, &result);
+            if (result.gap > sufficient_gap) return result;
         }
     }
     for (uint32_t j = 0u; j < edges_b; ++j) {
@@ -226,14 +243,9 @@ NUKA_DAT_HD inline DatSeparator DatFindSeparator(const DatPrimitive& a,
         for (uint32_t i = 0u; i < a.count; ++i) {
             const math::Vec3 offset = a.vertex[i] - b.vertex[j];
             DatConsiderAxis(edge.Cross(offset.Cross(edge)), a, b, &result);
+            if (result.gap > sufficient_gap) return result;
         }
     }
-    if (a.count == kDatPrimitiveVertices)
-        DatConsiderAxis((a.vertex[1] - a.vertex[0]).Cross(a.vertex[2] - a.vertex[0]),
-                        a, b, &result);
-    if (b.count == kDatPrimitiveVertices)
-        DatConsiderAxis((b.vertex[1] - b.vertex[0]).Cross(b.vertex[2] - b.vertex[0]),
-                        a, b, &result);
     return result;
 }
 

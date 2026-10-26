@@ -218,6 +218,11 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
         (cap.particle_surfaces_per_env > 0u || cap.mesh_vertex_source_count > 0u))
         model_.capacities.contact_cache_scratch_bytes = std::max(cap.contact_cache_scratch_bytes,
             phi::OgcOrderScratchBytes(cap.ogc_contacts_per_env, cap.env_count));
+    // Contact ordering and warm-start commit finish before motion validation reuses their workspace.
+    for (const auto& call : pipeline_->Calls())
+        if (call.op == phi::NkOp::DatTruncate)
+            model_.capacities.contact_cache_scratch_bytes = std::max(cap.contact_cache_scratch_bytes,
+                phi::DatReachScratchBytes(*static_cast<const phi::DatTruncateParams*>(call.params)));
     model_.capacities.contact_index_scratch_bytes = cap.links_per_env > 0u && cap.max_rows_per_env > 0u
         ? phi::ContactIndexScratchBytes(cap.max_rows_per_env * cap.env_count, cap.env_count) : 0u;
     } catch (const std::exception& error) {

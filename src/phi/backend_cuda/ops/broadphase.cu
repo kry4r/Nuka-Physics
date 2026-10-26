@@ -46,6 +46,7 @@ namespace { using NkScanSumOp = ::cub::Sum; }
 #include "collision/lbvh_node.cuh"      // LbvhNode (query traversal)
 #include "collision/mesh_surface_types.hpp"
 #include "collision/shape_kind.hpp"     // nuka::collision::ShapeKind (R2: one enum)
+#include "collision/dat_geometry.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
 #include "nk/model/generated/views.hpp"  // ModelView / DataView (complete types)
@@ -175,7 +176,10 @@ __global__ void BuildAabbsKernel(const float* __restrict__ shape_table,
                                  const collision::MeshBvhNode* __restrict__ mesh_nodes,
                                  uint32_t total_bodies,
                                  uint32_t bodies_per_env,
-                                 float margin,
+                                 float margin, float dt,
+                                 const math::Vec3* __restrict__ linear_velocity,
+                                 const math::Vec3* __restrict__ angular_velocity,
+                                 const float* __restrict__ previous_motion,
                                  math::Vec3* __restrict__ out_lo,
                                  math::Vec3* __restrict__ out_hi) {
     const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -222,27 +226,17 @@ __global__ void BuildAabbsKernel(const float* __restrict__ shape_table,
                 r = s.p[0]; he = {r, r, r};
             }
             break;
-        // B3 (general contact pipeline Phase 2): the heightfield static collidable.
-        // A big FINITE local box spanning the full grid footprint + its z-range so
-        // the field is ONE big leaf in the LBVH and any overlapping body yields a
-        // (body, heightfield) candidate pair. The cook stamps the grid half-extents
-        // in p[0]/p[1] (== 0.5*(ncol-1)*cell / 0.5*(nrow-1)*cell, the local XY span
-        // from the grid CENTER, which is where the body_pose sits) and the LOCAL
-        // z-range min/max into p[2]/p[3]. The box is centred on the body origin in
-        // XY but z-asymmetric (min_z..max_z), so we build the world AABB from the
-        // local corners through RotAbs of the half-extent plus the z-centre offset.
-        // Mirror the plane clamp posture (rotate the local box by the body pose).
+        // Bound the full solid triangle prisms, including their downward extrusion.
+        // A penetrating shape remains a candidate after its top crosses the sampled surface.
         case kKindHeightfield: {
             const float hx = s.p[0];           // half X span (grid centre -> edge)
             const float hy = s.p[1];           // half Y span
-            const float zmin = s.p[2];         // LOCAL z range
+            const float zmin = s.p[2] - collision::HeightfieldPrismExtrusion(s.p[3] - s.p[2]);
             const float zmax = s.p[3];
             const float hz = 0.5f * (zmax - zmin);
             const float zc = 0.5f * (zmax + zmin);  // local z-centre offset.
             he = RotAbs(xf.rotation, math::Vec3{hx, hy, hz});
-            // The box is centred at the grid centre + the LOCAL z-centre (rotated
-            // into world by the body pose, like every other kind's extent). Inline
-            // the quaternion-vector rotation (HD-clean; mirrors the RotAbs lambda).
+            // Rotate the asymmetric local volume's centre into world space.
             const math::Quat q = xf.rotation;
             const math::Vec3 qv{q.x, q.y, q.z};
             const math::Vec3 zloc{0.0f, 0.0f, zc};
@@ -266,7 +260,11 @@ __global__ void BuildAabbsKernel(const float* __restrict__ shape_table,
             return;
     }
     const math::Vec3 c = center;
-    const float m = margin;
+    const float radius = sqrtf(he.LengthSq()) + sqrtf((center - xf.position).LengthSq());
+    const float speed = fmaxf(previous_motion != nullptr ? previous_motion[gid] : 0.0f,
+        sqrtf(linear_velocity[gid].LengthSq()) + sqrtf(angular_velocity[gid].LengthSq()) * radius);
+    const float m = fmaxf(margin, collision::DatQueryRadius(
+        collision::DatMotionRadius(margin, dt, speed, 0.0f, kDatRelaxation)));
     out_lo[gid] = {c.x - he.x - m, c.y - he.y - m, c.z - he.z - m};
     out_hi[gid] = {c.x + he.x + m, c.y + he.y + m, c.z + he.z + m};
 }
@@ -549,7 +547,8 @@ Status OpBuildAabbs(const ModelView& model, const DataView& data,
                static_cast<const math::Transform*>(data.body_pose),
                static_cast<const collision::MeshSurfaceInfo*>(model.mesh_surface_info),
                static_cast<const collision::MeshBvhNode*>(model.mesh_bvh_nodes),
-               total, p->bodies_per_env, p->margin,
+               total, p->bodies_per_env, p->margin, p->dt,
+               data.body_linear_velocity, data.body_angular_velocity, data.dat_body_motion,
                data.body_aabb_lo, data.body_aabb_hi);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }

@@ -192,6 +192,7 @@ struct MimicReduceParams {
 // pair stream). The pair-driven ops carry their launch geometry in params (the
 // views are pure pointer aggregates).
 struct BuildAabbsParams {
+    float dt = 0.0f;
     float    margin;            // AABB inflation margin
     uint32_t family;            // kContactFamily* (PairDriven => build)
     uint32_t env_count;
@@ -248,6 +249,7 @@ struct ParticleSurfacesParams {
 inline constexpr float kDatRelaxation = 0.9f;
 
 struct OgcDetectParams {
+    uint32_t ogc_body_pairs = 1u;
     float dt = 0.0f;
     float margin = 0.0f;
     float relaxation = kDatRelaxation;
@@ -281,9 +283,11 @@ struct OgcDetectParams {
 };
 
 struct DatTruncateParams {
+    uint32_t ogc_body_pairs = 1u;
     float dt = 0.0f;
     float relaxation = kDatRelaxation;
     float margin = 0.0f;
+    uint64_t workspace_bytes = 0u;
     uint32_t env_count = 0u;
     uint32_t particles_per_env = 0u;
     uint32_t vbd_particle_begin = 0u;
@@ -309,6 +313,8 @@ struct DatTruncateParams {
     uint32_t slot_base = 0u;
     uint32_t slot_capacity = 0u;
 };
+
+uint64_t DatReachScratchBytes(const DatTruncateParams& params);
 
 struct MpmParams {
     uint32_t contact_slot_base;
@@ -384,6 +390,7 @@ inline constexpr uint32_t kContactFamilyPairDriven = 2u;
 
 struct NarrowphasePrimitivesParams {
     float contact_margin;
+    float dt = 0.0f;
     uint8_t max_contacts_per_pair;
     // first batch (foot sphere x ground plane, the production Go2/H1 path):
     float    ground_height;

@@ -537,7 +537,8 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         // the ONE general PairDriven contact path. The family + per-env body
         // geometry travel in the params (the views are pure pointer aggregates).
         const uint32_t bodies_per_env = cap.bodies_per_env;
-        p_aabbs_.margin = contact_margin;
+        p_aabbs_.margin = std::max(contact_margin, collision::kRigidContactSeparation);
+        p_aabbs_.dt = cfg.dt;
         p_aabbs_.family = family;
         p_aabbs_.env_count = env_count;
         p_aabbs_.bodies_per_env = bodies_per_env;
@@ -587,6 +588,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
 
     if (has_collidables) {
         p_np_prim_.contact_margin = contact_margin;
+        p_np_prim_.dt = cfg.dt;
         p_np_prim_.max_contacts_per_pair = kMaxContactsPerPair;
         p_np_prim_.ground_height = model.ground_height;
         p_np_prim_.foot_count = static_cast<uint32_t>(model.feet.size());
@@ -682,7 +684,8 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
                     return shape.kind == collision::kShapeSdfMesh &&
                            (shape.contype | shape.conaffinity) != 0u;
                 });
-        if (has_sampled_geometry) add(phi::NkOp::NarrowphaseSdf, &p_np_sdf_);
+        if (has_sampled_geometry && HasMeshContactPairs(model, collision::MeshContactRoute::Sdf))
+            add(phi::NkOp::NarrowphaseSdf, &p_np_sdf_);
 
         // Body/artic <-> particle narrowphase (the row provider's pre-coupling
         // emission). Runs AFTER the rigid narrowphase and BEFORE AssembleRows,
@@ -698,6 +701,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     if (cap.ogc_contacts_per_env > 0u &&
         (cap.particle_surfaces_per_env > 0u || cap.mesh_vertex_source_count > 0u)) {
         p_ogc_detect_.dt = cfg.dt;
+        p_ogc_detect_.ogc_body_pairs = HasMeshContactPairs(model, collision::MeshContactRoute::Ogc);
         p_ogc_detect_.margin = contact_margin;
         p_ogc_detect_.env_count = env_count;
         p_ogc_detect_.particles_per_env = cap.particles_per_env;
@@ -828,11 +832,13 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
 
     if (cap.ogc_contacts_per_env > 0u) {
         p_dat_truncate_.dt = cfg.dt;
+        p_dat_truncate_.workspace_bytes = cap.contact_cache_scratch_bytes;
         p_dat_truncate_.margin = contact_margin;
         p_dat_truncate_.env_count = env_count;
         p_dat_truncate_.particles_per_env = cap.particles_per_env;
         p_dat_truncate_.vbd_particle_begin = cap.vbd_particle_begin;
         p_dat_truncate_.vbd_vertices_per_env = cap.vbd_vertices_per_env;
+        p_dat_truncate_.ogc_body_pairs = p_ogc_detect_.ogc_body_pairs;
         p_dat_truncate_.surfaces_per_env = cap.particle_surfaces_per_env;
         p_dat_truncate_.triangles_per_env = cap.particle_surface_triangles;
         p_dat_truncate_.nodes_per_env = cap.particle_surface_nodes_per_env;

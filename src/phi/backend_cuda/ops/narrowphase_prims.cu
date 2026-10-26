@@ -4,6 +4,7 @@
 
 #include "collision/analytical_manifold.hpp"   
 #include "collision/convex_narrowphase.hpp"    
+#include "collision/dat_geometry.hpp"
 #include "collision/shape_kind.hpp"            
 #include "math/transform.hpp"
 #include "nk/contact/contact_identity.hpp"
@@ -106,18 +107,50 @@ __device__ void DispatchConvexPair(uint32_t ka, const amf::PrimParams& a,
                                   const float* hull_verts,
                                   uint32_t hull_off_a, uint32_t hull_cnt_a,
                                   uint32_t hull_off_b, uint32_t hull_cnt_b,
-                                  ContactManifold* out, cvx::ConvexWorkspace& workspace) {
+                                  float separation, float query, ContactManifold* out,
+                                  math::Vec3* witness_a, math::Vec3* witness_b,
+                                  cvx::ConvexWorkspace& workspace) {
     cvx::ConvexHullView ha, hb;
     cvx::SupportProxy A, B;
     if (MakeSupportProxy(ka, a, hull_verts, hull_off_a, hull_cnt_a, &ha, &A) &&
         MakeSupportProxy(kb, b, hull_verts, hull_off_b, hull_cnt_b, &hb, &B)) {
-        cvx::ConvexNarrowphase(A, B, out, workspace);
+        ha.warp_lockstep = hb.warp_lockstep = true;
+        const auto gjk = cvx::GjkIntersect(A, B);
+        if (!gjk.intersect) {
+            const auto closest = cvx::ClosestBetweenProxies(A, B);
+            if (!(closest.dist > 0.0f && closest.dist < query)) return;
+            if (threadIdx.x % kWarp != 0u) return;
+            constraint::ContactPoint point;
+            point.position = (closest.wa + closest.wb) * 0.5f;
+            point.normal = (closest.wa - closest.wb) / closest.dist;
+            point.penetration = separation - closest.dist;
+            point.stable_key = 0ull;
+            out->AddPoint(point);
+            witness_a[0] = closest.wa;
+            witness_b[0] = closest.wb;
+        } else {
+            if (threadIdx.x % kWarp != 0u) return;
+            ha.warp_lockstep = hb.warp_lockstep = false;
+            const bool rounded = ka == kKindCapsule || kb == kKindCapsule ||
+                                 ka == kKindCylinder || kb == kKindCylinder;
+            if (rounded) cvx::ConvexNarrowphase(A, B, out, workspace);
+            else {
+                const auto epa = cvx::EpaExpand(A, B, gjk, workspace.epa);
+                cvx::BuildConvexManifold(A, B, epa, out, workspace);
+            }
+            for (uint32_t i = 0u; i < out->point_count; ++i) {
+                auto& point = out->points[i];
+                witness_a[i] = point.position - point.normal * (0.5f * point.penetration);
+                witness_b[i] = point.position + point.normal * (0.5f * point.penetration);
+                point.penetration += separation;
+            }
+        }
     }
 
 }
 
-// The analytic pass writes every slot. The convex pass then fills the pairs without a closed-form
-// manifold, so the GJK/EPA stack and registers stay out of the analytic kernel.
+// Analytic pairs use one thread; convex pairs share their support queries across a warp.
+// Only the leader expands EPA and writes the manifold, keeping its workspace race free.
 template <bool kConvex>
 __global__ void PairDrivenNarrowphaseKernel(
     const uint32_t* __restrict__ candidate_pairs,   
@@ -125,15 +158,23 @@ __global__ void PairDrivenNarrowphaseKernel(
     const float* __restrict__ shape_table,
     const uint8_t* __restrict__ mesh_contact_mode,
     const math::Transform* __restrict__ body_pose,
+    const math::Vec3* __restrict__ linear_velocity,
+    const math::Vec3* __restrict__ angular_velocity,
+    const math::Vec3* __restrict__ aabb_lo,
+    const math::Vec3* __restrict__ aabb_hi,
+    const float* __restrict__ previous_motion,
     const float* __restrict__ hull_verts,           
     uint32_t /*hull_vert_count*/,                    
-    uint32_t gen,                                    
+    uint32_t gen, float separation, float dt,
     uint32_t env_count, uint32_t slot_stride, uint32_t rigid_slot_cap,
     uint32_t bodies_per_env,
     uint32_t* __restrict__ ucount,
     math::Vec3* __restrict__ upoint,
     math::Vec3* __restrict__ unormal,
     float* __restrict__ udepth,
+    math::Vec3* __restrict__ uwitness_a,
+    math::Vec3* __restrict__ uwitness_b,
+    uint32_t* __restrict__ ulaw,
     uint32_t* __restrict__ ucontact_a,              
     uint32_t* __restrict__ ucontact_b,
     uint32_t* __restrict__ ucontact_a_kind,         
@@ -144,8 +185,8 @@ __global__ void PairDrivenNarrowphaseKernel(
     uint32_t* __restrict__ contact_count,
     uint32_t* __restrict__ mesh_ogc_pair_count,
     uint32_t* __restrict__ mesh_sdf_pair_count) {
-    const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t mask = __ballot_sync(0xffffffffu, item < env_count * rigid_slot_cap);
+    const uint32_t thread = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t item = kConvex ? thread / kWarp : thread;
     
     if (item >= env_count * rigid_slot_cap) return;
     const uint32_t env = item / rigid_slot_cap;
@@ -155,6 +196,7 @@ __global__ void PairDrivenNarrowphaseKernel(
 
     ContactManifold m;
     m.Clear();
+    math::Vec3 witness_a[4], witness_b[4];
     uint32_t a = 0u, b = 0u;
     PrimShapeDev sa, sb;
     bool convex = false;
@@ -182,26 +224,41 @@ __global__ void PairDrivenNarrowphaseKernel(
     }
 
     if constexpr (kConvex) {
+        if (!convex) return;
         __shared__ __align__(16) unsigned char storage[(kBlock / kWarp) * sizeof(cvx::ConvexWorkspace)];
         auto& workspace = reinterpret_cast<cvx::ConvexWorkspace*>(storage)[threadIdx.x / kWarp];
-        uint32_t pending = __ballot_sync(mask, convex);
-        while (pending != 0u) {
-            const uint32_t lane = static_cast<uint32_t>(__ffs(pending) - 1);
-            if (threadIdx.x % kWarp == lane) {
-                const amf::PrimParams pa = MakePrim(sa, body_pose[env * bodies_per_env + a]);
-                const amf::PrimParams pb = MakePrim(sb, body_pose[env * bodies_per_env + b]);
-                DispatchConvexPair(sa.kind, pa, sb.kind, pb, hull_verts,
-                                   sa.hull_vert_offset, sa.hull_vert_count,
-                                   sb.hull_vert_offset, sb.hull_vert_count, &m, workspace);
-            }
-            __syncwarp(mask);
-            pending &= pending - 1u;
+        auto pa = MakePrim(sa, body_pose[env * bodies_per_env + a]);
+        auto pb = MakePrim(sb, body_pose[env * bodies_per_env + b]);
+        const auto speed = [&](uint32_t body) {
+            const uint32_t at = env * bodies_per_env + body;
+            const auto center = body_pose[at].position;
+            const auto lo = aabb_lo[at] - center, hi = aabb_hi[at] - center;
+            const math::Vec3 extent{fmaxf(fabsf(lo.x), fabsf(hi.x)),
+                fmaxf(fabsf(lo.y), fabsf(hi.y)), fmaxf(fabsf(lo.z), fabsf(hi.z))};
+            return fmaxf(previous_motion != nullptr ? previous_motion[at] : 0.0f,
+                sqrtf(linear_velocity[at].LengthSq()) +
+                sqrtf(angular_velocity[at].LengthSq() * extent.LengthSq()));
+        };
+        const float query = fmaxf(separation, collision::DatQueryRadius(
+            collision::DatMotionRadius(separation, dt, speed(a), speed(b), kDatRelaxation)));
+        const auto origin = pa.frame.t;
+        pa.frame.t = {};
+        pb.frame.t -= origin;
+        DispatchConvexPair(sa.kind, pa, sb.kind, pb, hull_verts,
+                           sa.hull_vert_offset, sa.hull_vert_count,
+                           sb.hull_vert_offset, sb.hull_vert_count, separation, query,
+                           &m, witness_a, witness_b, workspace);
+        if (threadIdx.x % kWarp != 0u) return;
+        for (uint32_t i = 0u; i < m.point_count; ++i) {
+            m.points[i].position += origin;
+            witness_a[i] += origin;
+            witness_b[i] += origin;
         }
-        if (!convex) return;
     }
 
     const uint32_t n = m.point_count;
     ucount[gid] = n;
+    ulaw[gid] = kConvex ? ::nuka::nk::kContactLawSpeculative : ::nuka::nk::kContactLawCompliant;
 
     for (uint32_t i = 0u; i < 4u; ++i) {
         const size_t at = static_cast<size_t>(gid) * 4u + i;
@@ -209,6 +266,10 @@ __global__ void PairDrivenNarrowphaseKernel(
             upoint[at] = m.points[i].position;
             unormal[at] = m.points[i].normal;
             udepth[at] = m.points[i].penetration;
+            if constexpr (kConvex) {
+                uwitness_a[at] = witness_a[i];
+                uwitness_b[at] = witness_b[i];
+            }
 
             ucontact_a[at] = a;
             ucontact_b[at] = b;
@@ -244,12 +305,8 @@ __global__ void ZeroEnvKernel(uint32_t* __restrict__ contact_count,
                               uint32_t* __restrict__ mesh_ogc_pair_count,
                               uint32_t* __restrict__ mesh_sdf_pair_count, uint32_t n,
                               uint32_t* __restrict__ ucount, uint32_t slot_stride,
-                              uint32_t rigid_slots, uint32_t chunk_words,
-                              uint32_t* __restrict__ sample_chunks) {
+                              uint32_t rigid_slots) {
     const uint32_t e = blockIdx.x * blockDim.x + threadIdx.x;
-    for (uint64_t word = e; word < uint64_t{n} * rigid_slots * 2u * chunk_words;
-         word += uint64_t{gridDim.x} * blockDim.x)
-        sample_chunks[word] = 0u;
     const uint32_t compact = slot_stride - rigid_slots;
     if (e < n * compact) {
         const uint32_t env = e / compact;
@@ -278,25 +335,30 @@ Status LaunchPairDrivenNarrowphase(const ModelView& model, const DataView& data,
         LaunchCuda(ZeroEnvKernel, dim3(b), dim3(kBlock), 0u, stream,
                    data.contact_count, data.row_count, data.mesh_ogc_pair_count,
                    data.mesh_sdf_pair_count, p.env_count, data.ucontact_count,
-                   p.union_slot_count, rigid_slots, SampleChunkWords(p.max_body_samples),
-                   data.pair_sample_chunks);
+                   p.union_slot_count, rigid_slots);
     }
     if (rigid_slots == 0u) return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
     const uint32_t total = p.env_count * rigid_slots;
-    const uint32_t blocks = (total + kBlock - 1u) / kBlock;
 
     constexpr uint32_t kGen = 1u;
     for (const bool convex : {false, true}) {
         if (convex && p.convex_pairs == 0u) break;
+        const uint32_t threads = convex ? kWarp : 1u;
+        const uint32_t blocks = (uint64_t{total} * threads + kBlock - 1u) / kBlock;
         LaunchCuda(convex ? PairDrivenNarrowphaseKernel<true> : PairDrivenNarrowphaseKernel<false>,
                    dim3(blocks), dim3(kBlock), 0u, stream,
                    data.candidate_pairs, data.pair_count,
                    static_cast<const float*>(model.shape_table), model.mesh_contact_mode,
                    static_cast<const math::Transform*>(data.body_pose),
+                   data.body_linear_velocity, data.body_angular_velocity,
+                   data.body_aabb_lo, data.body_aabb_hi, data.dat_body_motion,
                    static_cast<const float*>(model.hull_verts), p.hull_vert_count, kGen,
+                   fmaxf(p.contact_margin, ::nuka::collision::kRigidContactSeparation),
+                   p.dt,
                    p.env_count, p.union_slot_count, rigid_slots, p.bodies_per_env,
                    data.ucontact_count, data.ucontact_point, data.ucontact_normal,
-                   data.ucontact_depth, data.ucontact_a, data.ucontact_b,
+                   data.ucontact_depth, data.ucontact_witness_a, data.ucontact_witness_b,
+                   data.ucontact_law, data.ucontact_a, data.ucontact_b,
                    data.ucontact_a_kind, data.ucontact_b_kind,
                    data.ucontact_gen, data.ucontact_id_pair,
                    data.ucontact_id_feature, data.contact_count,

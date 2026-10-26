@@ -344,9 +344,9 @@ NUKA_CVX_HD inline bool GjkDoSimplex(MinkPoint* s, int& n, Vec3& dir) {
         const Vec3 ab = b - a;
         if (ab.Dot(ao) > 0.0f) {
             dir = TripleCross(ab, ao, ab);                 // perp to ab toward O
-            if (dir.Dot(dir) < kGjkEps) {                  // O on the line: pick any perp
+            if (dir.Dot(dir) == 0.0f) {
                 dir = ab.Cross(Vec3::UnitX());
-                if (dir.Dot(dir) < kGjkEps) dir = ab.Cross(Vec3::UnitY());
+                if (dir.Dot(dir) == 0.0f) dir = ab.Cross(Vec3::UnitY());
             }
         } else {
             s[0] = s[1]; n = 1; dir = ao;                  // keep a only
@@ -404,7 +404,8 @@ NUKA_CVX_HD inline bool GjkDoSimplex(MinkPoint* s, int& n, Vec3& dir) {
         return false;
     }
     if (adb.Dot(ao) > 0.0f) {        // outside face adb -> drop c, simplex {a,d,b}
-        s[1] = s[2]; s[2] = s[3]; n = 3;  // {d,b,a}
+        const MinkPoint old_d = s[0];
+        s[0] = s[2]; s[1] = old_d; s[2] = s[3]; n = 3;
         dir = adb;
         return false;
     }
@@ -423,7 +424,9 @@ NUKA_CVX_HD inline GjkResult GjkIntersect(const SupportProxy& A,
     int n = 1;
     dir = -s[0].v;  // toward origin
     for (int it = 0; it < kGjkMaxIter; ++it) {
-        if (dir.Dot(dir) < kGjkEps) { dir = Vec3::UnitY(); }
+        // Simplex directions have different powers of length; preserve every nonzero direction.
+        const float direction_length = amf::Len(dir);
+        dir = direction_length > 0.0f ? dir / direction_length : Vec3::UnitY();
         const MinkPoint p = SupportMink(A, B, dir);
         if (p.v.Dot(dir) < 0.0f) {
             return res;  // no support past origin -> no overlap (intersect=false)

@@ -141,7 +141,7 @@ __global__ void OgcBodyQueryKernel(OgcDetectParams p, ModelView model, DataView 
                 model.mesh_surface_info[other].vertex_count == 0u ||
                 DatCommonFrame(p, model, env, body, other) != ~0u) continue;
             radius = fminf(radius, collision::DatQueryRadius(collision::DatMotionRadius(
-                0.0005f + p.margin, p.dt, speed, OgcBodySpeed(p, data, env, other),
+                collision::kRigidContactSeparation + p.margin, p.dt, speed, OgcBodySpeed(p, data, env, other),
                 p.relaxation)));
         }
     }
@@ -287,141 +287,192 @@ __device__ void OgcEmitMixedFace(
     atomicAdd(data.contact_count + env, 1u);
 }
 
-__global__ void OgcMixedVertexFaceKernel(OgcDetectParams p, ModelView model,
-                                         DataView data) {
-    const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t per_env = p.particles_per_env + p.mesh_vertex_sources;
-    const uint32_t total = p.env_count * per_env;
-    if (item >= total) return;
-    const uint32_t env = item / per_env, local = item % per_env;
-    const bool source_particle = local < p.particles_per_env;
-    const uint32_t source_index = source_particle
-        ? env * p.particles_per_env + local : 0u;
-    const uint64_t packed = source_particle ? 0u :
-        model.mesh_vertex_sources[local - p.particles_per_env];
-    const uint32_t source_body = static_cast<uint32_t>(packed >> 32u);
-    const uint32_t source_vertex = static_cast<uint32_t>(packed);
-    const auto particle_view = p.surfaces_per_env > 0u
-        ? OgcParticleView(p, model, data, env) : collision::MeshSurfaceView{};
-    uint32_t source_surface = ~0u;
-    math::Vec3 source{};
-    float source_radius = 0.0f, source_speed = 0.0f, source_mu = 0.0f;
-    if (source_particle) {
-        source = data.particle_pos[source_index];
-        for (uint32_t s = 0u; s < p.surfaces_per_env; ++s) {
-            const auto info = model.particle_surface_info[s];
-            if (local >= info.vertex_offset && local - info.vertex_offset < info.vertex_count) {
-                source_surface = s;
-                source_radius = model.particle_half_thickness[local];
-                source_speed = data.particle_surface_max_speed[size_t{env} * p.surfaces_per_env + s];
-                source_mu = model.particle_friction[local];
-                break;
-            }
-        }
-        if (source_surface == ~0u) {
-            return;
-        }
+struct OgcSurface {
+    collision::MeshSurfaceInfo info;
+    collision::MeshEdgeInfo edges;
+    collision::MeshSurfaceView view;
+    const collision::MeshEdge* edge_array;
+    const uint32_t* triangle_edges;
+    collision::MeshVertexIncidence vertex_faces, vertex_edges;
+    uint32_t owner;
+    bool particle;
+    float speed, radius, friction;
+};
+
+__device__ OgcSurface OgcLoadSurface(const OgcDetectParams& p, const ModelView& model,
+    const DataView& data, uint32_t env, uint32_t index) {
+    OgcSurface out{};
+    out.particle = index < p.surfaces_per_env;
+    out.owner = out.particle ? index : index - p.surfaces_per_env;
+    if (out.particle) {
+        out.info = model.particle_surface_info[out.owner];
+        out.edges = model.particle_surface_edge_info[out.owner];
+        out.view = OgcParticleView(p, model, data, env);
+        out.edge_array = model.particle_surface_edges;
+        out.triangle_edges = model.particle_surface_triangle_edges;
+        out.vertex_faces = {model.particle_surface_vertex_triangle_offsets, model.particle_surface_vertex_triangles};
+        out.vertex_edges = {model.particle_surface_vertex_edge_offsets, model.particle_surface_vertex_edges};
+        out.speed = data.particle_surface_max_speed[size_t{env} * p.surfaces_per_env + out.owner];
+        out.radius = model.particle_surface_thickness[out.owner];
     } else {
-        if (source_body >= p.bodies_per_env) {
-            atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
-            return;
-        }
-        const auto info = model.mesh_surface_info[source_body];
-        const auto view = OgcBodyView(p, model, data, env, source_body);
-        if (!collision::MeshSurfaceRangeValid(view, info) || source_vertex >= info.vertex_count) {
-            atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
-            return;
-        }
-        source = collision::MeshSurfaceVertex(view, info, source_vertex);
-        source_speed = OgcBodySpeed(p, data, env, source_body);
-        source_mu = OgcBodyFriction(model, data, source_body);
+        out.info = model.mesh_surface_info[out.owner];
+        out.edges = model.mesh_edge_info[out.owner];
+        out.view = OgcBodyView(p, model, data, env, out.owner);
+        out.edge_array = model.mesh_edges;
+        out.triangle_edges = model.mesh_triangle_edges;
+        out.vertex_faces = {model.mesh_vertex_triangle_offsets, model.mesh_vertex_triangles};
+        out.vertex_edges = {model.mesh_vertex_edge_offsets, model.mesh_vertex_edges};
+        out.speed = data.dat_body_speed[size_t{env} * p.bodies_per_env + out.owner];
+        out.friction = OgcBodyFriction(model, data, out.owner);
     }
-    const uint32_t target_groups = source_particle ? 1u : 2u;
-    for (uint32_t group = 0u; group < target_groups; ++group) {
-        const bool target_particle = !source_particle && group == 0u;
-        const uint32_t target_count = target_particle ? p.surfaces_per_env : p.bodies_per_env;
-        for (uint32_t target = 0u; target < target_count; ++target) {
-            if (!target_particle) {
-                // Every query radius is capped, so farther bodies fail the exact test below.
-                const size_t reach_at = size_t{env} * p.bodies_per_env + target;
-                if (OgcAabbDistanceSquared(source, data.body_aabb_lo[reach_at],
-                                           data.body_aabb_hi[reach_at]) >
-                    collision::kDatQueryRadiusMax * collision::kDatQueryRadiusMax) continue;
-                const auto shape = nkops::LoadPrimShape(model.shape_table, target);
-                if (shape.contype == 0u && shape.conaffinity == 0u) continue;
-                if (!source_particle && !OgcBodyPairAllowed(p, model, source_body, target))
-                    continue;
-            }
-            const auto info = target_particle ? model.particle_surface_info[target]
-                                              : model.mesh_surface_info[target];
-            const auto view = target_particle ? particle_view :
-                OgcBodyView(p, model, data, env, target);
-            if (!collision::MeshSurfaceRangeValid(view, info)) continue;
-            const float target_radius = target_particle
-                ? model.particle_surface_thickness[target] : 0.0f;
-            const float radius = source_radius + target_radius +
-                (!source_particle && !target_particle ? 0.0005f : 0.0f);
-            const float target_speed = target_particle
-                ? data.particle_surface_max_speed[size_t{env} * p.surfaces_per_env + target]
-                : OgcBodySpeed(p, data, env, target);
-            const uint32_t frame = source_particle || target_particle ? ~0u
-                : DatCommonFrame(p, model, env, source_body, target);
-            const float query = collision::DatQueryRadius(frame != ~0u
-                ? DatArticMotionRadius(p, model, data, env, source_body, target, frame, data.q)
-                : collision::DatMotionRadius(radius + p.margin, p.dt, source_speed,
-                                             target_speed, p.relaxation));
-            if (!(query > 0.0f)) continue;
-            if (!target_particle) {
-                const size_t at = size_t{env} * p.bodies_per_env + target;
-                if (OgcAabbDistanceSquared(source, data.body_aabb_lo[at],
-                                           data.body_aabb_hi[at]) > query * query) continue;
-            }
-            const math::Vec3 local_source = collision::MeshSurfaceLocalPoint(view, source);
-            uint32_t cursor = 0u;
-            while (cursor < info.node_count) {
-                const auto node = view.nodes[info.node_offset + cursor];
-                if (node.escape <= cursor || node.escape > info.node_count) {
-                    atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
-                    break;
+    return out;
+}
+
+struct OgcSurfacePair {
+    OgcSurface source, target;
+    float body_query;
+    bool active;
+};
+
+// A block compacts its nearby surface pairs before assigning complete warps to feature queries.
+__device__ bool OgcPairPotential(const OgcDetectParams& p, const ModelView& model,
+    const DataView& data, uint32_t env, uint32_t source, uint32_t target, bool edges) {
+    const bool sp = source < p.surfaces_per_env, tp = target < p.surfaces_per_env;
+    if ((sp && tp) || (edges && (tp || (!sp && target <= source)))) return false;
+    const uint32_t a = source - p.surfaces_per_env, b = target - p.surfaces_per_env;
+    if (!sp) {
+        const auto shape = nkops::LoadPrimShape(model.shape_table, a);
+        if (shape.contype == 0u || shape.conaffinity == 0u) return false;
+    }
+    if (!tp) {
+        const auto shape = nkops::LoadPrimShape(model.shape_table, b);
+        if (shape.contype == 0u && shape.conaffinity == 0u) return false;
+    }
+    if (!sp && !tp) {
+        const size_t ai = size_t{env} * p.bodies_per_env + a, bi = size_t{env} * p.bodies_per_env + b;
+        const auto al = data.body_aabb_lo[ai], ah = data.body_aabb_hi[ai];
+        const auto bl = data.body_aabb_lo[bi], bh = data.body_aabb_hi[bi];
+        const math::Vec3 gap{fmaxf(0.0f, fmaxf(al.x - bh.x, bl.x - ah.x)),
+            fmaxf(0.0f, fmaxf(al.y - bh.y, bl.y - ah.y)), fmaxf(0.0f, fmaxf(al.z - bh.z, bl.z - ah.z))};
+        const float reach = collision::kDatQueryRadiusMax + 1.0e-6f;
+        if (gap.LengthSq() > reach * reach || !OgcBodyPairAllowed(p, model, a, b)) return false;
+    }
+    return true;
+}
+
+__device__ void OgcPreparePair(const OgcDetectParams& p, const ModelView& model,
+    const DataView& data, uint32_t env, uint32_t source, uint32_t target, OgcSurfacePair* pair) {
+    pair->active = false;
+    const bool sp = source < p.surfaces_per_env, tp = target < p.surfaces_per_env;
+    const uint32_t a = source - p.surfaces_per_env, b = target - p.surfaces_per_env;
+    pair->source = OgcLoadSurface(p, model, data, env, source);
+    pair->target = OgcLoadSurface(p, model, data, env, target);
+    if (!collision::MeshSurfaceRangeValid(pair->source.view, pair->source.info) ||
+        !collision::MeshSurfaceRangeValid(pair->target.view, pair->target.info)) return;
+    pair->body_query = 0.0f;
+    if (!sp && !tp) {
+        const uint32_t frame = DatCommonFrame(p, model, env, a, b);
+        pair->body_query = collision::DatQueryRadius(frame != ~0u
+            ? DatArticMotionRadius(p, model, data, env, a, b, frame, data.q)
+            : collision::DatMotionRadius(collision::kRigidContactSeparation + p.margin, p.dt,
+                pair->source.speed, pair->target.speed, p.relaxation));
+    }
+    pair->active = true;
+}
+
+__device__ float OgcSurfaceQuery(const OgcDetectParams& p, const OgcSurfacePair& pair, float radius) {
+    return !pair.source.particle && !pair.target.particle ? pair.body_query
+        : collision::DatQueryRadius(collision::DatMotionRadius(radius + p.margin, p.dt,
+            pair.source.speed, pair.target.speed, p.relaxation));
+}
+
+struct OgcMixedCandidate { uint32_t source, target; };
+
+__global__ void OgcMixedVertexFaceKernel(OgcDetectParams p, ModelView model, DataView data) {
+    constexpr uint32_t kWarps = 4u;
+    __shared__ OgcMixedCandidate queue[kWarps][2u * kWarpLanes];
+    __shared__ __align__(alignof(OgcSurfacePair)) unsigned char storage[sizeof(OgcSurfacePair)];
+    auto* pairs = reinterpret_cast<OgcSurfacePair*>(storage);
+    const uint32_t warp = threadIdx.x / kWarpLanes, lane = threadIdx.x % kWarpLanes;
+    __shared__ uint32_t active_targets[kWarpLanes], active_count;
+    const uint32_t surfaces = p.surfaces_per_env + p.bodies_per_env;
+    const uint32_t groups = (surfaces + kWarpLanes - 1u) / kWarpLanes;
+    const uint32_t item = blockIdx.x / groups;
+    const uint32_t env = item / surfaces, source = item % surfaces;
+    const uint32_t first_target = (blockIdx.x % groups) * kWarpLanes;
+    const uint32_t share = warp;
+    if (warp == 0u) {
+        const uint32_t target = first_target + lane;
+        const bool allowed = target < surfaces && OgcPairPotential(p, model, data, env, source, target, false);
+        const uint32_t mask = __ballot_sync(~0u, allowed);
+        if (allowed) active_targets[__popc(mask & ((1u << lane) - 1u))] = target;
+        if (lane == 0u) active_count = __popc(mask);
+    }
+    __syncthreads();
+    for (uint32_t candidate = 0u; candidate < active_count; ++candidate) {
+        __syncthreads();
+        const uint32_t target = active_targets[candidate];
+        auto& pair = *pairs;
+        if (threadIdx.x == 0u) OgcPreparePair(p, model, data, env, source, target, &pair);
+        __syncthreads();
+        if (!pair.active) continue;
+        const auto& a = pair.source;
+        const auto& b = pair.target;
+        uint32_t vertex = share * kWarpLanes + lane, cursor = b.info.node_count;
+        bool entered = false;
+        math::Vec3 point{}, local{};
+        float query = 0.0f;
+        const auto next = [&](OgcMixedCandidate* candidate) {
+            while (vertex < a.info.vertex_count) {
+                if (cursor >= b.info.node_count) {
+                    if (entered) vertex += blockDim.x;
+                    if (vertex >= a.info.vertex_count) break;
+                    entered = true;
+                    point = collision::MeshSurfaceVertex(a.view, a.info, vertex);
+                    const float radius = a.particle ? model.particle_half_thickness[a.info.vertex_offset + vertex]
+                        : b.particle ? b.radius : collision::kRigidContactSeparation;
+                    query = OgcSurfaceQuery(p, pair, radius);
+                    if (!(query > 0.0f)) continue;
+                    local = collision::MeshSurfaceLocalPoint(b.view, point);
+                    cursor = 0u;
                 }
-                if (collision::MeshBoundsDistanceSquared(local_source, node) > query * query) {
+                const auto node = b.view.nodes[b.info.node_offset + cursor];
+                if (node.escape <= cursor || node.escape > b.info.node_count) {
+                    atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
+                    cursor = b.info.node_count;
+                    continue;
+                }
+                if (collision::MeshBoundsDistanceSquared(local, node) > query * query) {
                     cursor = node.escape;
                     continue;
                 }
-                if (node.triangle != ~0u) {
-                    const auto feature = collision::OgcFacetFeature(
-                        view, info,
-                        target_particle ? model.particle_surface_edges : model.mesh_edges,
-                        target_particle ? model.particle_surface_triangle_edges : model.mesh_triangle_edges,
-                        target_particle ? model.particle_surface_edge_info[target] : model.mesh_edge_info[target],
-                        target_particle
-                            ? collision::MeshVertexIncidence{model.particle_surface_vertex_triangle_offsets,
-                                                             model.particle_surface_vertex_triangles}
-                            : collision::MeshVertexIncidence{model.mesh_vertex_triangle_offsets,
-                                                             model.mesh_vertex_triangles},
-                        node.triangle, source, query);
-                    if (feature.feasible && feature.owner_triangle == node.triangle &&
-                        feature.distance <= query && feature.distance >= 0.0f) {
-                        const uint32_t ordinal = OgcClaimSlot(p, data, env);
-                        if (ordinal < p.slot_capacity) {
-                            // A particle face contacts at its interpolated thickness, under the surface bound.
-                            const auto face = target_particle ? OgcParticleFaceMaterial(
-                                model, view, info, node.triangle, feature.barycentric) : OgcParticleMaterial{};
-                            const float target_mu = target_particle
-                                ? face.friction : OgcBodyFriction(model, data, target);
-                            OgcEmitMixedFace(p, model, data, env, ordinal,
-                                source_particle, source_index, source_body, source_vertex,
-                                target_particle, target, target, view, info,
-                                node.triangle, source,
-                                target_particle ? source_radius + face.half_thickness : radius,
-                                OgcPairFriction(source_particle, target_particle,
-                                                source_mu, target_mu), feature);
-                        }
-                    }
-                }
                 ++cursor;
+                if (node.triangle == ~0u) continue;
+                *candidate = {vertex, node.triangle};
+                return true;
             }
-        }
+            return false;
+        };
+        TestInWarpBatches(queue[warp], vertex < a.info.vertex_count, next, [&](const OgcMixedCandidate& c) {
+            const auto source = collision::MeshSurfaceVertex(a.view, a.info, c.source);
+            const uint32_t particle = a.info.vertex_offset + c.source;
+            const float source_radius = a.particle ? model.particle_half_thickness[particle] : 0.0f;
+            const float radius = source_radius + b.radius + (!a.particle && !b.particle ? collision::kRigidContactSeparation : 0.0f);
+            const float reach = OgcSurfaceQuery(p, pair, radius);
+            const auto feature = collision::OgcFacetFeature(b.view, b.info, b.edge_array, b.triangle_edges,
+                b.edges, b.vertex_faces, c.target, source, reach);
+            if (!feature.feasible || feature.owner_triangle != c.target ||
+                !(feature.distance >= 0.0f && feature.distance <= reach)) return;
+            const uint32_t ordinal = OgcClaimSlot(p, data, env);
+            if (ordinal >= p.slot_capacity) return;
+            const auto face = b.particle ? OgcParticleFaceMaterial(model, b.view, b.info, c.target, feature.barycentric)
+                                        : OgcParticleMaterial{};
+            OgcEmitMixedFace(p, model, data, env, ordinal, a.particle,
+                env * p.particles_per_env + particle, a.owner, c.source, b.particle, b.owner, b.owner,
+                b.view, b.info, c.target, source, b.particle ? source_radius + face.half_thickness : radius,
+                OgcPairFriction(a.particle, b.particle, a.particle ? model.particle_friction[particle] : a.friction,
+                    b.particle ? face.friction : b.friction), feature);
+        });
     }
 }
 
@@ -495,147 +546,100 @@ __device__ void OgcEmitMixedEdge(
     atomicAdd(data.contact_count + env, 1u);
 }
 
-__global__ void OgcMixedEdgeEdgeKernel(OgcDetectParams p, ModelView model,
-                                       DataView data) {
-    const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t per_env = p.edges_per_env + p.mesh_edge_sources;
-    if (item >= p.env_count * per_env) return;
-    const uint32_t env = item / per_env, local = item % per_env;
-    const bool source_particle = local < p.edges_per_env;
-    const uint64_t packed = source_particle ? 0u :
-        model.mesh_edge_sources[local - p.edges_per_env];
-    const uint32_t source_body = static_cast<uint32_t>(packed >> 32u);
-    const uint32_t source_edge = static_cast<uint32_t>(packed);
-    uint32_t source_surface = ~0u;
-    collision::MeshSurfaceInfo source_info{};
-    collision::MeshEdgeInfo source_edges{};
-    collision::MeshSurfaceView source_view{};
-    const collision::MeshEdge* source_array = nullptr;
-    collision::MeshVertexIncidence source_incidence{};
-    float source_radius = 0.0f, source_speed = 0.0f, source_mu = 0.0f;
-    uint32_t local_edge = source_edge;
-    if (source_particle) {
-        for (uint32_t s = 0u; s < p.surfaces_per_env; ++s) {
-            const auto info = model.particle_surface_edge_info[s];
-            if (local >= info.edge_offset && local - info.edge_offset < info.edge_count) {
-                source_surface = s;
-                local_edge = local - info.edge_offset;
-                source_info = model.particle_surface_info[s];
-                source_edges = info;
-                source_view = OgcParticleView(p, model, data, env);
-                source_array = model.particle_surface_edges;
-                source_incidence = {model.particle_surface_vertex_edge_offsets,
-                                    model.particle_surface_vertex_edges};
-                source_radius = model.particle_surface_thickness[s];
-                source_speed = data.particle_surface_max_speed[size_t{env} * p.surfaces_per_env + s];
-                break;
-            }
-        }
-        if (source_surface == ~0u) {
-            return;
-        }
-    } else {
-        if (source_body >= p.bodies_per_env) {
-            atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
-            return;
-        }
-        source_info = model.mesh_surface_info[source_body];
-        source_edges = model.mesh_edge_info[source_body];
-        source_view = OgcBodyView(p, model, data, env, source_body);
-        source_array = model.mesh_edges;
-        source_incidence = {model.mesh_vertex_edge_offsets, model.mesh_vertex_edges};
-        source_speed = OgcBodySpeed(p, data, env, source_body);
-        source_mu = OgcBodyFriction(model, data, source_body);
-        if (!collision::MeshSurfaceRangeValid(source_view, source_info) ||
-            local_edge >= source_edges.edge_count) {
-            atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
-            return;
-        }
+__global__ void OgcMixedEdgeEdgeKernel(OgcDetectParams p, ModelView model, DataView data) {
+    constexpr uint32_t kWarps = 4u;
+    __shared__ OgcMixedCandidate queue[kWarps][2u * kWarpLanes];
+    __shared__ __align__(alignof(OgcSurfacePair)) unsigned char storage[sizeof(OgcSurfacePair)];
+    auto* pairs = reinterpret_cast<OgcSurfacePair*>(storage);
+    const uint32_t warp = threadIdx.x / kWarpLanes, lane = threadIdx.x % kWarpLanes;
+    __shared__ uint32_t active_targets[kWarpLanes], active_count;
+    const uint32_t surfaces = p.surfaces_per_env + p.bodies_per_env;
+    const uint32_t groups = (surfaces + kWarpLanes - 1u) / kWarpLanes;
+    const uint32_t item = blockIdx.x / groups;
+    const uint32_t env = item / surfaces, source = item % surfaces;
+    const uint32_t first_target = (blockIdx.x % groups) * kWarpLanes;
+    const uint32_t share = warp;
+    if (warp == 0u) {
+        const uint32_t target = first_target + lane;
+        const bool allowed = target < surfaces && OgcPairPotential(p, model, data, env, source, target, true);
+        const uint32_t mask = __ballot_sync(~0u, allowed);
+        if (allowed) active_targets[__popc(mask & ((1u << lane) - 1u))] = target;
+        if (lane == 0u) active_count = __popc(mask);
     }
-    const auto edge_a = source_array[source_edges.edge_offset + local_edge];
-    const math::Vec3 a0 = collision::MeshSurfaceVertex(source_view, source_info, edge_a.vertex0);
-    const math::Vec3 a1 = collision::MeshSurfaceVertex(source_view, source_info, edge_a.vertex1);
-    const math::Vec3 midpoint = (a0 + a1) * 0.5f;
-    const float half_length = sqrtf((a1 - a0).LengthSq()) * 0.5f;
-    // Every query radius is capped, so farther bodies fail the exact test below; segment tests
-    // add 1 um so frame rounding cannot drop a pair.
-    const float reach = collision::kDatQueryRadiusMax + half_length;
-    constexpr float kSlack = 1.0e-6f;
-    for (uint32_t target = 0u; target < p.bodies_per_env; ++target) {
-        if (!source_particle && target <= source_body) continue;
-        const size_t body_at = size_t{env} * p.bodies_per_env + target;
-        const math::Vec3 body_lo = data.body_aabb_lo[body_at], body_hi = data.body_aabb_hi[body_at];
-        if (OgcAabbDistanceSquared(midpoint, body_lo, body_hi) > reach * reach ||
-            !collision::SegmentWithinBox(a0, a1, body_lo, body_hi,
-                                         collision::kDatQueryRadiusMax + kSlack)) continue;
-        const auto shape = nkops::LoadPrimShape(model.shape_table, target);
-        if (shape.contype == 0u && shape.conaffinity == 0u) continue;
-        if (!source_particle && !OgcBodyPairAllowed(p, model, source_body, target)) continue;
-        const auto target_info = model.mesh_surface_info[target];
-        const auto target_edges = model.mesh_edge_info[target];
-        const auto target_view = OgcBodyView(p, model, data, env, target);
-        if (!collision::MeshSurfaceRangeValid(target_view, target_info) ||
-            target_edges.node_count == 0u) continue;
-        const float radius = source_radius + (source_particle ? 0.0f : 0.0005f);
-        const uint32_t frame = source_particle ? ~0u
-            : DatCommonFrame(p, model, env, source_body, target);
-        const float query = collision::DatQueryRadius(frame != ~0u
-            ? DatArticMotionRadius(p, model, data, env, source_body, target, frame, data.q)
-            : collision::DatMotionRadius(radius + p.margin, p.dt, source_speed,
-                                         OgcBodySpeed(p, data, env, target), p.relaxation));
+    __syncthreads();
+    for (uint32_t candidate = 0u; candidate < active_count; ++candidate) {
+        __syncthreads();
+        const uint32_t target = active_targets[candidate];
+        auto& pair = *pairs;
+        if (threadIdx.x == 0u) OgcPreparePair(p, model, data, env, source, target, &pair);
+        __syncthreads();
+        if (!pair.active || pair.target.edges.node_count == 0u) continue;
+        const auto& a = pair.source;
+        const auto& b = pair.target;
+        const float radius = a.radius + (a.particle ? 0.0f : collision::kRigidContactSeparation);
+        const float query = OgcSurfaceQuery(p, pair, radius), within = query + 1.0e-6f;
         if (!(query > 0.0f)) continue;
-        const float broad = query + half_length, within = query + kSlack;
-        if (OgcAabbDistanceSquared(midpoint, body_lo, body_hi) > broad * broad ||
-            !collision::SegmentWithinBox(a0, a1, body_lo, body_hi, within)) continue;
-        const math::Vec3 local_midpoint = collision::MeshSurfaceLocalPoint(target_view, midpoint);
-        const math::Vec3 local_a0 = collision::MeshSurfaceLocalPoint(target_view, a0);
-        const math::Vec3 local_a1 = collision::MeshSurfaceLocalPoint(target_view, a1);
-        uint32_t cursor = 0u;
-        while (cursor < target_edges.node_count) {
-            const auto node = model.mesh_edge_nodes[target_edges.node_offset + cursor];
-            if (node.escape <= cursor || node.escape > target_edges.node_count) {
-                atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
-                break;
-            }
-            if (collision::MeshBoundsDistanceSquared(local_midpoint, node) > broad * broad ||
-                !collision::SegmentWithinBox(local_a0, local_a1, node.lower, node.upper, within)) {
-                cursor = node.escape;
-                continue;
-            }
-            if (node.triangle != ~0u) {
-                if (node.triangle >= target_edges.edge_count) {
+        uint32_t edge = share * kWarpLanes + lane, cursor = b.edges.node_count;
+        bool entered = false;
+        math::Vec3 local_a0{}, local_a1{}, midpoint{};
+        float broad = 0.0f;
+        const auto next = [&](OgcMixedCandidate* candidate) {
+            while (edge < a.edges.edge_count) {
+                if (cursor >= b.edges.node_count) {
+                    if (entered) edge += blockDim.x;
+                    if (edge >= a.edges.edge_count) break;
+                    entered = true;
+                    const auto feature = a.edge_array[a.edges.edge_offset + edge];
+                    const auto a0 = collision::MeshSurfaceVertex(a.view, a.info, feature.vertex0);
+                    const auto a1 = collision::MeshSurfaceVertex(a.view, a.info, feature.vertex1);
+                    local_a0 = collision::MeshSurfaceLocalPoint(b.view, a0);
+                    local_a1 = collision::MeshSurfaceLocalPoint(b.view, a1);
+                    midpoint = collision::MeshSurfaceLocalPoint(b.view, (a0 + a1) * 0.5f);
+                    broad = query + sqrtf((a1 - a0).LengthSq()) * 0.5f;
+                    cursor = 0u;
+                }
+                const auto node = model.mesh_edge_nodes[b.edges.node_offset + cursor];
+                if (node.escape <= cursor || node.escape > b.edges.node_count) {
                     atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
-                    break;
+                    cursor = b.edges.node_count;
+                    continue;
                 }
-                const auto pair = collision::OgcEdgeContact(
-                    source_view, source_info, source_array, source_incidence,
-                    source_edges, local_edge, target_view, target_info, model.mesh_edges,
-                    {model.mesh_vertex_edge_offsets, model.mesh_vertex_edges}, target_edges,
-                    node.triangle, query);
-                if (pair.feasible && pair.owner_edge_a == local_edge &&
-                    pair.owner_edge_b == node.triangle &&
-                    pair.distance >= 0.0f && pair.distance <= query) {
-                    // A particle edge contacts at its interpolated thickness, under the surface bound.
-                    float contact_radius = radius, mu = source_mu;
-                    if (source_particle) {
-                        const uint32_t v0 = source_info.vertex_offset + edge_a.vertex0;
-                        const uint32_t v1 = source_info.vertex_offset + edge_a.vertex1;
-                        contact_radius = (1.0f - pair.weight_a) * model.particle_half_thickness[v0] +
-                                         pair.weight_a * model.particle_half_thickness[v1];
-                        mu = (1.0f - pair.weight_a) * model.particle_friction[v0] +
-                             pair.weight_a * model.particle_friction[v1];
-                    }
-                    const uint32_t ordinal = OgcClaimSlot(p, data, env);
-                    if (ordinal < p.slot_capacity) OgcEmitMixedEdge(p, model, data, env, ordinal,
-                        source_particle, source_surface, source_body, local_edge,
-                        target, node.triangle, edge_a, contact_radius,
-                        OgcPairFriction(source_particle, false, mu,
-                                        OgcBodyFriction(model, data, target)),
-                        pair);
+                if (collision::MeshBoundsDistanceSquared(midpoint, node) > broad * broad ||
+                    !collision::SegmentWithinBox(local_a0, local_a1, node.lower, node.upper, within)) {
+                    cursor = node.escape;
+                    continue;
                 }
+                ++cursor;
+                if (node.triangle == ~0u) continue;
+                if (node.triangle >= b.edges.edge_count) {
+                    atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
+                    cursor = b.edges.node_count;
+                    continue;
+                }
+                *candidate = {edge, node.triangle};
+                return true;
             }
-            ++cursor;
-        }
+            return false;
+        };
+        TestInWarpBatches(queue[warp], edge < a.edges.edge_count, next, [&](const OgcMixedCandidate& c) {
+            const auto contact = collision::OgcEdgeContact(a.view, a.info, a.edge_array, a.vertex_edges,
+                a.edges, c.source, b.view, b.info, b.edge_array, b.vertex_edges, b.edges, c.target, query);
+            if (!contact.feasible || contact.owner_edge_a != c.source || contact.owner_edge_b != c.target ||
+                !(contact.distance >= 0.0f && contact.distance <= query)) return;
+            const auto edge_a = a.edge_array[a.edges.edge_offset + c.source];
+            float contact_radius = radius, mu = a.friction;
+            if (a.particle) {
+                const uint32_t v0 = a.info.vertex_offset + edge_a.vertex0, v1 = a.info.vertex_offset + edge_a.vertex1;
+                contact_radius = (1.0f - contact.weight_a) * model.particle_half_thickness[v0] +
+                    contact.weight_a * model.particle_half_thickness[v1];
+                mu = (1.0f - contact.weight_a) * model.particle_friction[v0] +
+                    contact.weight_a * model.particle_friction[v1];
+            }
+            const uint32_t ordinal = OgcClaimSlot(p, data, env);
+            if (ordinal < p.slot_capacity) OgcEmitMixedEdge(p, model, data, env, ordinal, a.particle,
+                a.owner, a.owner, c.source, b.owner, c.target, edge_a, contact_radius,
+                OgcPairFriction(a.particle, false, mu, b.friction), contact);
+        });
     }
 }
 

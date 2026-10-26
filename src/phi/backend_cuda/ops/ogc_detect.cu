@@ -11,8 +11,8 @@
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
 #include "phi/op_schema.hpp"
-#include "phi/backend_cuda/ops/ogc_mesh.cuh"
 #include "phi/backend_cuda/ops/bvh_work_share.cuh"
+#include "phi/backend_cuda/ops/ogc_mesh.cuh"
 #include "phi/backend_cuda/ops/ogc_order.cuh"
 
 namespace nuka::phi {
@@ -474,11 +474,13 @@ Status OpOgcDetect(const ModelView& model, const DataView& data,
         (p->particles_per_env + p->edges_per_env +
          (mixed ? p->particles_per_env + p->edges_per_env +
                   p->mesh_vertex_sources + p->mesh_edge_sources : 0u));
+    const uint64_t surfaces = uint64_t{p->surfaces_per_env} + p->bodies_per_env;
+    const uint64_t mixed_pairs = uint64_t{p->env_count} * surfaces * surfaces;
     const uint64_t links = uint64_t{p->env_count} * p->links_per_env;
     if (slots > UINT32_MAX || particles + edges > UINT32_MAX ||
         particles > UINT32_MAX / kTreeShares || edges > UINT32_MAX / kTreeShares ||
         vertices > UINT32_MAX || mixed_edges > UINT32_MAX || sources > UINT32_MAX ||
-        links > UINT32_MAX)
+        links > UINT32_MAX || mixed_pairs > UINT32_MAX / kTreeShares)
         return Status::InvalidArgument;
     if (slots > static_cast<uint64_t>(std::numeric_limits<int>::max()) || !data.contact_cache_scratch ||
         p->workspace_bytes <= ogc_order::Layout(static_cast<uint32_t>(slots)).temp_offset)
@@ -494,6 +496,8 @@ Status OpOgcDetect(const ModelView& model, const DataView& data,
         LaunchCuda(OgcBodyQueryKernel,
                    dim3((p->env_count * p->bodies_per_env * kOgcQueryLanes + kBlockSize - 1u) / kBlockSize),
                    dim3(kBlockSize), 0u, stream, *p, model, data);
+    if (p->surfaces_per_env == 0u && p->ogc_body_pairs == 0u)
+        return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
     if (particles > 0u)
         LaunchCuda(OgcParticleVertexFaceKernel,
                    dim3((static_cast<uint32_t>(particles) * kTreeShares + kBlockSize - 1u) / kBlockSize),
@@ -504,11 +508,11 @@ Status OpOgcDetect(const ModelView& model, const DataView& data,
                    dim3(kBlockSize), 0u, stream, *p, model, data);
     if (mixed && vertices > 0u)
         LaunchCuda(OgcMixedVertexFaceKernel,
-                   dim3((static_cast<uint32_t>(vertices) + kBlockSize - 1u) / kBlockSize),
+                   dim3(p->env_count * surfaces * ((surfaces + kWarpLanes - 1u) / kWarpLanes)),
                    dim3(kBlockSize), 0u, stream, *p, model, data);
     if (mixed && mixed_edges > 0u)
         LaunchCuda(OgcMixedEdgeEdgeKernel,
-                   dim3((static_cast<uint32_t>(mixed_edges) + kBlockSize - 1u) / kBlockSize),
+                   dim3(p->env_count * surfaces * ((surfaces + kWarpLanes - 1u) / kWarpLanes)),
                    dim3(kBlockSize), 0u, stream, *p, model, data);
     LaunchCuda(FinalizeOgcCountKernel,
                dim3((p->env_count - 1u) / kBlockSize + 1u),

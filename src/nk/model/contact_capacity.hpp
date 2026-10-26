@@ -81,6 +81,28 @@ inline bool ConvexContactPairs(const Model& model) {
     return false;
 }
 
+inline bool HasMeshContactPairs(const Model& model, collision::MeshContactRoute route) {
+    const auto& rows = model.shape_table_rows;
+    for (uint32_t a = 0u; a < rows.size(); ++a) {
+        const auto& sa = rows[a];
+        for (uint32_t b = a + 1u; b < rows.size(); ++b) {
+            const auto& sb = rows[b];
+            if ((sa.body_id < 0 && sb.body_id < 0) ||
+                !collision::ShapeFilterAdmits(sa.contype, sa.conaffinity, sa.group,
+                    sb.contype, sb.conaffinity, sb.group) ||
+                std::binary_search(model.excluded_pairs.begin(), model.excluded_pairs.end(),
+                                   (uint64_t{a} << 32u) | b)) continue;
+            if (route == collision::MeshContactRoute::Ogc &&
+                (a >= model.mesh_surface_info.size() || b >= model.mesh_surface_info.size() ||
+                 model.mesh_surface_info[a].vertex_count == 0u ||
+                 model.mesh_surface_info[b].vertex_count == 0u)) continue;
+            if (collision::RouteMeshContact(sa.kind, sb.kind, sa.mesh_contact_mode,
+                                            sb.mesh_contact_mode) == route) return true;
+        }
+    }
+    return false;
+}
+
 // Mesh features of bodies that some filtered partner meets through mesh contact; one slot each.
 inline uint64_t PairedMeshFeatureCount(const Model& model) {
     const auto& rows = model.shape_table_rows;
@@ -89,7 +111,7 @@ inline uint64_t PairedMeshFeatureCount(const Model& model) {
     uint64_t features = 0u;
     for (uint32_t a = 0u; a < bodies; ++a) {
         const auto& sa = rows[a];
-        if (sa.contype == 0u || sa.conaffinity == 0u || model.mesh_surface_info[a].vertex_count == 0u) continue;
+        if ((sa.contype | sa.conaffinity) == 0u || model.mesh_surface_info[a].vertex_count == 0u) continue;
         bool paired = false;
         for (uint32_t b = 0u; b < bodies && !paired; ++b) {
             const auto& sb = rows[b];
