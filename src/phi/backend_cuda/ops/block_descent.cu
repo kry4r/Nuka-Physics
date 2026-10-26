@@ -328,10 +328,12 @@ struct BlockScratch {
     uint32_t* tile_next;
     uint32_t* tile_order;
     uint32_t* tile_cost;
+    uint32_t* tile_incidence;
     float* articulation_pseudo;
     float* rigid_pseudo;
     uint32_t tile_head_capacity;
     uint32_t tile_row_capacity;
+    uint32_t tile_incidence_stride;
 };
 
 // Incidence entries are row slots, so sorting the bits that index every slot orders them fully.
@@ -369,7 +371,7 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     const uint64_t rows = uint64_t{p.rows_per_env} * p.env_count;
     if (blocks >= uint64_t{std::numeric_limits<int>::max()} ||
         rows >= uint64_t{std::numeric_limits<int>::max()}) return 0u;
-    // Dense tiles keep their rows per environment, without incidence lists, colors or row caches.
+    // Dense tiles keep their rows and per-block head lists per environment, without colors or row caches.
     const bool tile = DenseTileRoute(p);
     const auto schedule =
         nk::MakeBlockRowScheduleLayout(blocks, rows, tile ? 0u : p.incidence_per_env, p.env_count);
@@ -512,6 +514,10 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     if (tile && tile_slots == 0u) return 0u;
     s.tile_fields = reinterpret_cast<float*>(take(tile_slots * kTileFields * s.tile_head_capacity));
     s.tile_jacobian = reinterpret_cast<float*>(take(tile_slots * s.tile_row_capacity * TileJacobianWidth(p)));
+    // A slot's blocks' list ends, then their heads: a head lists on each of its at most two blocks.
+    s.tile_incidence_stride = tile
+        ? (p.total_body_count + p.articulation_count) / p.env_count + 2u * s.tile_head_capacity : 0u;
+    s.tile_incidence = take(tile_slots * s.tile_incidence_stride);
     s.tile_next = take(tile ? 1u : 0u);
     s.tile_order = take(tile ? p.env_count : 0u);
     s.tile_cost = take(tile ? p.env_count : 0u);

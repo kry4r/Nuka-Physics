@@ -161,6 +161,9 @@ struct TileContext {
     float momentum;
     float* fields;
     float* jacobian;
+    // Each block's heads in head order run from its predecessor's incident_end to its own.
+    uint32_t* incident_end;
+    uint32_t* incident;
     float* mass;
     float* factor;
     uint2* chunk_rows;
@@ -189,6 +192,9 @@ struct TileContext {
     // The head's incidence (0 or 1) on `block`, or kNoTileIncidence when it does not touch it.
     __device__ uint32_t Incidence(uint32_t h, uint32_t block) const {
         return Index(kTileOwner, h) == block ? 0u : Index(kTileOwner + 1u, h) == block ? 1u : kNoTileIncidence;
+    }
+    __device__ uint32_t IncidentBegin(uint32_t block) const {
+        return block == 0u ? 0u : incident_end[block - 1u];
     }
 };
 
@@ -448,6 +454,57 @@ __device__ void ExecuteTileWork(DataView data, BlockDescentSolveParams p, BlockS
     }
 }
 
+// Lists each block's heads in head order, so a block solve visits only its own heads; a head whose two
+// sides share a block lists once.
+__device__ void IndexTileIncidence(const TileContext& c) {
+    const uint32_t blocks = c.bodies + c.articulations;
+    for (uint32_t block = c.lane; block < blocks; block += kTileLanes) c.incident_end[block] = 0u;
+    __syncwarp();
+    for (uint32_t h = c.lane; h < c.heads; h += kTileLanes)
+        for (uint32_t side = 0u; side < 2u; ++side)
+            if (c.Index(kTileOwner + side, h) != kNoTileBlock)
+                atomicAdd(c.incident_end + c.Index(kTileOwner + side, h), 1u);
+    __syncwarp();
+    uint32_t total = 0u;
+    for (uint32_t base = 0u; base < blocks; base += kTileLanes) {
+        const uint32_t count = base + c.lane < blocks ? c.incident_end[base + c.lane] : 0u;
+        uint32_t through = count;
+        for (uint32_t offset = 1u; offset < kTileLanes; offset <<= 1u) {
+            const uint32_t other = __shfl_up_sync(~0u, through, offset);
+            if (c.lane >= offset) through += other;
+        }
+        if (base + c.lane < blocks) c.incident_end[base + c.lane] = total + through - count;
+        total += __shfl_sync(~0u, through, kTileLanes - 1u);
+    }
+    __syncwarp();
+    // Each block's cursor starts at its list and ends at its end; a chunk's lanes place heads in lane order.
+    for (uint32_t chunk = 0u; chunk < c.heads; chunk += kTileLanes) {
+        const uint32_t h = chunk + c.lane;
+        const uint32_t first = h < c.heads ? c.Index(kTileOwner, h) : kNoTileBlock;
+        const uint32_t second = h < c.heads ? c.Index(kTileOwner + 1u, h) : kNoTileBlock;
+        uint32_t before_first = 0u, before_second = 0u;
+        for (uint32_t other = 0u; other < kTileLanes; ++other) {
+            const uint32_t a = __shfl_sync(~0u, first, other), b = __shfl_sync(~0u, second, other);
+            if (other < c.lane) {
+                before_first += (a == first) + (b == first);
+                before_second += (a == second) + (b == second);
+            }
+        }
+        const uint32_t at_first = first != kNoTileBlock ? c.incident_end[first] + before_first : 0u;
+        const uint32_t at_second = second != kNoTileBlock ? c.incident_end[second] + before_second : 0u;
+        __syncwarp();
+        if (first != kNoTileBlock) {
+            c.incident[at_first] = h;
+            atomicAdd(c.incident_end + first, 1u);
+        }
+        if (second != kNoTileBlock) {
+            c.incident[at_second] = h;
+            atomicAdd(c.incident_end + second, 1u);
+        }
+        __syncwarp();
+    }
+}
+
 // Jacobians on moving blocks and residuals at free velocities, including kinematic sides. Single-coordinate
 // rows store their coordinate and value; other rows store one vector of block coordinates per axis.
 template <uint32_t kN>
@@ -687,6 +744,7 @@ __device__ void InitializeTile(ArticulationDeviceState state, DataView data, Blo
             InitializeTileHead(data, p, s, c, c.Index(kTileSlot, h), h);
         __syncwarp();
     }
+    IndexTileIncidence(c);
     if (p.measure_contact_residual != 0u) {
         for (uint32_t base = 0u; base < heads; base += kTileLanes) {
             uint32_t at = 0u;
@@ -701,8 +759,8 @@ __device__ void InitializeTile(ArticulationDeviceState state, DataView data, Blo
 
 // Hold the current normal multiplier as the friction radius through the block solve, as LoadLocalTerm.
 __device__ void StartTileBlock(const TileContext& c, uint32_t block) {
-    for (uint32_t h = c.lane; h < c.heads; h += kTileLanes) {
-        if (c.Incidence(h, block) == kNoTileIncidence) continue;
+    for (uint32_t k = c.IncidentBegin(block) + c.lane; k < c.incident_end[block]; k += kTileLanes) {
+        const uint32_t h = c.incident[k];
         c.Value(kTileNormalBound, h) = c.Value(kTileDual, h);
         c.Store3(kTileMove, h, {});
     }
@@ -711,8 +769,8 @@ __device__ void StartTileBlock(const TileContext& c, uint32_t block) {
 
 // The block's moves enter the residuals of the heads it touches.
 __device__ void EndTileBlock(const TileContext& c, uint32_t block) {
-    for (uint32_t h = c.lane; h < c.heads; h += kTileLanes) {
-        if (c.Incidence(h, block) == kNoTileIncidence) continue;
+    for (uint32_t k = c.IncidentBegin(block) + c.lane; k < c.incident_end[block]; k += kTileLanes) {
+        const uint32_t h = c.incident[k];
         const Vec3 residual = c.Load3(kTileResidual, h);
         const Vec3 move = c.Load3(kTileMove, h);
         c.Store3(kTileResidual, h, {__fsub_rn(residual.x, move.x), __fsub_rn(residual.y, move.y),
@@ -753,9 +811,11 @@ __device__ bool AssembleTileBlock(const TileContext& c, const TileBlock& b, floa
     }
     TileSum g{-inertial.value, -inertial.error};
     float diagonal = 0.0f;
-    for (uint32_t chunk = 0u; chunk < c.heads; chunk += kTileLanes) {
-        const uint32_t own = chunk + c.lane;
-        const uint32_t incidence = own < c.heads ? c.Incidence(own, b.local) : kNoTileIncidence;
+    const uint32_t end = c.incident_end[b.local];
+    for (uint32_t chunk = c.IncidentBegin(b.local); chunk < end; chunk += kTileLanes) {
+        const bool listed = chunk + c.lane < end;
+        const uint32_t own = listed ? c.incident[chunk + c.lane] : 0u;
+        const uint32_t incidence = listed ? c.Incidence(own, b.local) : kNoTileIncidence;
         Vec3 f{}, noise{};
         SymmetricMat3 curvature{};
         uint32_t unit = ~0u, first = 0u, axes = 1u;
@@ -921,9 +981,11 @@ __device__ bool AssembleWideTileBlock(const TileContext& c, const TileBlock& b, 
     }
 #pragma unroll
     for (uint32_t r = 0u; r < kSpan; ++r) g[r] = {-inertial[r].value, -inertial[r].error};
-    for (uint32_t chunk = 0u; chunk < c.heads; chunk += kTileLanes) {
-        const uint32_t own = chunk + c.lane;
-        const uint32_t incidence = own < c.heads ? c.Incidence(own, b.local) : kNoTileIncidence;
+    const uint32_t end = c.incident_end[b.local];
+    for (uint32_t chunk = c.IncidentBegin(b.local); chunk < end; chunk += kTileLanes) {
+        const bool listed = chunk + c.lane < end;
+        const uint32_t own = listed ? c.incident[chunk + c.lane] : 0u;
+        const uint32_t incidence = listed ? c.Incidence(own, b.local) : kNoTileIncidence;
         Vec3 f{}, noise{};
         SymmetricMat3 curvature{};
         uint32_t unit = ~0u, first = 0u, axes = 1u;
@@ -1162,9 +1224,11 @@ __device__ nk::BlockSolveFailure TileNewtonDirection(const TileContext& c, const
 // sum over the warp.
 template <uint32_t kSpan>
 __device__ void TileRowSteps(const TileContext& c, uint32_t block, const float (&d)[kSpan]) {
-    for (uint32_t chunk = 0u; chunk < c.heads; chunk += kTileLanes) {
-        const uint32_t own = chunk + c.lane;
-        const uint32_t incidence = own < c.heads ? c.Incidence(own, block) : kNoTileIncidence;
+    const uint32_t end = c.incident_end[block];
+    for (uint32_t chunk = c.IncidentBegin(block); chunk < end; chunk += kTileLanes) {
+        const bool listed = chunk + c.lane < end;
+        const uint32_t own = listed ? c.incident[chunk + c.lane] : 0u;
+        const uint32_t incidence = listed ? c.Incidence(own, block) : kNoTileIncidence;
         const bool touches = incidence != kNoTileIncidence;
         const uint32_t unit = touches ? c.Index(kTileUnit + incidence, own) : ~0u;
         const uint32_t first = touches ? c.Index(kTileRow + incidence, own) : 0u;
@@ -1214,9 +1278,9 @@ __device__ void WideTileRowSteps(const TileContext& c, uint32_t block, uint32_t 
     for (uint32_t r = 0u; r < kSpan; ++r)
         if (c.lane + r * kTileLanes < kN) staged[c.lane + r * kTileLanes] = d[r];
     __syncwarp();
-    for (uint32_t h = c.lane; h < c.heads; h += kTileLanes) {
+    for (uint32_t k = c.IncidentBegin(block) + c.lane; k < c.incident_end[block]; k += kTileLanes) {
+        const uint32_t h = c.incident[k];
         const uint32_t incidence = c.Incidence(h, block);
-        if (incidence == kNoTileIncidence) continue;
         const uint32_t unit = c.Index(kTileUnit + incidence, h);
         Vec3 step{};
         if (unit != ~0u) {
@@ -1237,15 +1301,16 @@ __device__ void WideTileRowSteps(const TileContext& c, uint32_t block, uint32_t 
     __syncwarp();
 }
 
-// Slope and curvature of the local objective at `alpha` along the step, as DenseLineDerivatives.
+// Slope and curvature of the local objective at `alpha` along the step, as DenseLineDerivatives; a lane's
+// first listed head is `resident`.
 __device__ void TileLineDerivatives(const TileContext& c, uint32_t block, float alpha, float inertial_slope,
-                                    float inertial_curvature, const TileHead& resident, bool resident_incidence,
+                                    float inertial_curvature, const TileHead& resident,
                                     float* slope, float* curvature, float* magnitude) {
     TileSum row_slope{};
     float row_curvature = 0.0f, row_magnitude = 0.0f;
-    for (uint32_t h = c.lane; h < c.heads; h += kTileLanes) {
-        if (h < kTileLanes ? !resident_incidence : c.Incidence(h, block) == kNoTileIncidence) continue;
-        const TileHead t = h < kTileLanes ? resident : LoadTileHead(c, h);
+    const uint32_t begin = c.IncidentBegin(block);
+    for (uint32_t k = begin + c.lane; k < c.incident_end[block]; k += kTileLanes) {
+        const TileHead t = k < begin + kTileLanes ? resident : LoadTileHead(c, c.incident[k]);
         const Vec3 trial{fmaf(alpha, t.step.x, t.move.x), fmaf(alpha, t.step.y, t.move.y),
                          fmaf(alpha, t.step.z, t.move.z)};
         Vec3 f{};
@@ -1271,18 +1336,18 @@ __device__ void TileLineDerivatives(const TileContext& c, uint32_t block, float 
 // Safeguarded Newton iteration on the slope as SearchDenseLine; 0 when the step does not descend.
 __device__ float SearchTileLine(const TileContext& c, uint32_t block, float inertial_slope,
                                 float inertial_curvature) {
-    const bool incident = c.lane < c.heads && c.Incidence(c.lane, block) != kNoTileIncidence;
+    const uint32_t first = c.IncidentBegin(block) + c.lane;
     TileHead resident{};
-    if (incident) resident = LoadTileHead(c, c.lane);
+    if (first < c.incident_end[block]) resident = LoadTileHead(c, c.incident[first]);
     float slope = 0.0f, curvature = 0.0f, magnitude = 0.0f;
-    TileLineDerivatives(c, block, 0.0f, inertial_slope, inertial_curvature, resident, incident,
+    TileLineDerivatives(c, block, 0.0f, inertial_slope, inertial_curvature, resident,
                         &slope, &curvature, &magnitude);
     const float initial = slope;
     if (!(initial < 0.0f)) return 0.0f;
     float low = 0.0f, high = 0.0f, alpha = 1.0f;
     bool bounded = false;
     for (uint32_t step = 0u; step < kDenseLineSearchSteps; ++step) {
-        TileLineDerivatives(c, block, alpha, inertial_slope, inertial_curvature, resident, incident,
+        TileLineDerivatives(c, block, alpha, inertial_slope, inertial_curvature, resident,
                             &slope, &curvature, &magnitude);
         if (!isfinite(slope) || !isfinite(curvature)) {
             high = alpha;
@@ -1387,8 +1452,8 @@ __device__ void DescendTileBlock(DataView data, BlockDescentSolveParams p, Block
         if (!(alpha > 0.0f)) break;
 #pragma unroll
         for (uint32_t r = 0u; r < kSpan; ++r) u[r] = after[r];
-        for (uint32_t head = c.lane; head < c.heads; head += kTileLanes) {
-            if (c.Incidence(head, b.local) == kNoTileIncidence) continue;
+        for (uint32_t k = c.IncidentBegin(b.local) + c.lane; k < c.incident_end[b.local]; k += kTileLanes) {
+            const uint32_t head = c.incident[k];
             const Vec3 move = c.Load3(kTileMove, head);
             const Vec3 row_step = c.Load3(kTileStep, head);
             c.Store3(kTileMove, head, {fmaf(alpha, row_step.x, move.x), fmaf(alpha, row_step.y, move.y),
@@ -1558,6 +1623,7 @@ __device__ uint32_t InitializeTilePositions(DataView data, BlockDescentSolvePara
             s.articulation_pseudo[size_t{c.first_articulation + k} * p.max_dof + dof] = 0.0f;
     __syncwarp();
     if (!__any_sync(~0u, push)) return 0u;
+    IndexTileIncidence(c);
     return __any_sync(~0u, coupled) ? p.position_iterations : 1u;
 }
 
@@ -1744,6 +1810,8 @@ __global__ void __launch_bounds__(TileThreads<kN>()) DescendDenseTilesKernel(
         c.width = TileJacobianWidth(p);
         c.fields = s.tile_fields + size_t{slot} * kTileFields * c.capacity;
         c.jacobian = s.tile_jacobian + size_t{slot} * s.tile_row_capacity * c.width;
+        c.incident_end = s.tile_incidence + size_t{slot} * s.tile_incidence_stride;
+        c.incident = c.incident_end + c.bodies + c.articulations;
         c.mass = tile_shared + size_t{warp} * TileWarpFloats<kN>();
         c.factor = c.mass + kN * (kN + 1u);
         c.chunk_terms = reinterpret_cast<float4*>(c.factor + kN * (kN + 1u));
