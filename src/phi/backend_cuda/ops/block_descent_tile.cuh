@@ -1913,7 +1913,8 @@ __device__ uint32_t InitializeTilePositions(DataView data, BlockDescentSolvePara
         // A speculative row's gap already includes its separation shell; a second dead zone can erase it.
         const float slop = (rows[slot].flags & nk::nk_row_flags::kSpeculative) != 0u ? 0.0f : p.position_slop;
         const bool position =
-            (rows[slot].flags & (nk::nk_row_flags::kFriction | nk::nk_row_flags::kVelocityOnly)) == 0u &&
+            (rows[slot].flags & (nk::nk_row_flags::kFriction | nk::nk_row_flags::kVelocityOnly |
+                                nk::nk_row_flags::kMuJoCo)) == 0u &&
             (penetration > slop || c.Value(kTileDual, h) != 0.0f);
         const float bias = position ? fminf(p.position_beta * fmaxf(penetration - slop, 0.0f) / p.dt,
                                             p.position_max_velocity) : 0.0f;
