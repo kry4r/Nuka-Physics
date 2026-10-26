@@ -13,6 +13,15 @@ namespace nuka::terrain {
 
 HeightField TerrainField(const scene::TerrainRecord& record) {
     HeightField hf;
+    if (!record.heights.empty()) {
+        hf.values = record.heights;
+        hf.nrow = record.nrow;              hf.ncol = record.ncol;
+        hf.cell_x = record.cell;            hf.cell_y = record.cell_y;
+        hf.origin = record.origin;          hf.base_z = record.base_z;
+        hf.scale_z = record.height_scale;
+        if (!IsValid(hf)) throw std::runtime_error("degenerate terrain grid");
+        return hf;
+    }
     if (!record.image_path.empty()) {
         std::string err;
         if (!LoadHeightFieldFromImage(record.image_path, record.image_radius_x, record.image_radius_y,

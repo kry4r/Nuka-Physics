@@ -533,6 +533,12 @@ struct TerrainRecord {
     std::string image_path;
     float       image_radius_x = 0.0f, image_radius_y = 0.0f;
     float       image_elevation_z = 0.0f;
+
+    // Optional explicit grid (an MJCF <hfield>): normalized [0,1] heights, row-major nrow x ncol, rising
+    // height_scale above base_z; rows step cell_y. Non-empty => the grid fills the field as given.
+    std::vector<float> heights;
+    float              height_scale = 0.0f;
+    float              cell_y = 0.0f;
 };
 
 // A first-class scripting node: inline source the editor's ScriptHost execs +

@@ -754,6 +754,9 @@ Value SaveTerrain(const TerrainRecord& t) {
     o.Set("image_radius_x", Value::Float(t.image_radius_x));
     o.Set("image_radius_y", Value::Float(t.image_radius_y));
     o.Set("image_elevation_z", Value::Float(t.image_elevation_z));
+    o.Set("heights", FloatArray(t.heights.data(), static_cast<int>(t.heights.size())));
+    o.Set("height_scale", Value::Float(t.height_scale));
+    o.Set("cell_y", Value::Float(t.cell_y));
     return o;
 }
 
@@ -2000,6 +2003,10 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             rec.image_radius_x = f(tv, "image_radius_x", rec.image_radius_x);
             rec.image_radius_y = f(tv, "image_radius_y", rec.image_radius_y);
             rec.image_elevation_z = f(tv, "image_elevation_z", rec.image_elevation_z);
+            if (const Value* hv = tv.Find("heights"))
+                for (const Value& h : hv->Elements()) rec.heights.push_back(h.AsFloat());
+            rec.height_scale = f(tv, "height_scale", rec.height_scale);
+            rec.cell_y = f(tv, "cell_y", rec.cell_y);
             scene.AddTerrain(std::move(rec));
         }
     }

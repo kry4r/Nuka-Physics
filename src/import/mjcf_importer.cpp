@@ -14,6 +14,8 @@
 
 #include <tinyxml2.h>
 
+#include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <iostream>
 #include <sstream>
@@ -167,6 +169,13 @@ struct MjcfMeshAsset {
     math::Vec3  scale = {1.0f, 1.0f, 1.0f};
 };
 
+// An MJCF <hfield> asset: its grid, size (radius_x radius_y elevation_z base_z) and inline elevation data.
+struct MjcfHeightField {
+    uint32_t           nrow = 0u, ncol = 0u;
+    float              size[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    std::vector<float> elevation;
+};
+
 // A named MJCF <site>: the body it rides on plus its body-local frame. A sensor
 // that references the site mounts on that body with this frame as its offset.
 struct MjcfSite {
@@ -181,16 +190,27 @@ struct MjcfParseContext {
     std::unordered_map<std::string, scene::MaterialId> material_ids;
     std::unordered_map<std::string, std::string> texture_files;
     std::unordered_map<std::string, MjcfMeshAsset> mesh_assets;
+    std::unordered_map<std::string, MjcfHeightField> height_fields;
+    // The static body <worldbody> geoms ride, once there are any.
+    scene::BodyId world_body = scene::kInvalidBody;
     // Named geoms only: resolves a <contact><pair geom1=/geom2=> name to the
     // ShapeId returned by AddCollisionShape (v0.8 C1b).
     std::unordered_map<std::string, scene::ShapeId> geom_ids;
     std::unordered_map<std::string, MjcfSite> site_ids;
+    // A hinged body's link frame sits on its joint anchor (MJCF joint pos), so what it authors in its
+    // own frame (geoms, sites, inertial, children, ...) moves by this shift: minus the anchor.
+    std::unordered_map<scene::BodyId, math::Vec3> anchor_shift;
     MjcfDefaults defaults;
     float angle_scale = 0.017453292519943295f;
     std::string euler_sequence = "xyz";
     int inertia_from_geom = -1;  // -1 auto, 0 false, 1 true
     int inertia_groups[2] = {0, 5};
 };
+
+math::Vec3 AnchorShift(const MjcfParseContext& context, scene::BodyId body) {
+    const auto it = context.anchor_shift.find(body);
+    return it == context.anchor_shift.end() ? math::Vec3::Zero() : it->second;
+}
 
 scene::ShapeType MjcfGeomType(const char* type_str) {
     if (!type_str) {
@@ -477,6 +497,7 @@ MjcfSite ResolveSite(const MjcfSiteDefaults& description, scene::BodyId body, co
     }
     if (description.type == "sphere") region.size.y = region.size.z = 0.0f;
     if (description.type == "capsule" || description.type == "cylinder") region.size.z = 0.0f;
+    site.local.position = site.local.position + AnchorShift(context, body);
     return site;
 }
 
@@ -630,6 +651,69 @@ void ParseMeshAssets(tinyxml2::XMLElement* mujoco,
     }
 }
 
+// Resolve <asset><hfield> entries with inline elevation data; file-backed and runtime-filled fields fail loud.
+void ParseHeightFieldAssets(tinyxml2::XMLElement* mujoco, MjcfParseContext& context) {
+    auto* asset = mujoco->FirstChildElement("asset");
+    if (!asset) {
+        return;
+    }
+    for (auto* field = asset->FirstChildElement("hfield"); field != nullptr;
+         field = field->NextSiblingElement("hfield")) {
+        const std::string name = field->Attribute("name") ? field->Attribute("name") : "";
+        if (field->Attribute("file") || !field->Attribute("elevation")) {
+            throw std::runtime_error("MJCF: hfield '" + name +
+                                     "' needs inline elevation data; file and runtime fields are not supported");
+        }
+        MjcfHeightField record;
+        record.nrow = field->UnsignedAttribute("nrow", 0u);
+        record.ncol = field->UnsignedAttribute("ncol", 0u);
+        ParseFloatList(field->Attribute("size"), record.size, 4);
+        std::istringstream ss(field->Attribute("elevation"));
+        for (float v; ss >> v;) record.elevation.push_back(v);
+        if (record.nrow < 2u || record.ncol < 2u || record.size[0] <= 0.0f || record.size[1] <= 0.0f ||
+            record.elevation.size() != static_cast<size_t>(record.nrow) * record.ncol) {
+            throw std::runtime_error("MJCF: hfield '" + name + "' has an invalid grid");
+        }
+        context.height_fields[name] = std::move(record);
+    }
+}
+
+// A worldbody hfield geom becomes the scene's terrain as MuJoCo places it: the grid spans twice the radii
+// around the geom, row r at y = -radius_y + r * cell_y, and the elevation, normalized to [0,1], rises
+// elevation_z above the geom's z.
+void AddHeightFieldTerrain(tinyxml2::XMLElement* geom, const std::string& name, scene::SceneIR& scene,
+                           const MjcfParseContext& context) {
+    const char* field_name = geom->Attribute("hfield");
+    const auto it = field_name ? context.height_fields.find(field_name) : context.height_fields.end();
+    if (it == context.height_fields.end()) {
+        throw std::runtime_error("MJCF: hfield geom '" + name + "' references no inline <hfield>");
+    }
+    const math::Quat q = ParseQuat(geom->Attribute("quat"));
+    if (geom->Attribute("euler") || geom->Attribute("axisangle") || geom->Attribute("xyaxes") ||
+        geom->Attribute("zaxis") || std::fabs(std::fabs(q.w) - 1.0f) > 1e-6f) {
+        throw std::runtime_error("MJCF: hfield geom '" + name + "' is rotated; the terrain grid is axis-aligned");
+    }
+    if (scene.TerrainCount() != 0u) {
+        throw std::runtime_error("MJCF: hfield geom '" + name + "' is a second terrain; a scene holds one");
+    }
+    const MjcfHeightField& field = it->second;
+    const auto [low, high] = std::minmax_element(field.elevation.begin(), field.elevation.end());
+    const float span = *high - *low;
+    const math::Vec3 pos = ParseVec3(geom->Attribute("pos"));
+    scene::TerrainRecord terrain;
+    terrain.name = name.empty() ? std::string(field_name) : name;
+    terrain.nrow = field.nrow;
+    terrain.ncol = field.ncol;
+    terrain.cell = 2.0f * field.size[0] / static_cast<float>(field.ncol - 1u);
+    terrain.cell_y = 2.0f * field.size[1] / static_cast<float>(field.nrow - 1u);
+    terrain.origin = {pos.x - field.size[0], pos.y - field.size[1], pos.z};
+    terrain.base_z = pos.z;
+    terrain.height_scale = field.size[2];
+    terrain.heights.reserve(field.elevation.size());
+    for (const float v : field.elevation) terrain.heights.push_back(span > 0.0f ? (v - *low) / span : 0.0f);
+    scene.AddTerrain(std::move(terrain));
+}
+
 scene::BodyId ResolveBody(const char* name, const MjcfParseContext& context) {
     if (!name) {
         return scene::kInvalidBody;
@@ -695,6 +779,17 @@ void ParseGeoms(tinyxml2::XMLElement* body_elem,
         const char* geom_class = geom->Attribute("class");
         const MjcfGeomDefaults& gd =
             DefaultClassOrRoot(context.defaults, geom_class ? geom_class : child_class).geom;
+        // A worldbody hfield is the terrain, not a collision shape of its body.
+        const char* type_name = geom->Attribute("type") ? geom->Attribute("type")
+                              : gd.has_type ? gd.type.c_str() : nullptr;
+        if (type_name != nullptr && std::string(type_name) == "hfield") {
+            if (body_id != context.world_body) {
+                throw std::runtime_error("MJCF: hfield geom '" + shape.name +
+                                         "' must sit in <worldbody>; the terrain is static");
+            }
+            AddHeightFieldTerrain(geom, shape.name, scene, context);
+            continue;
+        }
         // An explicit type overrides the class default; MJCF defaults to a sphere.
         if (const char* geom_type = geom->Attribute("type")) {
             shape.type = MjcfGeomType(geom_type);
@@ -767,6 +862,7 @@ void ParseGeoms(tinyxml2::XMLElement* body_elem,
             if (axial) shape.half_height = half_length;
             else shape.half_extents.z = half_length;
         }
+        shape.local_transform.position = shape.local_transform.position + AnchorShift(context, body_id);
 
         // nuka:decompose="auto|force|skip" + optional nuka:decompose:max_pieces
         // on a mesh geom (v0.7 p06).
@@ -935,6 +1031,20 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
     if (const char* quat_attr = body_elem->Attribute("quat")) {
         rec.local_transform.rotation = ParseQuat(quat_attr);
     }
+    // MuJoCo turns a hinge about its pos in the body frame; the link frame moves onto that anchor.
+    math::Vec3 anchor = math::Vec3::Zero();
+    for (auto* joint = body_elem->FirstChildElement("joint"); joint != nullptr;
+         joint = joint->NextSiblingElement("joint")) {
+        const char* joint_class = joint->Attribute("class");
+        const scene::JointType type = joint->Attribute("type") ? MjcfJointType(joint->Attribute("type"))
+            : DefaultClassOrRoot(context.defaults, joint_class ? joint_class : child_class).joint.type;
+        if (type == scene::JointType::Revolute && joint->Attribute("pos")) {
+            anchor = ParseVec3(joint->Attribute("pos"));
+            break;
+        }
+    }
+    rec.local_transform.position = rec.local_transform.position + AnchorShift(context, parent_id) +
+        rec.local_transform.rotation.Rotate(anchor);
 
     if (auto* inertial = body_elem->FirstChildElement("inertial")) {
         inertial->QueryFloatAttribute("mass", &rec.mass);
@@ -964,12 +1074,16 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
             }
         }
     }
+    rec.inertial_transform.position = rec.inertial_transform.position - anchor;
 
     // compiler inertiafromgeom: auto fills bodies without <inertial>, true replaces it.
     const bool from_geoms = !rec.is_static && (context.inertia_from_geom == 1 ||
         (context.inertia_from_geom == -1 && !body_elem->FirstChildElement("inertial")));
     const scene::BodyId body_id = scene.AddRigidBody(std::move(rec));
     context.body_ids[body_name] = body_id;
+    if (anchor.x != 0.0f || anchor.y != 0.0f || anchor.z != 0.0f) {
+        context.anchor_shift[body_id] = math::Vec3::Zero() - anchor;
+    }
     BodyMass mass;
     ParseGeoms(body_elem, body_id, scene, context, child_class, from_geoms ? &mass : nullptr);
     if (from_geoms) SetBodyMass(mass, scene.GetBodyMut(body_id));
@@ -1022,9 +1136,7 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         if (const char* axis_attr = joint->Attribute("axis")) {
             jrec.axis = ParseVec3(axis_attr);
         }
-        if (const char* pos_attr = joint->Attribute("pos")) {
-            jrec.parent_frame.position = ParseVec3(pos_attr);
-        }
+        // The anchor is the link origin (see above); a slide's pos does not change its motion.
         if (joint->Attribute("range")) {
             ParseRange(joint->Attribute("range"), jrec.lower_limit, jrec.upper_limit);
             has_range = true;
@@ -1059,6 +1171,7 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         if (const char* pos = camera->Attribute("pos")) {
             record.local_transform.position = ParseVec3(pos);
         }
+        record.local_transform.position = record.local_transform.position + AnchorShift(context, body_id);
         if (const char* quat = camera->Attribute("quat")) {
             record.local_transform.rotation = ParseQuat(quat);
         }
@@ -1470,11 +1583,13 @@ scene::SceneIR LoadMjcf(const std::string& path) {
     ParseMaterials(mujoco, scene, context, std::filesystem::path(path).parent_path());
     ParseNukaEnvironment(mujoco, scene);
     ParseMeshAssets(mujoco, context, std::filesystem::path(path).parent_path());
+    ParseHeightFieldAssets(mujoco, context);
     ParseLights(worldbody, scene);
 
     // Geoms placed straight in <worldbody> ride a static world body.
     if (worldbody->FirstChildElement("geom")) {
-        ParseGeoms(worldbody, AddStaticBody("world", scene), scene, context, nullptr, nullptr);
+        context.world_body = AddStaticBody("world", scene);
+        ParseGeoms(worldbody, context.world_body, scene, context, nullptr, nullptr);
     }
     for (auto* body = worldbody->FirstChildElement("body");
          body != nullptr;
