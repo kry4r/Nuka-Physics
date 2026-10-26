@@ -99,9 +99,10 @@ __global__ void ContactForceKernel(const float* __restrict__ lambda,
     const uint32_t t1 = range.points;
     float fn = 0.0f, ft1 = 0.0f, ft2 = 0.0f;
     for (uint32_t i = 0u; i < pts; ++i) {
-        fn += lambda[row_base + i];
-        ft1 += lambda[row_base + t1 + i];
-        ft2 += lambda[row_base + 2u * t1 + i];
+        const auto impulse = nk::ContactPointImpulse(urows, lambda, row_base + i, t1);
+        fn += impulse.x;
+        ft1 += impulse.y;
+        ft2 += impulse.z;
     }
     const uint32_t base = slot * kContactForceComponents;
     out_contact_force[base + 0u] = fn * inv_dt;
@@ -347,7 +348,7 @@ __device__ void ClearWarmStartPoint(
     float* cache_lambda, Vec3* cache_normal, uint64_t* cache_material, uint32_t* cache_age) {
     cache_pair[point_index] = 0u;
     cache_feature[point_index] = 0u;
-    for (uint32_t k = 0u; k < 3u; ++k) cache_lambda[point_index * 3u + k] = 0.0f;
+    for (uint32_t k = 0u; k < 4u; ++k) cache_lambda[point_index * 4u + k] = 0.0f;
     cache_normal[point_index] = {0.0f, 0.0f, 0.0f};
     cache_material[point_index] = 0u;
     cache_age[point_index] = 0u;

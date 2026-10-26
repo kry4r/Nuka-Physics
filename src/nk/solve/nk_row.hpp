@@ -52,18 +52,15 @@ inline constexpr uint32_t kMaterialBlock = 1u << 9;
 // Moves a vertex-block particle, whose velocity also changes between row colors of a sweep.
 inline constexpr uint32_t kVertexBlock = 1u << 10;
 inline constexpr uint32_t kMuJoCo = 1u << 11;
+inline constexpr uint32_t kPyramidal = 1u << 12;
 }  // namespace nk_row_flags
 
-// General contact pipeline (PairDriven family, Phase 1B): the FIXED per-candidate-
-// slot row layout the assembly (EmitPairDrivenRowsKernel) emits and the cook sizes
-// max_rows_per_env by. Each candidate slot expands to kPdPtsPerSlot manifold points
-// (cvx caps at 4), each point -> one block normal plus two tangent rows.
-// The normal row owns the analytic cone projection; tangent rows carry their
-// Jacobians so the same island/reaction path sees all three directions.
+// Rigid points reserve four scalar edges; elliptic contacts occupy the first three axes.
 inline constexpr uint32_t kPairDrivenPtsPerSlot = 4u;
 inline constexpr uint32_t kPairDrivenTangentRowsPerPt = 2u;
+inline constexpr uint32_t kRigidContactRowsPerPt = 4u;
 inline constexpr uint32_t kPairDrivenRowsPerSlot =
-    kPairDrivenPtsPerSlot * (1u + kPairDrivenTangentRowsPerPt);  // 12
+    kPairDrivenPtsPerSlot * kRigidContactRowsPerPt;
 
 // A body<->particle provider models every particle as a sphere and therefore
 // emits at most one manifold point, independent of the particle solver mode.

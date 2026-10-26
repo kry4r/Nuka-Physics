@@ -160,7 +160,7 @@ __global__ void ReadoutContactImpulseKernel(ModelView model, DataView data, Read
             const uint32_t base = ContactRowBase(p, data, env, slot, count);
             for (uint32_t point = 0u; point < points && point < count; ++point) {
                 const auto arm = data.ucontact_point[point_base + point] - origin;
-                for (uint32_t axis = 0u; axis <= nk::kPairDrivenTangentRowsPerPt; ++axis) {
+                for (uint32_t axis = 0u; axis < nk::ContactPointAxes(rows[base + point]); ++axis) {
                     const uint32_t index = base + axis * count + point;
                     const auto& row = rows[index];
                     if (!(row.flags & nk::nk_row_flags::kActive)) continue;
@@ -264,10 +264,11 @@ __global__ void ReadoutContactRegionKernel(ModelView model, DataView data, Reado
                 const auto position = mg::RotateByQuatNormalized(inverse, data.ucontact_point[point_base + point] - origin);
                 for (uint32_t side = 0u; side < 2u; ++side) {
                     if (!sides[side]) continue;
-                    const auto normal = side == 0u ? normal_row.a.jlin : normal_row.b.jlin;
+                    const auto normal = nk::ContactPointNormal(rows, base + point, count, side != 0u);
                     const auto local_normal = mg::RotateByQuatNormalized(inverse, normal);
                     if (p.kind == sensor::StateSensorKind::Touch) {
-                        const float magnitude = sqrtf(normal.Dot(normal)) * data.lambda[base + point];
+                        const float magnitude = sqrtf(normal.Dot(normal)) *
+                            nk::ContactPointImpulse(rows, data.lambda, base + point, count).x;
                         if (magnitude > 0.0f && sensor::TouchRegionIntersectsRay(p.config, position, local_normal * -1.0f))
                             sum.x += magnitude;
                         continue;
@@ -276,7 +277,7 @@ __global__ void ReadoutContactRegionKernel(ModelView model, DataView data, Reado
                     const float weight = sensor::TaxelWeight(p.config, position);
                     if (!(weight > 0.0f)) continue;
                     math::Vec3 impulse{};
-                    for (uint32_t axis = 0u; axis <= nk::kPairDrivenTangentRowsPerPt; ++axis) {
+                    for (uint32_t axis = 0u; axis < nk::ContactPointAxes(normal_row); ++axis) {
                         const uint32_t index = base + axis * count + point;
                         const auto& row = rows[index];
                         if (!(row.flags & nk::nk_row_flags::kActive)) continue;

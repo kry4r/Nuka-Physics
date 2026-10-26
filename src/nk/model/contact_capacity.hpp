@@ -37,7 +37,7 @@ struct RigidContactCapacity {
             points += count * width;
             capacity -= count;
         }
-        return (points + capacity * kPairDrivenPtsPerSlot) * (1u + kPairDrivenTangentRowsPerPt);
+        return (points + capacity * kPairDrivenPtsPerSlot) * kRigidContactRowsPerPt;
     }
 };
 

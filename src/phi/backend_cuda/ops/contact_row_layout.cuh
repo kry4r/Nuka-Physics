@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include "nk/contact/row_layout.hpp"
+#include "nk/contact/row_readout.hpp"
 
 namespace nuka::phi::nkops {
 

@@ -504,7 +504,7 @@ fields:
   # in the friction basis its cached normal defines.
   - {name: contact_cache_pair, dtype: u64, per: contact_slot, arena: persistent, owner: data, elem: 4}
   - {name: contact_cache_feature, dtype: u64, per: contact_slot, arena: persistent, owner: data, elem: 4}
-  - {name: contact_cache_lambda, dtype: f32, per: contact_slot, arena: persistent, owner: data, elem: 12}
+  - {name: contact_cache_lambda, dtype: f32, per: contact_slot, arena: persistent, owner: data, elem: 16}
   - {name: contact_cache_normal, dtype: vec3, per: contact_slot, arena: persistent, owner: data, elem: 4}
   - {name: contact_cache_material, dtype: u64, per: contact_slot, arena: persistent, owner: data, elem: 4}
   - {name: contact_cache_age, dtype: u32, per: contact_slot, arena: persistent, owner: data, elem: 4}
@@ -512,7 +512,7 @@ fields:
   # Scratch snapshot and ownership masks for deterministic parallel cache rebuild.
   - {name: contact_cache_snapshot_pair, dtype: u64, per: contact_slot, arena: scratch, owner: data, elem: 4}
   - {name: contact_cache_snapshot_feature, dtype: u64, per: contact_slot, arena: scratch, owner: data, elem: 4}
-  - {name: contact_cache_snapshot_lambda, dtype: f32, per: contact_slot, arena: scratch, owner: data, elem: 12}
+  - {name: contact_cache_snapshot_lambda, dtype: f32, per: contact_slot, arena: scratch, owner: data, elem: 16}
   - {name: contact_cache_snapshot_normal, dtype: vec3, per: contact_slot, arena: scratch, owner: data, elem: 4}
   - {name: contact_cache_snapshot_material, dtype: u64, per: contact_slot, arena: scratch, owner: data, elem: 4}
   - {name: contact_cache_snapshot_age, dtype: u32, per: contact_slot, arena: scratch, owner: data, elem: 4}

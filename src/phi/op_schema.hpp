@@ -582,6 +582,7 @@ struct AssembleRowsParams {
     float    solimp[5];         // merged contact solimp (union family)
     float impratio;
     bool refsafe;
+    uint32_t cone;
     uint32_t particles_per_env; // particle coupling (kUSlotParticleSphere*).
     uint32_t num_material_buckets;  // 0 == no authored materials -> model defaults.
     // Cap on the contact normal aref so a deep contact recovers over several steps,

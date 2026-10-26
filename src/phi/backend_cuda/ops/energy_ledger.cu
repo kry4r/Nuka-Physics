@@ -456,7 +456,20 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
             add(EnergyColumn::RowRateWork, impulse * (a.rate + b.rate));
             add(EnergyColumn::RowPhysicalImpulseWork, impulse * (a.applied + b.applied));
             if (local >= first_drive && local < first_drive + p.drive_rows) continue;
-            if ((r.flags & nk::nk_row_flags::kBlockTangent) ||
+            if (r.flags & nk::nk_row_flags::kPyramidal) {
+                const uint32_t contact = nkops::ContactSlotForRow(d.ucontact_row_range,
+                    env * p.contact_slots_per_env, p.contact_slots_per_env, row);
+                const auto range = nkops::ContactRowRangeFor(d.ucontact_row_range, contact);
+                const uint32_t first = range.first + (row - range.first) % range.points;
+                const uint32_t second = first + range.points;
+                const auto n0a = SidePower(rows[first].a, false, first, m, d, p);
+                const auto n0b = SidePower(rows[first].b, true, first, m, d, p);
+                const auto n1a = SidePower(rows[second].a, false, second, m, d, p);
+                const auto n1b = SidePower(rows[second].b, true, second, m, d, p);
+                const double normal_work = impulse * 0.5 * (n0a.physical + n0b.physical + n1a.physical + n1b.physical);
+                add(EnergyColumn::NormalLoss, -normal_work);
+                add(EnergyColumn::FrictionLoss, normal_work - work);
+            } else if ((r.flags & nk::nk_row_flags::kBlockTangent) ||
                 (local >= first_friction && local < first_drive)) add(EnergyColumn::FrictionLoss, -work);
             else if (r.flags & (nk::nk_row_flags::kContactNormal | nk::nk_row_flags::kBlockNormal))
                 add(EnergyColumn::NormalLoss, -work);
@@ -849,15 +862,23 @@ __global__ void ContactAuditKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
             continue;
         }
         count(C::Contacts);
-        const uint32_t axes = normal.flags & nk::nk_row_flags::kBlockNormal ? 3u : 1u;
-        const float normal_impulse = d.lambda[slot];
+        const bool pyramidal = (normal.flags & nk::nk_row_flags::kPyramidal) != 0u;
+        const uint32_t axes = pyramidal ? 4u : normal.flags & nk::nk_row_flags::kBlockNormal ? 3u : 1u;
+        uint32_t stride = normal.group_normal_count;
+        if (pyramidal) {
+            const uint32_t contact = nkops::ContactSlotForRow(d.ucontact_row_range,
+                env * p.contact_slots_per_env, p.contact_slots_per_env, slot);
+            stride = nkops::ContactRowRangeFor(d.ucontact_row_range, contact).points;
+        }
+        const auto resolved = nk::ContactPointImpulse(rows, d.lambda, slot, stride);
+        const float normal_impulse = resolved.x;
         if (!isfinite(normal_impulse)) count(C::InvalidRows);
         if (normal_impulse < 0.0f) count(C::NegativeNormalImpulses);
         maximum(M::NegativeNormalImpulse, -normal_impulse, slot);
         double scaled_tangent[2]{};
         bool cone_invalid = false;
         for (uint32_t axis = 0u; axis < axes; ++axis) {
-            const uint32_t row = slot + axis * normal.group_normal_count;
+            const uint32_t row = slot + axis * stride;
             if (row >= (env + 1u) * p.rows_per_env) { count(C::InvalidRows); continue; }
             const auto r = rows[row];
             count(C::Rows);
@@ -874,13 +895,18 @@ __global__ void ContactAuditKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
                 maximum(axis == 0u ? M::NormalDisplacementRate : M::TangentDisplacementRate,
                     float(copysign(1.0, impulse) * (SideDisplacementRate(r.a, false, row, d, p) +
                                                     SideDisplacementRate(r.b, true, row, d, p))), row);
-            if (axis != 0u) {
+            if (axis != 0u && !pyramidal) {
                 const float mu = axis == 1u ? normal.mu : normal.friction_secondary;
                 if (mu > 0.0f) scaled_tangent[axis - 1u] = impulse / mu;
                 else if (impulse != 0.0) cone_invalid = true;
             }
         }
-        const double tangent = hypot(scaled_tangent[0], scaled_tangent[1]);
+        if (pyramidal) {
+            scaled_tangent[0] = resolved.y / normal.mu;
+            scaled_tangent[1] = resolved.z / normal.friction_secondary;
+        }
+        const double tangent = pyramidal ? fabs(scaled_tangent[0]) + fabs(scaled_tangent[1])
+                                         : hypot(scaled_tangent[0], scaled_tangent[1]);
         if (cone_invalid || tangent > fmax(double(normal_impulse), 0.0) * 1.001) count(C::ConeViolations);
         maximum(M::ConeImpulseExcess, cone_invalid ? FLT_MAX : float(tangent - normal_impulse), slot);
     }

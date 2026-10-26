@@ -205,10 +205,9 @@ bool DenseTileRoute(const BlockDescentSolveParams& p) {
                                  p.articulation_count + p.total_body_count, p.max_dof);
 }
 
-// Head rows an environment can hold in whole warps: a contact head takes two tangent rows, every other
-// row heads.
+// Each scalar row may head an independent constraint; grouped contacts use fewer heads.
 uint32_t TileHeadCapacity(const BlockDescentSolveParams& p) {
-    const uint32_t heads = p.contact_rows_per_env / 3u + (p.rows_per_env - p.contact_rows_per_env);
+    const uint32_t heads = p.rows_per_env;
     return (heads + kTileLanes - 1u) / kTileLanes * kTileLanes;
 }
 

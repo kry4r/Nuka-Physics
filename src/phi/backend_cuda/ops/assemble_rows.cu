@@ -330,7 +330,7 @@ __global__ void InitializePairDrivenRangesKernel(
         const uint32_t points = slot < rigid_slots ? counts[env * slot_count + slot] : 0u;
         uint32_t prefix;
         Scan(scratch).ExclusiveSum(points, prefix);
-        const uint32_t first = env * rows_per_env + (carry + prefix) * (1u + kPdTangentRows);
+        const uint32_t first = env * rows_per_env + (carry + prefix) * nk::kRigidContactRowsPerPt;
         if (slot < rigid_slots) {
             const size_t index = size_t{env * slot_count + slot} * 2u;
             ranges[index] = first;
@@ -406,7 +406,7 @@ __global__ void EmitPairDrivenRowsKernel(
     const float* __restrict__ particle_friction,
     float solref0, float solref1,
     float solimp0, float solimp1, float solimp2, float solimp3, float solimp4,
-    float dt, float impratio, bool refsafe, float overlap_recovery_velocity,
+    float dt, float impratio, bool refsafe, uint32_t cone, float overlap_recovery_velocity,
     uint32_t env_count, uint32_t slot_count, uint32_t rows_per_env,
     uint32_t full_row_slot_count, uint32_t ogc_slot_count,
     uint32_t bodies_per_env, uint32_t base_link_count, uint32_t artics_per_env,
@@ -436,7 +436,8 @@ __global__ void EmitPairDrivenRowsKernel(
         if (filled != 0u &&
             (threadIdx.x & 31u) == 31u - static_cast<uint32_t>(__clz(static_cast<int>(filled))))
             atomicMax(contact_row_extent + 2u * env + 1u,
-                      base - env * rows_per_env + (1u + kPdTangentRows) * points_per_slot + 1u);
+                      base - env * rows_per_env + points_per_slot *
+                          (slot < full_row_slot_count ? nk::kRigidContactRowsPerPt : 1u + kPdTangentRows) + 1u);
     }
     // Empty slots retain their initialized rows.
     if (n_active == 0u) return;
@@ -543,9 +544,11 @@ __global__ void EmitPairDrivenRowsKernel(
     const float mu1 = merged.mu1;
     const float mu2 = merged.mu2;
     const float invweight = mujoco ? body_invweight0[2u * body_a] + body_invweight0[2u * body_b] : 0.0f;
+    const bool pyramidal = mujoco && cone == 0u && merged.condim == 3u;
     contact_material[gid] = n_active > 0u ? HashMergedContactProfile(merged) : 0u;
     if (n_active > 0u && velocity_only)
         contact_material[gid] = nk::ContactHashWord(contact_material[gid], law);
+    if (mujoco) contact_material[gid] = nk::ContactHashWord(contact_material[gid], cone);
     const float kFltMaxLocal = kFltMax;
 
     uint32_t active_rows = 0u;
@@ -572,6 +575,46 @@ __global__ void EmitPairDrivenRowsKernel(
         }
 
         // ---- normal row ------------------------------------------------------
+        if (pyramidal) {
+            const float edge_invweight = (invweight + mu1 * mu1 * invweight) * 2.0f * mu1 * mu1 / impratio;
+            const float pos = -ucontact_depth[mp] - merged.margin;
+            const auto compliant = constraint::ComputeCompliantRow(solref, solimp,
+                pos, pos, 0.0f, edge_invweight, dt, refsafe);
+            for (uint32_t edge = 0u; edge < 4u; ++edge) {
+                const uint32_t rs = base + edge * points_per_slot + p;
+                NkRow row{};
+                lambda[rs] = 0.0f;
+                row_penetration[rs] = 0.0f;
+                row_cj_link[rs] = row_cj_link_b[rs] = kInvalidLink;
+                if (live) {
+                    const float mu = edge < 2u ? mu1 : mu2;
+                    const math::Vec3 tangent = edge < 2u ? t0 : t1v;
+                    const math::Vec3 dir = n + tangent * ((edge & 1u) ? -mu : mu);
+                    row.flags = nk::nk_row_flags::kActive | nk::nk_row_flags::kMuJoCo | nk::nk_row_flags::kPyramidal;
+                    if (edge == 0u) row.flags |= nk::nk_row_flags::kContactNormal;
+                    row.group_first = rs;
+                    row.group_normal_count = 1u;
+                    row.env = env;
+                    row.rhs = compliant.aref_bias;
+                    row.compliance_alpha = compliant.R;
+                    row.lower = 0.0f;
+                    row.upper = kFltMaxLocal;
+                    row.mu = mu1;
+                    row.friction_secondary = mu2;
+                    row.a.kind = kind_a; row.a.index = idx_a; row.a.jlin = dir;
+                    row.b.kind = kind_b; row.b.index = idx_b; row.b.jlin = dir * -1.0f;
+                    if (kind_a == kNkSideRigid) row.a.jang = (point - com_a).Cross(row.a.jlin);
+                    if (kind_b == kNkSideRigid) row.b.jang = (point - com_b).Cross(row.b.jlin);
+                    if (kind_a == kNkSideArtic) { row_cj_link[rs] = link_a; row_cj_point[rs] = point; }
+                    if (kind_b == kNkSideArtic) { row_cj_link_b[rs] = link_b; row_cj_point_b[rs] = point; }
+                    row_reference_velocity_gain[rs] = 1.0f / dt - compliant.damping;
+                    row_invweight[rs] = edge_invweight;
+                    ++active_rows;
+                }
+                urows[rs] = row;
+            }
+            continue;
+        }
         {
             const uint32_t rs = normal_row;
             NkRow row{};
@@ -1138,7 +1181,7 @@ __global__ void PrepareContactWarmStartKernel(
     const uint32_t* __restrict__ matches,
     const uint32_t* __restrict__ order,
     const uint32_t* __restrict__ begins,
-    const uint32_t* __restrict__ ends,
+    const uint32_t* __restrict__ ends, const NkRow* rows,
     uint32_t env_count, uint32_t slot_count, const uint32_t* row_ranges, uint32_t blocks_per_env, float* __restrict__ lambda) {
     BeginProgrammaticKernel();
     const uint32_t points_per_env = slot_count * 4u;
@@ -1158,12 +1201,18 @@ __global__ void PrepareContactWarmStartKernel(
         uint32_t normal_row = 0u, tangent1_row = 0u, tangent2_row = 0u;
         if (!ContactRowOffsets(env, slot, point, slot_count, row_ranges, &normal_row, &tangent1_row,
                                &tangent2_row)) continue;
-        const float normal_impulse = fmaxf(cache_lambda[match * 3u], 0.0f);
+        if (rows[normal_row].flags & nk::nk_row_flags::kPyramidal) {
+            const uint32_t stride = tangent1_row - normal_row;
+            for (uint32_t edge = 0u; edge < 4u; ++edge)
+                lambda[normal_row + edge * stride] = cache_lambda[match * 4u + edge];
+            continue;
+        }
+        const float normal_impulse = fmaxf(cache_lambda[match * 4u], 0.0f);
         math::Vec3 old_t1, old_t2, t1, t2;
         mg::ContactTangentBasis(cache_normal[match], &old_t1, &old_t2);
         mg::ContactTangentBasis(n, &t1, &t2);
         const math::Vec3 old_tangent_impulse =
-            old_t1 * cache_lambda[match * 3u + 1u] + old_t2 * cache_lambda[match * 3u + 2u];
+            old_t1 * cache_lambda[match * 4u + 1u] + old_t2 * cache_lambda[match * 4u + 2u];
         const float tangent1 = old_tangent_impulse.Dot(t1);
         const float tangent2 = old_tangent_impulse.Dot(t2);
         lambda[normal_row] = normal_impulse;
@@ -1177,9 +1226,7 @@ __device__ void ClearContactCachePoint(
     float* cache_lambda, math::Vec3* cache_normal, uint64_t* cache_material, uint32_t* cache_age) {
     cache_pair[point_index] = 0u;
     cache_feature[point_index] = 0u;
-    cache_lambda[point_index * 3u + 0u] = 0.0f;
-    cache_lambda[point_index * 3u + 1u] = 0.0f;
-    cache_lambda[point_index * 3u + 2u] = 0.0f;
+    for (uint32_t k = 0u; k < 4u; ++k) cache_lambda[point_index * 4u + k] = 0.0f;
     cache_normal[point_index] = {0.0f, 0.0f, 0.0f};
     cache_material[point_index] = 0u;
     cache_age[point_index] = 0u;
@@ -1213,8 +1260,8 @@ __global__ void SnapshotContactCacheKernel(
         if (old_keep[point_index] == 0u) continue;
         snapshot_pair[point_index] = cache_pair[point_index];
         snapshot_feature[point_index] = cache_feature[point_index];
-        for (uint32_t k = 0u; k < 3u; ++k)
-            snapshot_lambda[point_index * 3u + k] = cache_lambda[point_index * 3u + k];
+        for (uint32_t k = 0u; k < 4u; ++k)
+            snapshot_lambda[point_index * 4u + k] = cache_lambda[point_index * 4u + k];
         snapshot_normal[point_index] = cache_normal[point_index];
         snapshot_material[point_index] = cache_material[point_index];
         snapshot_age[point_index] = cache_age[point_index];
@@ -1239,7 +1286,7 @@ __global__ void RebuildContactCacheKernel(
     const contact_cache::Ranks* __restrict__ ranks,
     const uint32_t* __restrict__ retained_sources,
     const uint32_t* __restrict__ extent, uint32_t env_blocks,
-    uint32_t slot_count, const uint32_t* row_ranges,
+    uint32_t slot_count, const uint32_t* row_ranges, const NkRow* rows,
     uint64_t* __restrict__ cache_pair,
     uint64_t* __restrict__ cache_feature,
     float* __restrict__ cache_lambda,
@@ -1263,9 +1310,10 @@ __global__ void RebuildContactCacheKernel(
                                   &tangent2_row)) {
                 cache_pair[point_index] = current_pair[point_index];
                 cache_feature[point_index] = current_feature[point_index];
-                cache_lambda[point_index * 3u] = fmaxf(lambda[normal_row], 0.0f);
-                cache_lambda[point_index * 3u + 1u] = lambda[tangent1_row];
-                cache_lambda[point_index * 3u + 2u] = lambda[tangent2_row];
+                const uint32_t axes = nk::ContactPointAxes(rows[normal_row]);
+                const uint32_t stride = tangent1_row - normal_row;
+                for (uint32_t k = 0u; k < 4u; ++k)
+                    cache_lambda[point_index * 4u + k] = k < axes ? lambda[normal_row + k * stride] : 0.0f;
                 cache_normal[point_index] = current_normal[point_index];
                 cache_material[point_index] = current_material[point_index / 4u];
                 cache_age[point_index] = 0u;
@@ -1279,8 +1327,8 @@ __global__ void RebuildContactCacheKernel(
         if (source != ~0u) {
             cache_pair[point_index] = snapshot_pair[source];
             cache_feature[point_index] = snapshot_feature[source];
-            for (uint32_t k = 0u; k < 3u; ++k)
-                cache_lambda[point_index * 3u + k] = snapshot_lambda[source * 3u + k];
+            for (uint32_t k = 0u; k < 4u; ++k)
+                cache_lambda[point_index * 4u + k] = snapshot_lambda[source * 4u + k];
             cache_normal[point_index] = snapshot_normal[source];
             cache_material[point_index] = snapshot_material[source];
             cache_age[point_index] = snapshot_age[source] + 1u;
@@ -1315,7 +1363,8 @@ Status OpContactWarmStart(const ModelView& /*model*/, const DataView& data,
         LaunchCuda<true>(PrepareContactWarmStartKernel, dim3(p->env_count * env_blocks), dim3(kBlock), 0u,
                    stream, data.ucontact_normal, data.contact_cache_lambda,
                    data.contact_cache_normal, workspace.matches, workspace.order,
-                   workspace.begins, workspace.ends, p->env_count, p->slot_count,
+                   workspace.begins, workspace.ends, reinterpret_cast<const NkRow*>(data.urows),
+                   p->env_count, p->slot_count,
                    data.ucontact_row_range, env_blocks, data.lambda);
     } else {
         const uint32_t points_per_env = p->slot_count * nk::kPairDrivenPtsPerSlot;
@@ -1346,7 +1395,7 @@ Status OpContactWarmStart(const ModelView& /*model*/, const DataView& data,
                    data.contact_cache_current_owner,
                    data.contact_cache_old_keep, workspace.ranks, workspace.matches,
                    data.contact_cache_extent, point_blocks, p->slot_count,
-                   data.ucontact_row_range,
+                   data.ucontact_row_range, reinterpret_cast<const NkRow*>(data.urows),
                    data.contact_cache_pair, data.contact_cache_feature,
                    data.contact_cache_lambda, data.contact_cache_normal,
                    data.contact_cache_material, data.contact_cache_age);
@@ -1451,7 +1500,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    static_cast<const float*>(model.particle_friction),
                    p->solref[0], p->solref[1],
                    p->solimp[0], p->solimp[1], p->solimp[2], p->solimp[3], p->solimp[4],
-                   p->dt, p->impratio, p->refsafe, p->overlap_recovery_velocity,
+                   p->dt, p->impratio, p->refsafe, p->cone, p->overlap_recovery_velocity,
                    p->env_count, p->union_slot_count, p->rows_per_env,
                    p->full_row_slot_count, p->ogc_slot_count,
                    p->bodies_per_env, p->base_link_count, artics_per_env,
