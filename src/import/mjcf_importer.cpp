@@ -4,6 +4,7 @@
 
 #include "import/mjcf_importer.hpp"
 
+#include "import/cooker/convex_decomposition.hpp"
 #include "import/geom_inertia.hpp"
 #include "import/mesh_file_loader.hpp"
 #include "import/principal_inertia.hpp"
@@ -867,9 +868,12 @@ void ParseGeoms(tinyxml2::XMLElement* body_elem,
         // nuka:decompose="auto|force|skip" + optional nuka:decompose:max_pieces
         // on a mesh geom (v0.7 p06).
         if (shape.type == scene::ShapeType::TriMesh) {
+            bool as_hull = false;
             if (const char* mode = geom->Attribute("nuka:mesh_contact")) {
                 if (std::string(mode) == "sdf")
                     shape.mesh_contact = scene::CollisionShapeRecord::MeshContact::Sdf;
+                else if (std::string(mode) == "hull")
+                    as_hull = true;
                 else if (std::string(mode) != "ogc")
                     throw std::runtime_error("MJCF: invalid mesh contact mode");
             }
@@ -930,6 +934,20 @@ void ParseGeoms(tinyxml2::XMLElement* body_elem,
                 shape.mesh_normals = std::move(geo.normals);
                 shape.mesh_uvs = std::move(geo.uvs);
                 shape.mesh_indices = std::move(geo.indices);
+            }
+            // MuJoCo collides a mesh geom as the hull of its vertices, capped at maxhullvert corners.
+            if (as_hull) {
+                int limit = 0x7fffffff;
+                geom->QueryIntAttribute("nuka:hull_vertex_limit", &limit);
+                cooker::ConvexPiece hull = cooker::ComputeConvexHull(shape.mesh_vertices.data(),
+                    static_cast<uint32_t>(shape.mesh_vertices.size() / 3u), static_cast<uint32_t>(limit));
+                if (hull.volume > 0.0f) {
+                    shape.type = scene::ShapeType::ConvexHull;
+                    shape.mesh_vertices = std::move(hull.vertices);
+                    shape.mesh_indices = std::move(hull.indices);
+                    shape.mesh_normals.clear();
+                    shape.mesh_uvs.clear();
+                }
             }
         }
 
@@ -1031,20 +1049,45 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
     if (const char* quat_attr = body_elem->Attribute("quat")) {
         rec.local_transform.rotation = ParseQuat(quat_attr);
     }
-    // MuJoCo turns a hinge about its pos in the body frame; the link frame moves onto that anchor.
+    // MuJoCo turns a hinge about its pos in the body frame; the link frame moves onto that anchor. Several
+    // hinges/slides apply in order (mj_kinematics): every joint but the last moves a massless link on its own
+    // anchor, and the body hangs off the last one. A slide keeps the previous anchor (its pos moves nothing).
+    std::vector<std::pair<tinyxml2::XMLElement*, math::Vec3>> chain;
     math::Vec3 anchor = math::Vec3::Zero();
     for (auto* joint = body_elem->FirstChildElement("joint"); joint != nullptr;
          joint = joint->NextSiblingElement("joint")) {
         const char* joint_class = joint->Attribute("class");
         const scene::JointType type = joint->Attribute("type") ? MjcfJointType(joint->Attribute("type"))
             : DefaultClassOrRoot(context.defaults, joint_class ? joint_class : child_class).joint.type;
-        if (type == scene::JointType::Revolute && joint->Attribute("pos")) {
-            anchor = ParseVec3(joint->Attribute("pos"));
-            break;
-        }
+        if (type != scene::JointType::Revolute && type != scene::JointType::Prismatic) continue;
+        if (type == scene::JointType::Revolute && joint->Attribute("pos")) anchor = ParseVec3(joint->Attribute("pos"));
+        chain.emplace_back(joint, anchor);
     }
-    rec.local_transform.position = rec.local_transform.position + AnchorShift(context, parent_id) +
-        rec.local_transform.rotation.Rotate(anchor);
+    rec.local_transform.position = rec.local_transform.position + AnchorShift(context, parent_id);
+    std::unordered_map<tinyxml2::XMLElement*, std::pair<scene::BodyId, scene::BodyId>> joint_bodies;
+    math::Vec3 previous = math::Vec3::Zero();
+    for (size_t k = 0; k + 1 < chain.size(); ++k) {
+        scene::RigidBodyRecord link;
+        const char* jname = chain[k].first->Attribute("name");
+        link.name = body_name + "/" + (jname ? jname : "joint" + std::to_string(k));
+        link.parent_id = parent_id;
+        link.local_transform.position = k == 0 ? rec.local_transform.position +
+            rec.local_transform.rotation.Rotate(chain[k].second) : chain[k].second - previous;
+        link.local_transform.rotation = k == 0 ? rec.local_transform.rotation : math::Quat::Identity();
+        link.mass = 1.0e-6f;
+        link.inertia = math::Vec3{1.0e-9f, 1.0e-9f, 1.0e-9f};
+        const scene::BodyId link_id = scene.AddRigidBody(std::move(link));
+        joint_bodies[chain[k].first] = {parent_id, link_id};
+        parent_id = link_id;
+        previous = chain[k].second;
+    }
+    if (chain.size() > 1) {
+        rec.parent_id = parent_id;
+        rec.local_transform.position = anchor - previous;
+        rec.local_transform.rotation = math::Quat::Identity();
+    } else {
+        rec.local_transform.position = rec.local_transform.position + rec.local_transform.rotation.Rotate(anchor);
+    }
 
     if (auto* inertial = body_elem->FirstChildElement("inertial")) {
         inertial->QueryFloatAttribute("mass", &rec.mass);
@@ -1081,6 +1124,7 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         (context.inertia_from_geom == -1 && !body_elem->FirstChildElement("inertial")));
     const scene::BodyId body_id = scene.AddRigidBody(std::move(rec));
     context.body_ids[body_name] = body_id;
+    if (!chain.empty()) joint_bodies[chain.back().first] = {parent_id, body_id};
     if (anchor.x != 0.0f || anchor.y != 0.0f || anchor.z != 0.0f) {
         context.anchor_shift[body_id] = math::Vec3::Zero() - anchor;
     }
@@ -1111,8 +1155,9 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
             DefaultClassOrRoot(context.defaults, joint_class ? joint_class : child_class);
         scene::JointRecord jrec;
         jrec.name = jname ? jname : "unnamed_joint";
-        jrec.parent_body = parent_id;
-        jrec.child_body = body_id;
+        const auto link = joint_bodies.find(joint);
+        jrec.parent_body = link != joint_bodies.end() ? link->second.first : parent_id;
+        jrec.child_body = link != joint_bodies.end() ? link->second.second : body_id;
         jrec.type = defaults.joint.type;
         jrec.axis = defaults.joint.axis;
         jrec.lower_limit = defaults.joint.lower_limit;
