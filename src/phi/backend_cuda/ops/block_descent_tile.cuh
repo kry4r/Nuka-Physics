@@ -111,32 +111,123 @@ __device__ __forceinline__ void TileWorkSync() {
     asm volatile("barrier.cta.sync 1;" ::: "memory");
 }
 
+// The work a wide tile's helper warps join: head setup, a staged chunk's Hessian products, the Hessian's
+// rounding scale, or its factor.
+enum class TileWork : uint32_t { Heads, Products, Scale, Factor };
+
 struct TileChunkWork {
     bool stop;
+    TileWork kind;
     uint32_t dimension, begin, end;
-    float* factor;
-    const float* stage;
-    const uint2* rows;
-    const float4* terms;
     const TileContext* heads;
+    // The coordinates the staged rows touch, ascending; entries off them take no products.
+    uint32_t count;
+    uint8_t coordinates[64];
 };
+
+// A tile's shared buffers past its mass: the factor, a chunk's row terms and rows, and the stage. Helpers derive
+// them from the shared array itself, so their accesses stay shared ones.
+struct TileBuffers {
+    float* factor;
+    float4* terms;
+    uint2* rows;
+    float* stage;
+};
+
+template <uint32_t kN>
+__device__ __forceinline__ TileBuffers TileBuffersAt(float* mass) {
+    float* const factor = mass + kN * (kN + 1u);
+    float4* const terms = reinterpret_cast<float4*>(factor + kN * (kN + 1u));
+    uint2* const rows = reinterpret_cast<uint2*>(terms + kTileChunkRows);
+    return {factor, terms, rows, reinterpret_cast<float*>(rows + kTileChunkRows)};
+}
+
+// Stage floats of the scale and factor passes: |u|, the rounding scales, finite rows, two raw factor columns,
+// the pivot inverses and the factor's validity.
+constexpr uint32_t kStageSpeeds = 0u, kStageScale = 64u, kStageFinite = 128u, kStageRaw = 192u,
+                   kStageInverse = 320u, kStageValid = 384u;
 
 // Coordinates above a warp share the Hessian products across a block, retaining each sum's row order.
 template <uint32_t kN>
-__device__ void AssembleTileChunk(const TileChunkWork& work) {
-    const uint32_t n = work.dimension;
-    for (uint32_t item = threadIdx.x; item < n * n; item += blockDim.x) {
-        const uint32_t i = item / n, j = item % n;
-        if (i > j) continue;
-        float value = work.factor[i * (kN + 1u) + j];
-        for (uint32_t t = work.begin; t < work.end; ++t) {
-            const auto term = work.terms[t];
-            const float* self = work.stage + (t - work.begin) * kN;
-            const float* partner = work.stage + (work.rows[t].y - work.begin) * kN;
+__device__ void AssembleTileChunk(const TileChunkWork& work, const TileBuffers& at) {
+    const uint32_t m = work.count, begin = work.begin, end = work.end;
+    for (uint32_t item = threadIdx.x; item < m * m; item += blockDim.x) {
+        const uint32_t a = item / m, b = item % m;
+        if (a > b) continue;
+        const uint32_t i = work.coordinates[a], j = work.coordinates[b];
+        float value = at.factor[i * (kN + 1u) + j];
+        for (uint32_t t = begin; t < end; ++t) {
+            const auto term = at.terms[t];
+            const float* self = at.stage + (t - begin) * kN;
+            const float* partner = at.stage + (at.rows[t].y - begin) * kN;
             const float weighted = self[i] * term.x + partner[i] * term.y;
             value = fmaf(weighted, self[j], value);
         }
-        work.factor[i * (kN + 1u) + j] = value;
+        at.factor[i * (kN + 1u) + j] = value;
+    }
+}
+
+// Rows of H a thread each: a row's rounding scale gains |H_ik| |u_k| in coordinate order.
+template <uint32_t kN>
+__device__ void ScaleTileRows(const TileChunkWork& work, const TileBuffers& at) {
+    constexpr uint32_t kS = kN + 1u;
+    const uint32_t n = work.dimension, i = threadIdx.x;
+    if (i >= n) return;
+    const float* const h = at.factor;
+    float scale = at.stage[kStageScale + i];
+    bool finite = true;
+    for (uint32_t k = 0u; k < n; ++k) {
+        const float entry = h[min(i, k) * kS + max(i, k)];
+        finite &= isfinite(entry);
+        scale += fabsf(entry) * at.stage[kStageSpeeds + k];
+    }
+    at.stage[kStageScale + i] = scale;
+    at.stage[kStageFinite + i] = finite ? 1.0f : 0.0f;
+}
+
+// H = U U^T across the block, left-looking from the last coordinate down so a tree's leaves go first: four
+// threads a row take its dot with the pivot row; the diagonal row roots the pivot, and the column's other
+// rows take its scale while the next column is taken.
+template <uint32_t kN>
+__device__ void FactorTileColumns(const TileChunkWork& work, const TileBuffers& at) {
+    constexpr uint32_t kS = kN + 1u;
+    static_assert(kN <= 64u, "a raw column is 64 floats");
+    float* const h = at.factor;
+    float* const stage = at.stage;
+    float* const inverse = stage + kStageInverse;
+    const uint32_t n = work.dimension, i = threadIdx.x / 4u, part = threadIdx.x % 4u;
+    const float* const row = h + i * kS;
+    for (uint32_t k = n; k-- > 0u;) {
+        // Column k + 1 is still raw in the stage, scaled as it is read.
+        const float* const last = stage + kStageRaw + (k + 1u) % 2u * 64u;
+        float* const next = stage + kStageRaw + k % 2u * 64u;
+        const float* const pivot_row = h + k * kS;
+        const bool scaled = k + 1u < n;
+        const float scale = scaled ? inverse[k + 1u] : 0.0f;
+        // A warp's lanes split each row's columns into runs of eight, keeping a load's banks apart.
+        float sum = 0.0f;
+        if (i <= k) {
+#pragma unroll
+            for (uint32_t m = 0u; m < 16u; ++m) {
+                const uint32_t j = k + 2u + 8u * part + m % 8u + 32u * (m / 8u);
+                if (j < n) sum = fmaf(row[j], pivot_row[j], sum);
+            }
+            if (part == 0u && scaled) sum = fmaf(last[i] * scale, last[k] * scale, sum);
+        }
+        sum += __shfl_xor_sync(~0u, sum, 1u);
+        sum += __shfl_xor_sync(~0u, sum, 2u);
+        if (part == 0u && i < k) next[i] = row[k] - sum;
+        if (part == 1u && i <= k && scaled) h[i * kS + k + 1u] = last[i] * scale;
+        // A failed pivot leaves every later root at one.
+        if (part == 0u && i == k) {
+            const float pivot = row[k] - sum;
+            const bool valid = (!scaled || stage[kStageValid] != 0.0f) && pivot > 0.0f && pivot <= FLT_MAX;
+            const float root = sqrtf(valid ? pivot : 1.0f);
+            h[k * kS + k] = root;
+            inverse[k] = 1.0f / root;
+            stage[kStageValid] = valid ? 1.0f : 0.0f;
+        }
+        TileWorkSync();
     }
 }
 
@@ -499,14 +590,16 @@ __device__ void InitializeTileHead(DataView data, BlockDescentSolveParams p, Blo
 }
 
 template <uint32_t kN>
-__device__ void ExecuteTileWork(DataView data, BlockDescentSolveParams p, BlockScratch s,
-                                const TileChunkWork& work) {
-    if (work.heads != nullptr) {
-        const auto& c = *work.heads;
-        for (uint32_t h = threadIdx.x; h < c.heads; h += blockDim.x)
-            InitializeTileHead(data, p, s, c, c.Index(kTileSlot, h), h);
-    } else {
-        AssembleTileChunk<kN>(work);
+__device__ __forceinline__ void ExecuteTileWork(DataView data, BlockDescentSolveParams p, BlockScratch s,
+                                                const TileChunkWork& work, const TileBuffers& at) {
+    switch (work.kind) {
+        case TileWork::Heads:
+            for (uint32_t h = threadIdx.x; h < work.heads->heads; h += blockDim.x)
+                InitializeTileHead(data, p, s, *work.heads, work.heads->Index(kTileSlot, h), h);
+            break;
+        case TileWork::Products: AssembleTileChunk<kN>(work, at); break;
+        case TileWork::Scale: ScaleTileRows<kN>(work, at); break;
+        case TileWork::Factor: FactorTileColumns<kN>(work, at); break;
     }
 }
 
@@ -857,10 +950,10 @@ __device__ void InitializeTile(ArticulationDeviceState state, DataView data, Blo
     if constexpr (TileSpan<kN>() > 1u) {
         if (c.lane == 0u) {
             *c.shared_context = c;
-            *c.chunk_work = {false, 0u, 0u, 0u, nullptr, nullptr, nullptr, nullptr, c.shared_context};
+            *c.chunk_work = {false, TileWork::Heads, 0u, 0u, 0u, c.shared_context};
         }
         TileWorkSync();
-        ExecuteTileWork<kN>(data, p, s, *c.chunk_work);
+        ExecuteTileWork<kN>(data, p, s, *c.chunk_work, {c.factor, c.chunk_terms, c.chunk_rows, c.stage});
         TileWorkSync();
     } else {
         for (uint32_t h = c.lane; h < heads; h += kTileLanes)
@@ -1068,12 +1161,12 @@ __device__ float SolveTileBlock(const float (&h)[kN], float inverse, float g, co
 }
 
 // AssembleTileBlock past a warp of coordinates: H's upper triangle over the block's own coordinates goes to
-// the warp's factor buffer, lane i holding rows i, i + 32, ...; `pattern` marks each row's nonzero columns.
+// the warp's factor buffer, lane i holding rows i, i + 32, ...
 template <uint32_t kN, uint32_t kSpan = TileSpan<kN>()>
 __device__ bool AssembleWideTileBlock(const TileContext& c, const TileBlock& b, const float (&u)[kSpan],
                                       const float (&free)[kSpan], float (&force)[kSpan], float (&inertia)[kSpan],
-                                      uint64_t (&pattern)[kSpan], bool* converged) {
-    static_assert(kN <= 64u, "a row pattern is one 64-bit mask");
+                                      bool* converged) {
+    static_assert(kN <= 64u, "a chunk's touched coordinates are one 64-bit mask");
     constexpr uint32_t kS = kN + 1u;
     const uint32_t n = b.dimension;
     float* const h = c.factor;
@@ -1089,9 +1182,17 @@ __device__ bool AssembleWideTileBlock(const TileContext& c, const TileBlock& b, 
         scale[r] = 0.0f;
         diagonal[r] = 0.0f;
     }
+    // Lanes read every coordinate's difference from the stage rather than exchanging it.
+    float* const across = c.stage;
+#pragma unroll
+    for (uint32_t r = 0u; r < kSpan; ++r) {
+        across[c.lane + r * kTileLanes] = difference[r];
+        across[kSpan * kTileLanes + c.lane + r * kTileLanes] = difference_error[r];
+    }
+    __syncwarp();
     for (uint32_t k = 0u; k < n; ++k) {
-        const float high = TileCoordinate(difference, k);
-        const float low = TileCoordinate(difference_error, k);
+        const float high = across[k];
+        const float low = across[kSpan * kTileLanes + k];
 #pragma unroll
         for (uint32_t r = 0u; r < kSpan; ++r) {
             if (!coordinate[r]) continue;
@@ -1165,6 +1266,7 @@ __device__ bool AssembleWideTileBlock(const TileContext& c, const TileBlock& b, 
             if (begin == end) continue;
             __syncwarp();
             constexpr uint32_t kBatch = 16u;
+            bool support[kSpan] = {};
             for (uint32_t first_row = begin; first_row < end; first_row += kBatch) {
                 float staged[kBatch][kSpan];
 #pragma unroll
@@ -1179,13 +1281,27 @@ __device__ bool AssembleWideTileBlock(const TileContext& c, const TileBlock& b, 
 #pragma unroll
                 for (uint32_t k = 0u; k < kBatch; ++k)
 #pragma unroll
-                    for (uint32_t r = 0u; r < kSpan; ++r)
+                    for (uint32_t r = 0u; r < kSpan; ++r) {
                         if (first_row + k < end && c.lane + r * kTileLanes < kN)
                             c.stage[(first_row + k - begin) * kN + c.lane + r * kTileLanes] = staged[k][r];
+                        support[r] |= staged[k][r] != 0.0f;
+                    }
             }
-            if (c.lane == 0u) *c.chunk_work = {false, n, begin, end, c.factor, c.stage, c.chunk_rows, c.chunk_terms};
+            uint64_t touched = 0u;
+#pragma unroll
+            for (uint32_t r = 0u; r < kSpan; ++r)
+                touched |= uint64_t{__ballot_sync(~0u, support[r])} << (r * kTileLanes);
+            if (c.lane == 0u)
+                *c.chunk_work = {false, TileWork::Products, n, begin, end, nullptr,
+                                 static_cast<uint32_t>(__popcll(touched))};
+            __syncwarp();
+#pragma unroll
+            for (uint32_t r = 0u; r < kSpan; ++r) {
+                const uint32_t i = c.lane + r * kTileLanes;
+                if (support[r]) c.chunk_work->coordinates[__popcll(touched & ((uint64_t{1} << i) - 1u))] = i;
+            }
             TileWorkSync();
-            AssembleTileChunk<kN>(*c.chunk_work);
+            AssembleTileChunk<kN>(*c.chunk_work, {c.factor, c.chunk_terms, c.chunk_rows, c.stage});
             TileWorkSync();
             for (uint32_t t = begin; t < end; ++t) {
                 const float4 term = c.chunk_terms[t];
@@ -1208,20 +1324,24 @@ __device__ bool AssembleWideTileBlock(const TileContext& c, const TileBlock& b, 
         force[r] = coordinate[r] ? g[r].value + g[r].error : 0.0f;
         inertia[r] = coordinate[r] ? inertial[r].value + inertial[r].error : 0.0f;
         finite &= isfinite(force[r]);
-        pattern[r] = 0u;
     }
-    // A float velocity is off its optimum by up to a rounding, which moves g by H times it.
-    for (uint32_t k = 0u; k < n; ++k) {
-        const float along = fabsf(TileCoordinate(u, k));
+    // A float velocity is off its optimum by up to a rounding, which moves g by H times it; the block's threads
+    // take H's rows.
+    __syncwarp();
 #pragma unroll
-        for (uint32_t r = 0u; r < kSpan; ++r) {
-            if (!coordinate[r]) continue;
-            const uint32_t i = c.lane + r * kTileLanes;
-            const float entry = h[min(i, k) * kS + max(i, k)];
-            finite &= isfinite(entry);
-            scale[r] += fabsf(entry) * along;
-            if (entry != 0.0f) pattern[r] |= uint64_t{1} << k;
-        }
+    for (uint32_t r = 0u; r < kSpan; ++r) {
+        c.stage[kStageSpeeds + c.lane + r * kTileLanes] = fabsf(u[r]);
+        c.stage[kStageScale + c.lane + r * kTileLanes] = scale[r];
+    }
+    if (c.lane == 0u) *c.chunk_work = {false, TileWork::Scale, n};
+    TileWorkSync();
+    ScaleTileRows<kN>(*c.chunk_work, {c.factor, c.chunk_terms, c.chunk_rows, c.stage});
+    TileWorkSync();
+#pragma unroll
+    for (uint32_t r = 0u; r < kSpan; ++r) {
+        if (!coordinate[r]) continue;
+        scale[r] = c.stage[kStageScale + c.lane + r * kTileLanes];
+        finite &= c.stage[kStageFinite + c.lane + r * kTileLanes] != 0.0f;
     }
 #pragma unroll
     for (uint32_t r = 0u; r < kSpan; ++r)
@@ -1230,59 +1350,8 @@ __device__ bool AssembleWideTileBlock(const TileContext& c, const TileBlock& b, 
     return __all_sync(~0u, finite);
 }
 
-// FactorTileBlock past a warp of coordinates as H = U U^T in the factor buffer's upper triangle. Columns go
-// from the last coordinate down, so a tree's leaves go first and its pattern takes no fill; only rows on a
-// column's pattern take it, and entries off the pattern stay exact zeros.
-template <uint32_t kN, uint32_t kSpan = TileSpan<kN>()>
-__device__ bool FactorWideTileBlock(const TileContext& c, float (&inverse)[kSpan], uint64_t (&pattern)[kSpan],
-                                    uint32_t n) {
-    constexpr uint32_t kS = kN + 1u;
-    float* const h = c.factor;
-    bool valid = true;
-#pragma unroll
-    for (uint32_t r = 0u; r < kSpan; ++r) inverse[r] = 0.0f;
-    __syncwarp();
-    for (uint32_t k = n; k-- > 0u;) {
-        uint64_t column = 0u;
-#pragma unroll
-        for (uint32_t r = 0u; r < kSpan; ++r) {
-            const bool above = c.lane + r * kTileLanes < k && (pattern[r] >> k & 1u) != 0u;
-            column |= uint64_t{__ballot_sync(~0u, above)} << (r * kTileLanes);
-        }
-        const float* const pivot_row = h + k * kS;
-        float value[kSpan];
-        bool member[kSpan];
-#pragma unroll
-        for (uint32_t r = 0u; r < kSpan; ++r) {
-            const uint32_t i = c.lane + r * kTileLanes;
-            member[r] = i == k || (i < k && (column >> i & 1u) != 0u);
-            value[r] = 0.0f;
-            if (!member[r]) continue;
-            const float* const own = h + i * kS;
-            float v = own[k];
-#pragma unroll 4
-            for (uint32_t j = k + 1u; j < n; ++j) v -= own[j] * pivot_row[j];
-            value[r] = v;
-        }
-        const float pivot = TileCoordinate(value, k);
-        valid &= pivot > 0.0f && pivot <= FLT_MAX;
-        const float root = sqrtf(valid ? pivot : 1.0f);
-        const float scale = 1.0f / root;
-        // Eliminating column k joins the rows above it on the column.
-#pragma unroll
-        for (uint32_t r = 0u; r < kSpan; ++r) {
-            const uint32_t i = c.lane + r * kTileLanes;
-            if (i == k) inverse[r] = scale;
-            if (member[r]) h[i * kS + k] = i == k ? root : value[r] * scale;
-            if (member[r] && i != k) pattern[r] |= column;
-        }
-        __syncwarp();
-    }
-    return valid;
-}
-
 // SolveTileBlock past a warp of coordinates on the factor buffer's U: U w = g up its columns, then
-// U^T d = w down its rows.
+// U^T d = w down its rows. Lanes select rather than branch, loading entries they then drop.
 template <uint32_t kN, uint32_t kSpan = TileSpan<kN>()>
 __device__ void SolveWideTileBlock(const TileContext& c, const float (&inverse)[kSpan], const float (&g)[kSpan],
                                    uint32_t n, float (&d)[kSpan]) {
@@ -1298,8 +1367,8 @@ __device__ void SolveWideTileBlock(const TileContext& c, const float (&inverse)[
 #pragma unroll
         for (uint32_t s = 0u; s < kSpan; ++s) {
             const uint32_t i = c.lane + s * kTileLanes;
-            if (i == j) r[s] = y;
-            else if (i < j) r[s] = fmaf(-h[i * kS + j], y, r[s]);
+            const float entry = h[i * kS + j];
+            r[s] = i == j ? y : i < j ? fmaf(-entry, y, r[s]) : r[s];
         }
     }
     for (uint32_t j = 0u; j < n; ++j) {
@@ -1309,8 +1378,8 @@ __device__ void SolveWideTileBlock(const TileContext& c, const float (&inverse)[
 #pragma unroll
         for (uint32_t s = 0u; s < kSpan; ++s) {
             const uint32_t i = c.lane + s * kTileLanes;
-            if (i == j) r[s] = x;
-            else if (i > j && i < n) r[s] = fmaf(-h[j * kS + i], x, r[s]);
+            const float entry = h[j * kS + i];
+            r[s] = i == j ? x : i > j && i < n ? fmaf(-entry, x, r[s]) : r[s];
         }
     }
     __syncwarp();
@@ -1334,11 +1403,19 @@ __device__ nk::BlockSolveFailure TileNewtonDirection(const TileContext& c, const
         d[0] = SolveTileBlock<kN>(h, inverse, force[0], c, b.dimension);
     } else {
         float inverse[kSpan];
-        uint64_t pattern[kSpan];
-        if (!AssembleWideTileBlock<kN>(c, b, u, free, force, inertia, pattern, converged))
+        if (!AssembleWideTileBlock<kN>(c, b, u, free, force, inertia, converged))
             return nk::BlockSolveFailure::InvalidEquation;
         if (*converged) return nk::BlockSolveFailure::None;
-        if (!FactorWideTileBlock<kN>(c, inverse, pattern, b.dimension)) return nk::BlockSolveFailure::Factorization;
+        if (c.lane == 0u) *c.chunk_work = {false, TileWork::Factor, b.dimension};
+        TileWorkSync();
+        FactorTileColumns<kN>(*c.chunk_work, {c.factor, c.chunk_terms, c.chunk_rows, c.stage});
+        TileWorkSync();
+#pragma unroll
+        for (uint32_t r = 0u; r < kSpan; ++r) {
+            const uint32_t i = c.lane + r * kTileLanes;
+            inverse[r] = i < b.dimension ? c.stage[kStageInverse + i] : 0.0f;
+        }
+        if (c.stage[kStageValid] == 0.0f) return nk::BlockSolveFailure::Factorization;
         SolveWideTileBlock<kN>(c, inverse, force, b.dimension, d);
     }
     return nk::BlockSolveFailure::None;
@@ -1530,10 +1607,18 @@ __device__ void DescendTileBlock(DataView data, BlockDescentSolveParams p, Block
         if (failure != nk::BlockSolveFailure::None || converged) break;
 #pragma unroll
         for (uint32_t r = 0u; r < kSpan; ++r) mass_step[r] = 0.0f;
+        // Past a warp, lanes read the step's coordinates from the stage.
+        if constexpr (kSpan > 1u) {
+#pragma unroll
+            for (uint32_t r = 0u; r < kSpan; ++r) c.stage[c.lane + r * kTileLanes] = d[r];
+            __syncwarp();
+        }
         // Past a warp, coordinates beyond the block's have zero step and mass.
 #pragma unroll
         for (uint32_t k = 0u; k < (kSpan == 1u ? kN : n); ++k) {
-            const float along = TileCoordinate(d, k);
+            float along;
+            if constexpr (kSpan == 1u) along = TileCoordinate(d, k);
+            else along = c.stage[k];
 #pragma unroll
             for (uint32_t r = 0u; r < kSpan; ++r) {
                 const uint32_t i = c.lane + r * kTileLanes;
@@ -1914,10 +1999,11 @@ __global__ void __launch_bounds__(TileBoundThreads<kN>()) DescendDenseTilesKerne
     const uint32_t lane = threadIdx.x % kTileLanes;
     if constexpr (TileSpan<kN>() > 1u) {
         if (warp != 0u) {
+            const TileBuffers at = TileBuffersAt<kN>(tile_shared);
             for (;;) {
                 TileWorkSync();
                 if (chunk_work.stop) return;
-                ExecuteTileWork<kN>(data, p, s, chunk_work);
+                ExecuteTileWork<kN>(data, p, s, chunk_work, at);
                 TileWorkSync();
             }
         }
@@ -1962,10 +2048,11 @@ __global__ void __launch_bounds__(TileBoundThreads<kN>()) DescendDenseTilesKerne
         c.color_end = c.order + c.bodies + c.articulations;
         c.team_share = team_share;
         c.mass = tile_shared + size_t{warp} * TileWarpFloats<kN>();
-        c.factor = c.mass + kN * (kN + 1u);
-        c.chunk_terms = reinterpret_cast<float4*>(c.factor + kN * (kN + 1u));
-        c.chunk_rows = reinterpret_cast<uint2*>(c.chunk_terms + kTileChunkRows);
-        c.stage = reinterpret_cast<float*>(c.chunk_rows + kTileChunkRows);
+        const TileBuffers at = TileBuffersAt<kN>(c.mass);
+        c.factor = at.factor;
+        c.chunk_terms = at.terms;
+        c.chunk_rows = at.rows;
+        c.stage = at.stage;
         c.chunk_work = TileSpan<kN>() > 1u ? &chunk_work : nullptr;
         c.shared_context = TileSpan<kN>() > 1u ? &shared_context : nullptr;
         c.iteration = ~0u;
