@@ -1196,10 +1196,8 @@ __global__ void CountIncidenceKernel(DataView data, BlockDescentSolveParams p, B
         } else {
             s.penalty[slot] = static_cast<float>(penalty);
         }
-        const float scale = (flags & nk::nk_row_flags::kMaterialBlock) != 0u
-            ? 1.0f : 1.0f / (1.0f + data.row_damping[slot] * p.dt);
         s.scalar_response[slot] = nk::augmented::ComputeScalarResponse(
-            s.penalty[slot], row.compliance_alpha * scale);
+            s.penalty[slot], row.compliance_alpha);
         VisitOwners(row, points, p, [&](uint32_t owner) {
             atomicAdd(s.counts + owner, 1u);
             const uint32_t dense_first = p.total_particle_count;
@@ -1355,19 +1353,15 @@ __device__ PointMassView RowPointMasses(DataView data, BlockScratch s, bool snap
     return points;
 }
 
-__device__ float RowStateScale(DataView data, BlockDescentSolveParams p, uint32_t slot) {
-    return 1.0f / (1.0f + data.row_damping[slot] * p.dt);
-}
-
 // Residual and dual of one axis of the row group headed by `slot`. Explicit roundings keep the
 // residual identical in every kernel that inlines it.
 __device__ void AugmentedRowAxis(DataView data, BlockDescentSolveParams p, BlockScratch s,
-                                 const NkRow& normal, uint32_t slot, uint32_t axis, float scale,
+                                 const NkRow& normal, uint32_t slot, uint32_t axis,
                                  bool snapshot, float* residual, float* dual) {
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
     const uint32_t row_slot = slot + axis * normal.group_normal_count;
     const NkRow row = rows[row_slot];
-    *residual = __fsub_rn(__fmul_rn(__fmul_rn(row.rhs, p.dt), axis == 0u ? scale : 1.0f),
+    *residual = __fsub_rn(__fmul_rn(row.rhs, p.dt),
                 RowVelocity(row, row_slot, data, p, RowPointMasses(data, s, snapshot),
                     snapshot ? s.articulation_snapshot : data.qdot_flat,
                     snapshot ? s.rigid_snapshot : nullptr));
@@ -1375,14 +1369,14 @@ __device__ void AugmentedRowAxis(DataView data, BlockDescentSolveParams p, Block
 }
 
 __device__ nk::augmented::ScalarTerm AugmentedRowBoundTerm(BlockScratch s, const NkRow& normal, uint32_t slot,
-                                                           float scale, const AugmentedRowState& state) {
+                                                           const AugmentedRowState& state) {
     return nk::augmented::EvaluateScalarImpulse(state.dual.x, s.penalty[slot], state.residual.x,
-        normal.compliance_alpha * scale, normal.lower, normal.upper, s.scalar_response[slot]);
+        normal.compliance_alpha, normal.lower, normal.upper, s.scalar_response[slot]);
 }
 
-__device__ float AugmentedRowBound(BlockScratch s, const NkRow& normal, uint32_t slot, float scale,
+__device__ float AugmentedRowBound(BlockScratch s, const NkRow& normal, uint32_t slot,
                                    const AugmentedRowState& state) {
-    return AugmentedRowBoundTerm(s, normal, slot, scale, state).impulse;
+    return AugmentedRowBoundTerm(s, normal, slot, state).impulse;
 }
 
 __device__ AugmentedRowState ComputeAugmentedRowState(
@@ -1391,12 +1385,11 @@ __device__ AugmentedRowState ComputeAugmentedRowState(
     const NkRow normal = rows[slot];
     AugmentedRowState state{};
     const bool contact = (normal.flags & nk::nk_row_flags::kBlockNormal) != 0u;
-    const float scale = RowStateScale(data, p, slot);
     float* residual[] = {&state.residual.x, &state.residual.y, &state.residual.z};
     float* dual[] = {&state.dual.x, &state.dual.y, &state.dual.z};
     for (uint32_t axis = 0u; axis < (contact ? 3u : 1u); ++axis)
-        AugmentedRowAxis(data, p, s, normal, slot, axis, scale, snapshot, residual[axis], dual[axis]);
-    state.normal_bound = AugmentedRowBound(s, normal, slot, scale, state);
+        AugmentedRowAxis(data, p, s, normal, slot, axis, snapshot, residual[axis], dual[axis]);
+    state.normal_bound = AugmentedRowBound(s, normal, slot, state);
     return state;
 }
 
@@ -1417,8 +1410,7 @@ __device__ LocalTerm LoadLocalTerm(DataView data, BlockDescentSolveParams p, Blo
     t.upper = normal.upper;
     t.mu_first = normal.mu;
     t.mu_second = normal.friction_secondary;
-    const float scale = 1.0f / (1.0f + data.row_damping[slot] * p.dt);
-    t.compliance = normal.compliance_alpha * scale;
+    t.compliance = normal.compliance_alpha;
     for (uint32_t axis = 0u; axis < (t.contact ? 3u : 1u); ++axis) {
         const uint32_t row_slot = slot + axis * normal.group_normal_count;
         const NkRow row = rows[row_slot];
@@ -1628,17 +1620,16 @@ __global__ void CacheAugmentedRowsKernel(DataView data, BlockDescentSolveParams 
         const NkRow row = rows[slot];
         if (row.flags & nk::nk_row_flags::kMaterialBlock) continue;
         const bool contact = (row.flags & nk::nk_row_flags::kBlockNormal) != 0u;
-        const float scale = RowStateScale(data, p, slot);
         float residual = 0.0f, dual = 0.0f;
         if (axis < (contact ? 3u : 1u))
-            AugmentedRowAxis(data, p, s, row, slot, axis, scale, true, &residual, &dual);
+            AugmentedRowAxis(data, p, s, row, slot, axis, true, &residual, &dual);
         AugmentedRowState state{};
         state.residual = {residual, __shfl_sync(group_mask, residual, 1, kRowAxisLanes),
                           __shfl_sync(group_mask, residual, 2, kRowAxisLanes)};
         state.dual = {dual, __shfl_sync(group_mask, dual, 1, kRowAxisLanes),
                       __shfl_sync(group_mask, dual, 2, kRowAxisLanes)};
         if (axis != 0u) continue;
-        state.normal_bound = AugmentedRowBound(s, row, slot, scale, state);
+        state.normal_bound = AugmentedRowBound(s, row, slot, state);
         s.row_state[slot] = state;
     }
 }
@@ -2088,7 +2079,7 @@ __global__ void DualUpdateKernel(DataView data, BlockDescentSolveParams p, Block
         const bool grid_only = p.total_grid_count != 0u && GridOnlyRow(s, p.vertex_blocks.colors, slot);
         AugmentedRowState current = grid_only ? s.row_state[slot] : ComputeAugmentedRowState(data, p, s, slot, false);
         if (grid_only)
-            current.normal_bound = AugmentedRowBound(s, rows[slot], slot, RowStateScale(data, p, slot), current);
+            current.normal_bound = AugmentedRowBound(s, rows[slot], slot, current);
         const LocalTerm t = LoadLocalTerm(data, p, s, slot, ~0u, false, &current);
         const uint32_t stride = rows[slot].group_normal_count;
         const Vec3 next = ProjectRowDual(t.dual, t.normal_bound, t.penalty, t.residual, t.contact, t.mu_first,
@@ -2125,7 +2116,7 @@ __global__ void DualUpdateKernel(DataView data, BlockDescentSolveParams p, Block
             AugmentedRowState seeded{};
             seeded.residual = t.residual;
             seeded.dual = y;
-            seeded.normal_bound = AugmentedRowBound(s, rows[slot], slot, RowStateScale(data, p, slot), seeded);
+            seeded.normal_bound = AugmentedRowBound(s, rows[slot], slot, seeded);
             s.row_state[slot] = seeded;
         }
     }

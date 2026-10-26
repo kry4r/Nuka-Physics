@@ -783,6 +783,8 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         for (int k = 0; k < 2; ++k) p_assemble_.solref[k] = model.contact_solref[k];
         for (int k = 0; k < 5; ++k) p_assemble_.solimp[k] = model.contact_solimp[k];
         p_assemble_.num_material_buckets = cap.num_material_buckets;
+        p_assemble_.impratio = model.solver_options.impratio;
+        p_assemble_.refsafe = model.solver_options.refsafe;
         p_assemble_.particles_per_env = cap.particles_per_env;  // coupling.
         p_assemble_.baumgarte_max_velocity = model.baumgarte_max_velocity;
         p_assemble_.overlap_recovery_velocity = model.overlap_recovery_velocity;

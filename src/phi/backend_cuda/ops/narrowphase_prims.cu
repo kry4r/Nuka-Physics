@@ -262,6 +262,7 @@ __global__ void PairDrivenNarrowphaseKernel(
     PrimShapeDev sa, sb;
     bool convex = false;
     uint32_t law = ::nuka::nk::kContactLawSpeculative;
+    float query_margin = separation;
 
     if (slot < live && slot < rigid_slot_cap) {
         a = candidate_pairs[static_cast<size_t>(gid) * 2u + 0u];
@@ -276,6 +277,11 @@ __global__ void PairDrivenNarrowphaseKernel(
         if (source_a == static_cast<uint32_t>(constraint::LawSource::MuJoCo) ||
             source_b == static_cast<uint32_t>(constraint::LawSource::MuJoCo))
             law = nk::kContactLawCompliant;
+        const float* profile_a = profiles + size_t{sa.contact_profile_index} * nk::kContactProfileWordCount;
+        const float* profile_b = profiles + size_t{sb.contact_profile_index} * nk::kContactProfileWordCount;
+        if (law == nk::kContactLawCompliant)
+            query_margin = fmaxf(profile_a[nk::kContactProfileMargin], profile_b[nk::kContactProfileMargin]) +
+                           fmaxf(profile_a[nk::kContactProfileGap], profile_b[nk::kContactProfileGap]);
         const auto route = RouteMeshContact(sa.kind, sb.kind, mesh_contact_mode[a],
                                             mesh_contact_mode[b]);
         if (!kConvex && route == MeshContactRoute::Ogc) atomicAdd(&mesh_ogc_pair_count[env], 1u);
@@ -308,14 +314,15 @@ __global__ void PairDrivenNarrowphaseKernel(
                 sqrtf(linear_velocity[at].LengthSq()) +
                 sqrtf(angular_velocity[at].LengthSq() * extent.LengthSq()));
         };
-        const float query = fmaxf(separation, collision::DatQueryRadius(
+        const float query = fmaxf(query_margin, collision::DatQueryRadius(
             collision::DatMotionRadius(separation, dt, speed(a), speed(b), kDatRelaxation)));
         const auto origin = pa.frame.t;
         pa.frame.t = {};
         pb.frame.t -= origin;
         DispatchConvexPair(sa.kind, pa, sb.kind, pb, hull_verts,
                            sa.hull_vert_offset, sa.hull_vert_count,
-                           sb.hull_vert_offset, sb.hull_vert_count, separation, query,
+                           sb.hull_vert_offset, sb.hull_vert_count,
+                           law == nk::kContactLawCompliant ? 0.0f : separation, query,
                            &m, witness_a, witness_b, workspace);
         if (threadIdx.x % kWarp != 0u) return;
         for (uint32_t i = 0u; i < m.point_count; ++i) {

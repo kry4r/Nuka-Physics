@@ -348,14 +348,14 @@ __global__ void ClearPairDrivenRowsKernel(
     uint32_t total_rows, uint32_t rows_per_env, uint32_t contact_rows,
     uint32_t slot_count, uint32_t rigid_slots, uint32_t rigid_rows, const uint32_t* extent,
     uint32_t* ranges, NkRow* urows, float* lambda, uint32_t* row_cj_link, uint32_t* row_cj_link_b,
-    float* row_penetration, float* row_damping, uint64_t* contact_material) {
+    float* row_penetration, float* row_invweight, uint64_t* contact_material) {
     BeginProgrammaticKernel();
     for (uint32_t row = blockIdx.x * blockDim.x + threadIdx.x; row < total_rows;
          row += gridDim.x * blockDim.x) {
         const uint32_t env = row / rows_per_env;
         const uint32_t local = row % rows_per_env;
         const uint32_t bound = ContactRowBound(extent, env, contact_rows);
-        row_damping[row] = 0.0f;
+        row_invweight[row] = 0.0f;
         if (local < bound) {
             lambda[row] = 0.0f;
             row_penetration[row] = 0.0f;
@@ -396,6 +396,7 @@ __global__ void EmitPairDrivenRowsKernel(
     const uint32_t* __restrict__ body_to_link,
     const uint32_t* __restrict__ body_to_articulation,
     const uint32_t* __restrict__ body_collidable_body,
+    const float* __restrict__ body_invweight0,
     const float* __restrict__ mat_buckets,
     uint32_t num_material_buckets,
     uint64_t* __restrict__ contact_material,
@@ -405,7 +406,7 @@ __global__ void EmitPairDrivenRowsKernel(
     const float* __restrict__ particle_friction,
     float solref0, float solref1,
     float solimp0, float solimp1, float solimp2, float solimp3, float solimp4,
-    float dt, float baumgarte_max_velocity, float contact_margin, float overlap_recovery_velocity,
+    float dt, float impratio, bool refsafe, float overlap_recovery_velocity,
     uint32_t env_count, uint32_t slot_count, uint32_t rows_per_env,
     uint32_t full_row_slot_count, uint32_t ogc_slot_count,
     uint32_t bodies_per_env, uint32_t base_link_count, uint32_t artics_per_env,
@@ -414,7 +415,8 @@ __global__ void EmitPairDrivenRowsKernel(
     uint32_t* __restrict__ row_cj_link_b, math::Vec3* __restrict__ row_cj_point_b,
     uint32_t* __restrict__ row_count,
     float* __restrict__ row_penetration,
-    float* __restrict__ row_damping, uint32_t* __restrict__ env_status,
+    float* __restrict__ row_reference_velocity_gain, float* __restrict__ row_invweight,
+    uint32_t* __restrict__ env_status,
     uint32_t* __restrict__ contact_row_extent) {
     BeginProgrammaticKernel();
     const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -441,6 +443,7 @@ __global__ void EmitPairDrivenRowsKernel(
     const uint32_t law = ucontact_law != nullptr ? ucontact_law[gid] : nk::kContactLawCompliant;
     const bool speculative = law == nk::kContactLawSpeculative;
     const bool velocity_only = law == nk::kContactLawVelocity || speculative;
+    const bool mujoco = law == nk::kContactLawCompliant;
 
     // Resolve the two sides ONCE per slot (same a/b for every manifold point).
     uint32_t kind_a = kNkSideStatic, kind_b = kNkSideStatic;
@@ -519,6 +522,10 @@ __global__ void EmitPairDrivenRowsKernel(
     if (kind_b == kNkSideGrid || kind_b == kNkSidePointEndpoint || side_kind_b == nk::kUContactSideBoundary)
         side_b = DefaultProfile(endpoint_mu, solref0, solref1, default_solimp);
     scene::MergedContactParams merged = scene::MergeContactParams(side_a, side_b);
+    if (mujoco) {
+        merged.mu1 = fmaxf(1.0e-5f, merged.mu1);
+        merged.mu2 = fmaxf(1.0e-5f, merged.mu2);
+    }
     if (kind_a == kNkSideParticle && side_kind_b == nk::kUContactSideBody) {
         merged.mu1 = scene::ParticleBodyFriction(side_a.mu1, side_b.mu1);
         merged.mu2 = scene::ParticleBodyFriction(side_a.mu2, side_b.mu2);
@@ -535,6 +542,7 @@ __global__ void EmitPairDrivenRowsKernel(
     const float* solimp = merged.solimp;
     const float mu1 = merged.mu1;
     const float mu2 = merged.mu2;
+    const float invweight = mujoco ? body_invweight0[2u * body_a] + body_invweight0[2u * body_b] : 0.0f;
     contact_material[gid] = n_active > 0u ? HashMergedContactProfile(merged) : 0u;
     if (n_active > 0u && velocity_only)
         contact_material[gid] = nk::ContactHashWord(contact_material[gid], law);
@@ -542,10 +550,8 @@ __global__ void EmitPairDrivenRowsKernel(
 
     uint32_t active_rows = 0u;
     for (uint32_t p = 0u; p < points_per_slot; ++p) {
-        // A speculative row closes its emitted gap exactly; the margin gate applies to compliant rows.
-        const bool live = p < n_active && p < 4u && (speculative ||
-            ucontact_depth[static_cast<size_t>(gid) * 4u + p] >=
-                merged.gap - fmaxf(contact_margin, merged.margin));
+        const bool live = p < n_active && p < 4u && (velocity_only ||
+            ucontact_depth[static_cast<size_t>(gid) * 4u + p] + merged.margin > 0.0f);
         const size_t mp = static_cast<size_t>(gid) * 4u + p;
         const uint32_t normal_row = base + p;          // pts normal rows first.
         const uint32_t tangent1_row = base + points_per_slot + p;
@@ -571,32 +577,31 @@ __global__ void EmitPairDrivenRowsKernel(
             NkRow row{};
             lambda[rs] = 0.0f;
             row_penetration[rs] = 0.0f;
-            row_damping[rs] = 0.0f;
             row_cj_link[rs] = kInvalidLink;
             row_cj_link_b[rs] = kInvalidLink;
             if (live) {
-                const float pos = -ucontact_depth[mp];
+                const float pos = -ucontact_depth[mp] - merged.margin;
                 // Geometric penetration (positive when overlapping) for the
                 // split-impulse position pass; the velocity solve uses aref.
                 row_penetration[rs] = speculative ? ucontact_depth[mp] : fmaxf(ucontact_depth[mp], 0.0f);
                 constraint::CompliantContactRow compliant{};
                 if (!velocity_only)
                     compliant = constraint::ComputeCompliantRow(solref, solimp, pos, pos,
-                        /*vel=*/0.0f, /*invweight=*/1.0f, dt, /*refsafe=*/true);
+                        0.0f, invweight, dt, refsafe);
                 row.flags = nk::nk_row_flags::kActive | nk::nk_row_flags::kContactNormal;
+                if (mujoco) row.flags |= nk::nk_row_flags::kMuJoCo;
                 if (merged.condim == 3u) row.flags |= nk::nk_row_flags::kBlockNormal;
                 if (law == nk::kContactLawVelocity) row.flags |= nk::nk_row_flags::kVelocityOnly;
                 if (speculative) row.flags |= nk::nk_row_flags::kSpeculative;
                 row.group_first = base;
                 row.group_normal_count = points_per_slot;
                 row.env = env;
-                // Cap aref so the target separating velocity aref*dt <=
-                // baumgarte_max_velocity (+inf default => byte-identical): bounded recovery.
-                row.rhs = fminf(compliant.aref_bias, baumgarte_max_velocity / dt);
+                row.rhs = compliant.aref_bias;
                 // Gap closure belongs to physical velocity; overlap recovers at most overlap_recovery_velocity.
                 if (speculative) row.rhs = (fminf(ucontact_depth[mp], 0.0f) +
                     fminf(fmaxf(ucontact_depth[mp], 0.0f), overlap_recovery_velocity * dt)) / (dt * dt);
-                row_damping[rs] = compliant.damping;
+                row_reference_velocity_gain[rs] = 1.0f / dt - compliant.damping;
+                row_invweight[rs] = invweight;
                 row.compliance_alpha = compliant.R;
                 row.lower = 0.0f;
                 row.upper = kFltMaxLocal;
@@ -623,7 +628,6 @@ __global__ void EmitPairDrivenRowsKernel(
             NkRow row{};
             lambda[rs] = 0.0f;
             row_penetration[rs] = 0.0f;
-            row_damping[rs] = 0.0f;
             row_cj_link[rs] = kInvalidLink;
             row_cj_link_b[rs] = kInvalidLink;
             if (live && merged.condim == 3u) {
@@ -634,6 +638,16 @@ __global__ void EmitPairDrivenRowsKernel(
                 row.env = env;
                 row.rhs = 0.0f;
                 row.compliance_alpha = 0.0f;
+                if (mujoco) {
+                    const float mu = k == 0u ? mu1 : mu2;
+                    const float tangent_invweight = invweight / impratio * (mu1 * mu1) / (mu * mu);
+                    const auto compliant = constraint::ComputeCompliantRow(solref, solimp,
+                        -ucontact_depth[mp] - merged.margin, 0.0f, 0.0f, tangent_invweight, dt, refsafe);
+                    row.flags |= nk::nk_row_flags::kMuJoCo;
+                    row.compliance_alpha = compliant.R;
+                    row_reference_velocity_gain[rs] = 1.0f / dt - compliant.damping;
+                    row_invweight[rs] = tangent_invweight;
+                }
                 row.lower = -kFltMaxLocal;
                 row.upper = kFltMaxLocal;
                 row.mu = mu1;
@@ -658,6 +672,7 @@ __global__ void EmitPairDrivenRowsKernel(
 // A scalar joint bound is a one-sided row with J = +/-e_joint.
 __device__ void EmitJointLimitRows(
     uint32_t link, const ArticulationDeviceState& state,
+    const ModelView& model, const DataView& data, bool refsafe,
     const float* __restrict__ lower_limits,
     const float* __restrict__ upper_limits,
     const uint8_t* __restrict__ limit_flags,
@@ -671,7 +686,6 @@ __device__ void EmitJointLimitRows(
     uint32_t* __restrict__ row_cj_link,
     uint32_t* __restrict__ row_cj_link_b,
     float* __restrict__ row_penetration,
-    float* __restrict__ row_damping,
     uint32_t* __restrict__ row_count) {
     const uint32_t env = link / base_link_count;
     if (env >= env_count) return;
@@ -692,7 +706,6 @@ __device__ void EmitJointLimitRows(
         row_cj_link[rs] = kInvalidLink;
         row_cj_link_b[rs] = kInvalidLink;
         row_penetration[rs] = 0.0f;
-        row_damping[rs] = 0.0f;
         float* const J = chain_jacobian + static_cast<size_t>(rs) * dof_stride;
         for (uint32_t k = 0u; k < dof_stride; ++k) J[k] = 0.0f;
         const uint8_t bit = static_cast<uint8_t>(1u << side);
@@ -719,7 +732,24 @@ __device__ void EmitJointLimitRows(
             row.a.index = articulation;
             J[dof] = sign;
             row_penetration[rs] = fmaxf(-signed_distance, 0.0f);
-            atomicAdd(&row_count[env], 1u);
+            if (model.joint_law_source[link] == static_cast<uint32_t>(constraint::LawSource::MuJoCo)) {
+                const float pos = signed_distance - model.joint_limit_margin[link];
+                const float* reference = model.joint_limit_reference + size_t{link} * 7u;
+                const float invweight = model.dof_invweight0[size_t{articulation} * dof_stride + dof];
+                const auto compliant = constraint::ComputeCompliantRow(reference, reference + 2u,
+                    pos, pos, 0.0f, invweight, dt, refsafe);
+                row.flags |= nk::nk_row_flags::kMuJoCo;
+                const bool lower_nearest = state.q[link] - lower_limits[link] < upper_limits[link] - state.q[link];
+                if (pos >= 0.0f || lower_nearest != (side == 0u)) {
+                    row.flags &= ~nk::nk_row_flags::kActive;
+                    lambda[rs] = 0.0f;
+                }
+                row.rhs = compliant.aref_bias;
+                row.compliance_alpha = compliant.R;
+                data.row_reference_velocity_gain[rs] = 1.0f / dt - compliant.damping;
+                data.row_invweight[rs] = invweight;
+            }
+            if (row.flags & nk::nk_row_flags::kActive) atomicAdd(&row_count[env], 1u);
         } else {
             lambda[rs] = 0.0f;
         }
@@ -731,12 +761,13 @@ __device__ void EmitJointLimitRows(
 // Its Jacobian is e_joint, with no geometric position correction.
 __device__ void EmitJointFrictionRows(
     uint32_t link, const ArticulationDeviceState& state, float dt,
+    const ModelView& model, const DataView& data, bool refsafe,
     uint32_t base_link_count, uint32_t rows_per_env,
     uint32_t first_row_per_env, uint32_t dof_stride,
     NkRow* __restrict__ urows, float* __restrict__ lambda,
     float* __restrict__ chain_jacobian,
     uint32_t* __restrict__ row_cj_link, uint32_t* __restrict__ row_cj_link_b,
-    float* __restrict__ row_penetration, float* __restrict__ row_damping,
+    float* __restrict__ row_penetration,
     uint32_t* __restrict__ row_count) {
     const uint32_t env = link / base_link_count;
     const uint32_t local_link = link - env * base_link_count;
@@ -745,7 +776,6 @@ __device__ void EmitJointFrictionRows(
     row_cj_link[rs] = kInvalidLink;
     row_cj_link_b[rs] = kInvalidLink;
     row_penetration[rs] = 0.0f;
-    row_damping[rs] = 0.0f;
     lambda[rs] = 0.0f;
     float* const J = chain_jacobian + static_cast<size_t>(rs) * dof_stride;
     for (uint32_t k = 0u; k < dof_stride; ++k) J[k] = 0.0f;
@@ -763,6 +793,16 @@ __device__ void EmitJointFrictionRows(
         row.a.kind = kNkSideArtic;
         row.a.index = articulation;
         J[dof] = 1.0f;
+        if (model.joint_law_source[link] == static_cast<uint32_t>(constraint::LawSource::MuJoCo)) {
+            const float* reference = model.joint_friction_reference + size_t{link} * 7u;
+            const float invweight = model.dof_invweight0[size_t{articulation} * dof_stride + dof];
+            const auto compliant = constraint::ComputeCompliantRow(reference, reference + 2u,
+                0.0f, 0.0f, 0.0f, invweight, dt, refsafe);
+            row.flags |= nk::nk_row_flags::kMuJoCo;
+            row.compliance_alpha = compliant.R;
+            data.row_reference_velocity_gain[rs] = 1.0f / dt - compliant.damping;
+            data.row_invweight[rs] = invweight;
+        }
         atomicAdd(&row_count[env], 1u);
     }
     urows[rs] = row;
@@ -776,13 +816,13 @@ __device__ void EmitJointDriveRows(
     const float* command, const float* lower, const float* upper,
     NkRow* urows, float* lambda, float* chain_jacobian,
     uint32_t* row_cj_link, uint32_t* row_cj_link_b,
-    float* row_penetration, float* row_damping, uint32_t* row_count) {
+    float* row_penetration, uint32_t* row_count) {
     const uint32_t env = link / base_link_count;
     const uint32_t local = link - env * base_link_count;
     const uint32_t slot = env * rows_per_env + first_row + local;
     NkRow row{};
     row_cj_link[slot] = row_cj_link_b[slot] = kInvalidLink;
-    row_penetration[slot] = row_damping[slot] = lambda[slot] = 0.0f;
+    row_penetration[slot] = lambda[slot] = 0.0f;
     float* J = chain_jacobian + static_cast<size_t>(slot) * dof_stride;
     for (uint32_t d = 0u; d < dof_stride; ++d) J[d] = 0.0f;
     if (JointDofCountDevice(state.joint_type[link]) == 1u &&
@@ -805,7 +845,7 @@ __device__ void EmitJointDriveRows(
 }
 
 __global__ void EmitJointRowsKernel(
-    ArticulationDeviceState state, AssembleRowsParams p,
+    ArticulationDeviceState state, AssembleRowsParams p, ModelView model,
     const float* lower_limits, const float* upper_limits, const uint8_t* limit_flags,
     DataView data) {
     BeginProgrammaticKernel();
@@ -813,22 +853,22 @@ __global__ void EmitJointRowsKernel(
     if (link >= state.total_link_count) return;
     auto* const urows = reinterpret_cast<NkRow*>(data.urows);
     if (p.joint_limit_rows_per_env >= p.base_link_count * 2u)
-        EmitJointLimitRows(link, state, lower_limits, upper_limits, limit_flags,
+        EmitJointLimitRows(link, state, model, data, p.refsafe, lower_limits, upper_limits, limit_flags,
             p.dt, p.baumgarte_max_velocity, p.position_pass != 0u, p.env_count,
             p.base_link_count, p.rows_per_env, p.contact_rows_per_env, p.max_dof,
             urows, data.lambda, data.chain_jacobian, data.row_cj_link,
-            data.row_cj_link_b, data.row_penetration, data.row_damping, data.row_count);
+            data.row_cj_link_b, data.row_penetration, data.row_count);
     if (p.joint_friction_rows_per_env >= p.base_link_count && p.base_link_count > 0u)
-        EmitJointFrictionRows(link, state, p.dt, p.base_link_count, p.rows_per_env,
+        EmitJointFrictionRows(link, state, p.dt, model, data, p.refsafe, p.base_link_count, p.rows_per_env,
             p.contact_rows_per_env + p.joint_limit_rows_per_env, p.max_dof,
             urows, data.lambda, data.chain_jacobian, data.row_cj_link,
-            data.row_cj_link_b, data.row_penetration, data.row_damping, data.row_count);
+            data.row_cj_link_b, data.row_penetration, data.row_count);
     if (p.joint_drive_rows_per_env >= p.base_link_count && p.base_link_count > 0u)
         EmitJointDriveRows(link, state, p.dt, p.base_link_count, p.rows_per_env,
             p.contact_rows_per_env + p.joint_limit_rows_per_env + p.joint_friction_rows_per_env,
             p.max_dof, data.drive_command, data.drive_lower, data.drive_upper,
             urows, data.lambda, data.chain_jacobian, data.row_cj_link,
-            data.row_cj_link_b, data.row_penetration, data.row_damping, data.row_count);
+            data.row_cj_link_b, data.row_penetration, data.row_count);
 }
 
 // L^-1 J of a row's articulated sides; side 0 reads chain_jacobian, side 1 chain_jacobian_b.
@@ -983,7 +1023,7 @@ __global__ void PrepareContactRowsKernel(
     const float* __restrict__ body_inv_mass,
     const math::SymmetricMat3* __restrict__ body_world_inv_inertia,
     PointMassView point_masses,
-    const float* __restrict__ row_damping,
+    const float* __restrict__ row_reference_velocity_gain,
     const float* __restrict__ step_qdot,
     const math::Vec3* __restrict__ step_body_linear,
     const math::Vec3* __restrict__ step_body_angular,
@@ -1004,10 +1044,14 @@ __global__ void PrepareContactRowsKernel(
     if (TouchesVertexBlock(row.a, point_masses, vertex_blocks) ||
         TouchesVertexBlock(row.b, point_masses, vertex_blocks))
         row.flags |= nk::nk_row_flags::kVertexBlock;
-    const bool reference = (row.flags & nk::nk_row_flags::kContactNormal) &&
-        !(row.flags & (nk::nk_row_flags::kVelocityOnly | nk::nk_row_flags::kSpeculative));
+    if (row.flags & nk::nk_row_flags::kMuJoCo) {
+        const float initial_velocity = ContactReferenceVelocity(
+            row, rs, dof_stride, chain_jacobian, chain_jacobian_b,
+            step_qdot, step_body_linear, step_body_angular, step_particle, point_masses);
+        row.rhs += row_reference_velocity_gain[rs] * initial_velocity;
+    }
     const bool respond = measure != 0u && (row.flags & nk::nk_row_flags::kBlockNormal);
-    if (!reference && !respond) return;
+    if (!respond) return;
     uint32_t tangent_rows[2] = {0u, 0u};
     const bool block = respond && BlockTangentRows(urows, rs, row, tangent_rows);
     const uint32_t tangent1_row = tangent_rows[0], tangent2_row = tangent_rows[1];
@@ -1038,17 +1082,7 @@ __global__ void PrepareContactRowsKernel(
     float diagonal = PairDrivenRowCoupling(
         row, forward, row, forward, mass_factor, body_inv_mass, body_world_inv_inertia, point_masses,
         dof_stride);
-    if (reference) {
-        // Scale impedance by J*M^-1*J^T so compliance is independent of mass units.
-        row.compliance_alpha *= fmaxf(diagonal, 0.0f);
-        const float initial_velocity = ContactReferenceVelocity(
-            row, rs, dof_stride, chain_jacobian, chain_jacobian_b,
-            step_qdot, step_body_linear, step_body_angular, step_particle, point_masses);
-        // (1+b*dt)*v_next + R*impulse = v_start - dt*k*d*position.
-        row.rhs += initial_velocity / dt;
-    }
     diagonal += row.compliance_alpha;
-    if (!respond) return;
     if (!block) {
         contact_response[rs] = {};
         return;
@@ -1059,9 +1093,7 @@ __global__ void PrepareContactRowsKernel(
                                                 mass_factor, dof_stride, storage + size_t{2u} * dof_stride);
     const RowForward forward2 = ForwardRowSides(tangent2, tangent2_row, chain_jacobian, chain_jacobian_b,
                                                 mass_factor, dof_stride, storage + size_t{4u} * dof_stride);
-    // Normalize by (1+b*dt) to retain a symmetric block with R/(1+b*dt).
-    const float damping_scale = 1.0f / (1.0f + row_damping[rs] * dt);
-    const float k00 = diagonal - row.compliance_alpha * (1.0f - damping_scale);
+    const float k00 = diagonal;
     const float k11 = PairDrivenRowCoupling(
         tangent1, forward1, tangent1, forward1, mass_factor, body_inv_mass,
         body_world_inv_inertia, point_masses, dof_stride, shared[0]) + tangent1.compliance_alpha;
@@ -1372,7 +1404,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                p->union_slot_count, full_slots, rigid_rows, data.contact_row_extent,
                data.ucontact_row_range, reinterpret_cast<NkRow*>(data.urows),
                data.lambda, data.row_cj_link, data.row_cj_link_b, data.row_penetration,
-               data.row_damping, data.contact_material);
+               data.row_invweight, data.contact_material);
     const bool has_artic = p->max_dof > 0u && p->articulation_count > 0u;
     const uint32_t artics_per_env =
         (p->articulation_count > 0u && p->env_count > 0u)
@@ -1410,6 +1442,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    static_cast<const uint32_t*>(model.body_to_link),
                    static_cast<const uint32_t*>(model.body_to_articulation),
                    static_cast<const uint32_t*>(model.body_collidable_body),
+                   model.body_invweight0,
                    static_cast<const float*>(data.mat_buckets),
                    p->num_material_buckets, data.contact_material,
                    p->particles_per_env, p->grid_nodes_per_env,
@@ -1418,14 +1451,15 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    static_cast<const float*>(model.particle_friction),
                    p->solref[0], p->solref[1],
                    p->solimp[0], p->solimp[1], p->solimp[2], p->solimp[3], p->solimp[4],
-                   p->dt, p->baumgarte_max_velocity, p->contact_margin, p->overlap_recovery_velocity,
+                   p->dt, p->impratio, p->refsafe, p->overlap_recovery_velocity,
                    p->env_count, p->union_slot_count, p->rows_per_env,
                    p->full_row_slot_count, p->ogc_slot_count,
                    p->bodies_per_env, p->base_link_count, artics_per_env,
                    reinterpret_cast<NkRow*>(data.urows), data.lambda,
                    data.row_cj_link, data.row_cj_point,
                    data.row_cj_link_b, data.row_cj_point_b,
-                   data.row_count, data.row_penetration, data.row_damping, data.env_status,
+                   data.row_count, data.row_penetration, data.row_reference_velocity_gain,
+                   data.row_invweight, data.env_status,
                    data.contact_row_extent);
     }
 
@@ -1435,7 +1469,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
         const auto state = MakeArticulationDeviceState(model, data, p->total_link_count, p->articulation_count);
         const uint32_t blocks = (p->total_link_count + kBlockSize - 1u) / kBlockSize;
         LaunchCuda<true>(EmitJointRowsKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-                   state, *p, model.joint_limit_lower, model.joint_limit_upper,
+                   state, *p, model, model.joint_limit_lower, model.joint_limit_upper,
                    model.joint_limit_flags, data);
     }
 
@@ -1494,7 +1528,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    static_cast<const float*>(data.body_inv_mass),
                    static_cast<const math::SymmetricMat3*>(data.body_world_inv_inertia),
                    PointMasses(data),
-                   data.row_damping, data.step_qdot_flat, data.step_body_linear_velocity,
+                   data.row_reference_velocity_gain, data.step_qdot_flat, data.step_body_linear_velocity,
                    data.step_body_angular_velocity, data.step_particle_velocity,
                    total_rows, p->max_dof, p->dt, p->vertex_blocks, p->rows_per_env,
                    p->contact_rows_per_env, p->measure_contact_response, data.contact_row_extent);

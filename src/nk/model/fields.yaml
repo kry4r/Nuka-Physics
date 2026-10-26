@@ -159,7 +159,8 @@ fields:
   - {name: urows,           dtype: f32,  per: row_slot, arena: scratch,    owner: data, elem: 26}
   - {name: row_contact_response, dtype: symmat3, per: row_slot, arena: scratch, owner: data}
   - {name: chain_jacobian,  dtype: f32,  per: row_dof,  arena: scratch,    owner: data}
-  - {name: row_damping,     dtype: f32,  per: row_slot, arena: scratch,    owner: data}
+  - {name: row_reference_velocity_gain, dtype: f32, per: row_slot, arena: scratch, owner: data}
+  - {name: row_invweight, dtype: f32, per: row_slot, arena: scratch, owner: data}
   - {name: row_cj_link,     dtype: u32,  per: row_slot, arena: scratch,    owner: data}
   - {name: row_cj_point,    dtype: vec3, per: row_slot, arena: scratch,    owner: data}
   - {name: qdot_flat,       dtype: f32,  per: articulation_dof, arena: scratch, owner: data}

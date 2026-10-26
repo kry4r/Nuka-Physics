@@ -51,6 +51,7 @@ inline constexpr uint32_t kSpeculative = 1u << 8;
 inline constexpr uint32_t kMaterialBlock = 1u << 9;
 // Moves a vertex-block particle, whose velocity also changes between row colors of a sweep.
 inline constexpr uint32_t kVertexBlock = 1u << 10;
+inline constexpr uint32_t kMuJoCo = 1u << 11;
 }  // namespace nk_row_flags
 
 // General contact pipeline (PairDriven family, Phase 1B): the FIXED per-candidate-

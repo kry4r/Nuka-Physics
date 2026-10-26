@@ -562,7 +562,7 @@ __device__ void InitializeTileHead(DataView data, BlockDescentSolveParams p, Blo
         });
         rho = nanf("");
     }
-    const float compliance = row.compliance_alpha * RowStateScale(data, p, slot);
+    const float compliance = row.compliance_alpha;
     const auto scalar = nk::augmented::ComputeFloatScalarResponse(rho, compliance);
     s.penalty[slot] = rho;
     if (p.measure_contact_residual != 0u)
@@ -858,7 +858,6 @@ __device__ void InitializeTileResiduals(DataView data, BlockDescentSolveParams p
     const uint32_t step = TileSpan<kN>() == 1u ? 1u : kTileLanes;
     for (uint32_t h = first; h < c.heads; h += step) {
         const uint32_t slot = c.Index(kTileSlot, h), stride = c.Index(kTileStride, h);
-        const float scale = RowStateScale(data, p, slot);
         Vec3 velocity{}, rhs{};
         for (uint32_t axis = 0u; axis < c.Index(kTileAxes, h); ++axis) {
             const uint32_t at = slot + axis * stride;
@@ -871,7 +870,7 @@ __device__ void InitializeTileResiduals(DataView data, BlockDescentSolveParams p
                 along = TileSideSpeed(p, s, row.a, data.chain_jacobian, at) +
                         TileSideSpeed(p, s, row.b, data.chain_jacobian_b, at);
             SetAxisComponent(velocity, axis, along);
-            SetAxisComponent(rhs, axis, __fmul_rn(__fmul_rn(row.rhs, p.dt), axis == 0u ? scale : 1.0f));
+            SetAxisComponent(rhs, axis, __fmul_rn(row.rhs, p.dt));
         }
         if constexpr (TileSpan<kN>() == 1u) velocity = TileWarpSum3(velocity);
         if (TileSpan<kN>() > 1u || c.lane == 0u)

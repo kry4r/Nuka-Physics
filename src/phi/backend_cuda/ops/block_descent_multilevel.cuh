@@ -188,8 +188,7 @@ __global__ void MultilevelTouchKernel(DataView data, BlockDescentSolveParams p, 
          item += gridDim.x * blockDim.x) {
         const uint32_t slot = s.coarse_rows[item];
         const NkRow normal = rows[slot];
-        const float scale = RowStateScale(data, p, slot);
-        s.multilevel_row_terms[item] = {s.penalty[slot], normal.compliance_alpha * scale, normal.lower,
+        s.multilevel_row_terms[item] = {s.penalty[slot], normal.compliance_alpha, normal.lower,
             normal.upper, normal.mu, normal.friction_secondary,
             (normal.flags & nk::nk_row_flags::kBlockNormal) != 0u, s.scalar_response[slot]};
         const NkRowSide sides[2] = {normal.a, normal.b};
@@ -400,10 +399,9 @@ __global__ void MultilevelRowsKernel(DataView data, BlockDescentSolveParams p, B
         if (s.multilevel_touch_count[item] == 0u) continue;
         const NkRow normal = rows[slot];
         const bool contact = (normal.flags & nk::nk_row_flags::kBlockNormal) != 0u;
-        const float scale = RowStateScale(data, p, slot);
         float residual = 0.0f, dual = 0.0f;
         if (axis < (contact ? 3u : 1u))
-            AugmentedRowAxis(data, p, s, normal, slot, axis, scale, false, &residual, &dual);
+            AugmentedRowAxis(data, p, s, normal, slot, axis, false, &residual, &dual);
         AugmentedRowState state{};
         state.residual = {residual, __shfl_sync(mask, residual, 1, kRowAxisLanes),
                                     __shfl_sync(mask, residual, 2, kRowAxisLanes)};
@@ -411,7 +409,7 @@ __global__ void MultilevelRowsKernel(DataView data, BlockDescentSolveParams p, B
                             __shfl_sync(mask, dual, 2, kRowAxisLanes)};
         if (axis != 0u) continue;
         // The bound is the normal term at zero move, so the response reuses it.
-        const nk::augmented::ScalarTerm bound = AugmentedRowBoundTerm(s, normal, slot, scale, state);
+        const nk::augmented::ScalarTerm bound = AugmentedRowBoundTerm(s, normal, slot, state);
         state.normal_bound = bound.impulse;
         s.row_state[slot] = state;
         Vec3 impulse{};

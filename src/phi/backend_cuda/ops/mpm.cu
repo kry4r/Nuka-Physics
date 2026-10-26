@@ -854,7 +854,7 @@ __global__ void MpmClearStressRowsKernel(MpmParams p, DataView data) {
         urows[slot] = nk::NkRow{};
         data.lambda[slot] = 0.0f;
         data.row_cj_link[slot] = data.row_cj_link_b[slot] = ~0u;
-        data.row_penetration[slot] = data.row_damping[slot] = 0.0f;
+        data.row_penetration[slot] = 0.0f;
     }
 }
 
@@ -1466,7 +1466,7 @@ Status OpMpmStage(const ModelView& model, const DataView& data,
         uint64_t{p->stress_cells_per_env} * nk::kMpmStressRowsPerCell > p->rows_per_env ||
         uint64_t{p->stress_cells_per_env} * p->env_count > INT_MAX ||
         (p->stress_cells_per_env > 0u && (!data.urows || !data.lambda || !data.row_cj_link ||
-            !data.row_cj_link_b || !data.row_penetration || !data.row_damping)) ||
+            !data.row_cj_link_b || !data.row_penetration)) ||
         uint64_t{p->point_endpoints_per_env} * p->env_count > INT_MAX ||
         uint64_t{p->point_endpoint_terms_per_env} * p->env_count > INT_MAX ||
         !data.point_endpoint_ranges || !data.point_endpoint_terms ||

@@ -59,7 +59,7 @@ NUKA_AUGMENTED_HD inline math::Vec3 RelaxContactImpulse(math::Vec3 dual, math::V
     return {dual.x + weight * step.x, dual.y + weight * step.y, dual.z + weight * step.z};
 }
 
-// Residual is rhs * dt * damping_scale - Ju; compliance includes damping_scale.
+// Residual is rhs * dt - Ju; compliance maps impulse to velocity.
 NUKA_AUGMENTED_HD inline ScalarTerm EvaluateScalar(
     float dual, float rho, float residual, float compliance, float lower, float upper,
     const ScalarResponse& response) {
