@@ -182,6 +182,19 @@ __forceinline__ __device__ void ContactTangentBasis(Vec3 normal, Vec3* t1, Vec3*
     *t2 = Cross(n, tangent_a);
 }
 
+// MuJoCo's contact frame (t1,t2) of a normal: t1 is a preferred axis projected off the normal, or the
+// world y axis (z for a normal near y) when that projection is short.
+__forceinline__ __device__ void MuJoCoContactFrame(Vec3 normal, Vec3 axis, Vec3* t1, Vec3* t2) {
+    const Vec3 n = NormalizeOrUp(normal);
+    Vec3 tangent = Sub(axis, Scale(n, Dot(n, axis)));
+    if (Dot(tangent, tangent) < 0.25f) {
+        const Vec3 reference = n.y > -0.5f && n.y < 0.5f ? Vec3{0.0f, 1.0f, 0.0f} : Vec3{0.0f, 0.0f, 1.0f};
+        tangent = Sub(reference, Scale(n, Dot(n, reference)));
+    }
+    *t1 = Scale(tangent, rsqrtf(Dot(tangent, tangent)));
+    *t2 = Cross(n, *t1);
+}
+
 // Family C: rsqrtf(LengthSq)-scale, branch length_sq <= eps, caller fallback.
 //   Used by:  cuda_particle_world.cu NormalizeOr (eps 1e-12, caller fallback)
 // rsqrtf path => distinct from Family A; keep separate.

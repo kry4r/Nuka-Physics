@@ -461,6 +461,7 @@ __global__ void EmitPairDrivenRowsKernel(
     uint32_t side_kind_a = nk::kUContactSideBody, side_kind_b = nk::kUContactSideBody;
     int32_t bid_a = -1, bid_b = -1;
     uint32_t profile_a = 0u, profile_b = 0u;
+    uint32_t shape_kind_a = ~0u, shape_kind_b = ~0u;
     if (n_active > 0u) {
         local_a = ucontact_a[static_cast<size_t>(gid) * 4u];
         local_b = ucontact_b[static_cast<size_t>(gid) * 4u];
@@ -471,11 +472,13 @@ __global__ void EmitPairDrivenRowsKernel(
             const PrimShapeDev shape = LoadPrimShape(shape_table, local_a);
             bid_a = shape.body_id;
             profile_a = shape.contact_profile_index;
+            shape_kind_a = shape.kind;
         }
         if (side_kind_b == nk::kUContactSideBody && local_b < bodies_per_env) {
             const PrimShapeDev shape = LoadPrimShape(shape_table, local_b);
             bid_b = shape.body_id;
             profile_b = shape.contact_profile_index;
+            shape_kind_b = shape.kind;
         }
         kind_a = ResolvePairSide(side_kind_a, bid_a, body_to_link,
                                  body_to_articulation, body_collidable_body,
@@ -557,6 +560,13 @@ __global__ void EmitPairDrivenRowsKernel(
     const uint32_t weight_body_b = kind_b == kNkSideArtic ? env * bodies_per_env + link_body[link_b] : body_b;
     const float invweight = mujoco ? body_invweight0[2u * weight_body_a] + body_invweight0[2u * weight_body_b] : 0.0f;
     const bool pyramidal = mujoco && cone == 0u && merged.condim == 3u;
+    // Only a pyramid's edges depend on the frame's orientation, and MuJoCo aligns a capsule-plane frame
+    // with the capsule axis.
+    math::Vec3 frame_axis{0.0f, 0.0f, 0.0f};
+    if (pyramidal && shape_kind_a == collision::kShapeCapsule && shape_kind_b == collision::kShapePlane)
+        frame_axis = PrimRotate(body_pose[env * bodies_per_env + local_a].rotation, math::Vec3{0.0f, 0.0f, 1.0f});
+    if (pyramidal && shape_kind_b == collision::kShapeCapsule && shape_kind_a == collision::kShapePlane)
+        frame_axis = PrimRotate(body_pose[env * bodies_per_env + local_b].rotation, math::Vec3{0.0f, 0.0f, 1.0f});
     // The slope's elliptic tangent reference: timeconst 2 / (kf invweight ((1 - dmax) / impratio + dmax)).
     float friction_reference[2] = {solref[0], solref[1]};
     if (friction_slope && merged.friction_stiffness > 0.0f) {
@@ -593,7 +603,8 @@ __global__ void EmitPairDrivenRowsKernel(
                 slot - full_row_slot_count < ogc_slot_count;
             point_a = ogc_slot ? ucontact_witness_a[mp] : point;
             point_b = ogc_slot ? ucontact_witness_b[mp] : point;
-            mg::ContactTangentBasis(ucontact_normal[mp], &t0, &t1v);
+            if (pyramidal) mg::MuJoCoContactFrame(ucontact_normal[mp], frame_axis, &t0, &t1v);
+            else mg::ContactTangentBasis(ucontact_normal[mp], &t0, &t1v);
         }
 
         // ---- normal row ------------------------------------------------------
