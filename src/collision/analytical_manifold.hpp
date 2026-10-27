@@ -421,7 +421,7 @@ NUKA_AMF_HD inline void SphereSphere(const PrimParams& a, const PrimParams& b,
     const float pen = (a.radius + b.radius) - dist;
     if (pen <= 0.0f) return;
     const Vec3 n = Norm(delta, Vec3::UnitY());         // points A away from B
-    const Vec3 p = b.frame.t + n * b.radius;           // on B's surface
+    const Vec3 p = b.frame.t + n * (b.radius - 0.5f * pen);  // midway between the surfaces
     ContactPoint pt;
     pt.position = p; pt.normal = n; pt.penetration = pen; pt.stable_key = 0ull;
     out->AddPoint(pt);
@@ -440,8 +440,8 @@ NUKA_AMF_HD inline void SphereBox(const PrimParams& sph, const PrimParams& box,
     const float pen = sph.radius - surface.distance;
     if (pen <= 0.0f) return;
     ContactPoint pt;
-    pt.position = box.frame.LocalToWorld(surface.point);
     pt.normal = box.frame.DirLocalToWorld(surface.normal);
+    pt.position = box.frame.LocalToWorld(surface.point) - pt.normal * (0.5f * pen);
     pt.penetration = pen;
     pt.stable_key = 0ull;
     out->AddPoint(pt);
@@ -455,7 +455,7 @@ NUKA_AMF_HD inline void SpherePlane(const PrimParams& sph, const PrimParams& pla
     const float signed_dist = (sph.frame.t - plane.frame.t).Dot(n);
     const float pen = sph.radius - signed_dist;
     if (pen <= 0.0f) return;
-    const Vec3 p = sph.frame.t - n * sph.radius;             // sphere bottom
+    const Vec3 p = sph.frame.t - n * (sph.radius - 0.5f * pen);  // midway between the surfaces
     ContactPoint pt;
     pt.position = p; pt.normal = n; pt.penetration = pen; pt.stable_key = 0ull;
     out->AddPoint(pt);
@@ -482,7 +482,7 @@ NUKA_AMF_HD inline void BoxPlane(const PrimParams& box, const PrimParams& plane,
             box.frame.LocalToWorld({sx * he.x, sy * he.y, sz * he.z});
         const float signed_dist = (corner_world - plane.frame.t).Dot(n);
         if (signed_dist < 0.0f) {                            // below plane -> overlap
-            cand[ncand].position    = corner_world;
+            cand[ncand].position    = corner_world - n * (0.5f * signed_dist);
             cand[ncand].penetration = -signed_dist;          // >0 == depth
             cand[ncand].feature     = c;                     // 0..7 corner id
             ++ncand;
@@ -748,7 +748,7 @@ NUKA_AMF_HD inline void CapsulePlane(const PrimParams& cap, const PrimParams& pl
     for (uint32_t k = 0; k < 2u; ++k) {
         const float signed_dist = (ends[k] - plane.frame.t).Dot(n) - cap.radius;
         if (signed_dist < 0.0f) {
-            cand[ncand].position    = ends[k] - n * cap.radius;  // surface point
+            cand[ncand].position    = ends[k] - n * (cap.radius + 0.5f * signed_dist);
             cand[ncand].penetration = -signed_dist;
             cand[ncand].feature     = k;                          // endpoint id
             ++ncand;
@@ -770,8 +770,8 @@ NUKA_AMF_HD inline void CapsuleSphere(const PrimParams& cap, const PrimParams& s
     const float pen = sph.radius - surface.distance;
     if (pen <= 0.0f) return;
     ContactPoint pt;
-    pt.position = cap.frame.LocalToWorld(surface.point);
     pt.normal = cap.frame.DirLocalToWorld(surface.normal) * -1.0f;
+    pt.position = cap.frame.LocalToWorld(surface.point) + pt.normal * (0.5f * pen);
     pt.penetration = pen;
     pt.stable_key = 0ull;
     out->AddPoint(pt);
@@ -825,8 +825,8 @@ NUKA_AMF_HD inline void CylinderSphere(const PrimParams& cyl, const PrimParams& 
     const float pen = sph.radius - surface.distance;
     if (pen <= 0.0f) return;
     ContactPoint pt;
-    pt.position = cyl.frame.LocalToWorld(surface.point);
     pt.normal = cyl.frame.DirLocalToWorld(surface.normal) * -1.0f;
+    pt.position = cyl.frame.LocalToWorld(surface.point) + pt.normal * (0.5f * pen);
     pt.penetration = pen;
     pt.stable_key = static_cast<uint64_t>(surface.feature);
     out->AddPoint(pt);
