@@ -113,7 +113,7 @@ __device__ __forceinline__ void TileWorkSync() {
 
 // The work a wide tile's helper warps join: head setup, a staged chunk's Hessian products, the Hessian's
 // rounding scale, or its factor.
-enum class TileWork : uint32_t { Heads, Products, Scale, Factor, Support, Rows, Residuals };
+enum class TileWork : uint32_t { Heads, Products, Scale, Factor, Support, Rows, Residuals, Couplings };
 
 struct TileChunkWork {
     bool stop;
@@ -517,8 +517,9 @@ __device__ float TileSideSpeed(BlockDescentSolveParams p, BlockScratch s, const 
 
 // RowInertialResponse in float: J M^-1 J^T over the row's rigid bodies and articulations, with both sides
 // on one owner summed first; `coupling` is the product of the two owners' shares, `largest` the larger share.
+// `known` holds articulated sides' shares already computed, in side order.
 __device__ float TileInertialResponse(DataView data, BlockDescentSolveParams p, const NkRow& row, uint32_t slot,
-                                      float* coupling, float* largest) {
+                                      float* coupling, float* largest, const float* known = nullptr) {
     const NkRowSide sides[2] = {row.a, row.b};
     const bool shared = row.a.kind == row.b.kind && row.a.index == row.b.index;
     const size_t at = size_t{slot} * p.max_dof;
@@ -533,6 +534,8 @@ __device__ float TileInertialResponse(DataView data, BlockDescentSolveParams p, 
             const Vec3 angular = shared ? side.jang + row.b.jang : side.jang;
             contribution = data.body_inv_mass[side.index] * linear.Dot(linear) +
                            angular.Dot(data.body_world_inv_inertia[side.index].Multiply(angular));
+        } else if (side.kind == kNkSideArtic && known != nullptr) {
+            contribution = known[i];
         } else if (side.kind == kNkSideArtic) {
             const auto* jacobian = i == 0u ? static_cast<const float*>(data.chain_jacobian) + at : jacobian_b;
             const float* const factor = data.m_factor + size_t{side.index} * p.max_dof * p.max_dof;
@@ -551,7 +554,7 @@ __device__ float TileInertialResponse(DataView data, BlockDescentSolveParams p, 
 // Head row setup as CountIncidenceKernel in float: penalty, response and the row's fixed coefficients; the
 // double response stays for the residual measure.
 __device__ void InitializeTileHead(DataView data, BlockDescentSolveParams p, BlockScratch s,
-                                   const TileContext& c, uint32_t slot, uint32_t h) {
+                                   const TileContext& c, uint32_t slot, uint32_t h, bool known = false) {
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
     const NkRow row = rows[slot];
     const uint32_t stride = row.group_normal_count;
@@ -559,7 +562,8 @@ __device__ void InitializeTileHead(DataView data, BlockDescentSolveParams p, Blo
     const uint32_t owner = TileOwner(s, c, row.a);
     const uint32_t other = TileOwner(s, c, row.b);
     float coupling = 0.0f, largest = 0.0f;
-    const float response = TileInertialResponse(data, p, row, slot, &coupling, &largest);
+    const float shares[2] = {c.Value(kTileStep, h), c.Value(kTileStep + 1u, h)};
+    const float response = TileInertialResponse(data, p, row, slot, &coupling, &largest, known ? shares : nullptr);
     const float coupled = coupling > 0.0f
         ? (response + sqrtf(response * response + 12.0f * coupling)) / (6.0f * coupling) : FLT_MAX;
     const float cap = (row.flags & nk::nk_row_flags::kMuJoCo) != 0u
@@ -704,13 +708,77 @@ __device__ void InitializeWideTileResiduals(DataView data, BlockDescentSolvePara
     }
 }
 
+// J M^-1 J^T of every articulated head side, a warp per side over the articulation's factor staged in
+// shared memory: each settled entry of L^-1 J passes down the later rows in ForwardMass's order, and the
+// D^-1-weighted dot sums in coordinate order, so each share is MassCoupling's. Shares wait in kTileStep.
+template <uint32_t kN>
+__device__ void ComputeWideTileCouplings(DataView data, BlockDescentSolveParams p, const TileContext& c,
+                                         const TileBuffers& at) {
+    constexpr uint32_t kSpan = TileSpan<kN>();
+    const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
+    const uint32_t n = p.max_dof, ld = n | 1u;
+    const uint32_t lane = threadIdx.x % kTileLanes, warps = blockDim.x / kTileLanes;
+    float* const factor = at.factor;
+    for (uint32_t k = 0u; k < c.articulations; ++k) {
+        const uint32_t articulation = c.first_articulation + k;
+        const float* const source = data.m_factor + size_t{articulation} * n * n;
+        for (uint32_t e = threadIdx.x; e < n * n; e += blockDim.x) factor[e / n * ld + e % n] = source[e];
+        TileWorkSync();
+        for (uint32_t h = threadIdx.x / kTileLanes; h < c.heads; h += warps) {
+            const uint32_t slot = c.Index(kTileSlot, h);
+            const NkRow row = rows[slot];
+            const bool shared = row.a.kind == row.b.kind && row.a.index == row.b.index;
+            const size_t base = size_t{slot} * n;
+            for (uint32_t side = 0u; side < (shared ? 1u : 2u); ++side) {
+                const NkRowSide& own = side == 0u ? row.a : row.b;
+                if (own.kind != kNkSideArtic || own.index != articulation) continue;
+                const float* const v = static_cast<const float*>(side == 0u ? data.chain_jacobian
+                                                                            : data.chain_jacobian_b) + base;
+                const float* const extra = shared ? static_cast<const float*>(data.chain_jacobian_b) + base : nullptr;
+                float y[kSpan];
+#pragma unroll
+                for (uint32_t r = 0u; r < kSpan; ++r) {
+                    const uint32_t i = lane + r * kTileLanes;
+                    y[r] = i < n ? v[i] + (extra == nullptr ? 0.0f : extra[i]) : 0.0f;
+                }
+                for (uint32_t j = 0u; j < n; ++j) {
+                    float settled = y[0];
+#pragma unroll
+                    for (uint32_t r = 1u; r < kSpan; ++r) settled = j / kTileLanes == r ? y[r] : settled;
+                    settled = __shfl_sync(~0u, settled, j % kTileLanes);
+#pragma unroll
+                    for (uint32_t r = 0u; r < kSpan; ++r) {
+                        const uint32_t i = lane + r * kTileLanes;
+                        if (i > j && i < n) y[r] -= factor[i * ld + j] * settled;
+                    }
+                }
+                float term[kSpan];
+#pragma unroll
+                for (uint32_t r = 0u; r < kSpan; ++r) {
+                    const uint32_t i = lane + r * kTileLanes;
+                    term[r] = i < n ? y[r] * y[r] / factor[i * ld + i] : 0.0f;
+                }
+                float response = 0.0f;
+                for (uint32_t i = 0u; i < n; ++i) {
+                    float t = term[0];
+#pragma unroll
+                    for (uint32_t r = 1u; r < kSpan; ++r) t = i / kTileLanes == r ? term[r] : t;
+                    response += __shfl_sync(~0u, t, i % kTileLanes);
+                }
+                if (lane == 0u) c.Value(kTileStep + side, h) = response;
+            }
+        }
+        TileWorkSync();
+    }
+}
+
 template <uint32_t kN>
 __device__ __forceinline__ void ExecuteTileWork(DataView data, BlockDescentSolveParams p, BlockScratch s,
                                                 const TileChunkWork& work, const TileBuffers& at) {
     switch (work.kind) {
         case TileWork::Heads:
             for (uint32_t h = threadIdx.x; h < work.heads->heads; h += blockDim.x)
-                InitializeTileHead(data, p, s, *work.heads, work.heads->Index(kTileSlot, h), h);
+                InitializeTileHead(data, p, s, *work.heads, work.heads->Index(kTileSlot, h), h, true);
             break;
         case TileWork::Products: AssembleTileChunk<kN>(work, at); break;
         case TileWork::Scale: ScaleTileRows<kN>(work, at); break;
@@ -718,6 +786,7 @@ __device__ __forceinline__ void ExecuteTileWork(DataView data, BlockDescentSolve
         case TileWork::Support: FindWideTileSupport<kN>(data, p, s, *work.heads); break;
         case TileWork::Rows: CopyWideTileRows<kN>(data, p, s, *work.heads); break;
         case TileWork::Residuals: InitializeWideTileResiduals<kN>(data, p, s, *work.heads); break;
+        case TileWork::Couplings: ComputeWideTileCouplings<kN>(data, p, *work.heads, at); break;
     }
 }
 
@@ -1063,6 +1132,7 @@ __device__ void InitializeTile(ArticulationDeviceState state, DataView data, Blo
     c.heads = heads;
     __syncwarp();
     if constexpr (TileSpan<kN>() > 1u) {
+        RunTileWork<kN>(data, p, s, c, TileWork::Couplings);
         RunTileWork<kN>(data, p, s, c, TileWork::Heads);
     } else {
         for (uint32_t h = c.lane; h < heads; h += kTileLanes)
