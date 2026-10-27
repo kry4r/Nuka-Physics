@@ -492,6 +492,12 @@ __device__ void TileResponse(const TileHead& t, Vec3 move, Vec3* impulse, Symmet
         t.residual.x - move.x, t.compliance, t.lower, t.upper, t.response), move, impulse, curvature);
 }
 
+// Whether a head's response moves with its multiplier: a full-curvature soft row or a fixed impulse does not.
+__device__ bool TileResponseUsesDual(const TileHead& t) {
+    return t.elliptic ? nk::augmented::EllipticFraction(t.rho, t.cone_compliance) < 1.0f
+                      : t.axes == 3u || (t.response.dual_scale != 0.0f && t.lower != t.upper);
+}
+
 // Lane c's share of a row side's velocity J u at the tile's current velocities.
 __device__ float TileSideVelocity(BlockDescentSolveParams p, BlockScratch s, const NkRowSide& side,
                                   const float* jacobian, uint32_t slot, uint32_t c) {
@@ -2224,6 +2230,13 @@ __device__ void DescendTile(ArticulationDeviceState state, DataView data, BlockD
     if (c.member == 0u) InitializeTile<kN>(state, data, p, s, c, clock);
     c.heads = TeamBroadcast(c, c.heads);
     LoadTileColors(c);
+    // Without a multiplier-dependent or block-coupling head the dual update keeps the primal equation, so a
+    // converged sweep needs no remeasure.
+    bool remeasure = false;
+    for (uint32_t h = c.member * kTileLanes + c.lane; h < c.heads; h += c.team * kTileLanes)
+        remeasure |= TileResponseUsesDual(LoadTileHead(c, h)) ||
+                     (c.Index(kTileOwner, h) != kNoTileBlock && c.Index(kTileOwner + 1u, h) != kNoTileBlock);
+    remeasure = TeamMax(c, make_uint4(__any_sync(~0u, remeasure) ? 1u : 0u, 0u, 0u, 0u)).x != 0u;
     clock.Stamp(kPhaseSetup);
     // Lane k holds the residual of class k.
     float residual = 0.0f;
@@ -2249,7 +2262,7 @@ __device__ void DescendTile(ArticulationDeviceState state, DataView data, BlockD
         const float4 rows = UpdateTileDuals(data, c, momentum.beta);
         step = rows.w;
         clock.Stamp(kPhaseDual);
-        if (fmaxf(fmaxf(rows.x, rows.y), fmaxf(rows.z, c.residual)) < p.velocity_tolerance)
+        if (remeasure && fmaxf(fmaxf(rows.x, rows.y), fmaxf(rows.z, c.residual)) < p.velocity_tolerance)
             MeasureTilePrimals<kN>(data, p, s, c);
         if (c.trace_work && c.lane == 0u)
             for (uint32_t kind = 0u; kind < kSolverWorkWords; ++kind)
