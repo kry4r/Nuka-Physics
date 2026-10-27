@@ -244,11 +244,19 @@ inline size_t MassWorkBytes(uint32_t max_dof, uint32_t vectors, uint32_t words) 
 __device__ inline void FactorMass(const float* __restrict__ mass, const float* add, float* __restrict__ work,
                                   float* factor, uint32_t n, uint32_t stride) {
     const uint32_t lane = threadIdx.x, ld = MassWorkStride(n);
+    // Each lane loads a column eight rows at a time before storing any, so the loads overlap.
     for (uint32_t j = lane; j < n; j += blockDim.x) {
-#pragma unroll 8
-        for (uint32_t i = 0u; i < n; ++i)
-            if (j <= i) work[i * ld + j] = add == nullptr ? mass[size_t{i} * stride + j]
-                                                         : mass[size_t{i} * stride + j] + (i == j ? add[i] : 0.0f);
+        for (uint32_t first = 0u; first < n; first += 8u) {
+            float value[8];
+#pragma unroll
+            for (uint32_t r = 0u; r < 8u; ++r)
+                value[r] = first + r < n && j <= first + r ? mass[size_t{first + r} * stride + j] : 0.0f;
+#pragma unroll
+            for (uint32_t r = 0u; r < 8u; ++r) {
+                const uint32_t i = first + r;
+                if (i < n && j <= i) work[i * ld + j] = add == nullptr ? value[r] : value[r] + (i == j ? add[i] : 0.0f);
+            }
+        }
     }
     __syncthreads();
     for (uint32_t j = 0u; j < n; ++j) {
@@ -277,9 +285,15 @@ __device__ inline void LoadMassFactor(const float* __restrict__ factor, float* _
                                       uint32_t stride) {
     const uint32_t ld = MassWorkStride(n);
     for (uint32_t j = threadIdx.x; j < n; j += blockDim.x) {
-#pragma unroll 8
-        for (uint32_t i = 0u; i < n; ++i)
-            if (j <= i) work[i * ld + j] = factor[size_t{i} * stride + j];
+        for (uint32_t first = 0u; first < n; first += 8u) {
+            float value[8];
+#pragma unroll
+            for (uint32_t r = 0u; r < 8u; ++r)
+                value[r] = first + r < n && j <= first + r ? factor[size_t{first + r} * stride + j] : 0.0f;
+#pragma unroll
+            for (uint32_t r = 0u; r < 8u; ++r)
+                if (first + r < n && j <= first + r) work[(first + r) * ld + j] = value[r];
+        }
     }
     __syncthreads();
 }
