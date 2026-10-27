@@ -63,6 +63,8 @@ constexpr uint32_t kPointJacobianWords = kPointJacobianAxes * kPointJacobianComp
 constexpr double kGridRowPenaltyScale = 1.0;
 // Largest penalty times a row's most compliant owner share, the condition float block solves keep exact enough.
 constexpr double kPenaltyConditionCap = 1.0e2;
+// MuJoCo-law rows cap curvature at this over their invweight, above every corpus contact's 1/R.
+constexpr double kCompliantConditionCap = 3.0e4;
 
 struct AugmentedRowState {
     Vec3 residual;
@@ -1184,7 +1186,9 @@ __global__ void CountIncidenceKernel(DataView data, BlockDescentSolveParams p, B
         // rho^2 P / (1 + rho W + rho^2 P), P = max w_i (W - w_i); the root below keeps it at most 1/4.
         const double coupled = coupling > 0.0
             ? (response + sqrt(response * response + 12.0 * coupling)) / (6.0 * coupling) : HUGE_VAL;
-        const double cap = grid ? kGridRowPenaltyScale / response : kPenaltyConditionCap / largest;
+        const double cap = (row.flags & nk::nk_row_flags::kMuJoCo) != 0u
+            ? kCompliantConditionCap / data.row_invweight[slot]
+            : grid ? kGridRowPenaltyScale / response : kPenaltyConditionCap / largest;
         const double penalty = response > 0.0 ? fmin(cap, coupled) : 0.0;
         const bool valid_penalty = response == 0.0 ||
             (penalty > 0.0 && penalty <= double(FLT_MAX) && static_cast<float>(penalty) > 0.0f);

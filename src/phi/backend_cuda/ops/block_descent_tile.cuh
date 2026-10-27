@@ -562,7 +562,10 @@ __device__ void InitializeTileHead(DataView data, BlockDescentSolveParams p, Blo
     const float response = TileInertialResponse(data, p, row, slot, &coupling, &largest);
     const float coupled = coupling > 0.0f
         ? (response + sqrtf(response * response + 12.0f * coupling)) / (6.0f * coupling) : FLT_MAX;
-    float rho = response > 0.0f ? fminf(static_cast<float>(kPenaltyConditionCap) / largest, coupled) : 0.0f;
+    const float cap = (row.flags & nk::nk_row_flags::kMuJoCo) != 0u
+        ? static_cast<float>(kCompliantConditionCap) / data.row_invweight[slot]
+        : static_cast<float>(kPenaltyConditionCap) / largest;
+    float rho = response > 0.0f ? fminf(cap, coupled) : 0.0f;
     if (!(response == 0.0f || (response > 0.0f && rho > 0.0f && rho <= FLT_MAX))) {
         atomicOr(data.env_status + c.env, kEnvStatusSolverFailure);
         VisitOwners(row, PointMasses(data), p, [&](uint32_t failed) {
