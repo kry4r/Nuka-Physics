@@ -904,6 +904,8 @@ __device__ void EmitJointDriveRows(
         J[dof] = 1.0f;
         const float effort = fminf(fmaxf(command[link], lower[link]), upper[link]);
         row.lower = row.upper = effort * dt;
+        // The row admits one impulse, so the first sweep already descends against it.
+        lambda[slot] = row.lower;
         atomicAdd(row_count + env, 1u);
     }
     urows[slot] = row;
