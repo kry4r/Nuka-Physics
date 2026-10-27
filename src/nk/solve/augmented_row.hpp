@@ -27,11 +27,9 @@ struct ScalarResponse {
     double residual_scale;
 };
 
-NUKA_AUGMENTED_HD inline ScalarResponse ComputeScalarResponse(float rho, float compliance) {
-    const double denominator = 1.0 + double(rho) * compliance;
-    const double s = 1.0 / denominator;
-    const double k = double(rho) / denominator;
-    return {s, k};
+NUKA_AUGMENTED_HD inline ScalarResponse ComputeScalarResponse(double cap, double compliance) {
+    const double product = cap * compliance;
+    return product >= 1.0 ? ScalarResponse{0.0, 1.0 / compliance} : ScalarResponse{1.0 - product, cap};
 }
 
 struct TangentTerm {
@@ -206,9 +204,9 @@ struct FloatScalarResponse {
     float residual_scale;
 };
 
-NUKA_AUGMENTED_HD inline FloatScalarResponse ComputeFloatScalarResponse(float rho, float compliance) {
-    const float denominator = fmaf(rho, compliance, 1.0f);
-    return {1.0f / denominator, rho / denominator};
+NUKA_AUGMENTED_HD inline FloatScalarResponse ComputeFloatScalarResponse(float cap, float compliance) {
+    const float product = cap * compliance;
+    return product >= 1.0f ? FloatScalarResponse{0.0f, 1.0f / compliance} : FloatScalarResponse{1.0f - product, cap};
 }
 
 // EvaluateScalarImpulse in float: the impulse argument takes one fma rounding past the float scales.
@@ -386,10 +384,10 @@ NUKA_AUGMENTED_HD inline BallTerm<N> EvaluateBall(
     if ((rho <= 0.0 && fabs(rho) <= DBL_MAX) || compliance == double(FLT_MAX)) return term;
     bool valid = rho > 0.0 && rho <= DBL_MAX && compliance >= 0.0 && compliance <= DBL_MAX &&
                  radius >= 0.0 && radius <= DBL_MAX;
-    const double denominator = valid ? 1.0 + rho * compliance : double(NAN);
-    const double s = 1.0 / denominator;
-    const double k = rho / denominator;
-    valid = valid && denominator <= DBL_MAX && k > 0.0 && k <= DBL_MAX;
+    const ScalarResponse response = ComputeScalarResponse(rho, compliance);
+    const double s = response.dual_scale;
+    const double k = response.residual_scale;
+    valid = valid && k > 0.0 && k <= DBL_MAX;
     double x[N]{};
     double scale = 0.0;
     if (valid) {
