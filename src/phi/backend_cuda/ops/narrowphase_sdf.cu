@@ -20,6 +20,7 @@
 #include "phi/backend_cuda/ops/registry.cuh"
 #include "phi/backend_cuda/ops/sdf_types.cuh"
 #include "phi/backend_cuda/ops/surface_query.cuh"
+#include "phi/backend_cuda/ops/word_spans.cuh"
 #include "phi/op_schema.hpp"
 
 namespace nuka::phi {
@@ -531,7 +532,7 @@ Status OpNarrowphaseSdf(const ModelView& model, const DataView& data,
     const uint64_t words = PairSampleChunkWords(*p);
     if (words > 0u) {
         if (data.pair_sample_chunks == nullptr) return Status::InvalidArgument;
-        if (cudaMemsetAsync(data.pair_sample_chunks, 0, words * sizeof(uint32_t), stream) != cudaSuccess)
+        if (FillWords(data.pair_sample_chunks, words * sizeof(uint32_t), 0u, stream) != cudaSuccess)
             return Status::Failed;
         const uint32_t sweeps = (p->max_body_samples + kSurfaceQueryThreads - 1u) / kSurfaceQueryThreads;
         const uint32_t spread = std::clamp(kSampleChunkBlockBudget / (blocks * 2u), 1u, sweeps);
