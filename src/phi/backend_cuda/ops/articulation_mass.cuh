@@ -332,25 +332,44 @@ __device__ inline void LoadMassFactor(const float* __restrict__ factor, float* _
     __syncthreads();
 }
 
-// L D L^T x = value in place with the factor in `work`, called by the whole block: the forward sweep spreads each
-// column over the block and the backward sweep stays on one lane, both in the serial operation order.
+// L D L^T x = value in place with the factor in `work`, called by the whole block: the first warp sweeps forward
+// with each lane holding its rows, then its first lane sweeps backward, both in the serial operation order.
 __device__ inline void SolveMassBlock(const float* work, float* value, uint32_t n) {
-    const uint32_t lane = threadIdx.x, ld = MassWorkStride(n);
-    for (uint32_t j = 0u; j < n; ++j) {
-        __syncthreads();
-        const float solved = value[j];
-        for (uint32_t i = j + 1u + lane; i < n; i += blockDim.x) value[i] -= work[i * ld + j] * solved;
-    }
+    constexpr uint32_t kRows = (kMaxArticulationDof + 31u) / 32u;
+    const uint32_t lane = threadIdx.x % 32u, ld = MassWorkStride(n);
     __syncthreads();
-    for (uint32_t i = lane; i < n; i += blockDim.x) value[i] /= work[i * ld + i];
-    __syncthreads();
-    if (lane == 0u) {
-        for (uint32_t end = n; end > 0u; --end) {
-            const uint32_t i = end - 1u;
-            float sum = value[i];
-#pragma unroll 4
-            for (uint32_t j = i + 1u; j < n; ++j) sum -= work[j * ld + i] * value[j];
-            value[i] = sum;
+    if (threadIdx.x < 32u) {
+        float x[kRows];
+#pragma unroll
+        for (uint32_t r = 0u; r < kRows; ++r) {
+            const uint32_t i = lane + 32u * r;
+            x[r] = i < n ? value[i] : 0.0f;
+        }
+        for (uint32_t j = 0u; j < n; ++j) {
+            float solved = x[0];
+#pragma unroll
+            for (uint32_t r = 1u; r < kRows; ++r) solved = j / 32u == r ? x[r] : solved;
+            solved = __shfl_sync(~0u, solved, j % 32u);
+#pragma unroll
+            for (uint32_t r = 0u; r < kRows; ++r) {
+                const uint32_t i = lane + 32u * r;
+                if (i > j && i < n) x[r] -= work[i * ld + j] * solved;
+            }
+        }
+#pragma unroll
+        for (uint32_t r = 0u; r < kRows; ++r) {
+            const uint32_t i = lane + 32u * r;
+            if (i < n) value[i] = x[r] / work[i * ld + i];
+        }
+        __syncwarp();
+        if (lane == 0u) {
+            for (uint32_t end = n; end > 0u; --end) {
+                const uint32_t i = end - 1u;
+                float sum = value[i];
+#pragma unroll 8
+                for (uint32_t j = i + 1u; j < n; ++j) sum -= work[j * ld + i] * value[j];
+                value[i] = sum;
+            }
         }
     }
     __syncthreads();
