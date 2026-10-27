@@ -659,6 +659,8 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
     blob.joints.armatures.reserve(joints.size());
     blob.joints.initial_positions.reserve(joints.size());
     blob.joints.frictionlosses.reserve(joints.size());
+    blob.joints.stiffnesses.reserve(joints.size());
+    blob.joints.spring_references.reserve(joints.size());
     blob.joints.mimic_sources.reserve(joints.size());
     blob.joints.mimic_multipliers.reserve(joints.size());
     blob.joints.mimic_offsets.reserve(joints.size());
@@ -679,6 +681,8 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
         blob.joints.armatures.push_back(j.armature);
         blob.joints.initial_positions.push_back(j.initial_position);
         blob.joints.frictionlosses.push_back(j.frictionloss);
+        blob.joints.stiffnesses.push_back(j.stiffness);
+        blob.joints.spring_references.push_back(j.spring_reference);
         blob.joints.law_sources.push_back(j.law_source);
         blob.joints.limit_references.push_back(j.limit_reference);
         blob.joints.friction_references.push_back(j.friction_reference);

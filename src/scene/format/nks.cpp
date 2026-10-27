@@ -492,6 +492,7 @@ Value SaveJoint(const JointRecord& j) {
     o.Set("damping", Value::Float(j.damping));
     o.Set("armature", Value::Float(j.armature));
     o.Set("stiffness", Value::Float(j.stiffness));
+    o.Set("spring_reference", Value::Float(j.spring_reference));
     o.Set("initial_position", Value::Float(j.initial_position));
     o.Set("frictionloss", Value::Float(j.frictionloss));
     o.Set("law_source", Value::Int(static_cast<uint32_t>(j.law_source)));
@@ -1626,6 +1627,7 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             rec.damping = j->At("damping").AsFloat();
             rec.armature = j->At("armature").AsFloat();
             rec.stiffness = j->At("stiffness").AsFloat();
+            if (const Value* p = j->Find("spring_reference")) rec.spring_reference = p->AsFloat();
             rec.initial_position = j->At("initial_position").AsFloat();
             // Backward-compatible: a pre-frictionloss .nks lacks the key -> 0.
             if (const Value* fl = j->Find("frictionloss")) rec.frictionloss = fl->AsFloat();

@@ -504,7 +504,9 @@ __global__ void ArticulationDynamicsKernel(ArticulationDeviceState state, DataVi
                          : state.link_bias_force[link].p[component];
         const float damping = scalar ? state.joint_damping[link] +
             (p.fold_drive_damping != 0u ? data.drive_dissipation[link] : 0.0f) : 0.0f;
-        acceleration[d] = (scalar ? state.tau[link] : 0.0f) - bias[d] - damping * velocity[d];
+        const float spring = scalar ?
+            state.joint_stiffness[link] * (state.q[link] - state.joint_spring_reference[link]) : 0.0f;
+        acceleration[d] = (scalar ? state.tau[link] : 0.0f) - bias[d] - damping * velocity[d] - spring;
     }
     __syncthreads();
     if (p.reuse_mass == 0u) {

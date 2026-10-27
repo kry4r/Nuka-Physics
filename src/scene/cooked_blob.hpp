@@ -42,6 +42,8 @@ struct CookedJointTable {
     std::vector<float>      armatures;
     std::vector<float>      initial_positions;
     std::vector<float>      frictionlosses;
+    std::vector<float>      stiffnesses;
+    std::vector<float>      spring_references;
     std::vector<constraint::LawSource> law_sources;
     std::vector<constraint::SolverReference> limit_references;
     std::vector<constraint::SolverReference> friction_references;

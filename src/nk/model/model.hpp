@@ -179,6 +179,8 @@ struct ModelArticulation {
     std::vector<float>            joint_damping;
     std::vector<float>            joint_armature;
     std::vector<float>            joint_frictionloss;    // MuJoCo joint dry friction bound
+    std::vector<float>            joint_stiffness;
+    std::vector<float>            joint_spring_reference;
     std::vector<constraint::LawSource> joint_law_source;
     std::vector<constraint::SolverReference> joint_limit_reference;
     std::vector<constraint::SolverReference> joint_friction_reference;

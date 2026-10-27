@@ -25,7 +25,8 @@ constexpr Field<RigidBodyRecord> kBodyFields[] = {
 constexpr Field<JointRecord> kJointFields[] = {
     {"damping", &JointRecord::damping},         {"armature", &JointRecord::armature},
     {"stiffness", &JointRecord::stiffness},     {"frictionloss", &JointRecord::frictionloss},
-    {"lower_limit", &JointRecord::lower_limit}, {"upper_limit", &JointRecord::upper_limit}};
+    {"lower_limit", &JointRecord::lower_limit}, {"upper_limit", &JointRecord::upper_limit},
+    {"spring_reference", &JointRecord::spring_reference}};
 constexpr Field<ActuatorRecord> kActuatorFields[] = {
     {"gain", &ActuatorRecord::gain}, {"force_limit", &ActuatorRecord::force_limit}};
 constexpr Field<CollisionShapeRecord> kShapeFields[] = {

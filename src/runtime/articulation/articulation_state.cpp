@@ -417,6 +417,10 @@ ArticulationHostState BuildArticulationHostState(
                 local_link < topology.joint_frictionlosses.size()
                     ? topology.joint_frictionlosses[local_link]
                     : 0.0f);
+            result.joint_stiffness.push_back(local_link < topology.joint_stiffnesses.size()
+                ? topology.joint_stiffnesses[local_link] : 0.0f);
+            result.joint_spring_reference.push_back(local_link < topology.joint_spring_references.size()
+                ? topology.joint_spring_references[local_link] : 0.0f);
             result.joint_axis.push_back(topology.joint_axes[local_link]);
             result.parent_offset.push_back(parent_frame.position);
             result.joint_type.push_back(topology.joint_types[local_link]);

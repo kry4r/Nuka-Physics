@@ -100,6 +100,8 @@ struct MjcfJointDefaults {
     float damping = 0.0f;
     float armature = 0.0f;
     float frictionloss = 0.0f;
+    float stiffness = 0.0f;
+    float spring_reference = 0.0f;
     constraint::SolverReference limit_reference;
     constraint::SolverReference friction_reference;
     float limit_margin = 0.0f;
@@ -311,6 +313,8 @@ void ApplyJointDefault(tinyxml2::XMLElement* joint_elem, MjcfDefaultClass* defau
     joint_elem->QueryFloatAttribute("damping", &defaults->joint.damping);
     joint_elem->QueryFloatAttribute("armature", &defaults->joint.armature);
     joint_elem->QueryFloatAttribute("frictionloss", &defaults->joint.frictionloss);
+    joint_elem->QueryFloatAttribute("stiffness", &defaults->joint.stiffness);
+    joint_elem->QueryFloatAttribute("springref", &defaults->joint.spring_reference);
     joint_elem->QueryFloatAttribute("margin", &defaults->joint.limit_margin);
     ParseFloatList(joint_elem->Attribute("solreflimit"), defaults->joint.limit_reference.solref, 2);
     ParseFloatList(joint_elem->Attribute("solimplimit"), defaults->joint.limit_reference.solimp, 5);
@@ -1181,6 +1185,8 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         jrec.damping = defaults.joint.damping;
         jrec.armature = defaults.joint.armature;
         jrec.frictionloss = defaults.joint.frictionloss;
+        jrec.stiffness = defaults.joint.stiffness;
+        jrec.spring_reference = defaults.joint.spring_reference;
         jrec.law_source = constraint::LawSource::MuJoCo;
         jrec.limit_reference = defaults.joint.limit_reference;
         jrec.friction_reference = defaults.joint.friction_reference;
@@ -1193,6 +1199,8 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         joint->QueryFloatAttribute("damping", &jrec.damping);
         joint->QueryFloatAttribute("armature", &jrec.armature);
         joint->QueryFloatAttribute("frictionloss", &jrec.frictionloss);
+        joint->QueryFloatAttribute("stiffness", &jrec.stiffness);
+        joint->QueryFloatAttribute("springref", &jrec.spring_reference);
         joint->QueryFloatAttribute("margin", &jrec.limit_margin);
         ParseFloatList(joint->Attribute("solreflimit"), jrec.limit_reference.solref, 2);
         ParseFloatList(joint->Attribute("solimplimit"), jrec.limit_reference.solimp, 5);

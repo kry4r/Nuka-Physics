@@ -480,6 +480,9 @@ fields:
 
   # Joint dry friction is a per-link bound on the shared solver impulse divided by dt.
   - {name: joint_frictionloss, dtype: f32, per: link, arena: persistent, owner: model, flags: [param]}
+  # A passive joint spring pulls a scalar joint toward its spring reference.
+  - {name: joint_stiffness, dtype: f32, per: link, arena: persistent, owner: model}
+  - {name: joint_spring_reference, dtype: f32, per: link, arena: persistent, owner: model}
 
   # =========================================================================
   # Per-body EXTRA-collidable owner binding (multi-collidable bodies/links). A body

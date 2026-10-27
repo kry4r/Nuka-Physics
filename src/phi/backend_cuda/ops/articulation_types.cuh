@@ -68,6 +68,8 @@ struct ArticulationDeviceState {
     float* joint_damping = nullptr;
     float* joint_armature = nullptr;
     float* joint_frictionloss = nullptr;
+    float* joint_stiffness = nullptr;
+    float* joint_spring_reference = nullptr;
     math::Vec3* joint_axis = nullptr;
     math::Vec3* parent_offset = nullptr;
     ArticulationJointType* joint_type = nullptr;
@@ -236,6 +238,8 @@ inline ArticulationDeviceState MakeArticulationDeviceState(
     s.joint_damping = model.joint_damping;
     s.joint_armature = model.joint_armature;
     s.joint_frictionloss = model.joint_frictionloss;
+    s.joint_stiffness = model.joint_stiffness;
+    s.joint_spring_reference = model.joint_spring_reference;
     s.joint_axis = model.joint_axis;
     s.parent_offset = model.parent_offset;
     s.joint_type = reinterpret_cast<ArticulationJointType*>(model.joint_type);

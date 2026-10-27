@@ -549,6 +549,8 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         m.joint_damping = host.joint_damping;
         m.joint_armature = host.joint_armature;
         m.joint_frictionloss = host.joint_frictionloss;
+        m.joint_stiffness = host.joint_stiffness;
+        m.joint_spring_reference = host.joint_spring_reference;
         m.joint_law_source.resize(m.link_count, constraint::LawSource::None);
         m.joint_limit_reference.resize(m.link_count);
         m.joint_friction_reference.resize(m.link_count);

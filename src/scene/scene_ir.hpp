@@ -136,6 +136,7 @@ struct JointRecord {
     float damping                          = 0.0f;
     float armature                         = 0.0f;
     float stiffness                        = 0.0f;
+    float spring_reference                 = 0.0f;
     float initial_position                 = 0.0f;
     float frictionloss                     = 0.0f;   // MuJoCo joint dry friction
     constraint::LawSource law_source       = constraint::LawSource::None;

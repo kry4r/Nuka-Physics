@@ -529,6 +529,12 @@ void Model::StageModelField(FieldId id, const Segment& seg,
         case FieldId::JointFrictionloss:
             StampPerLink(dst, a.joint_frictionloss, L, E, sizeof(float));
             break;
+        case FieldId::JointStiffness:
+            StampPerLink(dst, a.joint_stiffness, L, E, sizeof(float));
+            break;
+        case FieldId::JointSpringReference:
+            StampPerLink(dst, a.joint_spring_reference, L, E, sizeof(float));
+            break;
         case FieldId::JointLawSource:
             StampPerLink(dst, a.joint_law_source, L, E, sizeof(uint32_t));
             break;
@@ -1115,6 +1121,8 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::JointDamping:          v.joint_damping = static_cast<float*>(p); break;
         case FieldId::JointArmature:         v.joint_armature = static_cast<float*>(p); break;
         case FieldId::JointFrictionloss:     v.joint_frictionloss = static_cast<float*>(p); break;
+        case FieldId::JointStiffness:        v.joint_stiffness = static_cast<float*>(p); break;
+        case FieldId::JointSpringReference:  v.joint_spring_reference = static_cast<float*>(p); break;
         case FieldId::JointLawSource:       v.joint_law_source = static_cast<uint32_t*>(p); break;
         case FieldId::JointLimitReference:  v.joint_limit_reference = static_cast<float*>(p); break;
         case FieldId::JointFrictionReference: v.joint_friction_reference = static_cast<float*>(p); break;
