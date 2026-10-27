@@ -535,11 +535,15 @@ bool World::SeedInitialState() {
         }
     }
 
-    if (L == 0) {
+    // Creation and reset expose the same FK and collision proxy poses and the reference weights at them.
+    const auto finish = [&]() {
         if (RefreshPoses(0u) != phi::Status::Ok) return false;
-        return DispatchOp(phi::NkOp::SnapshotState, &snapshot_params_) ==
-               phi::Status::Ok;
-    }
+        const phi::ReferenceWeightsParams weights{cap.dofs_per_env, cap.articulations_per_env * E,
+            L * E, cap.articulations_per_env, cap.bodies_per_env, total_body_count};
+        if (DispatchOp(phi::NkOp::ReferenceWeights, &weights) != phi::Status::Ok) return false;
+        return DispatchOp(phi::NkOp::SnapshotState, &snapshot_params_) == phi::Status::Ok;
+    };
+    if (L == 0) return finish();
 
     const ModelArticulation& a = model_.articulation;
     // env-major replication of the per-link template arrays (the EXACT layout
@@ -626,12 +630,7 @@ bool World::SeedInitialState() {
             return false;
         }
     }
-    // Creation and reset expose the same FK and collision proxy poses.
-    if (RefreshPoses(0u) != phi::Status::Ok) return false;
-    const phi::ReferenceWeightsParams weights{cap.dofs_per_env, cap.articulations_per_env * E,
-        L * E, cap.articulations_per_env, cap.bodies_per_env, total_body_count};
-    if (DispatchOp(phi::NkOp::ReferenceWeights, &weights) != phi::Status::Ok) return false;
-    return DispatchOp(phi::NkOp::SnapshotState, &snapshot_params_) == phi::Status::Ok;
+    return finish();
 }
 
 World::~World() {
