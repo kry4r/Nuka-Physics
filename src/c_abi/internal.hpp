@@ -189,6 +189,8 @@ struct WorldRecord {
     runtime::WorldStepOptions step_options;
 
     runtime::articulation::ArticulationHostState articulation_host;
+    // Body of every cooked articulation link, articulation-concatenated (name lookup).
+    std::vector<nuka::scene::BodyId> link_bodies;
 
     uint32_t simulated_step_count = 0u;
 

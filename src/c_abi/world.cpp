@@ -106,6 +106,11 @@ void CaptureArticulationHostMirror(const scene::CookedBlob& blob, WorldRecord* r
     // model was cooked from, so no collision geometry is cooked a second time.
     const std::vector<articulation::ArticulationCookedTopology> arts =
         articulation::CookArticulations(blob);
+    record->link_bodies.clear();
+    for (const auto& art : arts) {
+        record->link_bodies.insert(record->link_bodies.end(), art.link_bodies.begin(),
+                                   art.link_bodies.end());
+    }
     if (arts.empty()) {
         record->articulation_host = articulation::ArticulationHostState{};
         return;
@@ -1156,23 +1161,15 @@ nuka_result_t nuka_world_get_dof_name(nuka_world_handle world,
     if (record == nullptr) {
         return NUKA_RESULT_NULL_HANDLE;
     }
-    if (record->scene == nullptr ||
-        record->articulation_host.articulations.empty()) {
+    if (record->scene == nullptr || record->link_bodies.empty()) {
         return NUKA_RESULT_NOT_SUPPORTED;  // no cooked articulation retained.
     }
     try {
-        // Cooked link -> its body row. link_index spans EVERY cooked articulation
-        // (env-concatenated order), so resolve it by cumulative link ranges.
-        const auto& artics = record->articulation_host.articulations;
-        size_t k = 0u, local = link_index;
-        while (k < artics.size() && local >= artics[k].link_bodies.size()) {
-            local -= artics[k].link_bodies.size();
-            ++k;
-        }
-        if (k >= artics.size()) {
+        // link_index spans EVERY cooked articulation (env-concatenated order).
+        if (link_index >= record->link_bodies.size()) {
             return NUKA_RESULT_INVALID_ARG;
         }
-        const nuka::scene::BodyId body = artics[k].link_bodies[local];
+        const nuka::scene::BodyId body = record->link_bodies[link_index];
         const nuka::scene::SceneIR& scene = *record->scene;
 
         // The DOF name is the joint whose CHILD is this link's body (the actuated

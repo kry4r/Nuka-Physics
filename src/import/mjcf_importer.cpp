@@ -1469,8 +1469,6 @@ void ParseActuators(tinyxml2::XMLElement* mujoco,
             record.gain = gear * gear * gain;
             record.damping = record.gain;
         }
-        if (scene.GetJoint(record.joint_id).mimic_source != scene::kInvalidJoint)
-            throw std::runtime_error("MJCF: mimic joint cannot be driven directly");
         ParseRange(actuator->Attribute("forcerange"), record.force_limit, record.force_limit);
         scene.AddActuator(std::move(record));
     }
