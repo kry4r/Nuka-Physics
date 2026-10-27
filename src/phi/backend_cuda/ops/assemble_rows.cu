@@ -98,7 +98,6 @@ __device__ uint64_t HashMergedContactProfile(const scene::MergedContactParams& p
 namespace mg = ::nuka::math::gpu;
 using mg::Cross;
 using mg::Dot;
-using mg::NormalizeOrUp;
 using mg::Sub;
 
 __forceinline__ __device__ float Dot3(math::Vec3 a, math::Vec3 b) {
@@ -133,8 +132,9 @@ __global__ void ComputeContactChainJacobianKernel(
     const uint32_t offset = state.articulation_link_offset[articulation];
 
     const math::Vec3 point = contact_point_world[contact];
-    const math::Vec3 normal = NormalizeOrUp(
-        *reinterpret_cast<const math::Vec3*>(contact_normal_world + size_t{contact} * normal_stride));
+    // The row direction is the Jacobian itself; a pyramid edge keeps its sqrt(1 + mu^2) length.
+    const math::Vec3 normal =
+        *reinterpret_cast<const math::Vec3*>(contact_normal_world + size_t{contact} * normal_stride);
     float* const out_row = out_chain_jacobian + static_cast<size_t>(contact) * dof_stride;
 
     // AccumulateChainJointForce uses +=. Zero exactly the live articulation row
