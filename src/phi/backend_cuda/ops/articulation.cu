@@ -529,7 +529,11 @@ __global__ void ArticulationDynamicsKernel(ArticulationDeviceState state, DataVi
             state.qddot[link] = acceleration[d];
             if (p.integrate_velocity != 0u) state.qdot[link] = velocity[d] + p.dt * acceleration[d];
         } else if (p.integrate_velocity != 0u) {
-            state.link_velocity[link].v[component] = velocity[d] + p.dt * acceleration[d];
+            // The root's linear velocity steps with its origin's classical acceleration, as MuJoCo's free joint.
+            const uint32_t i = component % 3u, j = (i + 1u) % 3u, k = (i + 2u) % 3u;
+            const float transport = component < 3u ? 0.0f :
+                velocity[d - component + j] * velocity[d - i + k] - velocity[d - component + k] * velocity[d - i + j];
+            state.link_velocity[link].v[component] = velocity[d] + p.dt * (acceleration[d] + transport);
         }
     }
     __syncthreads();
@@ -651,6 +655,11 @@ __device__ void IntegrateFloatingBasePose(ArticulationDeviceState state,
     dq.y = 0.5f * v[1] * dt;
     dq.z = 0.5f * v[2] * dt;
     pose.rotation = QuatNormalizeForward(QuatMulForward(pose.rotation, dq));
+    // The linear velocity keeps its world direction through the turn.
+    const math::Vec3 turned = RotateByQuatInverse(QuatNormalizeForward(dq), MakeVec3(rv[3], rv[4], rv[5]));
+    state.link_velocity[root].v[3] = turned.x;
+    state.link_velocity[root].v[4] = turned.y;
+    state.link_velocity[root].v[5] = turned.z;
 
     state.base_pose[articulation] = pose;
 }
