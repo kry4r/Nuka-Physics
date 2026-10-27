@@ -33,6 +33,7 @@ __global__ void MimicReduceKernel(ArticulationDeviceState state,
                                   uint32_t* scratch, uint32_t* err_status) {
     __shared__ uint32_t dof_sh;
     __shared__ uint32_t free_sh;
+    extern __shared__ float shared[];
 
     const uint32_t articulation = blockIdx.x;
     const uint32_t lane = threadIdx.x;
@@ -157,7 +158,7 @@ __global__ void MimicReduceKernel(ArticulationDeviceState state,
     }
     __syncthreads();
 
-    FactorMass(a, a, n, max_dof);
+    FactorMass(a, nullptr, shared, a, n, max_dof);
     for (uint32_t i = lane; i < max_dof; i += blockDim.x)
         factor[size_t{i} * max_dof + i] = kMinDiagonal;
     __syncthreads();
@@ -229,7 +230,8 @@ Status OpMimicReduce(const ModelView& model, const DataView& data,
     }
     const ArticulationDeviceState state = MakeArticulationDeviceState(
         model, data, p->total_link_count, p->articulation_count);
-    LaunchCuda(MimicReduceKernel, dim3(p->articulation_count), dim3(32u), 0u, stream, state,
+    LaunchCuda(MimicReduceKernel, dim3(p->articulation_count), dim3(32u), MassWorkBytes(p->max_dof, 0u, 0u),
+               stream, state,
                static_cast<const uint32_t*>(model.mimic_source_link),
                static_cast<const float*>(model.mimic_multiplier),
                static_cast<const float*>(model.mimic_offset), p->max_dof,

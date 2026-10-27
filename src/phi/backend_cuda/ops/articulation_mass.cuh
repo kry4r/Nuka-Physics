@@ -59,6 +59,35 @@ __device__ inline uint32_t ActualCrbaDof(const ArticulationDeviceState& state,
     return static_cast<uint32_t>(dof);
 }
 
+// Shared DOF maps of one articulation, built by its warp once per kernel: DOF -> (link, component, ~0 for
+// scalar joints) and local link -> first DOF. Returns the DOF count, or ~0 after flagging an overflow.
+__device__ inline uint32_t BuildDofMaps(const ArticulationDeviceState& state, uint32_t articulation,
+    uint32_t max_dof, uint32_t* dof_link, uint32_t* dof_component, uint32_t* link_dof, uint32_t* err_status) {
+    const uint32_t lane = threadIdx.x;
+    const uint32_t offset = state.articulation_link_offset[articulation];
+    const uint32_t count = state.articulation_link_count[articulation];
+    uint32_t total = 0u;
+    for (uint32_t first = 0u; first < count; first += 32u) {
+        const uint32_t local = first + lane;
+        const uint32_t width = local < count ? JointDofCountDevice(state.joint_type[offset + local]) : 0u;
+        uint32_t scan = width;
+        for (uint32_t delta = 1u; delta < 32u; delta <<= 1u) {
+            const uint32_t below = __shfl_up_sync(~0u, scan, delta);
+            if (lane >= delta) scan += below;
+        }
+        const uint32_t dof = total + scan - width;
+        if (local < count && link_dof != nullptr) link_dof[local] = dof;
+        for (uint32_t c = 0u; c < width && dof + c < max_dof; ++c) {
+            dof_link[dof + c] = offset + local;
+            dof_component[dof + c] = width == 1u ? ~0u : c;
+        }
+        total += __shfl_sync(~0u, scan, 31u);
+    }
+    if (total > max_dof && lane == 0u) atomicOr(err_status, kEnvStatusDofOverflow);
+    __syncwarp();
+    return total > max_dof ? ~0u : total;
+}
+
 namespace mg = ::nuka::math::gpu;
 
 // Spatial operations share the backend math primitives.
@@ -90,19 +119,14 @@ __forceinline__ __device__ void TransformForceTransposeLocal(
     mg::TransformForceTranspose(transform.X, in, out);
 }
 
-__forceinline__ __device__ uint32_t LocalDofIndex(const ArticulationDeviceState& state,
-                                                  uint32_t offset,
-                                                  uint32_t link) {
-    return LocalDofIndexDevice(state, offset, link);
-}
-
 // Composite inertia preserves child order; independent columns fill the symmetric mass tile.
 __device__ inline void ComputeArticulationMass(ArticulationDeviceState state,
                                                   uint32_t max_dof,
                                                   LinkSpatialInertia* composite,
                                                   float* out_inertia_M,
                                                   const float* joint_damping,
-                                                  float dt, ArticulationTreeView tree) {
+                                                  float dt, ArticulationTreeView tree,
+                                                  const uint32_t* link_dof) {
     const uint32_t articulation = blockIdx.x;
     const uint32_t lane = threadIdx.x;
     if (articulation >= state.articulation_count) {
@@ -156,7 +180,7 @@ __device__ inline void ComputeArticulationMass(ArticulationDeviceState state,
         if (local == 0u && floating_root) {
             continue;
         }
-        const uint32_t dof_i = LocalDofIndex(state, offset, link);
+        const uint32_t dof_i = link_dof[local];
         if (dof_i >= max_dof) {
             continue;
         }
@@ -186,7 +210,7 @@ __device__ inline void ComputeArticulationMass(ArticulationDeviceState state,
             if (JointDofCountDevice(state.joint_type[walk]) == 0u) {
                 continue;
             }
-            const uint32_t dof_j = LocalDofIndex(state, offset, walk);
+            const uint32_t dof_j = link_dof[walk - offset];
             if (dof_j >= max_dof) {
                 continue;
             }
@@ -207,33 +231,80 @@ __device__ inline void ComputeArticulationMass(ArticulationDeviceState state,
     }
 }
 
-// A = L D L^T, with unit diagonal L and D stored on the factor diagonal.
-__device__ inline void FactorMass(const float* mass, float* factor, uint32_t n, uint32_t stride) {
-    const uint32_t lane = threadIdx.x;
-    for (size_t i = lane; i < size_t{stride} * stride; i += blockDim.x)
-        factor[i] = mass[i];
+// Row stride of a shared factor block; odd, so lanes walking different rows of one column hit different banks.
+__host__ __device__ constexpr uint32_t MassWorkStride(uint32_t n) { return n | 1u; }
+
+// Shared bytes of a factor block for max_dof DOFs plus `vectors` DOF vectors and `words` extra words.
+inline size_t MassWorkBytes(uint32_t max_dof, uint32_t vectors, uint32_t words) {
+    return (size_t{max_dof} * MassWorkStride(max_dof) + size_t{vectors} * max_dof + words) * sizeof(float);
+}
+
+// A = L D L^T, with unit diagonal L and D on the diagonal, factored in the shared block `work`. Each entry is a
+// serial dot over earlier pivots, as in a one-lane column sweep; `add` joins the diagonal, `factor` gets the tile.
+__device__ inline void FactorMass(const float* __restrict__ mass, const float* add, float* __restrict__ work,
+                                  float* factor, uint32_t n, uint32_t stride) {
+    const uint32_t lane = threadIdx.x, ld = MassWorkStride(n);
+    for (uint32_t j = lane; j < n; j += blockDim.x) {
+#pragma unroll 8
+        for (uint32_t i = 0u; i < n; ++i)
+            if (j <= i) work[i * ld + j] = add == nullptr ? mass[size_t{i} * stride + j]
+                                                         : mass[size_t{i} * stride + j] + (i == j ? add[i] : 0.0f);
+    }
     __syncthreads();
     for (uint32_t j = 0u; j < n; ++j) {
-        if (lane == 0u) {
-            float diagonal = factor[size_t{j} * stride + j];
-            for (uint32_t k = 0u; k < j; ++k) {
-                const float l = factor[size_t{j} * stride + k];
-                diagonal -= l * l * factor[size_t{k} * stride + k];
-            }
-            factor[size_t{j} * stride + j] = fmaxf(diagonal, 1.0e-6f);
+        for (uint32_t i = j + lane; i < n; i += blockDim.x) {
+            float value = work[i * ld + j];
+#pragma unroll 4
+            for (uint32_t k = 0u; k < j; ++k) value -= work[i * ld + k] * work[j * ld + k] * work[k * ld + k];
+            work[i * ld + j] = value;
         }
         __syncthreads();
-        for (uint32_t i = j + 1u + lane; i < n; i += blockDim.x) {
-            float value = factor[size_t{i} * stride + j];
-            for (uint32_t k = 0u; k < j; ++k)
-                value -= factor[size_t{i} * stride + k] * factor[size_t{j} * stride + k] *
-                         factor[size_t{k} * stride + k];
-            factor[size_t{i} * stride + j] = value / factor[size_t{j} * stride + j];
-        }
+        const float diagonal = fmaxf(work[j * ld + j], 1.0e-6f);
+        for (uint32_t i = j + 1u + lane; i < n; i += blockDim.x) work[i * ld + j] /= diagonal;
+        if (lane == 0u) work[j * ld + j] = diagonal;
         __syncthreads();
     }
-    for (uint32_t i = n + lane; i < stride; i += blockDim.x)
-        factor[size_t{i} * stride + i] = 1.0e-6f;
+    if (factor == nullptr) return;
+    // Readers take the strict lower triangle and the diagonal; padded DOFs keep unit rows with a tiny pivot.
+    for (uint32_t i = 0u; i < stride; ++i)
+        for (uint32_t j = lane; j <= i; j += blockDim.x)
+            factor[size_t{i} * stride + j] = i < n ? work[i * ld + j] : i == j ? 1.0e-6f : 0.0f;
+    __syncthreads();
+}
+
+// Loads a stored factor's leading block into `work`.
+__device__ inline void LoadMassFactor(const float* __restrict__ factor, float* __restrict__ work, uint32_t n,
+                                      uint32_t stride) {
+    const uint32_t ld = MassWorkStride(n);
+    for (uint32_t j = threadIdx.x; j < n; j += blockDim.x) {
+#pragma unroll 8
+        for (uint32_t i = 0u; i < n; ++i)
+            if (j <= i) work[i * ld + j] = factor[size_t{i} * stride + j];
+    }
+    __syncthreads();
+}
+
+// L D L^T x = value in place with the factor in `work`, called by the whole block: the forward sweep spreads each
+// column over the block and the backward sweep stays on one lane, both in the serial operation order.
+__device__ inline void SolveMassBlock(const float* work, float* value, uint32_t n) {
+    const uint32_t lane = threadIdx.x, ld = MassWorkStride(n);
+    for (uint32_t j = 0u; j < n; ++j) {
+        __syncthreads();
+        const float solved = value[j];
+        for (uint32_t i = j + 1u + lane; i < n; i += blockDim.x) value[i] -= work[i * ld + j] * solved;
+    }
+    __syncthreads();
+    for (uint32_t i = lane; i < n; i += blockDim.x) value[i] /= work[i * ld + i];
+    __syncthreads();
+    if (lane == 0u) {
+        for (uint32_t end = n; end > 0u; --end) {
+            const uint32_t i = end - 1u;
+            float sum = value[i];
+#pragma unroll 4
+            for (uint32_t j = i + 1u; j < n; ++j) sum -= work[j * ld + i] * value[j];
+            value[i] = sum;
+        }
+    }
     __syncthreads();
 }
 

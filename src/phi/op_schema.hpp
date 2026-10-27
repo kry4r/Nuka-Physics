@@ -111,6 +111,7 @@ struct ArticulationDynamicsParams {
     uint32_t articulation_count;
     uint32_t total_link_count;
     uint32_t apply_link_wrench = 0u;
+    uint32_t max_links = 0u;   // links of the largest articulation
 };
 
 struct ReferenceWeightsParams {

@@ -334,6 +334,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_dynamics_.gravity[2] = cfg.gravity[2];
         p_dynamics_.articulation_count = articulation_cnt;
         p_dynamics_.total_link_count = total_link_count;
+        p_dynamics_.max_links = base_link_count;
         p_dynamics_.apply_link_wrench = 1u;
         p_dynamics_.dt = cfg.dt;
         p_dynamics_.max_dof = max_dof;
