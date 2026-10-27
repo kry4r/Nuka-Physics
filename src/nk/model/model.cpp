@@ -65,7 +65,7 @@ bool CanonicalizeContactProfileForUpload(const ModelMaterialBucket& source,
     float* values[] = {&p.mu1, &p.mu2, &p.solref[0], &p.solref[1],
                        &p.solimp[0], &p.solimp[1], &p.solimp[2],
                        &p.solimp[3], &p.solimp[4], &p.solmix,
-                       &p.margin, &p.gap};
+                       &p.margin, &p.gap, &p.friction_stiffness};
     for (float* value : values) {
         if (!std::isfinite(*value)) return false;
         *value = CanonicalZero(*value);

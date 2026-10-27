@@ -20,7 +20,7 @@ fields:
   - {name: articulation_bias, dtype: f32, per: articulation_dof, arena: scratch, owner: data}
   - {name: m_factor,         dtype: f32,       per: articulation_dof2, arena: scratch, owner: data}
   - {name: particle_pos,  dtype: vec3,      per: particle,     arena: persistent, owner: data}
-  - {name: mat_buckets,   dtype: f32,       per: scalar, count: "num_buckets*19*env_count", arena: persistent, owner: data, flags: [param]}
+  - {name: mat_buckets,   dtype: f32,       per: scalar, count: "num_buckets*20*env_count", arena: persistent, owner: data, flags: [param]}
   - {name: mat_index,     dtype: u32,       per: body,         arena: persistent, owner: data,  flags: [param]}
   - {name: link_contact_wrench, dtype: spatial6, per: link,    arena: scratch,    owner: data,  flags: [readout]}
 

@@ -29,6 +29,7 @@ struct ContactParamsIn {
     float   solmix      = 1.0f;
     float   margin      = 0.0f;
     float   gap         = 0.0f;
+    float   friction_stiffness = -1.0f;
 };
 
 // The MERGE OUTPUT: a single resolved contact-parameter set (no priority/solmix;
@@ -43,6 +44,7 @@ struct MergedContactParams {
     float   solimp[5]   = {0.9f, 0.95f, 0.001f, 0.5f, 2.0f};
     float   margin      = 0.0f;
     float   gap         = 0.0f;
+    float   friction_stiffness = -1.0f;
 };
 
 // --- tiny HD arithmetic (avoid <algorithm> / std:: in the device path) -----
@@ -101,6 +103,8 @@ NUKA_CF_HD inline MergedContactParams MergeContactParams(const ContactParamsIn& 
 
     out.margin = A.margin + B.margin;
     out.gap = A.gap + B.gap;
+    if (A.friction_stiffness >= 0.0f && B.friction_stiffness >= 0.0f)
+        out.friction_stiffness = mix * A.friction_stiffness + imix * B.friction_stiffness;
     return out;
 }
 

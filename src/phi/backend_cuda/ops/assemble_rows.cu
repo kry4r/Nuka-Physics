@@ -68,6 +68,7 @@ __device__ scene::ContactParamsIn ReadContactProfile(
     out.gap = w[nk::kContactProfileGap];
     out.priority = static_cast<int32_t>(__float_as_uint(w[nk::kContactProfilePriority]));
     out.condim = static_cast<uint8_t>(__float_as_uint(w[nk::kContactProfileCondim]));
+    out.friction_stiffness = w[nk::kContactProfileFrictionStiffness];
     return out;
 }
 
@@ -90,6 +91,7 @@ __device__ uint64_t HashMergedContactProfile(const scene::MergedContactParams& p
     hash = HashContactProfileWord(hash, __float_as_uint(p.margin));
     hash = HashContactProfileWord(hash, __float_as_uint(p.gap));
     hash = HashContactProfileWord(hash, p.condim);
+    if (p.friction_stiffness >= 0.0f) hash = HashContactProfileWord(hash, __float_as_uint(p.friction_stiffness));
     return hash == 0u ? 0x9e3779b97f4a7c15ull : hash;
 }
 
@@ -532,6 +534,9 @@ __global__ void EmitPairDrivenRowsKernel(
         merged.mu1 = fmaxf(1.0e-5f, merged.mu1);
         merged.mu2 = fmaxf(1.0e-5f, merged.mu2);
     }
+    // A zero force-space friction slope removes an elliptic contact's friction rows.
+    const bool friction_slope = mujoco && cone == 1u && merged.friction_stiffness >= 0.0f;
+    if (friction_slope && merged.friction_stiffness == 0.0f) merged.condim = 1u;
     if (kind_a == kNkSideParticle && side_kind_b == nk::kUContactSideBody) {
         merged.mu1 = scene::ParticleBodyFriction(side_a.mu1, side_b.mu1);
         merged.mu2 = scene::ParticleBodyFriction(side_a.mu2, side_b.mu2);
@@ -552,6 +557,16 @@ __global__ void EmitPairDrivenRowsKernel(
     const uint32_t weight_body_b = kind_b == kNkSideArtic ? env * bodies_per_env + link_body[link_b] : body_b;
     const float invweight = mujoco ? body_invweight0[2u * weight_body_a] + body_invweight0[2u * weight_body_b] : 0.0f;
     const bool pyramidal = mujoco && cone == 0u && merged.condim == 3u;
+    // The slope's elliptic tangent reference: timeconst 2 / (kf invweight ((1 - dmax) / impratio + dmax)).
+    float friction_reference[2] = {solref[0], solref[1]};
+    if (friction_slope && merged.friction_stiffness > 0.0f) {
+        const float denominator = merged.friction_stiffness * invweight *
+            ((1.0f - solimp[1]) / impratio + solimp[1]);
+        if (denominator > 0.0f && isfinite(2.0f / denominator)) {
+            friction_reference[0] = 2.0f / denominator;
+            friction_reference[1] = 1.0f;
+        }
+    }
     contact_material[gid] = n_active > 0u ? HashMergedContactProfile(merged) : 0u;
     if (n_active > 0u && velocity_only)
         contact_material[gid] = nk::ContactHashWord(contact_material[gid], law);
@@ -691,7 +706,7 @@ __global__ void EmitPairDrivenRowsKernel(
                 if (mujoco) {
                     const float mu = k == 0u ? mu1 : mu2;
                     const float tangent_invweight = invweight / impratio * (mu1 * mu1) / (mu * mu);
-                    const auto compliant = constraint::ComputeCompliantRow(solref, solimp,
+                    const auto compliant = constraint::ComputeCompliantRow(friction_reference, solimp,
                         -ucontact_depth[mp] - merged.margin, 0.0f, 0.0f, tangent_invweight, dt, refsafe);
                     row.flags |= nk::nk_row_flags::kMuJoCo;
                     row.compliance_alpha = compliant.R;
