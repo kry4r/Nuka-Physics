@@ -21,6 +21,7 @@
 #include "phi/backend_cuda/ops/rigid_types.cuh"
 #include "phi/backend_cuda/ops/union_types.cuh"
 #include "phi/backend_cuda/ops/vertex_blocks.cuh"
+#include "phi/backend_cuda/ops/word_spans.cuh"
 
 namespace nuka::phi {
 
@@ -185,16 +186,6 @@ __forceinline__ __device__ math::Vec3 NormalizedHostExpr(math::Vec3 v) {
     const float len = sqrtf(v.x * v.x + v.y * v.y + v.z * v.z);
     if (len < 1e-12f) return {0.0f, 0.0f, 0.0f};
     return {v.x / len, v.y / len, v.z / len};
-}
-
-// Step-start velocity copies as a kernel, so the captured step carries no copy-engine nodes.
-__global__ void SnapshotVec3Kernel(const math::Vec3* __restrict__ a, math::Vec3* __restrict__ a_out,
-                                   const math::Vec3* __restrict__ b, math::Vec3* __restrict__ b_out,
-                                   uint32_t count) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= count) return;
-    a_out[i] = a[i];
-    if (b != nullptr) b_out[i] = b[i];
 }
 
 // Each articulation's flat velocity tile follows its actual joint DOF prefix; padding is zero.
@@ -1476,16 +1467,13 @@ Status OpSnapshotStepVelocity(const ModelView& model, const DataView& data,
         LaunchCuda(PackQdotFlatMultiKernel, dim3((total + block_size - 1u) / block_size),
                    dim3(block_size), 0u, stream, state, p->max_dof, data.step_qdot_flat);
     }
-    if (p->total_body_count > 0u)
-        LaunchCuda(SnapshotVec3Kernel, dim3((p->total_body_count + 127u) / 128u), dim3(128u), 0u, stream,
-                   static_cast<const math::Vec3*>(data.body_linear_velocity), data.step_body_linear_velocity,
-                   static_cast<const math::Vec3*>(data.body_angular_velocity), data.step_body_angular_velocity,
-                   p->total_body_count);
-    if (p->total_particle_count > 0u)
-        LaunchCuda(SnapshotVec3Kernel, dim3((p->total_particle_count + 127u) / 128u), dim3(128u), 0u, stream,
-                   static_cast<const math::Vec3*>(data.particle_vel), data.step_particle_velocity,
-                   static_cast<const math::Vec3*>(nullptr), static_cast<math::Vec3*>(nullptr),
-                   p->total_particle_count);
+    const size_t bodies = static_cast<size_t>(p->total_body_count) * sizeof(math::Vec3);
+    WordSpans snapshot;
+    snapshot.Copy(data.step_body_linear_velocity, data.body_linear_velocity, bodies);
+    snapshot.Copy(data.step_body_angular_velocity, data.body_angular_velocity, bodies);
+    snapshot.Copy(data.step_particle_velocity, data.particle_vel,
+                  static_cast<size_t>(p->total_particle_count) * sizeof(math::Vec3));
+    if (LaunchWordSpans(snapshot, stream) != cudaSuccess) return Status::Failed;
     return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
 }
 

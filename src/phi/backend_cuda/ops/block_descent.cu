@@ -25,6 +25,7 @@
 #include "phi/backend_cuda/ops/dense_block_solve.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
+#include "phi/backend_cuda/ops/word_spans.cuh"
 #include "phi/backend_cuda/ops/vertex_blocks.cuh"
 
 namespace nuka::phi {
@@ -2655,8 +2656,8 @@ cudaError_t LaunchMultilevelCorrection(const ModelView& model, const DataView& d
     if (status == cudaSuccess)
         status = LaunchWork(MultilevelForceKernel, vertices, kMultilevelForceTile, stream, model, data, p, s);
     if (status == cudaSuccess && assemble) {
-        status = cudaMemsetAsync(s.multilevel_operator, 0, size_t{p.env_count} *
-                                 MultilevelOperatorEntries(l) * sizeof(unsigned long long), stream);
+        status = FillWords(s.multilevel_operator, size_t{p.env_count} *
+                           MultilevelOperatorEntries(l) * sizeof(unsigned long long), 0u, stream);
         if (status == cudaSuccess) {
             LaunchCuda(MultilevelBoundKernel, parts, dim3(kThreads), 0u, stream, model, data, p, s);
             status = cudaGetLastError();
@@ -2726,7 +2727,7 @@ Status MeasureSolve(const ModelView& model, const DataView& data, const BlockDes
                     const BlockScratch& s, cudaStream_t stream) {
     if (p.measure_contact_residual == 0u) return Status::Ok;
     const auto clear = [&](void* ptr, size_t bytes) {
-        return bytes == 0u || (ptr != nullptr && cudaMemsetAsync(ptr, 0, bytes, stream) == cudaSuccess);
+        return bytes == 0u || (ptr != nullptr && FillWords(ptr, bytes, 0u, stream) == cudaSuccess);
     };
     if (!clear(data.contact_solve_metrics, size_t{p.env_count} * constraint::kContactSolveMetricCount * sizeof(uint64_t)) ||
         !clear(data.contact_solve_counts, size_t{p.env_count} * constraint::kContactSolveCountSize * sizeof(uint32_t)) ||
@@ -2816,7 +2817,7 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
     const ArticulationDeviceState articulation_state = MakeArticulationDeviceState(
         model, data, p->base_link_count * p->env_count, p->articulation_count);
     const auto clear = [&](void* ptr, size_t bytes) {
-        return bytes == 0u || (ptr != nullptr && cudaMemsetAsync(ptr, 0, bytes, stream) == cudaSuccess);
+        return bytes == 0u || (ptr != nullptr && FillWords(ptr, bytes, 0u, stream) == cudaSuccess);
     };
     if (p->telemetry != 0u) {
         if (data.telemetry == nullptr) return Status::InvalidArgument;
@@ -2838,16 +2839,18 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
     if (p->measure_vertex_audit != 0u && !clear(data.vbd_solve_audit,
             size_t{p->vertex_blocks.vertices} * p->env_count * nk::kVbdSolveAuditColumnCount * sizeof(float)))
         return Status::Failed;
-    if (!clear(s.counts, size_t{s.blocks + 1u} * sizeof(uint32_t)) ||
-        !clear(s.dense_coupled, size_t{p->total_body_count + p->articulation_count} * sizeof(uint32_t)) ||
-        !clear(s.cache_counts, size_t{s.cache_color_count} * sizeof(uint32_t)) ||
-        !clear(s.contact_relaxation, size_t{s.rows} * sizeof(nk::augmented::ContactRelaxation)) ||
-        !clear(s.active_count, sizeof(uint32_t)) ||
-        !clear(s.sweep_state, kSweepStateWords * sizeof(uint32_t)) ||
-        !clear(data.vbd_velocity_sweep_count, size_t{p->env_count} * sizeof(uint32_t)) ||
-        !clear(s.env_residual, size_t{p->env_count} * kResidualClasses * sizeof(uint32_t)) ||
-        !clear(data.solver_color_counts, size_t{p->env_count} * kSolverCountWords * sizeof(uint32_t)) ||
-        !clear(data.solver_phase_time, size_t{p->env_count} * kSolverPhaseWords * sizeof(uint64_t))) return Status::Failed;
+    WordSpans cleared;
+    cleared.Fill(s.counts, size_t{s.blocks + 1u} * sizeof(uint32_t));
+    cleared.Fill(s.dense_coupled, size_t{p->total_body_count + p->articulation_count} * sizeof(uint32_t));
+    cleared.Fill(s.cache_counts, size_t{s.cache_color_count} * sizeof(uint32_t));
+    cleared.Fill(s.contact_relaxation, size_t{s.rows} * sizeof(nk::augmented::ContactRelaxation));
+    cleared.Fill(s.active_count, sizeof(uint32_t));
+    cleared.Fill(s.sweep_state, kSweepStateWords * sizeof(uint32_t));
+    cleared.Fill(data.vbd_velocity_sweep_count, size_t{p->env_count} * sizeof(uint32_t));
+    cleared.Fill(s.env_residual, size_t{p->env_count} * kResidualClasses * sizeof(uint32_t));
+    cleared.Fill(data.solver_color_counts, size_t{p->env_count} * kSolverCountWords * sizeof(uint32_t));
+    cleared.Fill(data.solver_phase_time, size_t{p->env_count} * kSolverPhaseWords * sizeof(uint64_t));
+    if (LaunchWordSpans(cleared, stream) != cudaSuccess) return Status::Failed;
     // A timed solve stamps its phase boundaries; the stamps go into the captured sweeps too.
     const auto stamp = [&](uint32_t phase, cudaStream_t stream) {
         if (p->telemetry == 0u) return true;
@@ -2863,15 +2866,14 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
         (!clear(s.failure_reasons, size_t{s.blocks} * sizeof(uint32_t)) ||
          !clear(s.failure_equations, size_t{s.blocks} * nk::kBlockSolveFailureEquationColumnCount * sizeof(double)) ||
          (s.blocks > 0u &&
-          (cudaMemsetAsync(s.failure_rows, 0xff, size_t{s.blocks} * sizeof(uint32_t), stream) != cudaSuccess ||
-           cudaMemsetAsync(s.failure_substeps, 0xff, size_t{s.blocks} * sizeof(uint32_t), stream) != cudaSuccess))))
+          (FillWords(s.failure_rows, size_t{s.blocks} * sizeof(uint32_t), ~0u, stream) != cudaSuccess ||
+           FillWords(s.failure_substeps, size_t{s.blocks} * sizeof(uint32_t), ~0u, stream) != cudaSuccess))))
         return Status::Failed;
     uint32_t spread_rows = 0u;
     if (SchedulerThreads(&spread_rows) != cudaSuccess) return Status::Failed;
     const size_t particle_bytes = size_t{p->total_particle_count} * sizeof(Vec3);
     const size_t grid_bytes = size_t{p->total_grid_count} * sizeof(Vec3);
-    if (particle_bytes > 0u && cudaMemcpyAsync(s.particle_free, data.particle_vel, particle_bytes,
-            cudaMemcpyDeviceToDevice, stream) != cudaSuccess) return Status::Failed;
+    if (CopyWords(s.particle_free, data.particle_vel, particle_bytes, stream) != cudaSuccess) return Status::Failed;
     const size_t articulation_bytes = size_t{p->articulation_count} * p->max_dof * sizeof(float);
     if (p->articulation_count > 0u) {
         if (LaunchWork(PackBlockArticulationVelocityKernel,
@@ -2887,8 +2889,7 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
         if (cudaGetLastError() != cudaSuccess) return Status::Failed;
     }
     // The multipliers start unextrapolated, without momentum; residuals are measured at the unextrapolated ones.
-    if ((s.rows > 0u && cudaMemcpyAsync(s.dual_base, data.lambda, size_t{s.rows} * sizeof(float),
-            cudaMemcpyDeviceToDevice, stream) != cudaSuccess) ||
+    if (CopyWords(s.dual_base, data.lambda, size_t{s.rows} * sizeof(float), stream) != cudaSuccess ||
         LaunchWork(StartDualMomentumKernel, p->env_count, kThreads, stream, *p, s) != cudaSuccess)
         return Status::Failed;
     DataView measured = data;
@@ -2951,10 +2952,10 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
     // One sweep over every block; the first caches every row and builds the multilevel operators.
     const auto sweep = [&](bool first, cudaStream_t stream) {
         if (!stamp(kPhaseVertices, stream)) return Status::Failed;
-        if (grid_bytes > 0u && cudaMemcpyAsync(s.grid_snapshot, data.grid_velocity, grid_bytes,
-                cudaMemcpyDeviceToDevice, stream) != cudaSuccess) return Status::Failed;
-        if (articulation_bytes > 0u && cudaMemcpyAsync(s.articulation_snapshot, data.qdot_flat,
-                articulation_bytes, cudaMemcpyDeviceToDevice, stream) != cudaSuccess) return Status::Failed;
+        WordSpans snapshots;
+        snapshots.Copy(s.grid_snapshot, data.grid_velocity, grid_bytes);
+        snapshots.Copy(s.articulation_snapshot, data.qdot_flat, articulation_bytes);
+        if (LaunchWordSpans(snapshots, stream) != cudaSuccess) return Status::Failed;
         if (LaunchWork(PackBlockRigidSnapshotKernel, p->total_body_count, kThreads, stream,
                 data, *p, s) != cudaSuccess) return Status::Failed;
         BlockScratch particle_s = s;
@@ -2978,8 +2979,8 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
         }
         if (p->articulation_count > 0u || p->total_body_count > 0u) {
             if (!stamp(kPhaseDense, stream)) return Status::Failed;
-            if (particle_bytes > 0u && cudaMemcpyAsync(s.particle_snapshot, data.particle_vel,
-                    particle_bytes, cudaMemcpyDeviceToDevice, stream) != cudaSuccess) return Status::Failed;
+            if (CopyWords(s.particle_snapshot, data.particle_vel, particle_bytes, stream) != cudaSuccess)
+                return Status::Failed;
             if (LaunchWork(CacheAugmentedRowsKernel, s.rows, kThreads / kRowAxisLanes, stream,
                     data, *p, s, p->vertex_blocks.colors + 1u, spread_rows, false) != cudaSuccess)
                 return Status::Failed;
@@ -2998,8 +2999,8 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
         }
         if (p->total_grid_count > 0u) {
             if (!stamp(kPhaseGrid, stream)) return Status::Failed;
-            if (articulation_bytes > 0u && cudaMemcpyAsync(s.articulation_snapshot, data.qdot_flat,
-                    articulation_bytes, cudaMemcpyDeviceToDevice, stream) != cudaSuccess) return Status::Failed;
+            if (CopyWords(s.articulation_snapshot, data.qdot_flat, articulation_bytes, stream) != cudaSuccess)
+                return Status::Failed;
             if (LaunchWork(PackBlockRigidSnapshotKernel, p->total_body_count, kThreads, stream,
                     data, *p, s) != cudaSuccess) return Status::Failed;
             BlockScratch grid_s = s;
