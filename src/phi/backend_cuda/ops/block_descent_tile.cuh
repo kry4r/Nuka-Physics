@@ -616,40 +616,34 @@ __device__ void InitializeTileHead(DataView data, BlockDescentSolveParams p, Blo
     c.Value(kTileRelaxationWeight, h) = 0.0f;
 }
 
-// A warp per head finds each incidence's support on its block's coordinates, the last nonzero being a single
+// A thread per head incidence finds its support on its block's coordinates, the last nonzero being a single
 // row's unit; kTileRow holds the rows an incidence stages until PlaceWideTileRows orders them.
 template <uint32_t kN>
 __device__ void FindWideTileSupport(DataView data, BlockDescentSolveParams p, BlockScratch s, const TileContext& c) {
     const auto* row_data = reinterpret_cast<const NkRow*>(data.urows);
-    const uint32_t lane = threadIdx.x % kTileLanes, warps = blockDim.x / kTileLanes;
-    for (uint32_t h = threadIdx.x / kTileLanes; h < c.heads; h += warps) {
+    for (uint32_t item = threadIdx.x; item < 2u * c.heads; item += blockDim.x) {
+        const uint32_t h = item / 2u, incidence = item % 2u;
+        const uint32_t block = c.Index(kTileOwner + incidence, h);
+        if (block == kNoTileBlock) continue;
         const uint32_t slot = c.Index(kTileSlot, h);
         const uint32_t axes = c.Index(kTileAxes, h);
         const NkRow head = row_data[slot];
-        for (uint32_t incidence = 0u; incidence < 2u; ++incidence) {
-            const uint32_t block = c.Index(kTileOwner + incidence, h);
-            if (block == kNoTileBlock) continue;
-            const TileBlock b = LoadTileBlock(data, p, s, c, block);
-            uint32_t supported = 0u, unit = 0u;
-            float unit_value = 0.0f;
-#pragma unroll
-            for (uint32_t r = 0u; r < TileSpan<kN>(); ++r) {
-                const uint32_t i = lane + r * kTileLanes;
-                const float value = i < b.dimension ? b.Jacobian(data, p, head, slot, i) : 0.0f;
-                const uint32_t nonzero = __ballot_sync(~0u, value != 0.0f);
-                if (nonzero == 0u) continue;
-                const uint32_t last = 31u - __clz(nonzero);
-                supported += __popc(nonzero);
-                unit = r * kTileLanes + last;
-                unit_value = __shfl_sync(~0u, value, last);
-            }
-            const bool single = axes == 1u && supported <= 1u;
-            if (lane == 0u) {
-                c.Index(kTileRow + incidence, h) = single ? 0u : axes;
-                c.Index(kTileUnit + incidence, h) = single ? unit : ~0u;
-                c.Value(kTileUnitValue + incidence, h) = single ? unit_value : 0.0f;
+        const TileBlock b = LoadTileBlock(data, p, s, c, block);
+        uint32_t supported = 0u, unit = 0u;
+        float unit_value = 0.0f;
+#pragma unroll 8
+        for (uint32_t i = 0u; i < b.dimension; ++i) {
+            const float value = b.Jacobian(data, p, head, slot, i);
+            if (value != 0.0f) {
+                ++supported;
+                unit = i;
+                unit_value = value;
             }
         }
+        const bool single = axes == 1u && supported <= 1u;
+        c.Index(kTileRow + incidence, h) = single ? 0u : axes;
+        c.Index(kTileUnit + incidence, h) = single ? unit : ~0u;
+        c.Value(kTileUnitValue + incidence, h) = single ? unit_value : 0.0f;
     }
 }
 
@@ -677,102 +671,91 @@ __device__ void CopyWideTileRows(DataView data, BlockDescentSolveParams p, Block
     }
 }
 
-// TileSideSpeed with a warp's lanes taking the products, summed in coordinate order in every lane.
-__device__ float WarpSideSpeed(BlockDescentSolveParams p, BlockScratch s, const NkRowSide& side,
-                               const float* jacobian, uint32_t slot, uint32_t lane) {
-    const uint32_t count = side.kind == kNkSideRigid ? kRigidBlockDof
-        : side.kind == kNkSideArtic ? s.articulation_dimensions[side.index] : 0u;
+// TileSideSpeed with rounded products; an articulated side's loads run several coordinates ahead of the sum.
+__device__ float SerialSideSpeed(BlockDescentSolveParams p, BlockScratch s, const NkRowSide& side,
+                                 const float* jacobian, uint32_t slot) {
     float along = 0.0f;
-    for (uint32_t first = 0u; first < count; first += kTileLanes) {
-        const float term = first + lane < count ? TileSideVelocity(p, s, side, jacobian, slot, first + lane) : 0.0f;
-        const uint32_t width = min(kTileLanes, count - first);
-        for (uint32_t k = 0u; k < width; ++k) along += __shfl_sync(~0u, term, k);
+    if (side.kind == kNkSideArtic) {
+        const size_t base = size_t{side.index} * p.max_dof;
+        const float* const row = jacobian + size_t{slot} * p.max_dof;
+        const uint32_t count = s.articulation_dimensions[side.index];
+#pragma unroll 8
+        for (uint32_t c = 0u; c < count; ++c)
+            along = __fadd_rn(along, __fmul_rn(row[s.articulation_roots[base + c]], s.articulation_velocity[base + c]));
+    } else if (side.kind == kNkSideRigid) {
+        for (uint32_t c = 0u; c < kRigidBlockDof; ++c)
+            along = __fadd_rn(along, TileSideVelocity(p, s, side, jacobian, slot, c));
     }
     return along;
 }
 
-// InitializeTileResiduals past a warp of coordinates, a warp per head.
+// InitializeTileResiduals past a warp of coordinates, a thread per head axis.
 template <uint32_t kN>
 __device__ void InitializeWideTileResiduals(DataView data, BlockDescentSolveParams p, BlockScratch s,
                                             const TileContext& c) {
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
-    const uint32_t lane = threadIdx.x % kTileLanes, warps = blockDim.x / kTileLanes;
-    for (uint32_t h = threadIdx.x / kTileLanes; h < c.heads; h += warps) {
-        const uint32_t slot = c.Index(kTileSlot, h), stride = c.Index(kTileStride, h);
-        Vec3 velocity{}, rhs{};
-        for (uint32_t axis = 0u; axis < c.Index(kTileAxes, h); ++axis) {
-            const uint32_t at = slot + axis * stride;
+    for (uint32_t item = threadIdx.x; item < 3u * c.heads; item += blockDim.x) {
+        const uint32_t h = item / 3u, axis = item % 3u;
+        float residual = 0.0f;
+        if (axis < c.Index(kTileAxes, h)) {
+            const uint32_t at = c.Index(kTileSlot, h) + axis * c.Index(kTileStride, h);
             const NkRow row = rows[at];
-            const float along = WarpSideSpeed(p, s, row.a, data.chain_jacobian, at, lane) +
-                                WarpSideSpeed(p, s, row.b, data.chain_jacobian_b, at, lane);
-            SetAxisComponent(velocity, axis, along);
-            SetAxisComponent(rhs, axis, __fmul_rn(row.rhs, p.dt));
+            const float along = SerialSideSpeed(p, s, row.a, data.chain_jacobian, at) +
+                                SerialSideSpeed(p, s, row.b, data.chain_jacobian_b, at);
+            residual = __fsub_rn(__fmul_rn(row.rhs, p.dt), along);
         }
-        if (lane == 0u)
-            c.Store3(kTileResidual, h, {__fsub_rn(rhs.x, velocity.x), __fsub_rn(rhs.y, velocity.y),
-                                        __fsub_rn(rhs.z, velocity.z)});
+        c.Value(kTileResidual + axis, h) = residual;
     }
 }
 
-// J M^-1 J^T of every articulated head side, a warp per side over the articulation's factor staged in
-// shared memory: each settled entry of L^-1 J passes down the later rows in ForwardMass's order, and the
-// D^-1-weighted dot sums in coordinate order, so each share is MassCoupling's. Shares wait in kTileStep.
+// J M^-1 J^T of every articulated head side, a thread per side over the articulation's factor staged in
+// shared memory with rows on float4 boundaries: each entry of L^-1 J takes the earlier entries in ForwardMass's
+// order, and the D^-1-weighted dot sums in coordinate order, so each share is MassCoupling's. Shares wait in
+// kTileStep.
 template <uint32_t kN>
 __device__ void ComputeWideTileCouplings(DataView data, BlockDescentSolveParams p, const TileContext& c,
                                          const TileBuffers& at) {
-    constexpr uint32_t kSpan = TileSpan<kN>();
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
-    const uint32_t n = p.max_dof, ld = n | 1u;
-    const uint32_t lane = threadIdx.x % kTileLanes, warps = blockDim.x / kTileLanes;
+    const uint32_t n = p.max_dof, ld = (n + 3u) & ~3u;
     float* const factor = at.factor;
     for (uint32_t k = 0u; k < c.articulations; ++k) {
         const uint32_t articulation = c.first_articulation + k;
         const float* const source = data.m_factor + size_t{articulation} * n * n;
         for (uint32_t e = threadIdx.x; e < n * n; e += blockDim.x) factor[e / n * ld + e % n] = source[e];
         TileWorkSync();
-        for (uint32_t h = threadIdx.x / kTileLanes; h < c.heads; h += warps) {
+        for (uint32_t item = threadIdx.x; item < 2u * c.heads; item += blockDim.x) {
+            const uint32_t h = item / 2u, side = item % 2u;
             const uint32_t slot = c.Index(kTileSlot, h);
             const NkRow row = rows[slot];
             const bool shared = row.a.kind == row.b.kind && row.a.index == row.b.index;
+            const NkRowSide& own = side == 0u ? row.a : row.b;
+            if ((shared && side == 1u) || own.kind != kNkSideArtic || own.index != articulation) continue;
             const size_t base = size_t{slot} * n;
-            for (uint32_t side = 0u; side < (shared ? 1u : 2u); ++side) {
-                const NkRowSide& own = side == 0u ? row.a : row.b;
-                if (own.kind != kNkSideArtic || own.index != articulation) continue;
-                const float* const v = static_cast<const float*>(side == 0u ? data.chain_jacobian
-                                                                            : data.chain_jacobian_b) + base;
-                const float* const extra = shared ? static_cast<const float*>(data.chain_jacobian_b) + base : nullptr;
-                float y[kSpan];
+            const float* const v = static_cast<const float*>(side == 0u ? data.chain_jacobian
+                                                                        : data.chain_jacobian_b) + base;
+            const float* const extra = shared ? static_cast<const float*>(data.chain_jacobian_b) + base : nullptr;
+            float y[kN];
 #pragma unroll
-                for (uint32_t r = 0u; r < kSpan; ++r) {
-                    const uint32_t i = lane + r * kTileLanes;
-                    y[r] = i < n ? v[i] + (extra == nullptr ? 0.0f : extra[i]) : 0.0f;
+            for (uint32_t i = 0u; i < kN; ++i)
+                y[i] = i < n ? v[i] + (extra == nullptr ? 0.0f : extra[i]) : 0.0f;
+            float response = 0.0f;
+#pragma unroll
+            for (uint32_t i = 0u; i < kN; ++i) {
+                if (i >= n) break;
+                const float4* const line = reinterpret_cast<const float4*>(factor + i * ld);
+                float value = y[i];
+#pragma unroll
+                for (uint32_t j = 0u; j < i; j += 4u) {
+                    const float4 l = line[j / 4u];
+                    value -= l.x * y[j];
+                    if (j + 1u < i) value -= l.y * y[j + 1u];
+                    if (j + 2u < i) value -= l.z * y[j + 2u];
+                    if (j + 3u < i) value -= l.w * y[j + 3u];
                 }
-                for (uint32_t j = 0u; j < n; ++j) {
-                    float settled = y[0];
-#pragma unroll
-                    for (uint32_t r = 1u; r < kSpan; ++r) settled = j / kTileLanes == r ? y[r] : settled;
-                    settled = __shfl_sync(~0u, settled, j % kTileLanes);
-#pragma unroll
-                    for (uint32_t r = 0u; r < kSpan; ++r) {
-                        const uint32_t i = lane + r * kTileLanes;
-                        if (i > j && i < n) y[r] -= factor[i * ld + j] * settled;
-                    }
-                }
-                float term[kSpan];
-#pragma unroll
-                for (uint32_t r = 0u; r < kSpan; ++r) {
-                    const uint32_t i = lane + r * kTileLanes;
-                    term[r] = i < n ? y[r] * y[r] / factor[i * ld + i] : 0.0f;
-                }
-                float response = 0.0f;
-                for (uint32_t i = 0u; i < n; ++i) {
-                    float t = term[0];
-#pragma unroll
-                    for (uint32_t r = 1u; r < kSpan; ++r) t = i / kTileLanes == r ? term[r] : t;
-                    response += __shfl_sync(~0u, t, i % kTileLanes);
-                }
-                if (lane == 0u) c.Value(kTileStep + side, h) = response;
+                y[i] = value;
+                response += value * value / factor[i * ld + i];
             }
+            c.Value(kTileStep + side, h) = response;
         }
         TileWorkSync();
     }
