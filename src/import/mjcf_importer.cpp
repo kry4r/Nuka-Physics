@@ -1359,6 +1359,37 @@ void ParseLights(tinyxml2::XMLElement* worldbody, scene::SceneIR& scene) {
     }
 }
 
+// MuJoCo's dof_M0: the joint's subtree inertia about its axis at the authored pose, plus armature.
+float JointInertiaAtRest(const scene::SceneIR& scene, scene::JointId joint_id) {
+    const scene::JointRecord& joint = scene.GetJoint(joint_id);
+    std::vector<math::Transform> world(scene.RigidBodyCount());
+    for (scene::BodyId b = 0; b < world.size(); ++b) {
+        const scene::RigidBodyRecord& body = scene.GetBody(b);
+        world[b] = body.parent_id == scene::kInvalidBody ? body.local_transform
+                                                         : world[body.parent_id] * body.local_transform;
+    }
+    const math::Vec3 anchor = world[joint.child_body].position;
+    const math::Vec3 axis = world[joint.child_body].rotation.Rotate(
+        joint.axis * (1.0f / std::sqrt(joint.axis.LengthSq())));
+    float inertia = joint.armature;
+    for (scene::BodyId b = 0; b < world.size(); ++b) {
+        scene::BodyId walk = b;
+        while (walk != scene::kInvalidBody && walk != joint.child_body) walk = scene.GetBody(walk).parent_id;
+        if (walk == scene::kInvalidBody) continue;
+        const scene::RigidBodyRecord& body = scene.GetBody(b);
+        if (joint.type == scene::JointType::Prismatic) {
+            inertia += body.mass;
+            continue;
+        }
+        const math::Transform frame = world[b] * body.inertial_transform;
+        const math::Vec3 local = frame.rotation.Conjugate().Rotate(axis);
+        const math::Vec3 arm = (frame.position - anchor).Cross(axis);
+        inertia += body.inertia.x * local.x * local.x + body.inertia.y * local.y * local.y +
+                   body.inertia.z * local.z * local.z + body.mass * arm.LengthSq();
+    }
+    return inertia;
+}
+
 void ParseActuators(tinyxml2::XMLElement* mujoco,
                     scene::SceneIR& scene,
                     const MjcfParseContext& context) {
@@ -1388,6 +1419,7 @@ void ParseActuators(tinyxml2::XMLElement* mujoco,
             actuator->QueryFloatAttribute("kv", &kv);
             gain = kp;
             bias[0] = 0.0f; bias[1] = -kp; bias[2] = -kv;
+            actuator->QueryFloatAttribute("dampratio", &bias[2]);
             affine = true;
         } else if (tag == "velocity") {
             float kv = 1.0f;
@@ -1403,6 +1435,12 @@ void ParseActuators(tinyxml2::XMLElement* mujoco,
             ParseFloatList(actuator->Attribute("biasprm"), bias, 3);
             if (const char* type = actuator->Attribute("biastype")) affine = std::string(type) == "affine";
         }
+        record.joint_id = ResolveJoint(actuator->Attribute("joint"), context);
+        if (record.joint_id == scene::kInvalidJoint)
+            throw std::runtime_error("MJCF: actuator '" + record.name + "' needs a known joint transmission");
+        // A positive velocity bias on a position servo is MuJoCo's damping ratio over the reflected inertia.
+        if (affine && gain > 0.0f && gain == -bias[1] && bias[2] > 0.0f)
+            bias[2] = -bias[2] * 2.0f * std::sqrt(gain * JointInertiaAtRest(scene, record.joint_id) / (gear * gear));
         // A joint transmission applies gear (gain u + b0 + b1 gear q + b2 gear qdot) to its joint.
         if (tag != "position" && tag != "velocity" && tag != "motor" && tag != "general") {
             record.type = scene::ActuatorType::Force;
@@ -1423,9 +1461,6 @@ void ParseActuators(tinyxml2::XMLElement* mujoco,
             record.gain = gear * gear * gain;
             record.damping = record.gain;
         }
-        record.joint_id = ResolveJoint(actuator->Attribute("joint"), context);
-        if (record.joint_id == scene::kInvalidJoint)
-            throw std::runtime_error("MJCF: actuator '" + record.name + "' needs a known joint transmission");
         if (scene.GetJoint(record.joint_id).mimic_source != scene::kInvalidJoint)
             throw std::runtime_error("MJCF: mimic joint cannot be driven directly");
         ParseRange(actuator->Attribute("forcerange"), record.force_limit, record.force_limit);
