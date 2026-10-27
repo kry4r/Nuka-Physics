@@ -2828,8 +2828,6 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
          !clear(data.solver_dense_motion_trace, size_t{p->env_count} * p->trace_sweeps * sizeof(float))))
         return Status::Failed;
     if (DenseTileRoute(*p)) {
-        if (p->measure_contact_residual != 0u && !clear(s.active_count, sizeof(uint32_t))) return Status::Failed;
-        if (!clear(s.tile_next, sizeof(uint32_t))) return Status::Failed;
         LaunchCuda(OrderTilesKernel, dim3(1u), dim3(kOrderTileThreads), 0u, stream, *p, s);
         const cudaError_t launched = VisitTileWidth(*p, [&](auto width) {
             return LaunchDenseTiles<decltype(width)::value>(articulation_state, data, *p, s, stream);

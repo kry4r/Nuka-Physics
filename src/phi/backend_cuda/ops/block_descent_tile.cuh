@@ -2148,8 +2148,13 @@ __device__ uint32_t TileCostBucket(uint32_t cycles) {
 }
 
 // Environments costliest first by their last solve, so the resident warps start the longest solves first.
+// It also resets the tile ticket and active-row counters, which keeps copy-engine nodes out of the step.
 __global__ void __launch_bounds__(kOrderTileThreads) OrderTilesKernel(BlockDescentSolveParams p, BlockScratch s) {
     __shared__ uint32_t offsets[kTileCostBuckets];
+    if (threadIdx.x == 0u) {
+        *s.tile_next = 0u;
+        if (p.measure_contact_residual != 0u) *s.active_count = 0u;
+    }
     for (uint32_t k = threadIdx.x; k < kTileCostBuckets; k += blockDim.x) offsets[k] = 0u;
     __syncthreads();
     for (uint32_t env = threadIdx.x; env < p.env_count; env += blockDim.x)

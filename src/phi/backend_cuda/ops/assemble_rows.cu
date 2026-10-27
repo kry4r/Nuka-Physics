@@ -187,6 +187,16 @@ __forceinline__ __device__ math::Vec3 NormalizedHostExpr(math::Vec3 v) {
     return {v.x / len, v.y / len, v.z / len};
 }
 
+// Step-start velocity copies as a kernel, so the captured step carries no copy-engine nodes.
+__global__ void SnapshotVec3Kernel(const math::Vec3* __restrict__ a, math::Vec3* __restrict__ a_out,
+                                   const math::Vec3* __restrict__ b, math::Vec3* __restrict__ b_out,
+                                   uint32_t count) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    a_out[i] = a[i];
+    if (b != nullptr) b_out[i] = b[i];
+}
+
 // Each articulation's flat velocity tile follows its actual joint DOF prefix; padding is zero.
 __global__ void PackQdotFlatMultiKernel(ArticulationDeviceState state, uint32_t dof_stride,
                                         float* __restrict__ qdot_flat) {
@@ -745,15 +755,15 @@ __global__ void EmitPairDrivenRowsKernel(
 }
 
 // Stable per-link lower/upper slots appended after the contact footprint.
-// A scalar joint bound is a one-sided row with J = +/-e_joint.
-__device__ void EmitJointLimitRows(
-    uint32_t link, const ArticulationDeviceState& state,
+// A scalar joint bound is a one-sided row with J = +/-e_joint over a zeroed J row.
+__device__ void EmitJointLimitRow(
+    uint32_t link, uint32_t side, const ArticulationDeviceState& state,
     const ModelView& model, const DataView& data, bool refsafe,
     const float* __restrict__ lower_limits,
     const float* __restrict__ upper_limits,
     const uint8_t* __restrict__ limit_flags,
     float dt, float baumgarte_max_velocity, bool position_pass,
-    uint32_t env_count, uint32_t base_link_count,
+    uint32_t base_link_count,
     uint32_t rows_per_env, uint32_t contact_rows_per_env,
     uint32_t dof_stride,
     NkRow* __restrict__ urows,
@@ -764,73 +774,63 @@ __device__ void EmitJointLimitRows(
     float* __restrict__ row_penetration,
     uint32_t* __restrict__ row_count) {
     const uint32_t env = link / base_link_count;
-    if (env >= env_count) return;
     const uint32_t local_link = link - env * base_link_count;
     const bool scalar_joint = JointDofCount(state.joint_type[link]) == 1u;
     const uint8_t authored = limit_flags != nullptr ? limit_flags[link] : 0u;
-    const uint32_t articulation = scalar_joint
-                                      ? state.link_to_articulation[link] : ~0u;
-    uint32_t dof = 0u;
-    if (scalar_joint) {
-        const uint32_t offset = state.articulation_link_offset[articulation];
-        dof = LocalDofIndexDevice(state, offset, link);
-    }
-    for (uint32_t side = 0u; side < 2u; ++side) {
-        const uint32_t rs = env * rows_per_env + contact_rows_per_env +
-                            local_link * 2u + side;
-        NkRow row{};
-        row_cj_link[rs] = kInvalidLink;
-        row_cj_link_b[rs] = kInvalidLink;
-        row_penetration[rs] = 0.0f;
+    const uint32_t rs = env * rows_per_env + contact_rows_per_env + local_link * 2u + side;
+    NkRow row{};
+    row_cj_link[rs] = kInvalidLink;
+    row_cj_link_b[rs] = kInvalidLink;
+    row_penetration[rs] = 0.0f;
+    const uint8_t bit = static_cast<uint8_t>(1u << side);
+    if (scalar_joint && (authored & bit) != 0u && dt > 0.0f) {
+        const uint32_t articulation = state.link_to_articulation[link];
+        const uint32_t dof = LocalDofIndexDevice(state, state.articulation_link_offset[articulation], link);
         float* const J = chain_jacobian + static_cast<size_t>(rs) * dof_stride;
-        for (uint32_t k = 0u; k < dof_stride; ++k) J[k] = 0.0f;
-        const uint8_t bit = static_cast<uint8_t>(1u << side);
-        if (scalar_joint && (authored & bit) != 0u && dt > 0.0f) {
-            const float sign = side == 0u ? 1.0f : -1.0f;
-            const float bound = side == 0u ? lower_limits[link] : upper_limits[link];
-            const float signed_distance =
-                side == 0u ? state.q[link] - bound : bound - state.q[link];
-            // With a position pass the row only stops further violation; that pass removes it.
-            const float target_velocity =
-                -(position_pass ? fmaxf(signed_distance, 0.0f) : signed_distance) / dt;
-            const float capped_velocity =
-                fminf(target_velocity, baumgarte_max_velocity);
-            row.flags = nk::nk_row_flags::kActive |
-                        (side == 0u ? nk::nk_row_flags::kJointLimitLower
-                                    : nk::nk_row_flags::kJointLimitUpper);
-            row.group_first = rs;
-            row.group_normal_count = 1u;
-            row.env = env;
-            row.rhs = capped_velocity / dt;
-            row.lower = 0.0f;
-            row.upper = kFltMax;
-            row.a.kind = kNkSideArtic;
-            row.a.index = articulation;
-            J[dof] = sign;
-            row_penetration[rs] = fmaxf(-signed_distance, 0.0f);
-            if (model.joint_law_source[link] == static_cast<uint32_t>(constraint::LawSource::MuJoCo)) {
-                const float pos = signed_distance - model.joint_limit_margin[link];
-                const float* reference = model.joint_limit_reference + size_t{link} * 7u;
-                const float invweight = model.dof_invweight0[size_t{articulation} * dof_stride + dof];
-                const auto compliant = constraint::ComputeCompliantRow(reference, reference + 2u,
-                    pos, pos, 0.0f, invweight, dt, refsafe);
-                row.flags |= nk::nk_row_flags::kMuJoCo;
-                const bool lower_nearest = state.q[link] - lower_limits[link] < upper_limits[link] - state.q[link];
-                if (pos >= 0.0f || lower_nearest != (side == 0u)) {
-                    row.flags &= ~nk::nk_row_flags::kActive;
-                    lambda[rs] = 0.0f;
-                }
-                row.rhs = compliant.aref_bias;
-                row.compliance_alpha = compliant.R;
-                data.row_reference_velocity_gain[rs] = 1.0f / dt - compliant.damping;
-                data.row_invweight[rs] = invweight;
+        const float sign = side == 0u ? 1.0f : -1.0f;
+        const float bound = side == 0u ? lower_limits[link] : upper_limits[link];
+        const float signed_distance =
+            side == 0u ? state.q[link] - bound : bound - state.q[link];
+        // With a position pass the row only stops further violation; that pass removes it.
+        const float target_velocity =
+            -(position_pass ? fmaxf(signed_distance, 0.0f) : signed_distance) / dt;
+        const float capped_velocity =
+            fminf(target_velocity, baumgarte_max_velocity);
+        row.flags = nk::nk_row_flags::kActive |
+                    (side == 0u ? nk::nk_row_flags::kJointLimitLower
+                                : nk::nk_row_flags::kJointLimitUpper);
+        row.group_first = rs;
+        row.group_normal_count = 1u;
+        row.env = env;
+        row.rhs = capped_velocity / dt;
+        row.lower = 0.0f;
+        row.upper = kFltMax;
+        row.a.kind = kNkSideArtic;
+        row.a.index = articulation;
+        J[dof] = sign;
+        row_penetration[rs] = fmaxf(-signed_distance, 0.0f);
+        if (model.joint_law_source[link] == static_cast<uint32_t>(constraint::LawSource::MuJoCo)) {
+            const float pos = signed_distance - model.joint_limit_margin[link];
+            const float* reference = model.joint_limit_reference + size_t{link} * 7u;
+            const float invweight = model.dof_invweight0[size_t{articulation} * dof_stride + dof];
+            const auto compliant = constraint::ComputeCompliantRow(reference, reference + 2u,
+                pos, pos, 0.0f, invweight, dt, refsafe);
+            row.flags |= nk::nk_row_flags::kMuJoCo;
+            const bool lower_nearest = state.q[link] - lower_limits[link] < upper_limits[link] - state.q[link];
+            if (pos >= 0.0f || lower_nearest != (side == 0u)) {
+                row.flags &= ~nk::nk_row_flags::kActive;
+                lambda[rs] = 0.0f;
             }
-            if (row.flags & nk::nk_row_flags::kActive) atomicAdd(&row_count[env], 1u);
-        } else {
-            lambda[rs] = 0.0f;
+            row.rhs = compliant.aref_bias;
+            row.compliance_alpha = compliant.R;
+            data.row_reference_velocity_gain[rs] = 1.0f / dt - compliant.damping;
+            data.row_invweight[rs] = invweight;
         }
-        urows[rs] = row;
+        if (row.flags & nk::nk_row_flags::kActive) atomicAdd(&row_count[env], 1u);
+    } else {
+        lambda[rs] = 0.0f;
     }
+    urows[rs] = row;
 }
 
 // Joint dry friction is a bounded impulse in the shared coupled velocity solve.
@@ -854,7 +854,6 @@ __device__ void EmitJointFrictionRows(
     row_penetration[rs] = 0.0f;
     lambda[rs] = 0.0f;
     float* const J = chain_jacobian + static_cast<size_t>(rs) * dof_stride;
-    for (uint32_t k = 0u; k < dof_stride; ++k) J[k] = 0.0f;
     const float friction = state.joint_frictionloss[link];
     if (JointDofCount(state.joint_type[link]) == 1u && friction > 0.0f && dt > 0.0f) {
         const uint32_t articulation = state.link_to_articulation[link];
@@ -900,7 +899,6 @@ __device__ void EmitJointDriveRows(
     row_cj_link[slot] = row_cj_link_b[slot] = kInvalidLink;
     row_penetration[slot] = lambda[slot] = 0.0f;
     float* J = chain_jacobian + static_cast<size_t>(slot) * dof_stride;
-    for (uint32_t d = 0u; d < dof_stride; ++d) J[d] = 0.0f;
     if (JointDofCountDevice(state.joint_type[link]) == 1u &&
         fminf(fmaxf(command[link], lower[link]), upper[link]) != 0.0f) {
         const uint32_t articulation = state.link_to_articulation[link];
@@ -922,28 +920,56 @@ __device__ void EmitJointDriveRows(
     urows[slot] = row;
 }
 
+// One thread per joint row slot of an env; each warp zeroes its emitted rows' Jacobians together first.
 __global__ void EmitJointRowsKernel(
     ArticulationDeviceState state, AssembleRowsParams p, ModelView model,
     const float* lower_limits, const float* upper_limits, const uint8_t* limit_flags,
     DataView data) {
     BeginProgrammaticKernel();
-    const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
-    if (link >= state.total_link_count) return;
+    const uint32_t env = blockIdx.y;
+    const uint32_t L = p.base_link_count;
+    const uint32_t limit_rows = p.joint_limit_rows_per_env;
+    const uint32_t friction_rows = p.joint_friction_rows_per_env;
+    const uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
+    // Kind 0/1 is the lower/upper limit, 2 friction, 3 drive, 4 an unused slot.
+    uint32_t kind = 4u, local = 0u;
+    if (slot < limit_rows) {
+        if (limit_rows >= L * 2u && slot < L * 2u) {
+            kind = slot & 1u;
+            local = slot / 2u;
+        }
+    } else if (slot < limit_rows + friction_rows) {
+        local = slot - limit_rows;
+        if (friction_rows >= L && local < L) kind = 2u;
+    } else if (slot < limit_rows + friction_rows + p.joint_drive_rows_per_env) {
+        local = slot - limit_rows - friction_rows;
+        if (p.joint_drive_rows_per_env >= L && local < L) kind = 3u;
+    }
+    const uint32_t lane = threadIdx.x % 32u;
+    const uint32_t emitted = __ballot_sync(~0u, kind != 4u);
+    float* const J = data.chain_jacobian +
+        (static_cast<size_t>(env) * p.rows_per_env + p.contact_rows_per_env + slot - lane) * p.max_dof;
+    for (uint32_t r = 0u; r < 32u; ++r)
+        if ((emitted >> r) & 1u)
+            for (uint32_t k = lane; k < p.max_dof; k += 32u) J[r * p.max_dof + k] = 0.0f;
+    __syncwarp();
+    if (kind == 4u) return;
     auto* const urows = reinterpret_cast<NkRow*>(data.urows);
-    if (p.joint_limit_rows_per_env >= p.base_link_count * 2u)
-        EmitJointLimitRows(link, state, model, data, p.refsafe, lower_limits, upper_limits, limit_flags,
-            p.dt, p.baumgarte_max_velocity, p.position_pass != 0u, p.env_count,
-            p.base_link_count, p.rows_per_env, p.contact_rows_per_env, p.max_dof,
+    const uint32_t link = env * L + local;
+    if (kind < 2u)
+        EmitJointLimitRow(link, kind, state, model, data, p.refsafe, lower_limits, upper_limits, limit_flags,
+            p.dt, p.baumgarte_max_velocity, p.position_pass != 0u,
+            L, p.rows_per_env, p.contact_rows_per_env, p.max_dof,
             urows, data.lambda, data.chain_jacobian, data.row_cj_link,
             data.row_cj_link_b, data.row_penetration, data.row_count);
-    if (p.joint_friction_rows_per_env >= p.base_link_count && p.base_link_count > 0u)
-        EmitJointFrictionRows(link, state, p.dt, model, data, p.refsafe, p.base_link_count, p.rows_per_env,
-            p.contact_rows_per_env + p.joint_limit_rows_per_env, p.max_dof,
+    else if (kind == 2u)
+        EmitJointFrictionRows(link, state, p.dt, model, data, p.refsafe, L, p.rows_per_env,
+            p.contact_rows_per_env + limit_rows, p.max_dof,
             urows, data.lambda, data.chain_jacobian, data.row_cj_link,
             data.row_cj_link_b, data.row_penetration, data.row_count);
-    if (p.joint_drive_rows_per_env >= p.base_link_count && p.base_link_count > 0u)
-        EmitJointDriveRows(link, state, p.dt, p.base_link_count, p.rows_per_env,
-            p.contact_rows_per_env + p.joint_limit_rows_per_env + p.joint_friction_rows_per_env,
+    else
+        EmitJointDriveRows(link, state, p.dt, L, p.rows_per_env,
+            p.contact_rows_per_env + limit_rows + friction_rows,
             p.max_dof, data.drive_command, data.drive_lower, data.drive_upper,
             urows, data.lambda, data.chain_jacobian, data.row_cj_link,
             data.row_cj_link_b, data.row_penetration, data.row_count);
@@ -1450,21 +1476,16 @@ Status OpSnapshotStepVelocity(const ModelView& model, const DataView& data,
         LaunchCuda(PackQdotFlatMultiKernel, dim3((total + block_size - 1u) / block_size),
                    dim3(block_size), 0u, stream, state, p->max_dof, data.step_qdot_flat);
     }
-    if (p->total_body_count > 0u) {
-        const size_t bytes = static_cast<size_t>(p->total_body_count) * sizeof(math::Vec3);
-        if (cudaMemcpyAsync(data.step_body_linear_velocity, data.body_linear_velocity,
-                            bytes, cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
-            cudaMemcpyAsync(data.step_body_angular_velocity, data.body_angular_velocity,
-                            bytes, cudaMemcpyDeviceToDevice, stream) != cudaSuccess) {
-            return Status::Failed;
-        }
-    }
-    if (p->total_particle_count > 0u &&
-        cudaMemcpyAsync(data.step_particle_velocity, data.particle_vel,
-                        static_cast<size_t>(p->total_particle_count) * sizeof(math::Vec3),
-                        cudaMemcpyDeviceToDevice, stream) != cudaSuccess) {
-        return Status::Failed;
-    }
+    if (p->total_body_count > 0u)
+        LaunchCuda(SnapshotVec3Kernel, dim3((p->total_body_count + 127u) / 128u), dim3(128u), 0u, stream,
+                   static_cast<const math::Vec3*>(data.body_linear_velocity), data.step_body_linear_velocity,
+                   static_cast<const math::Vec3*>(data.body_angular_velocity), data.step_body_angular_velocity,
+                   p->total_body_count);
+    if (p->total_particle_count > 0u)
+        LaunchCuda(SnapshotVec3Kernel, dim3((p->total_particle_count + 127u) / 128u), dim3(128u), 0u, stream,
+                   static_cast<const math::Vec3*>(data.particle_vel), data.step_particle_velocity,
+                   static_cast<const math::Vec3*>(nullptr), static_cast<math::Vec3*>(nullptr),
+                   p->total_particle_count);
     return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
 }
 
@@ -1552,8 +1573,10 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
         (p->base_link_count > 0u && (p->joint_friction_rows_per_env >= p->base_link_count ||
                                     p->joint_drive_rows_per_env >= p->base_link_count)))) {
         const auto state = MakeArticulationDeviceState(model, data, p->total_link_count, p->articulation_count);
-        const uint32_t blocks = (p->total_link_count + kBlockSize - 1u) / kBlockSize;
-        LaunchCuda<true>(EmitJointRowsKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
+        const uint32_t slots = p->joint_limit_rows_per_env + p->joint_friction_rows_per_env +
+                               p->joint_drive_rows_per_env;
+        LaunchCuda<true>(EmitJointRowsKernel, dim3((slots + kBlockSize - 1u) / kBlockSize, p->env_count),
+                   dim3(kBlockSize), 0u, stream,
                    state, *p, model, model.joint_limit_lower, model.joint_limit_upper,
                    model.joint_limit_flags, data);
     }
