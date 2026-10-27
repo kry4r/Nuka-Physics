@@ -554,6 +554,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_lbvh_build_.env_count = env_count;
         p_lbvh_build_.bodies_per_env = bodies_per_env;
         p_lbvh_build_.workspace_bytes = cap.lbvh_sort_scratch_bytes;
+        p_lbvh_build_.tree_queries = has_particles ? 1u : 0u;
         add(phi::NkOp::LbvhBuild, &p_lbvh_build_);
 
         p_lbvh_query_.max_pairs = pair_emit_cap;

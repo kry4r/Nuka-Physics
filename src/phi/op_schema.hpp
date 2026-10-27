@@ -224,6 +224,7 @@ struct LbvhBuildParams {
     uint32_t env_count;
     uint32_t bodies_per_env;
     uint64_t workspace_bytes = 0u;
+    uint32_t tree_queries = 0u;  // 1 => body-particle queries walk the tree
 };
 
 struct LbvhQueryPairsParams {

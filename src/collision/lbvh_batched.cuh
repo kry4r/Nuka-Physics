@@ -80,7 +80,7 @@ __device__ __forceinline__ void WarpFoldBound(float (&bound)[6]) {
 }
 
 // One block folds the env's AABB-center bound; min and max are exact in any order.
-// Each leaf then gets its env-LOCAL Morton, index and (env<<32)|morton key.
+// Each leaf then gets its env-LOCAL Morton, index and (env<<30)|morton key.
 template <typename Src>
 __global__ void EnvMortonKernel(Src src,
                                 uint32_t leaves_per_env,
@@ -130,7 +130,7 @@ __global__ void EnvMortonKernel(Src src,
         out_morton[base + i] = code;
         out_index[base + i] = i;  // env-LOCAL leaf index (0..N-1)
         out_sortkey[base + i] =
-            (static_cast<uint64_t>(env) << 32) | static_cast<uint64_t>(code);
+            (static_cast<uint64_t>(env) << 30) | static_cast<uint64_t>(code);
     }
 }
 
@@ -153,7 +153,7 @@ __global__ void EnvInitNodesKernel(Src src,
     const uint32_t nbase = env * node_count;
     const uint32_t bbase = env * N;
     if (N > 1u && idx < N) {
-        morton[bbase + idx] = static_cast<uint32_t>(sorted_keys[bbase + idx]);
+        morton[bbase + idx] = static_cast<uint32_t>(sorted_keys[bbase + idx]) & 0x3FFFFFFFu;
         visit[bbase + idx] = 0u;
     }
     if (idx < internal) {
@@ -290,9 +290,12 @@ inline cudaError_t BuildLbvhBatchedNodesImpl(cudaStream_t stream, Src src,
     EnvMortonKernel<Src><<<dim3(E), dim3(kMortonBlockSize), 0, stream>>>(
         src, N, morton, indices_in, keys_in);
     if (const auto status = cudaGetLastError(); status != cudaSuccess) return status;
+    // Morton codes take 30 bits, so the sort stops at the highest bit an env index sets.
+    uint32_t key_end = 30u;
+    while ((uint32_t{1} << (key_end - 30u)) < E) ++key_end;
     const auto sorted = cub::DeviceRadixSort::SortPairs(
         bytes + layout.temp_offset, temp_bytes, keys_in, sortkey,
-        indices_in, index, static_cast<int>(count), 0, 64, stream);
+        indices_in, index, static_cast<int>(count), 0, static_cast<int>(key_end), stream);
     if (sorted != cudaSuccess) return sorted;
     const uint32_t node_count = 2u * N - 1u;
     const uint32_t node_blocks = (node_count + kBlockSize - 1u) / kBlockSize;

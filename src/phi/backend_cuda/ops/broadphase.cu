@@ -397,9 +397,10 @@ __global__ void EnvQueryPairsKernel(const cg::LbvhNode* __restrict__ nodes,
 // Pair grids up to this many threads test every leaf pair instead of walking the trees.
 constexpr uint64_t kAllPairsItems = uint64_t{1} << 20u;
 
-// One thread per (env x leaf pair): EnvQueryPairsKernel's pairs, as a leaf overlaps exactly the leaves its
-// walk reaches. A warp reserves its pairs' slots at once, saturating at capacity like ReservePairSlot.
-__global__ void EnvAllPairsKernel(const cg::LbvhNode* __restrict__ nodes,
+// One thread per (env x body pair): EnvQueryPairsKernel's pairs, read straight from the body AABBs the tree
+// leaves copy. A warp reserves its pairs' slots at once, saturating at capacity like ReservePairSlot.
+__global__ void EnvAllPairsKernel(const math::Vec3* __restrict__ aabb_lo,
+                                  const math::Vec3* __restrict__ aabb_hi,
                                   const float* __restrict__ shape_table,
                                   const uint64_t* __restrict__ excluded,
                                   uint32_t excluded_count,
@@ -414,16 +415,18 @@ __global__ void EnvAllPairsKernel(const cg::LbvhNode* __restrict__ nodes,
     const uint32_t N = bodies_per_env;
     const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t i = item / N, j = item % N;
-    const uint32_t internal = N - 1u;
-    const uint32_t nbase = env * (2u * N - 1u);
+    const uint32_t body0 = env * N;
     bool emit = false;
     uint32_t a32 = 0u, b32 = 0u;
     if (i < j && i < N) {
-        const cg::LbvhNode first = nodes[nbase + internal + i];
-        const cg::LbvhNode second = nodes[nbase + internal + j];
-        if (Overlaps(first.aabb, second.aabb)) {
-            a32 = static_cast<uint32_t>(min(first.left, second.left));
-            b32 = static_cast<uint32_t>(max(first.left, second.left));
+        collision::AABB first, second;
+        first.min = aabb_lo[body0 + i];
+        first.max = aabb_hi[body0 + i];
+        second.min = aabb_lo[body0 + j];
+        second.max = aabb_hi[body0 + j];
+        if (Overlaps(first, second)) {
+            a32 = i;
+            b32 = j;
             const ShapeDev sa = LoadShape(shape_table, a32);
             const ShapeDev sb = LoadShape(shape_table, b32);
             const uint64_t key = (static_cast<uint64_t>(a32) << 32) | static_cast<uint64_t>(b32);
@@ -466,6 +469,7 @@ __global__ void PairSortFillKernel(uint32_t env_count, uint32_t slot_cap,
                                    const uint32_t* __restrict__ counts,
                                    const uint32_t* __restrict__ pairs,
                                    uint32_t bodies_per_env,
+                                   uint32_t key_bits,
                                    uint64_t* __restrict__ keys,
                                    uint32_t* __restrict__ perms,
                                    uint32_t* __restrict__ snap) {
@@ -477,6 +481,7 @@ __global__ void PairSortFillKernel(uint32_t env_count, uint32_t slot_cap,
     const uint32_t live = min(counts[env], slot_cap);
     const size_t at = (static_cast<size_t>(env) * slot_stride + slot) * 2u;
     if (slot >= live) {
+        // All ones in the sorted bits too, so dead slots rank after every live pair.
         keys[f] = 0xFFFFFFFFFFFFFFFFull;
         perms[f] = 0u;
         return;
@@ -489,7 +494,7 @@ __global__ void PairSortFillKernel(uint32_t env_count, uint32_t slot_cap,
     // ids keep every env's segment contiguous and ascending under one sort.
     const uint64_t ga = static_cast<uint64_t>(env) * bodies_per_env + a;
     const uint64_t gb = static_cast<uint64_t>(env) * bodies_per_env + b;
-    keys[f] = (ga << 32) | gb;
+    keys[f] = (ga << key_bits) | gb;
     perms[f] = static_cast<uint32_t>(f);
 }
 
@@ -511,12 +516,12 @@ __global__ void PairSortScatterKernel(
     uint32_t env_count, uint32_t slot_cap,
     const uint64_t* __restrict__ keys_out, const uint32_t* __restrict__ perms,
     const uint32_t* __restrict__ prefix, uint32_t slot_stride,
-    uint32_t bodies_per_env, const uint32_t* __restrict__ snap,
+    uint32_t bodies_per_env, uint32_t key_bits, const uint32_t* __restrict__ snap,
     uint32_t* __restrict__ pairs) {
     const uint64_t f = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (f >= static_cast<uint64_t>(env_count) * slot_cap) return;
     if (keys_out[f] == 0xFFFFFFFFFFFFFFFFull) return;
-    const uint64_t ga = keys_out[f] >> 32;
+    const uint64_t ga = keys_out[f] >> key_bits;
     const uint32_t dst_env = static_cast<uint32_t>(ga / bodies_per_env);
     const uint32_t dst_slot = static_cast<uint32_t>(f) - prefix[dst_env];
     const size_t dst_at = (static_cast<size_t>(dst_env) * slot_stride + dst_slot) * 2u;
@@ -561,6 +566,8 @@ Status OpLbvhBuild(const ModelView& /*model*/, const DataView& data,
     const uint32_t N = p->bodies_per_env;
     const uint32_t E = p->env_count;
     if (E == 0u || N < 2u) return Status::Ok;  // a <2-body env has no pairs.
+    // All-pairs grids read the body AABBs directly; only particle queries still walk the tree.
+    if (!p->tree_queries && uint64_t{N} * N * E <= kAllPairsItems) return Status::Ok;
 
     auto* nodes = reinterpret_cast<cg::LbvhNode*>(data.lbvh_nodes);
     // Shared batched env-build over the arena's split lo/hi AABBs. Leaf `.left`
@@ -587,14 +594,21 @@ Status OpLbvhQueryPairs(const ModelView& model, const DataView& data,
                    data.pair_count, data.env_status, E);
     }
     if (N < 2u) return Status::Ok;
-    auto* nodes = reinterpret_cast<const cg::LbvhNode*>(data.lbvh_nodes);
-    const bool all_pairs = uint64_t{N} * N * E <= kAllPairsItems;
-    const uint32_t items = all_pairs ? N * N : N;
-    LaunchCuda(all_pairs ? EnvAllPairsKernel : EnvQueryPairsKernel, dim3((items + kBlockSize - 1u) / kBlockSize, E),
-               dim3(kBlockSize), 0u, stream, nodes, static_cast<const float*>(model.shape_table),
-               static_cast<const uint64_t*>(model.excluded_pairs),
-               p->excluded_count, N, p->max_contacts_per_env, p->rigid_slot_cap,
-               p->max_pairs, data.candidate_pairs, data.pair_count, data.env_status);
+    if (uint64_t{N} * N * E <= kAllPairsItems) {
+        LaunchCuda(EnvAllPairsKernel, dim3((N * N + kBlockSize - 1u) / kBlockSize, E), dim3(kBlockSize), 0u,
+                   stream, static_cast<const math::Vec3*>(data.body_aabb_lo),
+                   static_cast<const math::Vec3*>(data.body_aabb_hi), static_cast<const float*>(model.shape_table),
+                   static_cast<const uint64_t*>(model.excluded_pairs),
+                   p->excluded_count, N, p->max_contacts_per_env, p->rigid_slot_cap,
+                   p->max_pairs, data.candidate_pairs, data.pair_count, data.env_status);
+    } else {
+        LaunchCuda(EnvQueryPairsKernel, dim3((N + kBlockSize - 1u) / kBlockSize, E), dim3(kBlockSize), 0u, stream,
+                   reinterpret_cast<const cg::LbvhNode*>(data.lbvh_nodes),
+                   static_cast<const float*>(model.shape_table),
+                   static_cast<const uint64_t*>(model.excluded_pairs),
+                   p->excluded_count, N, p->max_contacts_per_env, p->rigid_slot_cap,
+                   p->max_pairs, data.candidate_pairs, data.pair_count, data.env_status);
+    }
     // Canonicalize the emitted stream: the atomicAdd slot claim above orders
     // pairs by warp-scheduling race, which would leak into contact slots, row
     // slots, the GS sweep order, and the warm-start match as last-ULP float
@@ -611,6 +625,9 @@ Status OpLbvhQueryPairs(const ModelView& model, const DataView& data,
             return Status::Failed;  // LOUD: no silent nondeterministic fallback.
         }
         const uint32_t sort_slots = static_cast<uint32_t>(sort_slots64);
+        // Keys pack two global body ids of key_bits each, so the sort covers only those bits.
+        uint32_t key_bits = 1u;
+        while ((uint64_t{1} << key_bits) < uint64_t{E} * N) ++key_bits;
         const PairSortScratchLayout sl(sort_slots, E);
         if (p->workspace_bytes < sl.total) return Status::InvalidArgument;
         char* sbase = reinterpret_cast<char*>(data.pair_sort_scratch);
@@ -627,10 +644,10 @@ Status OpLbvhQueryPairs(const ModelView& model, const DataView& data,
             (sort_slots64 + kBlockSize - 1u) / kBlockSize);
         LaunchCuda(PairSortFillKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    E, p->rigid_slot_cap, p->max_contacts_per_env, data.pair_count,
-                   data.candidate_pairs, N, keys_in, perms_in, snap);
+                   data.candidate_pairs, N, key_bits, keys_in, perms_in, snap);
         if (cub::DeviceRadixSort::SortPairs(
             sort_temp, temp_bytes, keys_in, keys_out, perms_in, perms_out,
-            static_cast<int>(sort_slots), 0, 64, stream) != cudaSuccess) throw std::runtime_error("CUB workspace operation failed");
+            static_cast<int>(sort_slots), 0, static_cast<int>(2u * key_bits), stream) != cudaSuccess) throw std::runtime_error("CUB workspace operation failed");
         {
             const uint32_t eb = (E + kBlockSize - 1u) / kBlockSize;
             LaunchCuda(PairClampCountsKernel, dim3(eb), dim3(kBlockSize), 0u,
@@ -642,7 +659,7 @@ Status OpLbvhQueryPairs(const ModelView& model, const DataView& data,
         }
         LaunchCuda(PairSortScatterKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    E, p->rigid_slot_cap, keys_out, perms_out, prefix,
-                   p->max_contacts_per_env, N, snap, data.candidate_pairs);
+                   p->max_contacts_per_env, N, key_bits, snap, data.candidate_pairs);
     }
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
