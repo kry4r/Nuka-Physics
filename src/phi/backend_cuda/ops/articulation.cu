@@ -1521,7 +1521,7 @@ Status OpArticulationDynamics(const ModelView& model, const DataView& data,
     if (p == nullptr) return Status::Failed;
     if (p->articulation_count == 0u || p->total_link_count == 0u) return Status::Ok;
     const auto state = MakeArticulationDeviceState(model, data, p->total_link_count, p->articulation_count);
-    LaunchCuda(ArticulationDynamicsKernel, dim3(p->articulation_count), dim3(32u),
+    LaunchCuda(ArticulationDynamicsKernel, dim3(p->articulation_count), dim3(kMassThreads),
         MassWorkBytes(p->max_dof, 2u, 2u * p->max_dof + p->max_links), stream, state, data,
         MakeArticulationTreeView(model), *p);
     return LaunchOk(stream);
@@ -1536,7 +1536,7 @@ Status OpReferenceWeights(const ModelView& model, const DataView& data,
     if (p.total_link_count > 0u) {
         const auto state = MakeArticulationDeviceState(model, data, p.total_link_count, p.articulation_count);
         const uint32_t links = p.total_link_count * p.articulations_per_env / p.articulation_count;
-        LaunchCuda(ArticulationReferenceWeightsKernel, dim3(p.articulation_count), dim3(32u),
+        LaunchCuda(ArticulationReferenceWeightsKernel, dim3(p.articulation_count), dim3(kMassThreads),
             MassWorkBytes(p.max_dof, 0u, 2u * p.max_dof + links), stream, state, model, data,
             MakeArticulationTreeView(model), p);
     }
@@ -1548,7 +1548,7 @@ Status OpArticulationDamping(const ModelView& model, const DataView& data,
     const auto& p = *static_cast<const ArticulationDampingParams*>(params);
     if (p.articulation_count == 0u || p.total_link_count == 0u) return Status::Ok;
     const auto state = MakeArticulationDeviceState(model, data, p.total_link_count, p.articulation_count);
-    LaunchCuda(ArticulationDampingKernel, dim3(p.articulation_count), dim3(32u),
+    LaunchCuda(ArticulationDampingKernel, dim3(p.articulation_count), dim3(kMassThreads),
         MassWorkBytes(p.max_dof, 2u, 2u * p.max_dof), stream, state, data, MakeDriveControlView(data), p);
     return LaunchOk(stream);
 }

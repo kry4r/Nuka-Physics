@@ -230,7 +230,7 @@ Status OpMimicReduce(const ModelView& model, const DataView& data,
     }
     const ArticulationDeviceState state = MakeArticulationDeviceState(
         model, data, p->total_link_count, p->articulation_count);
-    LaunchCuda(MimicReduceKernel, dim3(p->articulation_count), dim3(32u), MassWorkBytes(p->max_dof, 0u, 0u),
+    LaunchCuda(MimicReduceKernel, dim3(p->articulation_count), dim3(kMassThreads), MassWorkBytes(p->max_dof, 0u, 0u),
                stream, state,
                static_cast<const uint32_t*>(model.mimic_source_link),
                static_cast<const float*>(model.mimic_multiplier),

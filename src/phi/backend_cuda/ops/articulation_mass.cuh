@@ -59,11 +59,12 @@ __device__ inline uint32_t ActualCrbaDof(const ArticulationDeviceState& state,
     return static_cast<uint32_t>(dof);
 }
 
-// Shared DOF maps of one articulation, built by its warp once per kernel: DOF -> (link, component, ~0 for
-// scalar joints) and local link -> first DOF. Returns the DOF count, or ~0 after flagging an overflow.
+// Shared DOF maps of one articulation, written by its first warp once per kernel while every warp counts: DOF ->
+// (link, component, ~0 for scalar joints), local link -> first DOF. Returns the DOF count, or ~0 on overflow.
 __device__ inline uint32_t BuildDofMaps(const ArticulationDeviceState& state, uint32_t articulation,
     uint32_t max_dof, uint32_t* dof_link, uint32_t* dof_component, uint32_t* link_dof, uint32_t* err_status) {
-    const uint32_t lane = threadIdx.x;
+    const uint32_t lane = threadIdx.x % 32u;
+    const bool writes = threadIdx.x < 32u;
     const uint32_t offset = state.articulation_link_offset[articulation];
     const uint32_t count = state.articulation_link_count[articulation];
     uint32_t total = 0u;
@@ -76,15 +77,15 @@ __device__ inline uint32_t BuildDofMaps(const ArticulationDeviceState& state, ui
             if (lane >= delta) scan += below;
         }
         const uint32_t dof = total + scan - width;
-        if (local < count && link_dof != nullptr) link_dof[local] = dof;
-        for (uint32_t c = 0u; c < width && dof + c < max_dof; ++c) {
+        if (writes && local < count && link_dof != nullptr) link_dof[local] = dof;
+        for (uint32_t c = 0u; writes && c < width && dof + c < max_dof; ++c) {
             dof_link[dof + c] = offset + local;
             dof_component[dof + c] = width == 1u ? ~0u : c;
         }
         total += __shfl_sync(~0u, scan, 31u);
     }
-    if (total > max_dof && lane == 0u) atomicOr(err_status, kEnvStatusDofOverflow);
-    __syncwarp();
+    if (total > max_dof && threadIdx.x == 0u) atomicOr(err_status, kEnvStatusDofOverflow);
+    __syncthreads();
     return total > max_dof ? ~0u : total;
 }
 
@@ -239,43 +240,76 @@ inline size_t MassWorkBytes(uint32_t max_dof, uint32_t vectors, uint32_t words) 
     return (size_t{max_dof} * MassWorkStride(max_dof) + size_t{vectors} * max_dof + words) * sizeof(float);
 }
 
-// A = L D L^T, with unit diagonal L and D on the diagonal, factored in the shared block `work`. Each entry is a
-// serial dot over earlier pivots, as in a one-lane column sweep; `add` joins the diagonal, `factor` gets the tile.
+// Threads of a block that factors one articulation's mass.
+constexpr uint32_t kMassWarps = 4u, kMassThreads = kMassWarps * 32u;
+
+// A = L D L^T, with unit diagonal L and D on the diagonal, factored into the shared block `work` by kMassThreads
+// threads. Entry (i, j) stays in lane i % 32 of warp j % kMassWarps and takes the earlier pivots' updates in
+// order, as a one-lane column sweep; `add` joins the diagonal, `factor` gets the tile.
 __device__ inline void FactorMass(const float* __restrict__ mass, const float* add, float* __restrict__ work,
                                   float* factor, uint32_t n, uint32_t stride) {
-    const uint32_t lane = threadIdx.x, ld = MassWorkStride(n);
-    // Each lane loads a column eight rows at a time before storing any, so the loads overlap.
-    for (uint32_t j = lane; j < n; j += blockDim.x) {
-        for (uint32_t first = 0u; first < n; first += 8u) {
-            float value[8];
+    constexpr uint32_t kRows = (kMaxArticulationDof + 31u) / 32u;
+    constexpr uint32_t kColumns = (kMaxArticulationDof + kMassWarps - 1u) / kMassWarps;
+    const uint32_t lane = threadIdx.x % 32u, warp = threadIdx.x / 32u, ld = MassWorkStride(n);
+    float a[kRows][kColumns];
 #pragma unroll
-            for (uint32_t r = 0u; r < 8u; ++r)
-                value[r] = first + r < n && j <= first + r ? mass[size_t{first + r} * stride + j] : 0.0f;
+    for (uint32_t r = 0u; r < kRows; ++r)
 #pragma unroll
-            for (uint32_t r = 0u; r < 8u; ++r) {
-                const uint32_t i = first + r;
-                if (i < n && j <= i) work[i * ld + j] = add == nullptr ? value[r] : value[r] + (i == j ? add[i] : 0.0f);
+        for (uint32_t c = 0u; c < kColumns; ++c) {
+            const uint32_t i = lane + 32u * r, j = warp + kMassWarps * c;
+            float value = 0.0f;
+            if (i < n && j <= i) {
+                value = mass[size_t{i} * stride + j];
+                if (add != nullptr) value = value + (i == j ? add[i] : 0.0f);
+            }
+            a[r][c] = value;
+        }
+    for (uint32_t k = 0u; k < n; ++k) {
+        // The pivot's warp scales its column into the shared factor.
+        if (warp == k % kMassWarps) {
+            const uint32_t slot = k / kMassWarps;
+            float column[kRows];
+#pragma unroll
+            for (uint32_t r = 0u; r < kRows; ++r) {
+                column[r] = a[r][0];
+#pragma unroll
+                for (uint32_t c = 1u; c < kColumns; ++c) column[r] = c == slot ? a[r][c] : column[r];
+            }
+            float pivot = column[0];
+#pragma unroll
+            for (uint32_t r = 1u; r < kRows; ++r) pivot = k / 32u == r ? column[r] : pivot;
+            const float diagonal = fmaxf(__shfl_sync(~0u, pivot, k % 32u), 1.0e-6f);
+#pragma unroll
+            for (uint32_t r = 0u; r < kRows; ++r) {
+                const uint32_t i = lane + 32u * r;
+                if (i > k && i < n) work[i * ld + k] = column[r] / diagonal;
+            }
+            if (lane == 0u) work[k * ld + k] = diagonal;
+        }
+        __syncthreads();
+        const float d = work[k * ld + k];
+        float pivot_row[kColumns];
+#pragma unroll
+        for (uint32_t c = 0u; c < kColumns; ++c) {
+            const uint32_t j = warp + kMassWarps * c;
+            pivot_row[c] = j > k && j < n ? work[j * ld + k] : 0.0f;
+        }
+#pragma unroll
+        for (uint32_t r = 0u; r < kRows; ++r) {
+            const uint32_t i = lane + 32u * r;
+            if (i <= k || i >= n) continue;
+            const float l = work[i * ld + k];
+#pragma unroll
+            for (uint32_t c = 0u; c < kColumns; ++c) {
+                const uint32_t j = warp + kMassWarps * c;
+                if (j > k && j <= i) a[r][c] -= l * pivot_row[c] * d;
             }
         }
-    }
-    __syncthreads();
-    for (uint32_t j = 0u; j < n; ++j) {
-        for (uint32_t i = j + lane; i < n; i += blockDim.x) {
-            float value = work[i * ld + j];
-#pragma unroll 4
-            for (uint32_t k = 0u; k < j; ++k) value -= work[i * ld + k] * work[j * ld + k] * work[k * ld + k];
-            work[i * ld + j] = value;
-        }
-        __syncthreads();
-        const float diagonal = fmaxf(work[j * ld + j], 1.0e-6f);
-        for (uint32_t i = j + 1u + lane; i < n; i += blockDim.x) work[i * ld + j] /= diagonal;
-        if (lane == 0u) work[j * ld + j] = diagonal;
-        __syncthreads();
     }
     if (factor == nullptr) return;
     // Readers take the strict lower triangle and the diagonal; padded DOFs keep unit rows with a tiny pivot.
     for (uint32_t i = 0u; i < stride; ++i)
-        for (uint32_t j = lane; j <= i; j += blockDim.x)
+        for (uint32_t j = threadIdx.x; j <= i; j += blockDim.x)
             factor[size_t{i} * stride + j] = i < n ? work[i * ld + j] : i == j ? 1.0e-6f : 0.0f;
     __syncthreads();
 }
