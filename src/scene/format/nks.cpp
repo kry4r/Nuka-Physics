@@ -517,6 +517,7 @@ Value SaveActuator(const ActuatorRecord& a) {
     o.Set("joint_id", Value::Int(static_cast<int64_t>(a.joint_id)));
     o.Set("gain", Value::Float(a.gain));
     o.Set("force_limit", Value::Float(a.force_limit));
+    if (std::isfinite(a.damping)) o.Set("damping", Value::Float(a.damping));
     return o;
 }
 
@@ -1125,6 +1126,7 @@ void Save(const SceneIR& scene, const std::string& nks_path, const SaveOptions& 
     solver.Set("integrator", Value::Int(static_cast<uint32_t>(scene.SolverOptions().integrator)));
     solver.Set("impratio", Value::Float(scene.SolverOptions().impratio));
     solver.Set("refsafe", Value::Bool(scene.SolverOptions().refsafe));
+    solver.Set("law_source", Value::Int(static_cast<uint32_t>(scene.SolverOptions().law_source)));
     root.Set("solver", std::move(solver));
 
     // -- split materials (keyed by name) ------------------------------------
@@ -1338,6 +1340,8 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
         options.integrator = static_cast<constraint::Integrator>(solver->At("integrator").AsInt());
         options.impratio = solver->At("impratio").AsFloat();
         options.refsafe = solver->At("refsafe").AsBool();
+        if (const Value* source = solver->Find("law_source"))
+            options.law_source = static_cast<constraint::LawSource>(source->AsInt());
     }
     std::unordered_map<std::string, NkaFile> containers;
     auto mesh_ref = [&](const Value& value) {
@@ -1727,6 +1731,7 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             rec.joint_id = OffsetId(static_cast<JointId>(a->At("joint_id").AsInt()), joint_offset);
             rec.gain = a->At("gain").AsFloat();
             rec.force_limit = a->At("force_limit").AsFloat();
+            if (const Value* damping = a->Find("damping")) rec.damping = damping->AsFloat();
             scene.AddActuator(std::move(rec));
         };
         for (const BodyNode& bn : body_nodes) {

@@ -106,8 +106,11 @@ struct MjcfJointDefaults {
 };
 
 struct MjcfGeneralDefaults {
-    float gain = 1.0f;
+    float gear = 1.0f;
     float force_limit = 0.0f;
+    float gain = 1.0f;
+    float bias[3] = {0.0f, 0.0f, 0.0f};
+    bool affine = false;
 };
 
 // Per-class <geom> contact-attribute defaults (v0.8 C1b). Each field carries a
@@ -319,10 +322,14 @@ void ApplyGeneralDefault(tinyxml2::XMLElement* general_elem, MjcfDefaultClass* d
     if (general_elem == nullptr || defaults == nullptr) {
         return;
     }
-    general_elem->QueryFloatAttribute("gear", &defaults->general.gain);
+    general_elem->QueryFloatAttribute("gear", &defaults->general.gear);
     ParseRange(general_elem->Attribute("forcerange"),
                defaults->general.force_limit,
                defaults->general.force_limit);
+    ParseFloatList(general_elem->Attribute("gainprm"), &defaults->general.gain, 1);
+    ParseFloatList(general_elem->Attribute("biasprm"), defaults->general.bias, 3);
+    if (const char* bias = general_elem->Attribute("biastype"))
+        defaults->general.affine = std::string(bias) == "affine";
 }
 
 // Read the first component of a MuJoCo `friction` list (slide,spin,roll[,...]).
@@ -1368,24 +1375,59 @@ void ParseActuators(tinyxml2::XMLElement* mujoco,
         record.name = actuator->Attribute("name") ? actuator->Attribute("name") : "actuator";
         const MjcfDefaultClass& defaults =
             DefaultClassOrRoot(context.defaults, actuator->Attribute("class"));
-        record.gain = defaults.general.gain;
         record.force_limit = defaults.general.force_limit;
+        float gear = defaults.general.gear;
+        float gain = defaults.general.gain;
+        float bias[3] = {defaults.general.bias[0], defaults.general.bias[1], defaults.general.bias[2]};
+        bool affine = defaults.general.affine;
         const std::string tag = actuator->Name() ? actuator->Name() : "";
+        actuator->QueryFloatAttribute("gear", &gear);
         if (tag == "position") {
-            record.type = scene::ActuatorType::Position;
+            float kp = 1.0f, kv = 0.0f;
+            actuator->QueryFloatAttribute("kp", &kp);
+            actuator->QueryFloatAttribute("kv", &kv);
+            gain = kp;
+            bias[0] = 0.0f; bias[1] = -kp; bias[2] = -kv;
+            affine = true;
         } else if (tag == "velocity") {
-            record.type = scene::ActuatorType::Velocity;
-        } else if (tag == "motor" || tag == "general") {
-            record.type = scene::ActuatorType::Motor;
-        } else {
+            float kv = 1.0f;
+            actuator->QueryFloatAttribute("kv", &kv);
+            gain = kv;
+            bias[0] = 0.0f; bias[1] = 0.0f; bias[2] = -kv;
+            affine = true;
+        } else if (tag == "motor") {
+            gain = 1.0f;
+            affine = false;
+        } else if (tag == "general") {
+            ParseFloatList(actuator->Attribute("gainprm"), &gain, 1);
+            ParseFloatList(actuator->Attribute("biasprm"), bias, 3);
+            if (const char* type = actuator->Attribute("biastype")) affine = std::string(type) == "affine";
+        }
+        // A joint transmission applies gear (gain u + b0 + b1 gear q + b2 gear qdot) to its joint.
+        if (tag != "position" && tag != "velocity" && tag != "motor" && tag != "general") {
             record.type = scene::ActuatorType::Force;
+            record.gain = gear;
+        } else if (!affine || (bias[1] == 0.0f && bias[2] == 0.0f)) {
+            record.type = scene::ActuatorType::Motor;
+            record.gain = gear * gain;
+        } else if (bias[1] != 0.0f) {
+            if (gain != -bias[1] || bias[0] != 0.0f)
+                throw std::runtime_error("MJCF: actuator '" + record.name + "' bias is not a position servo");
+            record.type = scene::ActuatorType::Position;
+            record.gain = gear * gear * gain;
+            record.damping = -gear * gear * bias[2];
+        } else {
+            if (gain != -bias[2] || bias[0] != 0.0f)
+                throw std::runtime_error("MJCF: actuator '" + record.name + "' bias is not a velocity servo");
+            record.type = scene::ActuatorType::Velocity;
+            record.gain = gear * gear * gain;
+            record.damping = record.gain;
         }
         record.joint_id = ResolveJoint(actuator->Attribute("joint"), context);
         if (record.joint_id == scene::kInvalidJoint)
             throw std::runtime_error("MJCF: actuator '" + record.name + "' needs a known joint transmission");
         if (scene.GetJoint(record.joint_id).mimic_source != scene::kInvalidJoint)
             throw std::runtime_error("MJCF: mimic joint cannot be driven directly");
-        actuator->QueryFloatAttribute("gear", &record.gain);
         ParseRange(actuator->Attribute("forcerange"), record.force_limit, record.force_limit);
         scene.AddActuator(std::move(record));
     }
@@ -1621,6 +1663,7 @@ scene::SceneIR LoadMjcf(const std::string& path) {
 
     scene::SceneIR scene;
     MjcfParseContext context;
+    scene.SolverOptionsMut().law_source = constraint::LawSource::MuJoCo;
 
     if (const auto* option = mujoco->FirstChildElement("option")) {
         auto& solver = scene.SolverOptionsMut();

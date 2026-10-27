@@ -289,6 +289,7 @@ struct CookedActuatorTable {
     std::vector<JointId>      joint_ids;
     std::vector<float>        gains;
     std::vector<float>        force_limits;
+    std::vector<float>        dampings;
 };
 
 struct CookedMeshReport {

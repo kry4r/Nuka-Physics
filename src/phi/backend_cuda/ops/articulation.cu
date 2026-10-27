@@ -731,7 +731,7 @@ __global__ void ApplyAffineDriveKernel(ArticulationDeviceState state,
     const bool velocity_control = control == ArticulationControlMode::Velocity;
     if ((position_control && (!isfinite(drive.target[link]) ||
             !isfinite(drive.stiffness[link]) || drive.stiffness[link] < 0.0f ||
-            !isfinite(drive.damping[link]) || drive.damping[link] < 0.0f)) ||
+            !isfinite(drive.damping[link]) || (implicit && drive.damping[link] < 0.0f))) ||
         ((position_control || velocity_control) && !isfinite(drive.velocity_target[link])) ||
         (velocity_control && (!isfinite(drive.stiffness[link]) || drive.stiffness[link] < 0.0f)) ||
         (control == ArticulationControlMode::ComputedTorque && !isfinite(drive.acceleration_target[link])) ||
@@ -792,6 +792,52 @@ __global__ void ApplyAffineDriveKernel(ArticulationDeviceState state,
     drive.lower[link] = lower;
     drive.upper[link] = upper;
     state.tau[link] = inverse_dynamics ? 0.0f : feedforward;
+}
+
+// A MuJoCo integrator solves contacts with the plain mass, then maps the step's velocity change through
+// (M + dt D)^-1 M; D holds joint damping and, for implicitfast, unclamped servo velocity gains.
+__global__ void ArticulationDampingKernel(ArticulationDeviceState state, DataView data,
+                                          DriveControlView drive, ArticulationDampingParams p) {
+    const uint32_t articulation = blockIdx.x;
+    const uint32_t stride = p.max_dof;
+    const uint32_t dof = ActualCrbaDof(state, articulation, stride, data.env_status);
+    if (dof == kInvalidLink) return;
+    const auto workspace = CrbaWorkspaceFor(data.crba_scratch, articulation, stride);
+    float* const factor = workspace.Matrix();
+    float* const change = workspace.Values(CrbaVector::Velocity);
+    float* const damping = workspace.Values(CrbaVector::Projected);
+    const size_t base = size_t{articulation} * stride;
+    const auto control = static_cast<ArticulationControlMode>(p.mode);
+    int damped = 0;
+    for (uint32_t d = threadIdx.x; d < dof; d += blockDim.x) {
+        uint32_t link = 0u, component = 0u;
+        ArticulationDofLocation(state, articulation, d, &link, &component);
+        const bool scalar = component == kInvalidLink;
+        float value = scalar ? state.joint_damping[link] : 0.0f;
+        if (scalar && p.actuator_derivative != 0u &&
+            drive.command[link] >= drive.lower[link] && drive.command[link] <= drive.upper[link])
+            value += control == ArticulationControlMode::PDPosition ? drive.damping[link]
+                   : control == ArticulationControlMode::Velocity ? drive.stiffness[link] : 0.0f;
+        const float velocity = scalar ? state.qdot[link] : state.link_velocity[link].v[component];
+        damping[d] = p.dt * value;
+        change[d] = damping[d] * (velocity - data.step_qdot_flat[base + d]);
+        damped |= value != 0.0f;
+    }
+    if (__syncthreads_or(damped) == 0) return;
+    const float* const mass = data.m + base * stride;
+    for (size_t i = threadIdx.x; i < size_t{stride} * stride; i += blockDim.x)
+        factor[i] = mass[i] + (i % (stride + 1u) == 0u && i / stride < dof ? damping[i / stride] : 0.0f);
+    __syncthreads();
+    FactorMass(factor, factor, dof, stride);
+    if (threadIdx.x == 0u) SolveMass(factor, change, dof, stride);
+    __syncthreads();
+    for (uint32_t d = threadIdx.x; d < dof; d += blockDim.x) {
+        uint32_t link = 0u, component = 0u;
+        ArticulationDofLocation(state, articulation, d, &link, &component);
+        float& velocity = component == kInvalidLink ? state.qdot[link] : state.link_velocity[link].v[component];
+        velocity -= change[d];
+        data.qdot_flat[base + d] = velocity;
+    }
 }
 
 __global__ void ReadoutDrivesKernel(ArticulationDeviceState state,
@@ -1475,6 +1521,16 @@ Status OpReferenceWeights(const ModelView& model, const DataView& data,
     return LaunchOk(stream);
 }
 
+Status OpArticulationDamping(const ModelView& model, const DataView& data,
+    const void* params, cudaStream_t stream) {
+    const auto& p = *static_cast<const ArticulationDampingParams*>(params);
+    if (p.articulation_count == 0u || p.total_link_count == 0u) return Status::Ok;
+    const auto state = MakeArticulationDeviceState(model, data, p.total_link_count, p.articulation_count);
+    LaunchCuda(ArticulationDampingKernel, dim3(p.articulation_count), dim3(32u), 0u,
+        stream, state, data, MakeDriveControlView(data), p);
+    return LaunchOk(stream);
+}
+
 Status OpIntegrateVelocity(const ModelView& model, const DataView& data,
                            const void* params, cudaStream_t stream) {
     const auto* p = static_cast<const IntegrateVelocityParams*>(params);
@@ -1609,6 +1665,7 @@ void RegisterNkAbaOps() {
     SetCudaOp(NkOp::ReadoutDrives, &OpReadoutDrives);
     SetCudaOp(NkOp::ArticulationDynamics, &OpArticulationDynamics);
     SetCudaOp(NkOp::ReferenceWeights, &OpReferenceWeights);
+    SetCudaOp(NkOp::ArticulationDamping, &OpArticulationDamping);
     SetCudaOp(NkOp::IntegrateVelocity, &OpIntegrateVelocity);
     SetCudaOp(NkOp::FkWorldPoses, &OpFkWorldPoses);
     SetCudaOp(NkOp::FkLinkVelocities, &OpFkLinkVelocities);

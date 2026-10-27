@@ -52,3 +52,4 @@ NUKA_OP(MimicReduce, MassResponse | ArticulationVelocity | Parameters, MassRespo
 NUKA_OP(BlockDescentSolve, Physical, Physical)
 NUKA_OP(RecordTelemetry, Physical | Readout, Readout)
 NUKA_OP(ReferenceWeights, Coordinates | ArticulationFrames | BodyPose | BodyDynamics | Parameters, Parameters | ArticulationDynamics | MassResponse)
+NUKA_OP(ArticulationDamping, ArticulationDynamics | ArticulationVelocity | Drives | Parameters | VelocityReference, ArticulationVelocity)

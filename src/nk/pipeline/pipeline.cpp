@@ -222,6 +222,9 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     const bool use_inverse_dynamics =
         model.drive_mode == static_cast<uint32_t>(phi::ArticulationControlMode::ComputedTorque) ||
         model.drive_mode == static_cast<uint32_t>(phi::ArticulationControlMode::Osc);
+    // A MuJoCo source keeps damping explicit in the constraint solve and integrates it afterwards.
+    const bool mujoco_damping = has_articulation &&
+        model.solver_options.law_source == constraint::LawSource::MuJoCo;
     // The same particle ownership sizes the cook reserve and the pipeline's row range.
     const uint64_t particle_reserve64 = cap.max_contacts_per_env > 0u
         ? cap.ParticleContactReserve(grid_particles_per_env) : 0u;
@@ -308,7 +311,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     };
     energy(EnergyStage::Begin);
 
-    if (has_contacts) {
+    if (has_contacts || mujoco_damping) {
         p_step_velocity_.env_count = env_count;
         p_step_velocity_.articulation_count = articulation_cnt;
         p_step_velocity_.max_dof = max_dof;
@@ -321,7 +324,8 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     if (has_articulation) {
         p_apply_drives_.dt = cfg.dt;
         p_apply_drives_.total_link_count = total_link_count;
-        p_apply_drives_.defer_velocity_damping = cfg.defer_velocity_damping && cfg.fold_drive_damping;
+        p_apply_drives_.defer_velocity_damping =
+            !mujoco_damping && cfg.defer_velocity_damping && cfg.fold_drive_damping;
         p_apply_drives_.links_per_env = base_link_count;
         p_apply_drives_.mode = model.drive_mode;
 
@@ -821,6 +825,18 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         }
     } else {
         add(phi::NkOp::BlockDescentSolve, &p_block_descent_);
+    }
+
+    if (mujoco_damping) {
+        p_damping_.dt = cfg.dt;
+        p_damping_.max_dof = max_dof;
+        p_damping_.articulation_count = articulation_cnt;
+        p_damping_.total_link_count = total_link_count;
+        p_damping_.mode = model.drive_mode;
+        p_damping_.actuator_derivative =
+            model.solver_options.integrator == constraint::Integrator::ImplicitFast ||
+            model.solver_options.integrator == constraint::Integrator::Implicit;
+        add(phi::NkOp::ArticulationDamping, &p_damping_);
     }
 
     if (cap.joint_drive_rows_per_env > 0u) {

@@ -13,6 +13,8 @@ struct SolverOptions {
     Integrator integrator = Integrator::Euler;
     float impratio = 1.0f;
     bool refsafe = true;
+    // A MuJoCo source integrates articulation damping with its integrator after the constraint solve.
+    LawSource law_source = LawSource::None;
 };
 
 struct SolverReference {

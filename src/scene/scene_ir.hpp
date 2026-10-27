@@ -31,6 +31,7 @@
 #include "sensor/tactile.hpp"
 
 #include <memory>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -327,6 +328,8 @@ struct ActuatorRecord {
     ActuatorType type                      = ActuatorType::Motor;
     float gain                             = 1.0f;
     float force_limit                      = 0.0f;
+    // Joint-space velocity gain; NaN keeps the critically damped default of a position servo.
+    float damping                          = std::numeric_limits<float>::quiet_NaN();
 };
 
 // An authored <contact><pair> explicit contact override (v0.8 C1b). MuJoCo's

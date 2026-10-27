@@ -25,6 +25,7 @@ const char* NkOpName(int op) {
         case NkOp::ReadoutDrives: return "ReadoutDrives";
         case NkOp::RefitParticleSurfaces: return "RefitParticleSurfaces";
         case NkOp::ArticulationDynamics: return "ArticulationDynamics";
+        case NkOp::ArticulationDamping: return "ArticulationDamping";
         case NkOp::IntegrateVelocity: return "IntegrateVelocity";
         case NkOp::FkWorldPoses: return "FkWorldPoses";
         case NkOp::IntegratePosition: return "IntegratePosition";

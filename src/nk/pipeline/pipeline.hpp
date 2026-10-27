@@ -105,6 +105,7 @@ private:
     phi::ApplyDrivesParams            p_apply_drives_{};
     phi::ApplyDynamicsDrivesParams    p_apply_dynamics_{};
     phi::ReadoutDrivesParams          p_readout_drives_{};
+    phi::ArticulationDampingParams    p_damping_{};
     phi::ParticleSurfacesParams       p_particle_surfaces_{};
     phi::ParticleSurfacesParams       p_dat_refit_{};
     phi::OgcDetectParams              p_ogc_detect_{};

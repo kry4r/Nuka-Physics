@@ -122,6 +122,16 @@ struct ReferenceWeightsParams {
     uint32_t total_body_count;
 };
 
+// Applies (M + dt D)^-1 M to each articulation's step velocity change after the constraint solve.
+struct ArticulationDampingParams {
+    float dt;
+    uint32_t max_dof;
+    uint32_t articulation_count;
+    uint32_t total_link_count;
+    uint32_t actuator_derivative;
+    uint32_t mode;
+};
+
 struct IntegrateVelocityParams {
     float    dt;
     float    gravity[3];

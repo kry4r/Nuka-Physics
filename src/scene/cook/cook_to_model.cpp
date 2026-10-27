@@ -872,12 +872,18 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             const float force_limit = act < blob.actuators.force_limits.size()
                                           ? std::max(blob.actuators.force_limits[act], 0.0f)
                                           : 0.0f;
+            const float damping = act < blob.actuators.dampings.size()
+                                      ? blob.actuators.dampings[act]
+                                      : std::numeric_limits<float>::quiet_NaN();
+            // Servos on one joint add; an unset velocity gain keeps DefaultDriveDamping.
             if (blob.actuators.types[act] == ActuatorType::Position && gain > 0.0f) {
-                d.stiffness[link] = gain;
-                d.damping[link] = 2.0f * std::sqrt(gain);  // DefaultDriveDamping.
+                d.stiffness[link] += gain;
+                d.damping[link] += std::isnan(damping) ? 2.0f * std::sqrt(gain) : damping;
+            } else if (blob.actuators.types[act] == ActuatorType::Velocity && !std::isnan(damping)) {
+                d.damping[link] += damping;
             }
             if (force_limit > 0.0f) {
-                d.force_limits[link] = force_limit;
+                d.force_limits[link] = std::max(d.force_limits[link], force_limit);
             }
         }
 

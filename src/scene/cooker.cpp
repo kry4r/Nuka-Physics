@@ -968,12 +968,14 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
     blob.actuators.joint_ids.reserve(actuators.size());
     blob.actuators.gains.reserve(actuators.size());
     blob.actuators.force_limits.reserve(actuators.size());
+    blob.actuators.dampings.reserve(actuators.size());
 
     for (const auto& a : actuators) {
         blob.actuators.types.push_back(a.type);
         blob.actuators.joint_ids.push_back(a.joint_id);
         blob.actuators.gains.push_back(a.gain);
         blob.actuators.force_limits.push_back(a.force_limit);
+        blob.actuators.dampings.push_back(a.damping);
     }
 
     return blob;
