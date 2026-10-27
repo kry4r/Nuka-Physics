@@ -414,12 +414,12 @@ struct PrimParams {
 // SPHERE x SPHERE -> 1 point. normal = separation dir for A (a's center - b's).
 // ---------------------------------------------------------------------------
 NUKA_AMF_HD inline void SphereSphere(const PrimParams& a, const PrimParams& b,
-                                     ContactManifold* out) {
+                                     ContactManifold* out, float query = 0.0f) {
     out->Clear();
     const Vec3 delta = a.frame.t - b.frame.t;          // A relative to B
     const float dist = Len(delta);
     const float pen = (a.radius + b.radius) - dist;
-    if (pen <= 0.0f) return;
+    if (pen <= -query) return;
     const Vec3 n = Norm(delta, Vec3::UnitY());         // points A away from B
     const Vec3 p = b.frame.t + n * (b.radius - 0.5f * pen);  // midway between the surfaces
     ContactPoint pt;
@@ -432,13 +432,13 @@ NUKA_AMF_HD inline void SphereSphere(const PrimParams& a, const PrimParams& b,
 // normal = separation dir for A (sphere). 1-pt.
 // ---------------------------------------------------------------------------
 NUKA_AMF_HD inline void SphereBox(const PrimParams& sph, const PrimParams& box,
-                                  ContactManifold* out) {
+                                  ContactManifold* out, float query = 0.0f) {
     out->Clear();
     const Vec3 cl = box.frame.WorldToLocal(sph.frame.t);     // sphere center, box-local
     const auto surface = QueryPrimitiveSurface(kShapeBox, box.half_extents, cl);
     if (!surface.valid) return;
     const float pen = sph.radius - surface.distance;
-    if (pen <= 0.0f) return;
+    if (pen <= -query) return;
     ContactPoint pt;
     pt.normal = box.frame.DirLocalToWorld(surface.normal);
     pt.position = box.frame.LocalToWorld(surface.point) - pt.normal * (0.5f * pen);
@@ -449,12 +449,12 @@ NUKA_AMF_HD inline void SphereBox(const PrimParams& sph, const PrimParams& box,
 
 // Sphere-plane contact uses the plane's local +Z outward normal.
 NUKA_AMF_HD inline void SpherePlane(const PrimParams& sph, const PrimParams& plane,
-                                    ContactManifold* out) {
+                                    ContactManifold* out, float query = 0.0f) {
     out->Clear();
     const Vec3 n = Norm(plane.frame.cz, Vec3::UnitZ());
     const float signed_dist = (sph.frame.t - plane.frame.t).Dot(n);
     const float pen = sph.radius - signed_dist;
-    if (pen <= 0.0f) return;
+    if (pen <= -query) return;
     const Vec3 p = sph.frame.t - n * (sph.radius - 0.5f * pen);  // midway between the surfaces
     ContactPoint pt;
     pt.position = p; pt.normal = n; pt.penetration = pen; pt.stable_key = 0ull;
@@ -467,7 +467,7 @@ NUKA_AMF_HD inline void SpherePlane(const PrimParams& sph, const PrimParams& pla
 // = the corner's signed-axis bitmask (0..7), deterministic + warm-start identity.
 // ---------------------------------------------------------------------------
 NUKA_AMF_HD inline void BoxPlane(const PrimParams& box, const PrimParams& plane,
-                                 ContactManifold* out) {
+                                 ContactManifold* out, float query = 0.0f) {
     out->Clear();
     const Vec3 n = Norm(plane.frame.cz, Vec3::UnitZ());
     const Vec3 he = box.half_extents;
@@ -481,7 +481,7 @@ NUKA_AMF_HD inline void BoxPlane(const PrimParams& box, const PrimParams& plane,
         const Vec3 corner_world =
             box.frame.LocalToWorld({sx * he.x, sy * he.y, sz * he.z});
         const float signed_dist = (corner_world - plane.frame.t).Dot(n);
-        if (signed_dist < 0.0f) {                            // below plane -> overlap
+        if (signed_dist < query) {                           // within the query band
             cand[ncand].position    = corner_world - n * (0.5f * signed_dist);
             cand[ncand].penetration = -signed_dist;          // >0 == depth
             cand[ncand].feature     = c;                     // 0..7 corner id
@@ -501,7 +501,7 @@ NUKA_AMF_HD inline void BoxPlane(const PrimParams& box, const PrimParams& plane,
 // preferred over edge axes by an EPS bias (btBoxBox trick) so a parallel-face
 // resting stack uses face-clip (4 pts), not a 1-pt edge result.
 NUKA_AMF_HD inline void BoxBox(const PrimParams& A, const PrimParams& B,
-                               ContactManifold* out) {
+                               ContactManifold* out, float query = 0.0f) {
     out->Clear();
     const Vec3 ha = A.half_extents;
     const Vec3 hb = B.half_extents;
@@ -537,7 +537,7 @@ NUKA_AMF_HD inline void BoxBox(const PrimParams& A, const PrimParams& B,
         const float rb = eb[0]*AbsR[i][0] + eb[1]*AbsR[i][1] + eb[2]*AbsR[i][2];
         const float s = dA[i] < 0.0f ? -dA[i] : dA[i];   // |projection of d|
         const float pen = (ra + rb) - s;
-        if (pen <= 0.0f) return;                           // separating axis found
+        if (pen <= -query) return;                         // separating axis found
         if (pen < min_pen - kFaceBias) {
             min_pen = pen; best_axis = i;
             best_n = (dA[i] < 0.0f) ? -ax[i] : ax[i];      // dir A away from B
@@ -550,7 +550,7 @@ NUKA_AMF_HD inline void BoxBox(const PrimParams& A, const PrimParams& B,
         const float dBj = dpos.Dot(bx[j]);
         const float s = dBj < 0.0f ? -dBj : dBj;
         const float pen = (ra + rb) - s;
-        if (pen <= 0.0f) return;
+        if (pen <= -query) return;
         if (pen < min_pen - kFaceBias) {
             min_pen = pen; best_axis = 3 + j;
             best_n = (dBj < 0.0f) ? -bx[j] : bx[j];
@@ -572,7 +572,7 @@ NUKA_AMF_HD inline void BoxBox(const PrimParams& A, const PrimParams& B,
             const float s = dpos.Dot(L);
             const float sa = s < 0.0f ? -s : s;
             const float pen = (ra + rb) - sa;
-            if (pen <= 0.0f) return;
+            if (pen <= -query) return;
             // Edge axes need a STRICT improvement beyond kFaceBias to beat a face.
             if (pen < min_pen - kFaceBias) {
                 min_pen = pen; best_axis = 6 + i * 3 + j;
@@ -699,7 +699,7 @@ NUKA_AMF_HD inline void BoxBox(const PrimParams& A, const PrimParams& B,
     int ncand = 0;
     for (int k = 0; k < poly.count; ++k) {
         const float depth = (ref_face_center - poly.v[k]).Dot(refN);  // >0 below face
-        if (depth >= 0.0f) {
+        if (depth >= -query) {
             // contact point: the incident-face vertex projected onto ref face.
             const Vec3 onref = poly.v[k] + refN * depth;
             cand[ncand].position    = (poly.v[k] + onref) * 0.5f;  // midpoint (stable)
@@ -736,7 +736,7 @@ NUKA_AMF_HD inline void BoxBox(const PrimParams& A, const PrimParams& B,
 // Capsule-plane contact tests both segment endpoints along the capsule's local Z.
 // The normal separates the capsule from the plane's solid half-space.
 NUKA_AMF_HD inline void CapsulePlane(const PrimParams& cap, const PrimParams& plane,
-                                     ContactManifold* out) {
+                                     ContactManifold* out, float query = 0.0f) {
     out->Clear();
     const Vec3 n = Norm(plane.frame.cz, Vec3::UnitZ());
     const Vec3 axis = cap.frame.cz;
@@ -747,7 +747,7 @@ NUKA_AMF_HD inline void CapsulePlane(const PrimParams& cap, const PrimParams& pl
     int ncand = 0;
     for (uint32_t k = 0; k < 2u; ++k) {
         const float signed_dist = (ends[k] - plane.frame.t).Dot(n) - cap.radius;
-        if (signed_dist < 0.0f) {
+        if (signed_dist < query) {
             cand[ncand].position    = ends[k] - n * (cap.radius + 0.5f * signed_dist);
             cand[ncand].penetration = -signed_dist;
             cand[ncand].feature     = k;                          // endpoint id
@@ -762,13 +762,13 @@ NUKA_AMF_HD inline void CapsulePlane(const PrimParams& cap, const PrimParams& pl
 // sphere center. normal = separation dir for A (capsule).
 // ---------------------------------------------------------------------------
 NUKA_AMF_HD inline void CapsuleSphere(const PrimParams& cap, const PrimParams& sph,
-                                      ContactManifold* out) {
+                                      ContactManifold* out, float query = 0.0f) {
     out->Clear();
     const auto surface = QueryPrimitiveSurface(kShapeCapsule,
         {cap.radius, cap.half_height, 0.0f}, cap.frame.WorldToLocal(sph.frame.t));
     if (!surface.valid) return;
     const float pen = sph.radius - surface.distance;
-    if (pen <= 0.0f) return;
+    if (pen <= -query) return;
     ContactPoint pt;
     pt.normal = cap.frame.DirLocalToWorld(surface.normal) * -1.0f;
     pt.position = cap.frame.LocalToWorld(surface.point) + pt.normal * (0.5f * pen);
@@ -790,7 +790,7 @@ NUKA_AMF_HD inline Vec3 CylinderRimDir(const PrimFrame& f, int k) {
 // Cylinder-plane contact from the facing feature: the lower cap's octagon and deepest point, the
 // two ends of the side line, or each cap's deepest point. The normal separates the cylinder.
 NUKA_AMF_HD inline void CylinderPlane(const PrimParams& cyl, const PrimParams& plane,
-                                      ContactManifold* out) {
+                                      ContactManifold* out, float query = 0.0f) {
     out->Clear();
     const Vec3 n = Norm(plane.frame.cz, Vec3::UnitZ());
     const Vec3 axis = cyl.frame.cz;
@@ -805,7 +805,7 @@ NUKA_AMF_HD inline void CylinderPlane(const PrimParams& cyl, const PrimParams& p
         for (int k = -1; k < (on_cap ? 8 : 0); ++k) {
             const Vec3 p = center + (k < 0 ? down : CylinderRimDir(cyl.frame, k)) * cyl.radius;
             const float signed_dist = (p - plane.frame.t).Dot(n);
-            if (signed_dist >= 0.0f) continue;
+            if (signed_dist >= query) continue;
             cand[ncand].position = p - n * (signed_dist * 0.5f);
             cand[ncand].penetration = -signed_dist;
             cand[ncand].feature = static_cast<uint32_t>(k < 0 ? cap : 2 + cap * 8 + k);
@@ -817,13 +817,13 @@ NUKA_AMF_HD inline void CylinderPlane(const PrimParams& cyl, const PrimParams& p
 
 // Cylinder (a) x sphere (b) -> 1 point from the exact cylinder distance; normal separates A.
 NUKA_AMF_HD inline void CylinderSphere(const PrimParams& cyl, const PrimParams& sph,
-                                       ContactManifold* out) {
+                                       ContactManifold* out, float query = 0.0f) {
     out->Clear();
     const auto surface = QueryPrimitiveSurface(kShapeCylinder,
         {cyl.radius, cyl.half_height, 0.0f}, cyl.frame.WorldToLocal(sph.frame.t));
     if (!surface.valid) return;
     const float pen = sph.radius - surface.distance;
-    if (pen <= 0.0f) return;
+    if (pen <= -query) return;
     ContactPoint pt;
     pt.normal = cyl.frame.DirLocalToWorld(surface.normal) * -1.0f;
     pt.position = cyl.frame.LocalToWorld(surface.point) + pt.normal * (0.5f * pen);
@@ -903,7 +903,7 @@ NUKA_AMF_HD inline float ClosestPtSegmentSegment(Vec3 p1, Vec3 q1, Vec3 p2,
 // closest features). This is the WP6 dog-dog leg/trunk narrowphase.
 // ---------------------------------------------------------------------------
 NUKA_AMF_HD inline void CapsuleCapsule(const PrimParams& a, const PrimParams& b,
-                                       ContactManifold* out) {
+                                       ContactManifold* out, float query = 0.0f) {
     out->Clear();
     const Vec3 axa = a.frame.cz;
     const Vec3 axb = b.frame.cz;
@@ -916,7 +916,7 @@ NUKA_AMF_HD inline void CapsuleCapsule(const PrimParams& a, const PrimParams& b,
     const float dist2 = ClosestPtSegmentSegment(a0, a1, b0, b1, &ca, &cb);
     const float dist = sqrtf(dist2);
     const float pen = (a.radius + b.radius) - dist;
-    if (pen <= 0.0f) return;
+    if (pen <= -query) return;
     const Vec3 delta = ca - cb;                   // a away from b
     // Fallback normal: if the axes intersect (dist ~ 0), use a's axis-perp guess.
     const Vec3 n = Norm(delta, Norm(axa.Cross(axb), Vec3::UnitY()));

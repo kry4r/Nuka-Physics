@@ -71,20 +71,20 @@ __device__ bool MakeSupportProxy(uint32_t kind, const amf::PrimParams& prim,
 
 __device__ bool DispatchAnalyticPair(uint32_t ka, const amf::PrimParams& a,
                              uint32_t kb, const amf::PrimParams& b,
-                             ContactManifold* out) {
+                             float query, ContactManifold* out) {
     out->Clear();
 
-    if (ka == kKindSphere && kb == kKindSphere) { amf::SphereSphere(a, b, out); return true; }
-    if (ka == kKindSphere && kb == kKindBox)    { amf::SphereBox(a, b, out); return true; }
-    if (ka == kKindSphere && kb == kKindPlane)  { amf::SpherePlane(a, b, out); return true; }
-    if (ka == kKindBox && kb == kKindPlane)     { amf::BoxPlane(a, b, out); return true; }
-    if (ka == kKindBox && kb == kKindBox)       { amf::BoxBox(a, b, out); return true; }
-    if (ka == kKindCapsule && kb == kKindPlane) { amf::CapsulePlane(a, b, out); return true; }
-    if (ka == kKindCapsule && kb == kKindSphere){ amf::CapsuleSphere(a, b, out); return true; }
+    if (ka == kKindSphere && kb == kKindSphere) { amf::SphereSphere(a, b, out, query); return true; }
+    if (ka == kKindSphere && kb == kKindBox)    { amf::SphereBox(a, b, out, query); return true; }
+    if (ka == kKindSphere && kb == kKindPlane)  { amf::SpherePlane(a, b, out, query); return true; }
+    if (ka == kKindBox && kb == kKindPlane)     { amf::BoxPlane(a, b, out, query); return true; }
+    if (ka == kKindBox && kb == kKindBox)       { amf::BoxBox(a, b, out, query); return true; }
+    if (ka == kKindCapsule && kb == kKindPlane) { amf::CapsulePlane(a, b, out, query); return true; }
+    if (ka == kKindCapsule && kb == kKindSphere){ amf::CapsuleSphere(a, b, out, query); return true; }
 
-    if (ka == kKindCapsule && kb == kKindCapsule){ amf::CapsuleCapsule(a, b, out); return true; }
-    if (ka == kKindCylinder && kb == kKindPlane) { amf::CylinderPlane(a, b, out); return true; }
-    if (ka == kKindCylinder && kb == kKindSphere) { amf::CylinderSphere(a, b, out); return true; }
+    if (ka == kKindCapsule && kb == kKindCapsule){ amf::CapsuleCapsule(a, b, out, query); return true; }
+    if (ka == kKindCylinder && kb == kKindPlane) { amf::CylinderPlane(a, b, out, query); return true; }
+    if (ka == kKindCylinder && kb == kKindSphere) { amf::CylinderSphere(a, b, out, query); return true; }
     
     auto flip = [&]() {
         for (uint32_t i = 0; i < out->point_count; ++i) {
@@ -93,13 +93,13 @@ __device__ bool DispatchAnalyticPair(uint32_t ka, const amf::PrimParams& a,
                                                -out->points[i].normal.z};
         }
     };
-    if (ka == kKindBox && kb == kKindSphere)    { amf::SphereBox(b, a, out); flip(); return true; }
-    if (ka == kKindPlane && kb == kKindSphere)  { amf::SpherePlane(b, a, out); flip(); return true; }
-    if (ka == kKindPlane && kb == kKindBox)     { amf::BoxPlane(b, a, out); flip(); return true; }
-    if (ka == kKindPlane && kb == kKindCapsule) { amf::CapsulePlane(b, a, out); flip(); return true; }
-    if (ka == kKindSphere && kb == kKindCapsule){ amf::CapsuleSphere(b, a, out); flip(); return true; }
-    if (ka == kKindPlane && kb == kKindCylinder) { amf::CylinderPlane(b, a, out); flip(); return true; }
-    if (ka == kKindSphere && kb == kKindCylinder) { amf::CylinderSphere(b, a, out); flip(); return true; }
+    if (ka == kKindBox && kb == kKindSphere)    { amf::SphereBox(b, a, out, query); flip(); return true; }
+    if (ka == kKindPlane && kb == kKindSphere)  { amf::SpherePlane(b, a, out, query); flip(); return true; }
+    if (ka == kKindPlane && kb == kKindBox)     { amf::BoxPlane(b, a, out, query); flip(); return true; }
+    if (ka == kKindPlane && kb == kKindCapsule) { amf::CapsulePlane(b, a, out, query); flip(); return true; }
+    if (ka == kKindSphere && kb == kKindCapsule){ amf::CapsuleSphere(b, a, out, query); flip(); return true; }
+    if (ka == kKindPlane && kb == kKindCylinder) { amf::CylinderPlane(b, a, out, query); flip(); return true; }
+    if (ka == kKindSphere && kb == kKindCylinder) { amf::CylinderSphere(b, a, out, query); flip(); return true; }
 
     return false;
 }
@@ -263,6 +263,22 @@ __global__ void PairDrivenNarrowphaseKernel(
     bool convex = false;
     uint32_t law = ::nuka::nk::kContactLawSpeculative;
     float query_margin = separation;
+    const auto speed = [&](uint32_t body) {
+        const uint32_t at = env * bodies_per_env + body;
+        const auto center = body_pose[at].position;
+        const auto lo = aabb_lo[at] - center, hi = aabb_hi[at] - center;
+        const math::Vec3 extent{fmaxf(fabsf(lo.x), fabsf(hi.x)),
+            fmaxf(fabsf(lo.y), fabsf(hi.y)), fmaxf(fabsf(lo.z), fabsf(hi.z))};
+        return fmaxf(previous_motion != nullptr ? previous_motion[at] : 0.0f,
+            sqrtf(linear_velocity[at].LengthSq()) +
+            sqrtf(angular_velocity[at].LengthSq() * extent.LengthSq()));
+    };
+    // A pair is queried over its profile band or the gap both bodies can close within the step; a
+    // second shell width keeps contacts resting on the separation shell detected.
+    const auto query_radius = [&]() {
+        return fmaxf(query_margin, collision::DatQueryRadius(
+            collision::DatMotionRadius(2.0f * separation, dt, speed(a), speed(b), kDatRelaxation)));
+    };
 
     if (slot < live && slot < rigid_slot_cap) {
         a = candidate_pairs[static_cast<size_t>(gid) * 2u + 0u];
@@ -294,7 +310,9 @@ __global__ void PairDrivenNarrowphaseKernel(
             const math::Transform xb = body_pose[env * bodies_per_env + b];
             const amf::PrimParams pa = MakePrim(sa, xa);
             const amf::PrimParams pb = MakePrim(sb, xb);
-            DispatchAnalyticPair(sa.kind, pa, sb.kind, pb, &m);
+            DispatchAnalyticPair(sa.kind, pa, sb.kind, pb, query_radius(), &m);
+            if (law != nk::kContactLawCompliant)
+                for (uint32_t i = 0u; i < m.point_count; ++i) m.points[i].penetration += separation;
         }
     }
 
@@ -304,18 +322,7 @@ __global__ void PairDrivenNarrowphaseKernel(
         auto& workspace = reinterpret_cast<cvx::ConvexWorkspace*>(storage)[threadIdx.x / kWarp];
         auto pa = MakePrim(sa, body_pose[env * bodies_per_env + a]);
         auto pb = MakePrim(sb, body_pose[env * bodies_per_env + b]);
-        const auto speed = [&](uint32_t body) {
-            const uint32_t at = env * bodies_per_env + body;
-            const auto center = body_pose[at].position;
-            const auto lo = aabb_lo[at] - center, hi = aabb_hi[at] - center;
-            const math::Vec3 extent{fmaxf(fabsf(lo.x), fabsf(hi.x)),
-                fmaxf(fabsf(lo.y), fabsf(hi.y)), fmaxf(fabsf(lo.z), fabsf(hi.z))};
-            return fmaxf(previous_motion != nullptr ? previous_motion[at] : 0.0f,
-                sqrtf(linear_velocity[at].LengthSq()) +
-                sqrtf(angular_velocity[at].LengthSq() * extent.LengthSq()));
-        };
-        const float query = fmaxf(query_margin, collision::DatQueryRadius(
-            collision::DatMotionRadius(separation, dt, speed(a), speed(b), kDatRelaxation)));
+        const float query = query_radius();
         const auto origin = pa.frame.t;
         pa.frame.t = {};
         pb.frame.t -= origin;
