@@ -930,11 +930,15 @@ __device__ void InitializeTile(ArticulationDeviceState state, DataView data, Blo
         }
         __syncwarp();
     }
+    // A block starts from its free velocity plus the constraint velocity its previous solve added.
     for (uint32_t k = c.lane; k < c.bodies; k += kTileLanes) {
         const uint32_t body = c.first_body + k;
+        const size_t base = size_t{body} * kRigidBlockDof;
+        float carried[kRigidBlockDof];
+        for (uint32_t i = 0u; i < kRigidBlockDof; ++i) carried[i] = s.rigid_velocity[base + i] - s.rigid_free[base + i];
         InitializeRigidBlock(data, p, s, body);
         for (uint32_t i = 0u; i < kRigidBlockDof; ++i)
-            s.rigid_velocity[size_t{body} * kRigidBlockDof + i] = s.rigid_free[size_t{body} * kRigidBlockDof + i];
+            s.rigid_velocity[base + i] = s.rigid_free[base + i] + (isfinite(carried[i]) ? carried[i] : 0.0f);
     }
     for (uint32_t k = 0u; k < c.articulations; ++k) {
         const uint32_t articulation = c.first_articulation + k;
@@ -951,9 +955,10 @@ __device__ void InitializeTile(ArticulationDeviceState state, DataView data, Blo
             const uint32_t roots = __ballot_sync(~0u, root);
             if (root) {
                 const uint32_t compact = compacted + __popc(roots & ((1u << c.lane) - 1u));
+                const float carried = s.articulation_velocity[base + compact] - s.articulation_free[base + compact];
                 s.articulation_roots[base + compact] = dof;
                 s.articulation_free[base + compact] = value;
-                s.articulation_velocity[base + compact] = value;
+                s.articulation_velocity[base + compact] = value + (isfinite(carried) ? carried : 0.0f);
             }
             compacted += __popc(roots);
         }
@@ -1657,6 +1662,54 @@ __device__ void DescendTileBlock(DataView data, BlockDescentSolveParams p, Block
         start[r] = coordinate[r] ? b.velocity[c.lane + r * kTileLanes] : 0.0f;
         free[r] = coordinate[r] && b.free != nullptr ? b.free[c.lane + r * kTileLanes] : 0.0f;
         u[r] = start[r];
+    }
+    // The first velocity sweep searches the segment from the carried start back to the free velocity, so the
+    // Newton steps begin no worse than either end.
+    if (c.iteration == 0u && b.free != nullptr) {
+        float d[kSpan], mass_step[kSpan];
+#pragma unroll
+        for (uint32_t r = 0u; r < kSpan; ++r) {
+            d[r] = coordinate[r] ? free[r] - u[r] : 0.0f;
+            mass_step[r] = 0.0f;
+        }
+        if constexpr (kSpan > 1u) {
+#pragma unroll
+            for (uint32_t r = 0u; r < kSpan; ++r) c.stage[c.lane + r * kTileLanes] = d[r];
+            __syncwarp();
+        }
+#pragma unroll
+        for (uint32_t k = 0u; k < (kSpan == 1u ? kN : n); ++k) {
+            float along;
+            if constexpr (kSpan == 1u) along = TileCoordinate(d, k);
+            else along = c.stage[k];
+#pragma unroll
+            for (uint32_t r = 0u; r < kSpan; ++r) {
+                const uint32_t i = c.lane + r * kTileLanes;
+                mass_step[r] += (i < kN ? c.mass[i * kS + k] : 0.0f) * along;
+            }
+        }
+        TileSum curvature{};
+#pragma unroll
+        for (uint32_t r = 0u; r < kSpan; ++r)
+            if (coordinate[r]) TileAddProduct(curvature, d[r], mass_step[r]);
+        const float inertial_curvature = TileWarpTotal(curvature);
+        if (inertial_curvature > 0.0f && isfinite(inertial_curvature)) {
+            if constexpr (kSpan == 1u) TileRowSteps(c, b.local, d);
+            else WideTileRowSteps<kN>(c, b.local, n, d);
+            const float alpha = SearchTileLine(c, b.local, -inertial_curvature, inertial_curvature);
+            if (alpha > 0.0f) {
+#pragma unroll
+                for (uint32_t r = 0u; r < kSpan; ++r) u[r] = fmaf(alpha, d[r], u[r]);
+                for (uint32_t k = c.IncidentBegin(b.local) + c.lane; k < c.incident_end[b.local]; k += kTileLanes) {
+                    const uint32_t head = c.incident[k];
+                    const Vec3 move = c.Load3(kTileMove, head);
+                    const Vec3 row_step = c.Load3(kTileStep, head);
+                    c.Store3(kTileMove, head, {fmaf(alpha, row_step.x, move.x), fmaf(alpha, row_step.y, move.y),
+                                               fmaf(alpha, row_step.z, move.z)});
+                }
+                __syncwarp();
+            }
+        }
     }
     nk::BlockSolveFailure failure = nk::BlockSolveFailure::None;
     float primal = FLT_MAX;
