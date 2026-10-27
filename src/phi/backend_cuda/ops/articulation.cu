@@ -584,6 +584,14 @@ __global__ void FkLinkVelocitiesKernel(ArticulationDeviceState state, Articulati
     if (articulation >= state.articulation_count) return;
     const uint32_t offset = state.articulation_link_offset[articulation];
     const uint32_t count = state.articulation_link_count[articulation];
+    // A thread's first link keeps its joint transform and motion subspace through the sweep.
+    LinkSpatialTransform own_transform{};
+    float own_subspace[6] = {};
+    if (threadIdx.x < count) {
+        own_transform = JointTransform(state, offset + threadIdx.x);
+        MotionSubspaceForJoint(state.joint_type[offset + threadIdx.x], state.joint_axis[offset + threadIdx.x],
+                               own_subspace);
+    }
     for (uint32_t depth = 0u; depth <= tree.max_depth[articulation]; ++depth) {
         for (uint32_t local = threadIdx.x; local < count; local += blockDim.x) {
             const uint32_t link = offset + local;
@@ -593,10 +601,15 @@ __global__ void FkLinkVelocitiesKernel(ArticulationDeviceState state, Articulati
                 continue;
             float parent_velocity[6] = {};
             if (parent != kInvalidLink) SpatialToArray(state.link_velocity[offset + parent], parent_velocity);
-            float velocity[6];
-            TransformMotion(JointTransform(state, link), parent_velocity, velocity);
+            LinkSpatialTransform transform = own_transform;
             float subspace[6];
-            MotionSubspaceForJoint(state.joint_type[link], state.joint_axis[link], subspace);
+            for (uint32_t component = 0u; component < 6u; ++component) subspace[component] = own_subspace[component];
+            if (local != threadIdx.x) {
+                transform = JointTransform(state, link);
+                MotionSubspaceForJoint(state.joint_type[link], state.joint_axis[link], subspace);
+            }
+            float velocity[6];
+            TransformMotion(transform, parent_velocity, velocity);
             for (uint32_t component = 0u; component < 6u; ++component)
                 velocity[component] += subspace[component] * state.qdot[link];
             ArrayToSpatial(velocity, &state.link_velocity[link]);
@@ -1426,11 +1439,13 @@ __global__ void UpdateWorldLinkPosesKernel(ArticulationDeviceState state,
 
     const uint32_t offset = state.articulation_link_offset[articulation];
     const uint32_t count = state.articulation_link_count[articulation];
+    // A thread's first link keeps its joint frame through the sweep.
+    const math::Transform own = threadIdx.x < count ? RelativeTransform(state, offset + threadIdx.x) : math::Transform{};
     for (uint32_t depth = 0u; depth <= tree.max_depth[articulation]; ++depth) {
         for (uint32_t local = threadIdx.x; local < count; local += blockDim.x) {
             const uint32_t link = offset + local;
             if (tree.depth[link] != depth) continue;
-            const math::Transform relative = RelativeTransform(state, link);
+            const math::Transform relative = local == threadIdx.x ? own : RelativeTransform(state, link);
             const uint32_t parent_local = state.parent_link[link];
             if (parent_local == kInvalidLink) {
                 if (state.joint_type[link] == ArticulationJointType::FloatingBase) {
@@ -1597,7 +1612,7 @@ Status OpFkWorldPoses(const ModelView& model, const DataView& data,
     const uint32_t count = p->selected_env_count > 0u
         ? p->selected_env_count * p->articulations_per_env : p->articulation_count;
     const uint32_t* env_ids = p->selected_env_count > 0u ? data.reset_env_ids : nullptr;
-    LaunchCuda(UpdateWorldLinkPosesKernel, dim3(count), dim3(32u),
+    LaunchCuda(UpdateWorldLinkPosesKernel, dim3(count), dim3(kMassThreads),
                0u, stream, state, data.link_pose, env_ids, p->articulations_per_env, MakeArticulationTreeView(model));
     return LaunchOk(stream);
 }
@@ -1612,7 +1627,7 @@ Status OpFkLinkVelocities(const ModelView& model, const DataView& data,
         !data.q || !model.joint_axis || !model.link_local_pose || !model.parent_offset)
         return Status::InvalidArgument;
     const auto state = MakeArticulationDeviceState(model, data, p->total_link_count, p->articulation_count);
-    LaunchCuda(FkLinkVelocitiesKernel, dim3(p->articulation_count), dim3(32u),
+    LaunchCuda(FkLinkVelocitiesKernel, dim3(p->articulation_count), dim3(kMassThreads),
                0u, stream, state, MakeArticulationTreeView(model));
     return LaunchOk(stream);
 }
