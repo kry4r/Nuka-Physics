@@ -349,7 +349,8 @@ __global__ void PairDrivenNarrowphaseKernel(
             upoint[at] = m.points[i].position;
             unormal[at] = m.points[i].normal;
             udepth[at] = m.points[i].penetration;
-            if constexpr (kConvex) {
+            // Witness buffers exist only with OGC slots.
+            if (kConvex && uwitness_a != nullptr) {
                 uwitness_a[at] = witness_a[i];
                 uwitness_b[at] = witness_b[i];
             }
