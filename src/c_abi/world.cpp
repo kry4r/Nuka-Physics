@@ -709,8 +709,10 @@ nuka_result_t nuka_world_step_n(nuka_world_handle world, uint32_t step_count) {
         for (uint32_t step = 0u; step < step_count; ++step) {
             const auto result = record->world->StepConfigured();
             if (result != nuka::phi::Status::Ok) {
-                std::fprintf(stderr, "[World] step failed at op %u\n",
-                    static_cast<unsigned>(record->world->LastExecutionError().failed_op));
+                const auto& error = record->world->LastExecutionError();
+                std::fprintf(stderr, "[World] step %u failed at op %u (native %d): %s\n",
+                    record->simulated_step_count, static_cast<unsigned>(error.failed_op),
+                    error.native_code, error.message);
                 return nuka::c_abi::MapStatusToResult(result);
             }
             ++record->simulated_step_count;
