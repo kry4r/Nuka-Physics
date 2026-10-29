@@ -253,6 +253,7 @@ struct ModelHoldDrives {
     std::vector<float> stiffness;     // actuator gain (Position actuators)
     std::vector<float> damping;       // 2*sqrt(gain) (DefaultDriveDamping)
     std::vector<float> force_limits;
+    std::vector<float> joint_force_limits;  // joint-level range on the summed drive (MuJoCo actfrcrange)
 };
 
 // A cooked shape row (primitive params + optional hull/SDF asset reference).

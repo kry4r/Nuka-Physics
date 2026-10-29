@@ -47,6 +47,7 @@ fields:
   - {name: drive_stiffness,       dtype: f32,       per: link, arena: persistent, owner: data,  flags: [param]}
   - {name: drive_damping,         dtype: f32,       per: link, arena: persistent, owner: data,  flags: [param]}
   - {name: drive_force_limit,     dtype: f32,       per: link, arena: persistent, owner: data,  flags: [param]}
+  - {name: drive_joint_force_limit, dtype: f32,     per: link, arena: persistent, owner: data,  flags: [param]}
   # Reset/snapshot state (device-resident; backs SnapshotState/RestoreState/
   # ResetEnvs ops — the legacy batched articulated snapshot_* buffers 1:1).
   - {name: snapshot_q,             dtype: f32,       per: link, arena: persistent, owner: data}

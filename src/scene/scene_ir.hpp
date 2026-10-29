@@ -139,6 +139,7 @@ struct JointRecord {
     float spring_reference                 = 0.0f;
     float initial_position                 = 0.0f;
     float frictionloss                     = 0.0f;   // MuJoCo joint dry friction
+    float actuator_force_limit             = 0.0f;   // MuJoCo actfrcrange on the summed drive; 0 is unlimited
     constraint::LawSource law_source       = constraint::LawSource::None;
     constraint::SolverReference limit_reference;
     constraint::SolverReference friction_reference;

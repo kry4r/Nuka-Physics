@@ -58,6 +58,18 @@ void ParseRange(const char* text, float& lower, float& upper) {
     ss >> lower >> upper;
 }
 
+// MuJoCo bounds a joint's summed actuator force when actuatorfrclimited is true, or auto with a range.
+void ParseActuatorForceRange(const tinyxml2::XMLElement* element, float& limit) {
+    if (const char* range = element->Attribute("actuatorfrcrange")) {
+        float lower = 0.0f, upper = 0.0f;
+        ParseRange(range, lower, upper);
+        limit = std::max(std::fabs(lower), std::fabs(upper));
+    }
+    if (const char* limited = element->Attribute("actuatorfrclimited"); limited && std::string(limited) == "false") {
+        limit = 0.0f;
+    }
+}
+
 int ParseLimited(const char* text, int fallback) {
     if (text == nullptr) return fallback;
     const std::string value(text);
@@ -100,6 +112,7 @@ struct MjcfJointDefaults {
     float damping = 0.0f;
     float armature = 0.0f;
     float frictionloss = 0.0f;
+    float actuator_force_limit = 0.0f;
     float stiffness = 0.0f;
     float spring_reference = 0.0f;
     constraint::SolverReference limit_reference;
@@ -313,6 +326,7 @@ void ApplyJointDefault(tinyxml2::XMLElement* joint_elem, MjcfDefaultClass* defau
     joint_elem->QueryFloatAttribute("damping", &defaults->joint.damping);
     joint_elem->QueryFloatAttribute("armature", &defaults->joint.armature);
     joint_elem->QueryFloatAttribute("frictionloss", &defaults->joint.frictionloss);
+    ParseActuatorForceRange(joint_elem, defaults->joint.actuator_force_limit);
     joint_elem->QueryFloatAttribute("stiffness", &defaults->joint.stiffness);
     joint_elem->QueryFloatAttribute("springref", &defaults->joint.spring_reference);
     joint_elem->QueryFloatAttribute("margin", &defaults->joint.limit_margin);
@@ -1185,6 +1199,7 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         jrec.damping = defaults.joint.damping;
         jrec.armature = defaults.joint.armature;
         jrec.frictionloss = defaults.joint.frictionloss;
+        jrec.actuator_force_limit = defaults.joint.actuator_force_limit;
         jrec.stiffness = defaults.joint.stiffness;
         jrec.spring_reference = defaults.joint.spring_reference;
         jrec.law_source = constraint::LawSource::MuJoCo;
@@ -1199,6 +1214,7 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         joint->QueryFloatAttribute("damping", &jrec.damping);
         joint->QueryFloatAttribute("armature", &jrec.armature);
         joint->QueryFloatAttribute("frictionloss", &jrec.frictionloss);
+        ParseActuatorForceRange(joint, jrec.actuator_force_limit);
         joint->QueryFloatAttribute("stiffness", &jrec.stiffness);
         joint->QueryFloatAttribute("springref", &jrec.spring_reference);
         joint->QueryFloatAttribute("margin", &jrec.limit_margin);

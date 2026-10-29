@@ -715,6 +715,7 @@ struct DriveControlView {
     const float* stiffness;
     const float* damping;
     const float* force_limit;
+    const float* joint_force_limit;
     const float* noload_speed;
     const float* feedforward;
     const math::Vec3* task_target;
@@ -739,7 +740,7 @@ struct DriveControlView {
 DriveControlView MakeDriveControlView(const DataView& data) {
     return {data.drive_target, data.velocity_target, data.acceleration_target,
             data.drive_stiffness, data.drive_damping, data.drive_force_limit,
-            data.actuator_noload_speed, data.joint_f, data.task_target,
+            data.drive_joint_force_limit, data.actuator_noload_speed, data.joint_f, data.task_target,
             data.task_rotation_target, data.task_local_pose,
             data.task_nullspace_stiffness, data.task_nullspace_damping, data.m_factor,
             data.drive_command, data.drive_dissipation, data.drive_lower,
@@ -809,9 +810,22 @@ __global__ void ApplyAffineDriveKernel(ArticulationDeviceState state,
     // The force limit bounds the whole effort; as in MuJoCo, a drive clamped at the step
     // start applies its clamped effort without the implicit damping derivative.
     const float effort = bias - damping * velocity;
-    if (!implicit || effort < lower || effort > upper) {
+    const bool saturated = effort < lower || effort > upper;
+    const float joint_limit = drive.joint_force_limit[link];
+    if (implicit && joint_limit > 0.0f) {
+        // A joint range clamps the step-start effort and, as in MuJoCo, keeps the implicit damping unclamped.
+        bias = fminf(fmaxf(fminf(fmaxf(effort, lower), upper), -joint_limit), joint_limit);
+        damping = saturated ? 0.0f : damping;
+        bias += damping * velocity;
+        lower = -FLT_MAX;
+        upper = FLT_MAX;
+    } else if (!implicit || saturated) {
         bias = effort;
         damping = 0.0f;
+        if (joint_limit > 0.0f) {
+            lower = fmaxf(lower, -joint_limit);
+            upper = fminf(upper, joint_limit);
+        }
     } else {
         // The row clamps the command bias = effort + damping * velocity.
         lower += damping * velocity;
@@ -852,8 +866,9 @@ __global__ void ArticulationDampingKernel(ArticulationDeviceState state, DataVie
         const uint32_t link = dof_link[d], component = dof_component[d];
         const bool scalar = component == kInvalidLink;
         float value = scalar ? state.joint_damping[link] : 0.0f;
+        // Only the actuator's own range drops the derivative; a joint range keeps it, as in MuJoCo.
         if (scalar && p.actuator_derivative != 0u &&
-            drive.command[link] >= drive.lower[link] && drive.command[link] <= drive.upper[link])
+            !(drive.force_limit[link] > 0.0f && fabsf(drive.command[link]) > drive.force_limit[link]))
             value += control == ArticulationControlMode::PDPosition ? drive.damping[link]
                    : control == ArticulationControlMode::Velocity ? drive.stiffness[link] : 0.0f;
         const float velocity = scalar ? state.qdot[link] : state.link_velocity[link].v[component];

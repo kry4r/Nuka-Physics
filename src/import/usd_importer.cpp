@@ -2435,10 +2435,13 @@ void SceneBuilder::AddMjcActuator(const PrimData& prim, scene::SceneIR& scene) c
         const bool on_range = limited == "true" || (limited == "auto" && (has_lo || has_hi));
         return on_range ? std::max(std::abs(lo), std::abs(hi)) : kInf;
     };
-    const double limit = std::min(std::abs(gear[0]) * range(prim.prim, "mjc:forceRange", "mjc:forceLimited"),
-        range(prims_[joint->prim].prim, "mjc:actuatorfrcrange", "mjc:actuatorfrclimited"));
+    const double limit = std::abs(gear[0]) * range(prim.prim, "mjc:forceRange", "mjc:forceLimited");
+    const double joint_limit = range(prims_[joint->prim].prim, "mjc:actuatorfrcrange", "mjc:actuatorfrclimited");
     const double length = joint->angular ? units_.meters * units_.meters : 1.0;
     const double torque = units_.kilograms * units_.meters * (joint->angular ? units_.meters : 1.0);
+    if (std::isfinite(joint_limit) && joint_limit > 0.0) {
+        scene.GetJointMut(joint->id).actuator_force_limit = F(joint_limit * torque);
+    }
     scene::ActuatorRecord actuator;
     actuator.name = prim.name;
     actuator.joint_id = joint->id;

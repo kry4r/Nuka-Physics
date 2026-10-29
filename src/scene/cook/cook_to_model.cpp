@@ -847,6 +847,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         d.stiffness.assign(m.link_count, 0.0f);
         d.damping.assign(m.link_count, 0.0f);
         d.force_limits.assign(m.link_count, 0.0f);
+        d.joint_force_limits.assign(m.link_count, 0.0f);
         for (uint32_t act = 0; act < blob.actuator_count; ++act) {
             if (act >= blob.actuators.joint_ids.size() ||
                 act >= blob.actuators.types.size()) {
@@ -886,6 +887,9 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             }
             if (force_limit > 0.0f) {
                 d.force_limits[link] = std::max(d.force_limits[link], force_limit);
+            }
+            if (joint < blob.joints.actuator_force_limits.size()) {
+                d.joint_force_limits[link] = std::max(blob.joints.actuator_force_limits[joint], 0.0f);
             }
         }
 

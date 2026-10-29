@@ -565,7 +565,8 @@ bool World::SeedInitialState() {
                 ? std::vector<float>{} : model_.hold_drives.targets) ||
         !replicate_f32(FieldId::DriveStiffness, model_.hold_drives.stiffness) ||
         !replicate_f32(FieldId::DriveDamping, model_.hold_drives.damping) ||
-        !replicate_f32(FieldId::DriveForceLimit, model_.hold_drives.force_limits)) {
+        !replicate_f32(FieldId::DriveForceLimit, model_.hold_drives.force_limits) ||
+        !replicate_f32(FieldId::DriveJointForceLimit, model_.hold_drives.joint_force_limits)) {
         return false;
     }
     const size_t task_count = static_cast<size_t>(E) * model_.capacities.articulations_per_env;
@@ -820,6 +821,7 @@ std::vector<float>* World::LinkParamTemplate(FieldId id) {
         case FieldId::DriveStiffness: return &model_.hold_drives.stiffness;
         case FieldId::DriveDamping: return &model_.hold_drives.damping;
         case FieldId::DriveForceLimit: return &model_.hold_drives.force_limits;
+        case FieldId::DriveJointForceLimit: return &model_.hold_drives.joint_force_limits;
         default: return nullptr;
     }
 }

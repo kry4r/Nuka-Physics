@@ -81,6 +81,7 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::DriveStiffness:      v.drive_stiffness = static_cast<float*>(p); break;
         case FieldId::DriveDamping:        v.drive_damping = static_cast<float*>(p); break;
         case FieldId::DriveForceLimit:     v.drive_force_limit = static_cast<float*>(p); break;
+        case FieldId::DriveJointForceLimit: v.drive_joint_force_limit = static_cast<float*>(p); break;
         case FieldId::SnapshotQ:           v.snapshot_q = static_cast<float*>(p); break;
         case FieldId::SnapshotQdot:        v.snapshot_qdot = static_cast<float*>(p); break;
         case FieldId::SnapshotLinkVelocity:v.snapshot_link_velocity = static_cast<Spatial6*>(p); break;
