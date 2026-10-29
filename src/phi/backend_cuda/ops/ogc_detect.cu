@@ -56,8 +56,8 @@ struct OgcCandidate {
 __device__ float OgcParticleQuery(const OgcDetectParams& p, const ModelView& model,
                                   const DataView& data, uint32_t env, uint32_t source_surface,
                                   uint32_t target_surface) {
-    const float radius = model.particle_surface_thickness[source_surface] +
-                         model.particle_surface_thickness[target_surface];
+    const float radius = model.particle_surface_self_thickness[source_surface] +
+                         model.particle_surface_self_thickness[target_surface];
     const float source_speed = data.particle_surface_max_speed[
         size_t{env} * p.surfaces_per_env + source_surface];
     const float target_speed = data.particle_surface_max_speed[
@@ -85,8 +85,9 @@ __device__ void OgcEmitParticleFace(const OgcDetectParams& p, const ModelView& m
           feature.distance <= query && feature.distance > 0.0f)) return;
     const uint32_t source_local = item - env * p.particles_per_env;
     const size_t tri_at = (size_t{target_info.triangle_offset} + triangle) * 3u;
-    const auto face = OgcParticleFaceMaterial(model, view, target_info, triangle, feature.barycentric);
-    const float radius = model.particle_half_thickness[source_local] + face.half_thickness;
+    const auto face = OgcParticleFaceMaterial(model, model.particle_self_half_thickness, view, target_info, triangle,
+                                              feature.barycentric);
+    const float radius = model.particle_self_half_thickness[source_local] + face.half_thickness;
     if (c.source_surface == target_surface) {
         // Features of one surface already within their contact distance at rest are neighbours, not contacts.
         math::Vec3 rest[3];
@@ -179,8 +180,8 @@ __device__ void OgcEmitParticleEdge(const OgcDetectParams& p, const ModelView& m
     for (uint32_t j = 0u; j < 2u; ++j) {
         const float weight_a = j == 0u ? 1.0f - pair.weight_a : pair.weight_a;
         const float weight_b = j == 0u ? 1.0f - pair.weight_b : pair.weight_b;
-        radius += weight_a * model.particle_half_thickness[source_info.vertex_offset + vertices_a[j]] +
-                  weight_b * model.particle_half_thickness[target_info.vertex_offset + vertices_b[j]];
+        radius += weight_a * model.particle_self_half_thickness[source_info.vertex_offset + vertices_a[j]] +
+                  weight_b * model.particle_self_half_thickness[target_info.vertex_offset + vertices_b[j]];
     }
     if (source_surface == target_surface) {
         const auto* rest = model.particle_rest_pos;
@@ -275,6 +276,7 @@ __global__ void OgcParticleVertexFaceKernel(OgcDetectParams p, ModelView model,
     const auto enter = [&]() {
         cursor = end = 0u;
         if (target_surface >= p.surfaces_per_env) return;
+        if (!nkops::ParticleSelfPair(model.particle_surface_self_contact, source_surface, target_surface)) return;
         target_info = model.particle_surface_info[target_surface];
         query = OgcParticleQuery(p, model, data, env, source_surface, target_surface);
         if (!(query > 0.0f) || !collision::MeshSurfaceRangeValid(view, target_info)) return;
@@ -351,6 +353,7 @@ __global__ void OgcParticleEdgeEdgeKernel(OgcDetectParams p, ModelView model,
     const auto enter = [&]() {
         cursor = end = 0u;
         if (target_surface >= p.surfaces_per_env) return;
+        if (!nkops::ParticleSelfPair(model.particle_surface_self_contact, source_surface, target_surface)) return;
         target_edges = model.particle_surface_edge_info[target_surface];
         query = OgcParticleQuery(p, model, data, env, source_surface, target_surface);
         if (!(query > 0.0f)) return;

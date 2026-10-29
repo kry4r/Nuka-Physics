@@ -360,6 +360,9 @@ struct MediaVbdMaterial {
     float    particle_mass     = 0.0f;
     float    surface_density   = 0.0f;   // kg / m^2; mutually exclusive with particle_mass.
     float    half_thickness    = 0.0f;   // m from the cloth midsurface.
+    // Particle-particle contact half distance (m); 0 shares half_thickness, the body contact distance.
+    float    self_half_thickness = 0.0f;
+    bool     self_contact      = true;   // contact with particle surfaces, its own included
     float    friction          = 0.6f;   // body<->soft contact mu
     float    stretch_stiffness = 0.0f;   // cloth Young's modulus times thickness (N/m); cable EA (N)
     float    poisson           = 0.0f;   // cloth membrane Poisson ratio
@@ -370,6 +373,10 @@ struct MediaVbdMaterial {
     float    aero_drag_tangent = 0.0f;
     float    aero_drag_max_dv  = 0.0f;
 };
+
+inline float SelfHalfThickness(const MediaVbdMaterial& material) {
+    return material.self_half_thickness > 0.0f ? material.self_half_thickness : material.half_thickness;
+}
 
 // Constitutive material for an MLS-MPM medium. Mirrors cook::MpmMaterialInput
 // plus the cook::MpmCookInput grid/floor scalars.

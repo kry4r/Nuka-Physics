@@ -201,8 +201,10 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
             id == FieldId::VbdStep || id == FieldId::VbdRestart || id == FieldId::VbdSolveAudit)
             return CheckedProduct({vbd_vertices_per_env, env_count});
         if (id == FieldId::ParticleSurfaceInfo || id == FieldId::ParticleSurfaceEdgeInfo ||
-            id == FieldId::ParticleSurfaceThickness) return particle_surfaces_per_env;
-        if (id == FieldId::ParticleHalfThickness || id == FieldId::ParticleFriction ||
+            id == FieldId::ParticleSurfaceThickness || id == FieldId::ParticleSurfaceSelfThickness ||
+            id == FieldId::ParticleSurfaceSelfContact) return particle_surfaces_per_env;
+        if (id == FieldId::ParticleHalfThickness || id == FieldId::ParticleSelfHalfThickness ||
+            id == FieldId::ParticleFriction ||
             id == FieldId::ParticleRestPos) return particles_per_env;
         if (id == FieldId::ParticleSurfaceTriangles ||
             id == FieldId::ParticleSurfaceTriangleEdges ||
@@ -697,9 +699,21 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             if (!particles.surface_thickness.empty()) std::memcpy(dst, particles.surface_thickness.data(),
                 particles.surface_thickness.size() * sizeof(float));
             break;
+        case FieldId::ParticleSurfaceSelfThickness:
+            if (!particles.surface_self_thickness.empty()) std::memcpy(dst, particles.surface_self_thickness.data(),
+                particles.surface_self_thickness.size() * sizeof(float));
+            break;
+        case FieldId::ParticleSurfaceSelfContact:
+            if (!particles.surface_self_contact.empty()) std::memcpy(dst, particles.surface_self_contact.data(),
+                particles.surface_self_contact.size() * sizeof(uint32_t));
+            break;
         case FieldId::ParticleHalfThickness:
             if (!particles.half_thickness.empty()) std::memcpy(dst, particles.half_thickness.data(),
                 particles.half_thickness.size() * sizeof(float));
+            break;
+        case FieldId::ParticleSelfHalfThickness:
+            if (!particles.self_half_thickness.empty()) std::memcpy(dst, particles.self_half_thickness.data(),
+                particles.self_half_thickness.size() * sizeof(float));
             break;
         case FieldId::ParticleFriction:
             if (!particles.friction.empty()) std::memcpy(dst, particles.friction.data(),
@@ -1169,6 +1183,11 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::ParticleSurfaceVertexTriangles: v.particle_surface_vertex_triangles = static_cast<uint32_t*>(p); break;
         case FieldId::ParticleSurfaceThickness: v.particle_surface_thickness = static_cast<float*>(p); break;
         case FieldId::ParticleHalfThickness: v.particle_half_thickness = static_cast<float*>(p); break;
+        case FieldId::ParticleSelfHalfThickness: v.particle_self_half_thickness = static_cast<float*>(p); break;
+        case FieldId::ParticleSurfaceSelfThickness:
+            v.particle_surface_self_thickness = static_cast<float*>(p); break;
+        case FieldId::ParticleSurfaceSelfContact:
+            v.particle_surface_self_contact = static_cast<uint32_t*>(p); break;
         case FieldId::ParticleFriction: v.particle_friction = static_cast<float*>(p); break;
         case FieldId::ParticleRestPos: v.particle_rest_pos = static_cast<math::Vec3*>(p); break;
         case FieldId::MeshTriangles: v.mesh_triangles = static_cast<uint32_t*>(p); break;
@@ -1303,14 +1322,18 @@ phi::Status Model::ValidateTopology(std::string* reason) const {
         particles.surface_triangle_edges.size() != uint64_t{cap.particle_surface_triangles} * 3u ||
         particles.surface_triangle_vertex_owner.size() != uint64_t{cap.particle_surface_triangles} * 3u ||
         particles.surface_thickness.size() != particles.surface_info.size() ||
+        particles.surface_self_thickness.size() != particles.surface_info.size() ||
+        particles.surface_self_contact.size() != particles.surface_info.size() ||
         particles.surface_triangles.size() != uint64_t{cap.particle_surface_triangles} * 3u ||
         particles.surface_tree.size() != cap.particle_surface_nodes_per_env)
         return reject(Status::InvalidArgument, "particle surface topology counts disagree");
     if (particles.half_thickness.size() != cap.particles_per_env ||
+        particles.self_half_thickness.size() != cap.particles_per_env ||
         particles.friction.size() != cap.particles_per_env)
         return reject(Status::InvalidArgument, "particle contact materials disagree with the particle count");
     for (uint32_t particle = 0u; particle < cap.particles_per_env; ++particle)
         if (!std::isfinite(particles.half_thickness[particle]) || particles.half_thickness[particle] < 0.0f ||
+            !std::isfinite(particles.self_half_thickness[particle]) || particles.self_half_thickness[particle] < 0.0f ||
             !std::isfinite(particles.friction[particle]) || particles.friction[particle] < 0.0f)
             return reject(Status::InvalidArgument, "invalid particle contact material");
     const collision::MeshSurfaceView particle_mesh{
@@ -1336,10 +1359,13 @@ phi::Status Model::ValidateTopology(std::string* reason) const {
             edge_info.node_count != 2u * edge_info.edge_count - 1u ||
             particles.initial_pos.size() != cap.particles_per_env ||
             !std::isfinite(particles.surface_thickness[surface]) || particles.surface_thickness[surface] < 0.0f ||
+            !std::isfinite(particles.surface_self_thickness[surface]) ||
+            particles.surface_self_thickness[surface] < 0.0f || particles.surface_self_contact[surface] > 1u ||
             (triangle_surface && info.node_count != uint64_t{info.triangle_count} * 2u - 1u))
             return reject(Status::InvalidArgument, "invalid particle surface");
         for (uint32_t vertex = 0u; vertex < info.vertex_count; ++vertex)
-            if (particles.half_thickness[info.vertex_offset + vertex] > particles.surface_thickness[surface])
+            if (particles.half_thickness[info.vertex_offset + vertex] > particles.surface_thickness[surface] ||
+                particles.self_half_thickness[info.vertex_offset + vertex] > particles.surface_self_thickness[surface])
                 return reject(Status::InvalidArgument, "particle surface does not bound its vertex thickness");
         for (uint32_t triangle = 0u; triangle < info.triangle_count; ++triangle)
             for (uint32_t side = 0u; side < 3u; ++side) {

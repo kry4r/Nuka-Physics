@@ -682,8 +682,12 @@ fields:
   - {name: particle_surface_vertex_triangle_offsets, dtype: u32, per: scalar, count: "particles_per_env+1", arena: persistent, owner: model}
   - {name: particle_surface_vertex_triangles, dtype: u32, per: scalar, count: "particle_surface_triangles*3", arena: persistent, owner: model}
   - {name: particle_surface_thickness, dtype: f32, per: scalar, count: "particle_surfaces_per_env", arena: persistent, owner: model}
+  # Particle-particle contact: each surface's largest vertex half distance, and whether it takes part.
+  - {name: particle_surface_self_thickness, dtype: f32, per: scalar, count: "particle_surfaces_per_env", arena: persistent, owner: model}
+  - {name: particle_surface_self_contact, dtype: u32, per: scalar, count: "particle_surfaces_per_env", arena: persistent, owner: model}
   # Contact half thickness and friction of each environment particle; a surface thickness bounds its vertices.
   - {name: particle_half_thickness, dtype: f32, per: scalar, count: "particles_per_env", arena: persistent, owner: model}
+  - {name: particle_self_half_thickness, dtype: f32, per: scalar, count: "particles_per_env", arena: persistent, owner: model}
   - {name: particle_friction, dtype: f32, per: scalar, count: "particles_per_env", arena: persistent, owner: model}
   - {name: particle_rest_pos, dtype: vec3, per: scalar, count: "particles_per_env", arena: persistent, owner: model}
   - {name: particle_surface_nodes, dtype: mesh_bvh_node, per: scalar, count: "particle_surface_nodes_per_env*env_count", arena: scratch, owner: data}

@@ -658,6 +658,8 @@ Value SaveMedia(const MediaRecord& m, MeshSink& sink) {
         xp.Set("particle_mass", Value::Float(mv.particle_mass));
         xp.Set("surface_density", Value::Float(mv.surface_density));
         xp.Set("half_thickness", Value::Float(mv.half_thickness));
+        if (mv.self_half_thickness != 0.0f) xp.Set("self_half_thickness", Value::Float(mv.self_half_thickness));
+        if (!mv.self_contact) xp.Set("self_contact", Value::Bool(false));
         xp.Set("friction", Value::Float(mv.friction));
         xp.Set("stretch_stiffness", Value::Float(mv.stretch_stiffness));
         xp.Set("poisson", Value::Float(mv.poisson));
@@ -1960,6 +1962,8 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                 out.particle_mass = f(xp, "particle_mass", out.particle_mass);
                 out.surface_density = f(xp, "surface_density", out.surface_density);
                 out.half_thickness = f(xp, "half_thickness", out.half_thickness);
+                out.self_half_thickness = f(xp, "self_half_thickness", out.self_half_thickness);
+                out.self_contact = b(xp, "self_contact", out.self_contact);
                 out.friction = f(xp, "friction", out.friction);
                 out.stretch_stiffness = f(xp, "stretch_stiffness", out.stretch_stiffness);
                 out.poisson = f(xp, "poisson", out.poisson);

@@ -83,6 +83,11 @@ __forceinline__ __device__ uint32_t AuthoredPairProfile(const uint64_t* keys, co
     return ~0u;
 }
 
+// Particle surfaces a and b meet only when both take part in particle-particle contact.
+__forceinline__ __device__ bool ParticleSelfPair(const uint32_t* self_contact, uint32_t a, uint32_t b) {
+    return self_contact[a] != 0u && self_contact[b] != 0u;
+}
+
 // Quat rotate — EXACT host math::Quat::Rotate expression (matches BuildPrimFrame
 // columns at the FP floor; same posture as union_types.cuh::RotateQuatHostExpr).
 __forceinline__ __device__ math::Vec3 PrimRotate(math::Quat q, math::Vec3 v) {

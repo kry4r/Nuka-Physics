@@ -178,16 +178,17 @@ struct OgcParticleMaterial {
     float friction = 0.0f;
 };
 
-// Contact half thickness and friction of a particle face, interpolated at barycentric weights.
+// Contact half thickness (from the given per-particle array) and friction of a particle face, interpolated at
+// barycentric weights.
 __device__ OgcParticleMaterial OgcParticleFaceMaterial(
-    const ModelView& model, const collision::MeshSurfaceView& view,
+    const ModelView& model, const float* half_thickness, const collision::MeshSurfaceView& view,
     const collision::MeshSurfaceInfo& info, uint32_t triangle, math::Vec3 weights) {
     const size_t tri_at = (size_t{info.triangle_offset} + triangle) * 3u;
     const float w[3] = {weights.x, weights.y, weights.z};
     OgcParticleMaterial out;
     for (uint32_t j = 0u; j < 3u; ++j) {
         const uint32_t local = info.vertex_offset + view.triangles[tri_at + j];
-        out.half_thickness += w[j] * model.particle_half_thickness[local];
+        out.half_thickness += w[j] * half_thickness[local];
         out.friction += w[j] * model.particle_friction[local];
     }
     return out;
@@ -474,8 +475,10 @@ __global__ void OgcMixedVertexFaceKernel(OgcDetectParams p, ModelView model, Dat
                 !(feature.distance >= 0.0f && feature.distance <= reach)) return;
             const uint32_t ordinal = OgcClaimSlot(p, data, env);
             if (ordinal >= p.slot_capacity) return;
-            const auto face = b.particle ? OgcParticleFaceMaterial(model, b.view, b.info, c.target, feature.barycentric)
-                                        : OgcParticleMaterial{};
+            const auto face = b.particle
+                ? OgcParticleFaceMaterial(model, model.particle_half_thickness, b.view, b.info, c.target,
+                                          feature.barycentric)
+                : OgcParticleMaterial{};
             OgcEmitMixedFace(p, model, data, env, ordinal, a.particle,
                 env * p.particles_per_env + particle, a.owner, c.source, b.particle, b.owner, b.owner,
                 b.view, b.info, c.target, source, b.particle ? source_radius + face.half_thickness : radius,

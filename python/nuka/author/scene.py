@@ -439,7 +439,8 @@ class Scene:
                 particle_mass=rkw["vbd_particle_mass"], surface_density=rkw["vbd_surface_density"],
                 half_thickness=rkw["vbd_half_thickness"], friction=rkw["vbd_friction"],
                 stretch_stiffness=rkw["vbd_stretch_stiffness"], poisson=rkw["vbd_poisson"],
-                bend_stiffness=rkw["vbd_bend_stiffness"], damping=rkw["vbd_damping"])
+                bend_stiffness=rkw["vbd_bend_stiffness"], damping=rkw["vbd_damping"],
+                self_half_thickness=rkw["vbd_self_half_thickness"])
 
 
 __all__ = ["Scene", "SimOptions", "Environment"]

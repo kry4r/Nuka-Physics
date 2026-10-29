@@ -116,6 +116,7 @@ void SetOgcContactCapacity(nk::Model& model, uint32_t capacity);
 struct CookParticleSurface {
     std::vector<uint32_t> triangles;
     std::vector<uint32_t> edges;
+    bool self_contact = true;   // contact with particle surfaces, this one included
 };
 
 struct VbdCookInput {
@@ -130,8 +131,10 @@ struct VbdCookInput {
     float    aero_drag_normal  = 0.0f;
     float    aero_drag_tangent = 0.0f;
     float    aero_drag_max_dv  = 0.0f;
-    // Per-particle contact half thickness and Coulomb mu.
+    // Per-particle contact half thickness against bodies and against particle surfaces (empty shares
+    // half_thickness), and Coulomb mu.
     std::vector<float> half_thickness;
+    std::vector<float> self_half_thickness;
     std::vector<float> friction;
     std::vector<CookParticleSurface> surfaces;
     // Vertex-block elements over input particles [vbd_begin, vbd_begin + vbd_count), indexed by input particle.

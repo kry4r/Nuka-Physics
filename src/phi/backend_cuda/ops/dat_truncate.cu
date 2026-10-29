@@ -137,8 +137,8 @@ __device__ float RequestedRadius(const DatTruncateParams& p, const ModelView& mo
                                  const DataView& data, uint32_t env,
                                  uint32_t source, uint32_t target) {
     const size_t offset = size_t{env} * p.surfaces_per_env;
-    return model.particle_surface_thickness[source] +
-           model.particle_surface_thickness[target] + p.margin +
+    return model.particle_surface_self_thickness[source] +
+           model.particle_surface_self_thickness[target] + p.margin +
            data.dat_surface_motion[offset + source] +
            data.dat_surface_motion[offset + target];
 }
@@ -192,9 +192,10 @@ __global__ void ClearDatCountersKernel(DatTruncateParams p, ModelView model, Dat
         data.dat_failure_count[env] = 0u;
         for (uint32_t source = 0u; source < p.surfaces_per_env; ++source)
             for (uint32_t target = source; target < p.surfaces_per_env; ++target) {
+                if (!nkops::ParticleSelfPair(model.particle_surface_self_contact, source, target)) continue;
                 const float radius = RequestedRadius(p, model, data, env, source, target);
-                const float base = model.particle_surface_thickness[source] +
-                                   model.particle_surface_thickness[target] + p.margin;
+                const float base = model.particle_surface_self_thickness[source] +
+                                   model.particle_surface_self_thickness[target] + p.margin;
                 if (!(radius >= 0.0f && radius <= FLT_MAX) ||
                     !(base <= p.query_reach)) {
                     atomicOr(data.env_status + env, kEnvStatusDatFailure);
@@ -372,7 +373,8 @@ __global__ void ClearDatKernel(DatTruncateParams p, ModelView model, DataView da
             continue;
         for (uint32_t target = 0u; target < p.surfaces_per_env; ++target) {
             // Uncapped queries cover both primitives' complete linear trajectories.
-            if (RequestedRadius(p, model, data, env, source, target) > p.query_reach)
+            if (nkops::ParticleSelfPair(model.particle_surface_self_contact, source, target) &&
+                RequestedRadius(p, model, data, env, source, target) > p.query_reach)
                 bound = fminf(bound, 0.5f * p.relaxation * p.query_reach);
         }
         for (uint32_t body = 0u; body < p.bodies_per_env; ++body) {
@@ -412,7 +414,9 @@ __global__ void DatVertexFaceKernel(DatTruncateParams p, ModelView model, DataVi
     collision::MeshSurfaceInfo info{};
     float query = 0.0f;
     const auto enter = [&]() {
-        if (target >= p.surfaces_per_env) return;
+        cursor = end = 0u;
+        if (target >= p.surfaces_per_env ||
+            !nkops::ParticleSelfPair(model.particle_surface_self_contact, source, target)) return;
         info = model.particle_surface_info[target];
         query = QueryRadius(p, model, data, env, source, target);
         if (!TreeShare(view.nodes + info.node_offset, info.node_count, share, &cursor, &end))
@@ -500,7 +504,9 @@ __global__ void DatEdgeEdgeKernel(DatTruncateParams p, ModelView model, DataView
     collision::MeshEdgeInfo edges_b{};
     float query = 0.0f, broad_radius = 0.0f;
     const auto enter = [&]() {
-        if (target >= p.surfaces_per_env) return;
+        cursor = end = 0u;
+        if (target >= p.surfaces_per_env ||
+            !nkops::ParticleSelfPair(model.particle_surface_self_contact, source, target)) return;
         edges_b = model.particle_surface_edge_info[target];
         base_b = env * p.particles_per_env + model.particle_surface_info[target].vertex_offset;
         query = QueryRadius(p, model, data, env, source, target);
@@ -608,6 +614,7 @@ __global__ void DatInitialEdgeFaceKernel(DatTruncateParams p, ModelView model,
         const math::Vec3 midpoint = (segment.vertex[0] + segment.vertex[1]) * 0.5f;
         const float half_length = sqrtf((segment.vertex[1] - segment.vertex[0]).LengthSq()) * 0.5f;
         for (uint32_t target = 0u; target < p.surfaces_per_env; ++target) {
+            if (!nkops::ParticleSelfPair(model.particle_surface_self_contact, source, target)) continue;
             const auto info_b = model.particle_surface_info[target];
             uint32_t cursor = 0u, end = 0u;
             if (!TreeShare(view.nodes + info_b.node_offset, info_b.node_count, share, &cursor, &end)) {

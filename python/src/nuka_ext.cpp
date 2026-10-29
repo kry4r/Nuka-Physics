@@ -1815,7 +1815,8 @@ public:
                    uint32_t cable_slab_render_material_id,
                    float mpm_yield_stress, float mpm_hardening_modulus,
                    uint32_t mpm_contact_capacity, float vbd_half_thickness,
-                   float vbd_surface_density) {
+                   float vbd_surface_density, float vbd_self_half_thickness,
+                   bool vbd_self_contact) {
         auto vec3 = [](const std::vector<float>& v, float* out, const char* what) {
             if (v.empty()) return;
             if (v.size() != 3) {
@@ -1844,6 +1845,8 @@ public:
         d.vbd_friction = vbd_friction;
         d.vbd_half_thickness = vbd_half_thickness;
         d.vbd_surface_density = vbd_surface_density;
+        d.vbd_self_half_thickness = vbd_self_half_thickness;
+        d.vbd_self_contact_disabled = vbd_self_contact ? 0u : 1u;
         d.vbd_stretch_stiffness = vbd_stretch_stiffness;
         d.vbd_poisson = vbd_poisson;
         d.vbd_bend_stiffness = vbd_bend_stiffness;
@@ -1936,7 +1939,7 @@ public:
     void add_cloth_region(uint32_t media_id, const std::vector<uint32_t>& vertices,
                           float particle_mass, float surface_density, float half_thickness,
                           float friction, float stretch_stiffness, float poisson,
-                          float bend_stiffness, float damping) {
+                          float bend_stiffness, float damping, float self_half_thickness) {
         nuka_cloth_region_desc_t d{};
         d.vertices = vertices.data();
         d.vertex_count = static_cast<uint32_t>(vertices.size());
@@ -1948,6 +1951,7 @@ public:
         d.poisson = poisson;
         d.bend_stiffness = bend_stiffness;
         d.damping = damping;
+        d.self_half_thickness = self_half_thickness;
         check(nuka_scene_add_cloth_region(h_, media_id, &d), "nuka_scene_add_cloth_region");
     }
 
@@ -3668,6 +3672,7 @@ NB_MODULE(_nuka_ext, m) {
              nb::arg("mpm_contact_capacity") = 0u,
              nb::arg("vbd_half_thickness") = 0.0f,
              nb::arg("vbd_surface_density") = 0.0f,
+             nb::arg("vbd_self_half_thickness") = 0.0f, nb::arg("vbd_self_contact") = true,
              "Add a TAGGED media record. kind is a MEDIA_* code (CLOTH/SOFT_TET/"
              "FLUID/GRANULAR/CABLE); method a MEDIA_METHOD_* code (MLSMPM/VBD). kind "
              "selects the geometry block (cloth_*/tet_*/fluid_*/cable_*); method selects the "
@@ -3694,6 +3699,7 @@ NB_MODULE(_nuka_ext, m) {
              nb::arg("vertices"), nb::arg("particle_mass"), nb::arg("surface_density"),
              nb::arg("half_thickness"), nb::arg("friction"), nb::arg("stretch_stiffness"),
              nb::arg("poisson"), nb::arg("bend_stiffness"), nb::arg("damping"),
+             nb::arg("self_half_thickness") = 0.0f,
              "Append a material region to the cloth medium `media_id`: listed vertices take its "
              "contact thickness, friction and particle mass; faces with all three vertices listed "
              "take its density and moduli. Later regions win.")

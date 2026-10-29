@@ -34,6 +34,8 @@ class ClothMaterial:
     damping: float
     half_thickness: float = 0.0
     surface_density: float = 0.0
+    self_half_thickness: float = 0.0
+    self_contact: bool = True
 
     def cook_kwargs(self) -> dict:
         return dict(
@@ -55,6 +57,8 @@ class ClothMaterial:
             vbd_damping=float(self.damping),
             vbd_half_thickness=float(self.half_thickness),
             vbd_surface_density=float(self.surface_density),
+            vbd_self_half_thickness=float(self.self_half_thickness),
+            vbd_self_contact=bool(self.self_contact),
         )
 
 
@@ -65,9 +69,12 @@ class Cloth:
     def VBD(mass: float = 0.01, friction: float = 0.6,
             stretch_stiffness: float = 5.0e3, poisson: float = 0.3,
             bend_stiffness: float = 5.0e-5, damping: float = 0.0,
-            thickness: float = 0.0, areal_density: float = 0.0) -> ClothMaterial:
+            thickness: float = 0.0, areal_density: float = 0.0,
+            self_thickness: float = 0.0, self_contact: bool = True) -> ClothMaterial:
         """StVK membrane with dihedral bending and optional areal density (kg/m²).
-        ``thickness`` sets the contact shell; ``mass`` is per vertex when density is zero."""
+        ``thickness`` sets the contact shell against bodies and, unless ``self_thickness`` is set, against
+        particle surfaces; ``self_contact`` False skips particle-particle contact. ``mass`` is per vertex
+        when density is zero."""
         if not stretch_stiffness > 0.0:
             raise ValueError("Cloth.VBD: stretch_stiffness must be > 0")
         if not 0.0 <= poisson < 0.5:
@@ -76,10 +83,13 @@ class Cloth:
             raise ValueError("Cloth.VBD: thickness must be finite and nonnegative")
         if not _math.isfinite(areal_density) or areal_density < 0.0:
             raise ValueError("Cloth.VBD: areal_density must be finite and nonnegative")
+        if not _math.isfinite(self_thickness) or self_thickness < 0.0:
+            raise ValueError("Cloth.VBD: self_thickness must be finite and nonnegative")
         if areal_density > 0.0:
             mass = 0.0
         return ClothMaterial(mass, friction, stretch_stiffness, poisson,
-                             bend_stiffness, damping, thickness * 0.5, areal_density)
+                             bend_stiffness, damping, thickness * 0.5, areal_density,
+                             self_thickness * 0.5, bool(self_contact))
 
 
 @_dc.dataclass(frozen=True)

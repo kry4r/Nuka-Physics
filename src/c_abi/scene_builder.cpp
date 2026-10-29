@@ -162,6 +162,8 @@ bool MediaFromDesc(const nuka_media_desc_t& d, nscene::MediaRecord* out) {
     m.vbd.particle_mass = d.vbd_particle_mass;
     m.vbd.friction = d.vbd_friction;
     m.vbd.half_thickness = d.vbd_half_thickness;
+    m.vbd.self_half_thickness = d.vbd_self_half_thickness;
+    m.vbd.self_contact = d.vbd_self_contact_disabled == 0u;
     m.vbd.surface_density = d.vbd_surface_density;
     m.vbd.stretch_stiffness = d.vbd_stretch_stiffness;
     m.vbd.poisson = d.vbd_poisson;
@@ -515,6 +517,7 @@ nuka_result_t nuka_scene_add_cloth_region(nuka_scene_handle scene, uint32_t medi
         region.material.particle_mass = desc->particle_mass;
         region.material.surface_density = desc->surface_density;
         region.material.half_thickness = desc->half_thickness;
+        region.material.self_half_thickness = desc->self_half_thickness;
         region.material.friction = desc->friction;
         region.material.stretch_stiffness = desc->stretch_stiffness;
         region.material.poisson = desc->poisson;

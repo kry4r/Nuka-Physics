@@ -350,6 +350,9 @@ typedef struct nuka_media_desc_t {
     uint32_t render_material_id;     // ~0u (0xFFFFFFFF) => none.
     float    vbd_half_thickness;
     float    vbd_surface_density;
+    // Particle-particle contact half distance (0 shares vbd_half_thickness); nonzero disabled skips that contact.
+    float    vbd_self_half_thickness;
+    uint32_t vbd_self_contact_disabled;
 } nuka_media_desc_t;
 
 // Create a built-scene handle owning one in-memory SceneIR. A non-empty
@@ -473,6 +476,7 @@ typedef struct nuka_cloth_region_desc_t {
     float    poisson;
     float    bend_stiffness;
     float    damping;
+    float    self_half_thickness;    // particle-particle contact; 0 shares half_thickness
 } nuka_cloth_region_desc_t;
 
 // Append a region to the cloth medium `media_id`. INVALID_ARG on a NULL desc or vertex list, or a

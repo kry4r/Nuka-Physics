@@ -377,8 +377,12 @@ public:
         std::vector<uint32_t> surface_triangle_edges;
         std::vector<uint32_t> surface_triangle_vertex_owner;
         std::vector<float> surface_thickness;
-        // Per-particle contact half thickness and friction; each surface thickness is the maximum over its vertices.
+        std::vector<float> surface_self_thickness;
+        std::vector<uint32_t> surface_self_contact;   // 1 where the surface meets particle surfaces
+        // Per-particle contact half thickness against bodies and against particle surfaces, and friction;
+        // each surface thickness is the maximum over its vertices.
         std::vector<float> half_thickness;
+        std::vector<float> self_half_thickness;
         std::vector<float> friction;
         // MLS-MPM per-particle init (single-env template; replicated env-major).
         // F seeded identity, vol0 from the sampling lattice, material_id indexes

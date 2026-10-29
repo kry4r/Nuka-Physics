@@ -1788,6 +1788,7 @@ void CookVbdParticles(nk::Model& model, uint32_t env_count,
     mp.mode = nk::Model::ParticleMode::Vbd;
     mp.initial_pos = in.positions;
     mp.half_thickness = in.half_thickness;
+    mp.self_half_thickness = in.self_half_thickness.empty() ? in.half_thickness : in.self_half_thickness;
     mp.friction = in.friction;
     mp.initial_vel = in.velocities;
     mp.inv_mass = in.inv_mass;
@@ -1834,6 +1835,8 @@ void CookVbdParticles(nk::Model& model, uint32_t env_count,
     mp.surface_triangle_edges.clear();
     mp.surface_triangle_vertex_owner.clear();
     mp.surface_thickness.clear();
+    mp.surface_self_thickness.clear();
+    mp.surface_self_contact.clear();
     for (const auto& surface : in.surfaces) {
         if ((surface.triangles.empty() && surface.edges.empty()) ||
             surface.triangles.size() % 3u != 0u || surface.edges.size() % 2u != 0u ||
@@ -1842,7 +1845,8 @@ void CookVbdParticles(nk::Model& model, uint32_t env_count,
         const auto& vertices = surface.triangles.empty() ? surface.edges : surface.triangles;
         const auto bounds = std::minmax_element(vertices.begin(), vertices.end());
         const uint32_t begin = *bounds.first;
-        if (*bounds.second >= mp.initial_pos.size() || *bounds.second >= mp.half_thickness.size())
+        if (*bounds.second >= mp.initial_pos.size() || *bounds.second >= mp.half_thickness.size() ||
+            *bounds.second >= mp.self_half_thickness.size())
             throw std::invalid_argument("deformable collision surface has invalid vertex indices");
         const uint32_t count = *bounds.second - begin + 1u;
         const float* positions = reinterpret_cast<const float*>(mp.initial_pos.data() + begin);
@@ -1882,6 +1886,9 @@ void CookVbdParticles(nk::Model& model, uint32_t env_count,
             cooked_edges.triangle_vertex_owner.begin(), cooked_edges.triangle_vertex_owner.end());
         mp.surface_thickness.push_back(*std::max_element(mp.half_thickness.begin() + begin,
                                                          mp.half_thickness.begin() + begin + count));
+        mp.surface_self_thickness.push_back(*std::max_element(mp.self_half_thickness.begin() + begin,
+                                                              mp.self_half_thickness.begin() + begin + count));
+        mp.surface_self_contact.push_back(surface.self_contact ? 1u : 0u);
     }
     cap.particle_surfaces_per_env = static_cast<uint32_t>(mp.surface_info.size());
     cap.particle_surface_triangles = static_cast<uint32_t>(mp.surface_triangles.size() / 3u);
@@ -1918,6 +1925,8 @@ void CookMpmParticles(nk::Model& model, uint32_t env_count,
     mp.surface_triangles.clear();
     mp.surface_tree.clear();
     mp.surface_thickness.clear();
+    mp.surface_self_thickness.clear();
+    mp.surface_self_contact.clear();
     cap.particle_surfaces_per_env = 0u;
     cap.particle_surface_triangles = 0u;
     cap.particle_surface_nodes_per_env = 0u;
@@ -1944,6 +1953,7 @@ void CookMpmParticles(nk::Model& model, uint32_t env_count,
     if (mp.initial_vol0.size() != n) mp.initial_vol0.assign(n, in.dx * in.dx * in.dx);
     // Grid-owned points meet bodies through grid rows, never particle contacts.
     mp.half_thickness.assign(n, 0.0f);
+    mp.self_half_thickness.assign(n, 0.0f);
     mp.friction.assign(n, 0.0f);
 
     // Material validation is shared with direct model creation and device evaluation.
@@ -2106,6 +2116,8 @@ void CookMpmVbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
     mp.aero_drag_tangent = xp.aero_drag_tangent;
     mp.aero_drag_max_dv = xp.aero_drag_max_dv;
     mp.half_thickness.insert(mp.half_thickness.end(), xp.half_thickness.begin(), xp.half_thickness.end());
+    mp.self_half_thickness.insert(mp.self_half_thickness.end(), xp.self_half_thickness.begin(),
+                                  xp.self_half_thickness.end());
     mp.friction.insert(mp.friction.end(), xp.friction.begin(), xp.friction.end());
 
     mp.surface_info = xp.surface_info;
@@ -2119,6 +2131,8 @@ void CookMpmVbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
     mp.surface_triangle_edges = xp.surface_triangle_edges;
     mp.surface_triangle_vertex_owner = xp.surface_triangle_vertex_owner;
     mp.surface_thickness = xp.surface_thickness;
+    mp.surface_self_thickness = xp.surface_self_thickness;
+    mp.surface_self_contact = xp.surface_self_contact;
     cap.particle_surfaces_per_env = xtmp.capacities.particle_surfaces_per_env;
     cap.particle_surface_triangles = xtmp.capacities.particle_surface_triangles;
     cap.particle_surface_edges_per_env = xtmp.capacities.particle_surface_edges_per_env;
@@ -2328,6 +2342,7 @@ VbdCookInput BuildClothVertexBlockInput(const MediaRecord& media) {
         if (!std::isfinite(material.surface_density) || material.surface_density < 0.0f ||
             !std::isfinite(material.particle_mass) || material.particle_mass < 0.0f ||
             !std::isfinite(material.half_thickness) || material.half_thickness < 0.0f ||
+            !std::isfinite(material.self_half_thickness) || material.self_half_thickness < 0.0f ||
             (material.surface_density > 0.0f && material.particle_mass > 0.0f) ||
             (material.surface_density > 0.0f) != areal)
             throw std::invalid_argument("Cloth requires finite nonnegative thickness and one mass definition");
@@ -2369,11 +2384,13 @@ VbdCookInput BuildClothVertexBlockInput(const MediaRecord& media) {
     CookParticleSurface collision_surface;
     for (const auto& tri : tris)
         collision_surface.triangles.insert(collision_surface.triangles.end(), {tri.v[0], tri.v[1], tri.v[2]});
+    collision_surface.self_contact = media.vbd.self_contact;
     in.surfaces.push_back(std::move(collision_surface));
     in.velocities.assign(rest.size(), math::Vec3::Zero());
     std::vector<float> masses(rest.size(), 0.0f);
     for (size_t vertex = 0u; vertex < rest.size(); ++vertex) {
         in.half_thickness.push_back(vertex_material[vertex]->half_thickness);
+        in.self_half_thickness.push_back(SelfHalfThickness(*vertex_material[vertex]));
         in.friction.push_back(vertex_material[vertex]->friction);
         if (!areal)
             masses[vertex] = vertex_material[vertex]->particle_mass > 0.0f ? vertex_material[vertex]->particle_mass : 0.01f;
@@ -2640,8 +2657,10 @@ VbdCookInput BuildCableVertexBlockInput(const MediaRecord& media) {
     runtime::soft::BuildRodVertexBlocks(in.positions, chain, rod, in.vbd_elements);
 
     in.half_thickness.assign(np, c.radius);
+    in.self_half_thickness.assign(np, media.vbd.self_half_thickness > 0.0f ? media.vbd.self_half_thickness : c.radius);
     in.friction.assign(np, media.vbd.friction);
     CookParticleSurface wire;
+    wire.self_contact = media.vbd.self_contact;
     wire.edges.reserve(size_t(c.segments) * 2u);
     for (uint32_t i = 0u; i < c.segments; ++i) {
         wire.edges.push_back(i);
@@ -2660,6 +2679,7 @@ VbdCookInput BuildCableVertexBlockInput(const MediaRecord& media) {
             in.positions.push_back(corners[k]);
             in.inv_mass.push_back(1.0f / slab_mass);
             in.half_thickness.push_back(0.0f);
+            in.self_half_thickness.push_back(0.0f);
             in.friction.push_back(media.vbd.friction);
         }
         for (uint32_t i = 0u; i < 8u; ++i)
@@ -2670,7 +2690,7 @@ VbdCookInput BuildCableVertexBlockInput(const MediaRecord& media) {
         for (uint32_t k = 4u; k < 8u; ++k)  // the 4 top corners (iz == 1).
             in.vbd_elements.push_back(runtime::soft::VertexBlockSpring(end_p, base + k,
                 (corners[k] - in.positions[end_p]).Length(), stiffness, media.vbd.damping));
-        in.surfaces.push_back({CableSlabBoxTriangles(base), {}});
+        in.surfaces.push_back({CableSlabBoxTriangles(base), {}, media.vbd.self_contact});
     }
 
     in.velocities.assign(in.positions.size(), math::Vec3::Zero());
@@ -2939,6 +2959,8 @@ void AppendSoftMedium(VbdCookInput& dst, const VbdCookInput& src) {
                           src.velocities.end());
     dst.inv_mass.insert(dst.inv_mass.end(), src.inv_mass.begin(), src.inv_mass.end());
     dst.half_thickness.insert(dst.half_thickness.end(), src.half_thickness.begin(), src.half_thickness.end());
+    dst.self_half_thickness.insert(dst.self_half_thickness.end(), src.self_half_thickness.begin(),
+                                   src.self_half_thickness.end());
     dst.friction.insert(dst.friction.end(), src.friction.begin(), src.friction.end());
     for (std::array<uint32_t, 3> t : src.aero_triangles) {
         t[0] += base; t[1] += base; t[2] += base;

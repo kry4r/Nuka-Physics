@@ -165,9 +165,14 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     float contact_margin = cfg.contact_margin;
     for (const auto& bucket : model.material_buckets)
         contact_margin = std::max(contact_margin, bucket.Profile().margin);
-    const auto& surface_thickness = model.particles.surface_thickness;
-    const float query_reach = collision::DatQueryReach(surface_thickness.empty() ? 0.0f :
-        *std::max_element(surface_thickness.begin(), surface_thickness.end()), contact_margin);
+    // The reach covers each surface's body contact and, where it meets particle surfaces, its self contact.
+    float thickest = 0.0f;
+    for (size_t s = 0u; s < model.particles.surface_thickness.size(); ++s) {
+        thickest = std::max(thickest, model.particles.surface_thickness[s]);
+        if (model.particles.surface_self_contact[s] != 0u)
+            thickest = std::max(thickest, model.particles.surface_self_thickness[s]);
+    }
+    const float query_reach = collision::DatQueryReach(thickest, contact_margin);
 
     const bool has_articulation = cap.dofs_per_env > 0 || cap.links_per_env > 0;
     const bool has_bodies       = cap.bodies_per_env > 0;
