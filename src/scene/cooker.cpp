@@ -670,7 +670,8 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
         blob.joints.types.push_back(j.type);
         blob.joints.parent_bodies.push_back(j.parent_body);
         blob.joints.child_bodies.push_back(j.child_body);
-        blob.joints.axes.push_back(j.axis);
+        // A joint turns or slides by its coordinate along the unit axis, as MuJoCo, URDF and USD define it.
+        blob.joints.axes.push_back(j.axis.Normalized());
         blob.joints.parent_frames.push_back(j.parent_frame);
         blob.joints.child_frames.push_back(j.child_frame);
         blob.joints.lower_limits.push_back(j.lower_limit);
