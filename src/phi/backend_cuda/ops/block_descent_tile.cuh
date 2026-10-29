@@ -545,8 +545,7 @@ __device__ float TileInertialResponse(DataView data, BlockDescentSolveParams p, 
         } else if (side.kind == kNkSideArtic) {
             const auto* jacobian = i == 0u ? static_cast<const float*>(data.chain_jacobian) + at : jacobian_b;
             const float* const factor = data.m_factor + size_t{side.index} * p.max_dof * p.max_dof;
-            contribution = MassCoupling<float>(factor, p.max_dof, jacobian, jacobian,
-                                               shared ? jacobian_b : nullptr, shared ? jacobian_b : nullptr);
+            contribution = MassCoupling<float>(factor, p.max_dof, jacobian, shared ? jacobian_b : nullptr);
         }
         valid &= contribution >= 0.0f && isfinite(contribution);
         response += contribution;

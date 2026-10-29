@@ -410,16 +410,14 @@ __device__ inline Scalar MassDot(const float* factor, uint32_t n, const Scalar* 
     return response;
 }
 
-// Evaluates J A^-1 K^T without storing inverse matrices or row responses; a symmetric pair needs one solve.
+// Evaluates J A^-1 J^T for J = v + extra with one forward solve, without storing inverse matrices.
+// The solve lives in a fixed frame: a called function does not release alloca storage on return.
 template <typename Scalar>
-__device__ __noinline__ Scalar MassCoupling(const float* factor, uint32_t n,
-    const float* lhs, const float* rhs, const float* lhs_extra = nullptr, const float* rhs_extra = nullptr) {
-    const bool same = lhs == rhs && lhs_extra == rhs_extra;
-    auto* left = static_cast<Scalar*>(alloca(size_t{same ? 1u : 2u} * n * sizeof(Scalar)));
-    Scalar* const right = same ? left : left + n;
-    ForwardMass(factor, n, lhs, lhs_extra, left);
-    if (!same) ForwardMass(factor, n, rhs, rhs_extra, right);
-    return MassDot(factor, n, left, right);
+__device__ __noinline__ Scalar MassCoupling(const float* factor, uint32_t n, const float* v,
+                                            const float* extra = nullptr) {
+    Scalar y[kMaxArticulationDof];
+    ForwardMass(factor, n, v, extra, y);
+    return MassDot(factor, n, y, y);
 }
 
 } // namespace nuka::phi::nkops

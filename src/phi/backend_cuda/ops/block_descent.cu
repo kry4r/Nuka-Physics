@@ -920,7 +920,7 @@ __device__ float SideResponse(const NkRowSide& side, const DataView& data,
             ? data.chain_jacobian : data.chain_jacobian_b);
         const float* const J = jacobians + size_t{slot} * p.max_dof;
         const float* const factor = data.m_factor + size_t{side.index} * p.max_dof * p.max_dof;
-        return static_cast<float>(MassCoupling<double>(factor, p.max_dof, J, J));
+        return static_cast<float>(MassCoupling<double>(factor, p.max_dof, J));
     }
     return 0.0f;
 }
@@ -1117,7 +1117,7 @@ __device__ double OwnerInertialResponse(const NkRow& row, const DataView& data,
     const float* const J = (side_a ? data.chain_jacobian : data.chain_jacobian_b) + at;
     const float* const extra = side_a && side_b ? data.chain_jacobian_b + at : nullptr;
     const float* const factor = data.m_factor + size_t{articulation} * p.max_dof * p.max_dof;
-    return MassCoupling<double>(factor, p.max_dof, J, J, extra, extra);
+    return MassCoupling<double>(factor, p.max_dof, J, extra);
 }
 
 // J M^-1 J^T of a row over its owners; sets `grid` when a grid node owns it and `coupling` to the

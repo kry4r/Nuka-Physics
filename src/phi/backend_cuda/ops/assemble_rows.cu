@@ -1651,9 +1651,9 @@ uint64_t ContactCacheScratchBytes(uint32_t point_count, uint32_t env_count) {
 }
 
 uint64_t ArticulationThreadStackBytes(uint32_t max_dof) {
-    // PrepareContactRowsKernel allocates six float rows, MassCoupling two double rows; static frames stay small.
+    // PrepareContactRowsKernel allocates six float rows on top of its static frame.
     constexpr uint64_t kStaticFrameBytes = 512u;
-    return kStaticFrameBytes + std::max(6u * sizeof(float), 2u * sizeof(double)) * uint64_t{max_dof};
+    return kStaticFrameBytes + 6u * sizeof(float) * uint64_t{max_dof};
 }
 
 void RegisterNkAssembleRowsOps() {
