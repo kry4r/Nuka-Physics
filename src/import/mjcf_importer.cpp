@@ -1473,16 +1473,17 @@ void ParseActuators(tinyxml2::XMLElement* mujoco,
             record.type = scene::ActuatorType::Motor;
             record.gain = gear * gain;
         } else if (bias[1] != 0.0f) {
-            if (gain != -bias[1] || bias[0] != 0.0f)
+            if (bias[1] > 0.0f || bias[0] != 0.0f)
                 throw std::runtime_error("MJCF: actuator '" + record.name + "' bias is not a position servo");
+            // The bias sets the servo's stiffness and damping; the control gain only scales its target.
             record.type = scene::ActuatorType::Position;
-            record.gain = gear * gear * gain;
+            record.gain = -gear * gear * bias[1];
             record.damping = -gear * gear * bias[2];
         } else {
-            if (gain != -bias[2] || bias[0] != 0.0f)
+            if (bias[2] > 0.0f || bias[0] != 0.0f)
                 throw std::runtime_error("MJCF: actuator '" + record.name + "' bias is not a velocity servo");
             record.type = scene::ActuatorType::Velocity;
-            record.gain = gear * gear * gain;
+            record.gain = -gear * gear * bias[2];
             record.damping = record.gain;
         }
         ParseRange(actuator->Attribute("forcerange"), record.force_limit, record.force_limit);
