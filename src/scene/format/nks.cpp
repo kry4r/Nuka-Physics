@@ -666,6 +666,7 @@ Value SaveMedia(const MediaRecord& m, MeshSink& sink) {
         xp.Set("bend_stiffness", Value::Float(mv.bend_stiffness));
         xp.Set("damping", Value::Float(mv.damping));
         if (mv.compression_ratio != 1.0f) xp.Set("compression_ratio", Value::Float(mv.compression_ratio));
+        if (mv.membrane == MembraneLaw::NeoHookean) xp.Set("membrane", Value::Str("neo_hookean"));
         xp.Set("aero_drag_normal", Value::Float(mv.aero_drag_normal));
         xp.Set("aero_drag_tangent", Value::Float(mv.aero_drag_tangent));
         xp.Set("aero_drag_max_dv", Value::Float(mv.aero_drag_max_dv));
@@ -1970,6 +1971,12 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                 out.bend_stiffness = f(xp, "bend_stiffness", out.bend_stiffness);
                 out.damping = f(xp, "damping", out.damping);
                 out.compression_ratio = f(xp, "compression_ratio", out.compression_ratio);
+                if (const Value* law = xp.Find("membrane")) {
+                    const std::string name = law->AsString();
+                    if (name != "stvk" && name != "neo_hookean")
+                        throw std::invalid_argument("Cloth membrane must be \"stvk\" or \"neo_hookean\"");
+                    out.membrane = name == "stvk" ? MembraneLaw::Stvk : MembraneLaw::NeoHookean;
+                }
                 out.aero_drag_normal = f(xp, "aero_drag_normal", out.aero_drag_normal);
                 out.aero_drag_tangent = f(xp, "aero_drag_tangent", out.aero_drag_tangent);
                 out.aero_drag_max_dv = f(xp, "aero_drag_max_dv", out.aero_drag_max_dv);

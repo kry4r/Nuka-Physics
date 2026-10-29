@@ -58,6 +58,9 @@
 
 namespace nuka::scene::cook {
 
+static_assert(static_cast<uint32_t>(MembraneLaw::Stvk) == nk::kVbdMembraneStvk &&
+              static_cast<uint32_t>(MembraneLaw::NeoHookean) == nk::kVbdMembraneNeoHookean);
+
 namespace {
 
 // ExportObs per-env observation layout (readout.cu ExportObsKernel): the base
@@ -2375,6 +2378,7 @@ VbdCookInput BuildClothVertexBlockInput(const MediaRecord& media) {
         shells[f].bend_stiffness = face_material[f]->bend_stiffness;
         shells[f].damping = face_material[f]->damping;
         shells[f].compression_ratio = face_material[f]->compression_ratio;
+        shells[f].membrane = static_cast<uint32_t>(face_material[f]->membrane);
     }
     runtime::soft::BuildClothVertexBlocks(rest, tris, geometry.material_faces, shells, in.vbd_elements);
     in.vbd_begin = 0u;

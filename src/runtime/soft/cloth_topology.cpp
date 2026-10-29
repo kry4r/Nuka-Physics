@@ -51,6 +51,9 @@ void BuildClothVertexBlocks(const std::vector<math::Vec3>& rest_positions,
             !(material.compression_ratio > 0.0f && material.compression_ratio <= 1.0f))
             throw std::invalid_argument(
                 "Cloth shell material needs nonnegative stiffness, 0 <= poisson < 0.5 and 0 < compression ratio <= 1");
+        else if (material.membrane != nk::kVbdMembraneStvk &&
+                 (material.membrane != nk::kVbdMembraneNeoHookean || material.compression_ratio != 1.0f))
+            throw std::invalid_argument("Cloth membrane law is StVK or Neo-Hookean, and only StVK softens compression");
     if (!material_faces.empty() && material_faces.size() != triangles.size())
         throw std::invalid_argument("Cloth material faces must match its triangles");
     // Rest edge vectors of each face in its own plane, from the pattern or the 3D rest shape.
@@ -95,6 +98,7 @@ void BuildClothVertexBlocks(const std::vector<math::Vec3>& rest_positions,
         e.rest[6] = youngs * nu / (1.0f - nu * nu);
         e.rest[7] = 1.0f - materials[f].compression_ratio;
         e.damping = materials[f].damping;
+        e.law = materials[f].membrane;
         out.push_back(e);
         for (uint32_t j = 0u; j < 3u; ++j) {
             const uint32_t a = tri.v[j], b = tri.v[(j + 1u) % 3u];

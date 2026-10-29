@@ -354,6 +354,9 @@ struct ContactPairOverride {
 // cook input; one geometry/material variant is used per MediaRecord::Kind.
 // ---------------------------------------------------------------------------
 
+// Cloth membrane law: StVK with an area-loss barrier, or stable Neo-Hookean (Smith et al. 2018).
+enum class MembraneLaw : uint32_t { Stvk = 0u, NeoHookean = 1u };
+
 // Material of a vertex-block cloth or cable: mass, friction, elastic moduli and drag.
 // Fields map to cook::VbdCookInput.
 struct MediaVbdMaterial {
@@ -369,6 +372,7 @@ struct MediaVbdMaterial {
     float    bend_stiffness    = 0.0f;   // cloth hinge (N m); cable EI (N m^2)
     float    damping           = 0.0f;   // Rayleigh coefficient on the elastic stiffness (s)
     float    compression_ratio = 1.0f;   // cloth compressive over tensile membrane stiffness, (0, 1]
+    MembraneLaw membrane       = MembraneLaw::Stvk;
     float    aero_drag_normal  = 0.0f;
     float    aero_drag_tangent = 0.0f;
     float    aero_drag_max_dv  = 0.0f;

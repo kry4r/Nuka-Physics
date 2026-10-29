@@ -42,6 +42,9 @@ struct ElementCurvature {
     float stress[3] = {};
     float barrier = 0.0f;
     MembraneTangent tangent;
+    // A Neo-Hookean triangle weighs the area change by `volume` and the area normal change by `cofactor`.
+    bool neo_hookean = false;
+    float volume = 0.0f, cofactor = 0.0f;
     // Hinges and bent rods act through angle gradients, springs along `normal` with a lateral share and
     // straight rods through their segment projectors with the segment-order sign.
     Vec3 q[4];
@@ -67,6 +70,18 @@ NUKA_VBD_HD inline ElementCurvature GaussNewtonCurvature(const VbdElement& e, co
         const float mu = e.rest[5], lambda = e.rest[6], trace = t.g00 + t.g11;
         c.f0 = t.f0;
         c.f1 = t.f1;
+        if (NeoHookean(e)) {
+            const Vec3 n = t.f0.Cross(t.f1);
+            const float length = Norm(n), J = 1.0f + t.area_change;
+            c.neo_hookean = true;
+            c.volume = lambda + mu;
+            if (!(length > 0.0f && J > 0.0f)) return c;
+            c.normal = n / length;
+            const float s = c.volume * t.area_change - mu;
+            c.cofactor = s > 0.0f ? s / J : 0.0f;
+            c.volume -= c.cofactor;
+            return c;
+        }
         if (e.rest[7] > 0.0f) {
             c.tangent = SoftenedTangent(e.rest[7], t.g00, t.g11, t.g01);
             float s[3];
@@ -127,7 +142,7 @@ NUKA_VBD_HD inline ElementCurvature RayleighCurvature(const VbdElement& e, const
         }
         c.normal = n / length;
         if (e.rest[7] > 0.0f) c.tangent = SoftenedTangent(e.rest[7], t.g00, t.g11, t.g01);
-        if (t.area_change < 0.0f) c.barrier = e.rest[5] * (1.0f - e.rest[7]) / (J * J);
+        if (t.area_change < 0.0f && !NeoHookean(e)) c.barrier = e.rest[5] * (1.0f - e.rest[7]) / (J * J);
         return c;
     }
     Vec3 x[4];
@@ -200,6 +215,11 @@ NUKA_VBD_HD inline float ElementForm(const VbdElement& e, const ElementCurvature
                                      const ElementVariation& x, const ElementVariation& y) {
     if (e.kind == kVbdTriangle) {
         const float mu = e.rest[5], lambda = e.rest[6];
+        if (c.neo_hookean) {
+            const Vec3 nx = x.a.Cross(c.f1) + c.f0.Cross(x.b), ny = y.a.Cross(c.f1) + c.f0.Cross(y.b);
+            return e.rest[4] * (mu * (x.a.Dot(y.a) + x.b.Dot(y.b)) + c.volume * x.s * y.s +
+                                c.cofactor * nx.Dot(ny));
+        }
         if (e.rest[7] > 0.0f) {
             float s[3];
             SoftenedStress(c.tangent, mu, lambda, y.g00, y.g11, y.g01, s);
@@ -267,6 +287,9 @@ NUKA_VBD_HD inline float ElementMovesEnergyChange(const VbdElement& e, const Ele
         const float trace = t.g00 + t.g11, change = c00 + c11;
         // The area normal moves by f0 x d1 + d0 x f1'; a move turning it past 90 degrees collapses it.
         const Vec3 n = t.f0.Cross(t.f1), turn = t.f0.Cross(d1) + d0.Cross(f1);
+        if (NeoHookean(e))
+            return e.rest[4] * NeoHookeanEnergyChange(e, t.area_change, change,
+                                                      NeoHookeanAreaStep(n, turn, t.area_change));
         const float J = 1.0f + t.area_change, growth = 2.0f * n.Dot(turn) + turn.LengthSq();
         const float moved_sq = J * J + growth;
         const float area_step = n.Dot(n + turn) > 0.0f && moved_sq > 0.0f

@@ -20,6 +20,7 @@ struct ShellMaterial {
     float bend_stiffness = 0.0f;     // N m
     float damping = 0.0f;            // Rayleigh coefficient, s
     float compression_ratio = 1.0f;  // compressive over tensile membrane stiffness, (0, 1]
+    uint32_t membrane = nk::kVbdMembraneStvk;  // triangle law; softening applies to StVK only
 };
 
 // Axial and bending response of a vertex-block rod.

@@ -907,12 +907,17 @@ typedef enum nuka_vbd_element_kind_t {
     NUKA_VBD_TRIANGLE = 0, NUKA_VBD_HINGE = 1, NUKA_VBD_SPRING = 2, NUKA_VBD_ROD_BEND = 3
 } nuka_vbd_element_kind_t;
 
+typedef enum nuka_vbd_membrane_t {
+    NUKA_VBD_MEMBRANE_STVK = 0, NUKA_VBD_MEMBRANE_NEO_HOOKEAN = 1
+} nuka_vbd_membrane_t;
+
 typedef struct nuka_vbd_element_t {
     uint32_t kind;
     uint32_t vertex[4];
     float rest[8];
     float damping;
-    uint32_t reserved[2];
+    uint32_t law;  // nuka_vbd_membrane_t of a triangle
+    uint32_t reserved;
 } nuka_vbd_element_t;
 
 typedef enum nuka_energy_column_t {

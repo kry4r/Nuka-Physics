@@ -20,6 +20,9 @@ namespace nuka::nk {
 
 // Membrane triangle: rest = inverse material edges (row-major 2x2), area, mu, lambda, compression softening.
 inline constexpr uint32_t kVbdTriangle = 0u;
+// Triangle membrane laws: StVK with an area-loss barrier, or stable Neo-Hookean (Smith et al. 2018).
+inline constexpr uint32_t kVbdMembraneStvk = 0u;
+inline constexpr uint32_t kVbdMembraneNeoHookean = 1u;
 // Dihedral hinge over edge (v0, v1) with opposite vertices v2, v3: rest = angle, stiffness.
 inline constexpr uint32_t kVbdHinge = 1u;
 // Axial spring: rest = length, stiffness per length.
@@ -33,7 +36,8 @@ struct VbdElement {
     uint32_t vertex[4]{~0u, ~0u, ~0u, ~0u};
     float rest[8]{};
     float damping = 0.0f;  // Rayleigh coefficient in seconds on the element stiffness
-    uint32_t reserved[2]{};
+    uint32_t law = kVbdMembraneStvk;  // membrane law of a triangle
+    uint32_t reserved = 0u;
 };
 static_assert(sizeof(VbdElement) == 16u * sizeof(uint32_t), "VbdElement packs to 64 bytes");
 
@@ -283,6 +287,26 @@ NUKA_VBD_HD inline float AreaBarrierChange(float d, float s) {
     return s * d / (1.0f + d) + tail;
 }
 
+// Stable Neo-Hookean membrane mu/2 (I_C - 2) + l/2 ((J - a)^2 - (1 - a)^2), l = lambda + mu and a = 1 + mu / l,
+// whose rest linearization keeps the Lame pair; per rest area it is mu (tr G - d) + l/2 d^2 for d = J - 1.
+NUKA_VBD_HD inline bool NeoHookean(const VbdElement& e) { return e.law == kVbdMembraneNeoHookean; }
+
+NUKA_VBD_HD inline float NeoHookeanEnergy(const VbdElement& e, float trace, float d) {
+    return e.rest[5] * (trace - d) + 0.5f * (e.rest[6] + e.rest[5]) * d * d;
+}
+
+// Energy change per rest area as tr G moves by c and the area change d moves by s.
+NUKA_VBD_HD inline float NeoHookeanEnergyChange(const VbdElement& e, float d, float c, float s) {
+    return e.rest[5] * (c - s) + 0.5f * (e.rest[6] + e.rest[5]) * s * (s + 2.0f * d);
+}
+
+// Unsigned area change J' - J for the area normal n moved by `turn`, at the area change d = J - 1.
+NUKA_VBD_HD inline float NeoHookeanAreaStep(Vec3 n, Vec3 turn, float d) {
+    const float J = 1.0f + d, growth = 2.0f * n.Dot(turn) + turn.LengthSq();
+    const float moved = sqrtf(fmaxf(J * J + growth, 0.0f));
+    return moved + J > 0.0f ? growth / (moved + J) : 0.0f;
+}
+
 // Woven fabric buckles under a small share of its tensile stiffness (tension-field theory; Choi and Ko
 // 2002): softening s keeps 1 - s of the stiffness on negative principal strains, the trace and area loss.
 struct MembraneTangent {
@@ -385,8 +409,35 @@ NUKA_VBD_HD inline void SoftenedTriangleBlock(const VbdElement& e, uint32_t loca
     *hessian = Scaled(h, area);
 }
 
+// The area term pulls along dJ/dx = w x n^; its cofactor curvature keeps max(0, s) / J, the tight PSD clamp.
+NUKA_VBD_HD inline void NeoHookeanTriangleBlock(const VbdElement& e, uint32_t local, const TriangleStrain& t,
+                                                Vec3* gradient, SymmetricMat3* hessian) {
+    const float area = e.rest[4], mu = e.rest[5], volume = e.rest[6] + e.rest[5];
+    float bx, by;
+    MembraneWeights(e, local, &bx, &by);
+    Vec3 g = (t.f0 * bx + t.f1 * by) * mu;
+    SymmetricMat3 h{};
+    AddIdentity(h, mu * (bx * bx + by * by));
+    const Vec3 n = t.f0.Cross(t.f1), w = t.f1 * bx - t.f0 * by;
+    const float normal_length = Norm(n), J = 1.0f + t.area_change;
+    if (normal_length > 0.0f && J > 0.0f) {
+        const Vec3 q = w.Cross(n / normal_length);
+        const float s = volume * t.area_change - mu, r = s > 0.0f ? s / J : 0.0f;
+        g = g + q * s;
+        AddTo(h, Outer(q, volume - r));
+        AddIdentity(h, r * w.LengthSq());
+        AddTo(h, Outer(w, -r));
+    }
+    *gradient = g * area;
+    *hessian = Scaled(h, area);
+}
+
 NUKA_VBD_HD inline void TriangleBlock(const VbdElement& e, uint32_t local, const TriangleStrain& t,
                                       Vec3* gradient, SymmetricMat3* hessian) {
+    if (NeoHookean(e)) {
+        NeoHookeanTriangleBlock(e, local, t, gradient, hessian);
+        return;
+    }
     if (e.rest[7] > 0.0f) {
         SoftenedTriangleBlock(e, local, t, gradient, hessian);
         return;
@@ -658,7 +709,8 @@ NUKA_VBD_HD inline void ElementRayleighBlock(const VbdElement& e, uint32_t local
             *diagonal = {NAN, NAN, NAN, NAN, NAN, NAN};
             return;
         }
-        if (t.area_change < 0.0f && J > 0.0f && normal_length > 0.0f) {
+        // A Neo-Hookean membrane damps on its rest stiffness, which has no area barrier.
+        if (t.area_change < 0.0f && J > 0.0f && normal_length > 0.0f && !NeoHookean(e)) {
             const Vec3 unit_n = n / normal_length;
             const Vec3 q = (f1 * bx - f0 * by).Cross(unit_n);
             const float dj = unit_n.Dot(df0.Cross(f1) + f0.Cross(df1));
@@ -751,6 +803,9 @@ NUKA_VBD_HD inline float ElementEnergyChange(const VbdElement& e, uint32_t local
         // One vertex moves the area normal exactly by move x w; a move that turns it past 90 degrees
         // counts as collapsing the triangle.
         const Vec3 n = t.f0.Cross(t.f1), turn = move.Cross(t.f1 * bx - t.f0 * by);
+        if (NeoHookean(e))
+            return e.rest[4] * NeoHookeanEnergyChange(e, t.area_change, change,
+                                                      NeoHookeanAreaStep(n, turn, t.area_change));
         const float J = 1.0f + t.area_change, growth = 2.0f * n.Dot(turn) + turn.LengthSq();
         const float moved_sq = J * J + growth;
         const float area_step = n.Dot(n + turn) > 0.0f && moved_sq > 0.0f
@@ -789,6 +844,7 @@ NUKA_VBD_HD inline float ElementEnergy(const VbdElement& e, const ElementGeometr
     if (e.kind == kVbdTriangle) {
         const TriangleStrain t = MembraneStrain(e, g);
         const float trace = t.g00 + t.g11;
+        if (NeoHookean(e)) return e.rest[4] * NeoHookeanEnergy(e, trace, t.area_change);
         if (e.rest[7] > 0.0f) {
             const MembraneTangent m = SoftenedTangent(e.rest[7], t.g00, t.g11, t.g01);
             return e.rest[4] * (e.rest[5] * (m.high * m.e_high * m.e_high + m.low * m.e_low * m.e_low +
