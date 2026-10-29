@@ -262,6 +262,16 @@ __global__ void DatBodyPairLimitKernel(DatTruncateParams p, ModelView model, Dat
     if (__syncthreads_or(capped) != 0 && threadIdx.x == 0u) atomicOr(data.dat_query_limit_count + env, 1u);
 }
 
+// A pair with no free vertex has no motion to bound, so scripted pinned geometry may touch.
+__device__ bool DatPinnedPair(const DataView& data, const uint32_t* ids_a, uint32_t count_a,
+                              const uint32_t* ids_b, uint32_t count_b) {
+    for (uint32_t i = 0u; i < count_a; ++i)
+        if (data.particle_inv_mass[ids_a[i]] > 0.0f) return false;
+    for (uint32_t i = 0u; i < count_b; ++i)
+        if (data.particle_inv_mass[ids_b[i]] > 0.0f) return false;
+    return true;
+}
+
 __device__ void FailPrimitivePair(const DatTruncateParams& p, const ModelView& model,
                                   const DataView& data, uint32_t env, uint32_t reason, float depth,
                                   const uint32_t* ids_a, uint32_t count_a,
@@ -289,6 +299,7 @@ __device__ collision::MeshSurfaceView ReferenceView(const DatTruncateParams& p,
 __device__ void ClipPrimitivePair(const DatTruncateParams& p, const ModelView& model,
                                   const DataView& data, uint32_t env, const uint32_t* ids_a,
                                   uint32_t count_a, const uint32_t* ids_b, uint32_t count_b) {
+    if (DatPinnedPair(data, ids_a, count_a, ids_b, count_b)) return;
     collision::DatPrimitive a, b;
     a.count = count_a;
     b.count = count_b;
@@ -627,7 +638,7 @@ __global__ void DatInitialEdgeFaceKernel(DatTruncateParams p, ModelView model,
                         ids_b[i] = base_b + view.triangles[at + i];
                         incident |= ids_b[i] == ids_a[0] || ids_b[i] == ids_a[1];
                     }
-                    if (!incident) {
+                    if (!incident && !DatPinnedPair(data, ids_a, 2u, ids_b, 3u)) {
                         collision::DatPrimitive triangle;
                         triangle.count = 3u;
                         for (uint32_t i = 0u; i < 3u; ++i)
