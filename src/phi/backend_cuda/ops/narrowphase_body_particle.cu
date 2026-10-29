@@ -430,7 +430,7 @@ __global__ void NarrowphaseBodyParticleKernel(
     const Vec3 center = !vertex_block && pbf_predicted_pos != nullptr
         ? pbf_predicted_pos[global_particle] : particle_pos[global_particle];
     const collision::AABB query = ParticleAabb(center, vertex_block
-        ? ::nuka::collision::kDatQueryRadiusMax : radius + pp.contact_margin);
+        ? pp.query_reach : radius + pp.contact_margin);
 
     // LANE 0 gathers the candidate list (the cand[] + traversal stack are local
     // memory -- holding them on every lane would spill); under kWarp ncand + each
@@ -476,7 +476,7 @@ __global__ void NarrowphaseBodyParticleKernel(
             const float body_rate = sqrtf(body_linear_velocity[at].LengthSq()) +
                 sqrtf(body_angular_velocity[at].LengthSq()) * sqrtf(extent.LengthSq());
             sphere = ::nuka::collision::DatQueryRadius(::nuka::collision::DatMotionRadius(
-                radius + pp.contact_margin, pp.dt, surface_rate, body_rate, kDatRelaxation));
+                radius + pp.contact_margin, pp.dt, surface_rate, body_rate, kDatRelaxation), pp.query_reach);
         }
         const amf::PrimParams ps = MakeParticleSphere(center, sphere);
 

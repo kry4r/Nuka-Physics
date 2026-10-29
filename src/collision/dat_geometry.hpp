@@ -15,6 +15,7 @@
 namespace nuka::collision {
 
 constexpr uint32_t kDatPrimitiveVertices = 3u;
+// The smallest query reach; scenes with thicker particle surfaces widen it (DatQueryReach).
 constexpr float kDatQueryRadiusMax = 0.02f;
 constexpr uint32_t kDatFailureRadius = 1u, kDatFailureMotion = 2u, kDatFailureDegenerate = 3u,
                    kDatFailureOverlap = 4u, kDatFailureReasons = 4u, kDatWitnessSlots = 128u;
@@ -30,8 +31,13 @@ NUKA_DAT_HD inline uint32_t DatWitnessOwner(uint32_t kind, uint32_t index) {
                                                             : kDatWitnessNone;
 }
 
-NUKA_DAT_HD inline float DatQueryRadius(float radius) {
-    return fminf(radius, kDatQueryRadiusMax);
+// A query reaches twice the widest particle contact band of the scene, and never less than the floor.
+NUKA_DAT_HD inline float DatQueryReach(float max_surface_thickness, float margin) {
+    return fmaxf(kDatQueryRadiusMax, 2.0f * (2.0f * max_surface_thickness + margin));
+}
+
+NUKA_DAT_HD inline float DatQueryRadius(float radius, float reach) {
+    return fminf(radius, reach);
 }
 
 // Uncapped mixed query radius whose relaxed half covers each side's predicted step displacement.

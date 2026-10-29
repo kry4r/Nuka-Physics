@@ -228,7 +228,7 @@ __global__ void PairDrivenNarrowphaseKernel(
     const float* __restrict__ previous_motion,
     const float* __restrict__ hull_verts,           
     uint32_t /*hull_vert_count*/,                    
-    uint32_t gen, float separation, float dt,
+    uint32_t gen, float separation, float dt, float query_reach,
     uint32_t env_count, uint32_t slot_stride, uint32_t rigid_slot_cap,
     uint32_t bodies_per_env,
     uint32_t* __restrict__ ucount,
@@ -279,7 +279,8 @@ __global__ void PairDrivenNarrowphaseKernel(
     // second shell width keeps contacts resting on the separation shell detected.
     const auto query_radius = [&]() {
         return fmaxf(query_margin, collision::DatQueryRadius(
-            collision::DatMotionRadius(2.0f * separation, dt, speed(a), speed(b), kDatRelaxation)));
+            collision::DatMotionRadius(2.0f * separation, dt, speed(a), speed(b), kDatRelaxation),
+            query_reach));
     };
 
     if (slot < live && slot < rigid_slot_cap) {
@@ -448,7 +449,7 @@ Status LaunchPairDrivenNarrowphase(const ModelView& model, const DataView& data,
                    data.body_aabb_lo, data.body_aabb_hi, data.dat_body_motion,
                    static_cast<const float*>(model.hull_verts), p.hull_vert_count, kGen,
                    fmaxf(p.contact_margin, ::nuka::collision::kRigidContactSeparation),
-                   p.dt,
+                   p.dt, p.query_reach,
                    p.env_count, p.union_slot_count, rigid_slots, p.bodies_per_env,
                    data.ucontact_count, data.ucontact_point, data.ucontact_normal,
                    data.ucontact_depth, data.ucontact_witness_a, data.ucontact_witness_b,

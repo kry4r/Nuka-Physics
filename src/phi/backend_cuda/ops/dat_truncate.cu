@@ -146,7 +146,7 @@ __device__ float RequestedRadius(const DatTruncateParams& p, const ModelView& mo
 __device__ float QueryRadius(const DatTruncateParams& p, const ModelView& model,
                              const DataView& data, uint32_t env,
                              uint32_t source, uint32_t target) {
-    return collision::DatQueryRadius(RequestedRadius(p, model, data, env, source, target));
+    return collision::DatQueryRadius(RequestedRadius(p, model, data, env, source, target), p.query_reach);
 }
 
 __device__ bool DatBodyPairAllowed(DatTruncateParams p, ModelView model,
@@ -196,15 +196,15 @@ __global__ void ClearDatCountersKernel(DatTruncateParams p, ModelView model, Dat
                 const float base = model.particle_surface_thickness[source] +
                                    model.particle_surface_thickness[target] + p.margin;
                 if (!(radius >= 0.0f && radius <= FLT_MAX) ||
-                    !(base <= collision::kDatQueryRadiusMax)) {
+                    !(base <= p.query_reach)) {
                     atomicOr(data.env_status + env, kEnvStatusDatFailure);
                     data.dat_failure_count[env] = 1u;
-                    RecordDatFailure(data, env, base <= collision::kDatQueryRadiusMax
+                    RecordDatFailure(data, env, base <= p.query_reach
                         ? collision::kDatFailureMotion : collision::kDatFailureRadius,
                         collision::DatWitnessOwner(collision::kDatWitnessSurface, source),
                         collision::DatWitnessOwner(collision::kDatWitnessSurface, target), 0.0f);
                 }
-                capped |= radius > collision::kDatQueryRadiusMax;
+                capped |= radius > p.query_reach;
             }
     }
     __syncthreads();
@@ -218,15 +218,15 @@ __global__ void ClearDatCountersKernel(DatTruncateParams p, ModelView model, Dat
             data.particle_surface_max_speed[size_t{env} * p.surfaces_per_env + source],
             data.dat_body_speed[size_t{env} * p.bodies_per_env + body], p.relaxation);
         if (!(radius >= 0.0f && radius <= FLT_MAX) ||
-            !(base <= collision::kDatQueryRadiusMax)) {
+            !(base <= p.query_reach)) {
             atomicOr(data.env_status + env, kEnvStatusDatFailure);
             atomicAdd(data.dat_failure_count + env, 1u);
-            RecordDatFailure(data, env, base <= collision::kDatQueryRadiusMax
+            RecordDatFailure(data, env, base <= p.query_reach
                 ? collision::kDatFailureMotion : collision::kDatFailureRadius,
                 collision::DatWitnessOwner(collision::kDatWitnessSurface, source),
                 DatBodyWitness(p, model, env, body), 0.0f);
         }
-        capped |= radius > collision::kDatQueryRadiusMax;
+        capped |= radius > p.query_reach;
     }
     capped = __syncthreads_or(capped) != 0;
     if (threadIdx.x == 0u) data.dat_query_limit_count[env] = capped;
@@ -257,7 +257,7 @@ __global__ void DatBodyPairLimitKernel(DatTruncateParams p, ModelView model, Dat
                              DatBodyWitness(p, model, env, source),
                              DatBodyWitness(p, model, env, target), 0.0f);
         }
-        capped = radius > collision::kDatQueryRadiusMax;
+        capped = radius > p.query_reach;
     }
     if (__syncthreads_or(capped) != 0 && threadIdx.x == 0u) atomicOr(data.dat_query_limit_count + env, 1u);
 }
@@ -361,9 +361,8 @@ __global__ void ClearDatKernel(DatTruncateParams p, ModelView model, DataView da
             continue;
         for (uint32_t target = 0u; target < p.surfaces_per_env; ++target) {
             // Uncapped queries cover both primitives' complete linear trajectories.
-            if (RequestedRadius(p, model, data, env, source, target) >
-                collision::kDatQueryRadiusMax)
-                bound = fminf(bound, 0.5f * p.relaxation * collision::kDatQueryRadiusMax);
+            if (RequestedRadius(p, model, data, env, source, target) > p.query_reach)
+                bound = fminf(bound, 0.5f * p.relaxation * p.query_reach);
         }
         for (uint32_t body = 0u; body < p.bodies_per_env; ++body) {
             if (model.mesh_surface_info[body].vertex_count == 0u) continue;
@@ -372,7 +371,7 @@ __global__ void ClearDatKernel(DatTruncateParams p, ModelView model, DataView da
                 data.particle_surface_max_speed[size_t{env} * p.surfaces_per_env + source],
                 data.dat_body_speed[size_t{env} * p.bodies_per_env + body], p.relaxation);
             bound = fminf(bound, 0.5f * p.relaxation *
-                collision::DatQueryRadius(radius));
+                collision::DatQueryRadius(radius, p.query_reach));
         }
     }
     const float motion = sqrtf((data.particle_pos[item] - data.particle_prev_pos[item]).LengthSq());
@@ -691,7 +690,7 @@ __global__ void DatBodyMotionBoundKernel(DatTruncateParams p, ModelView model,
     const float speed = DatPointLipschitz(p, model, data, env, ref);
     const float query = data.dat_body_query_radius[size_t{env} * p.bodies_per_env + body];
     if (!(speed >= 0.0f && speed <= FLT_MAX) ||
-        !(query > 0.0f && query <= collision::kDatQueryRadiusMax)) {
+        !(query > 0.0f && query <= p.query_reach)) {
         atomicOr(data.env_status + env, kEnvStatusDatFailure);
         atomicAdd(data.dat_failure_count + env, 1u);
         RecordDatFailure(data, env, speed >= 0.0f && speed <= FLT_MAX
@@ -1184,7 +1183,7 @@ __device__ bool DatReachTarget(const DatTruncateParams& p, const ModelView& mode
         const float other = 0.5f * p.relaxation * collision::DatQueryRadius(
             collision::DatMotionRadius(model.particle_surface_thickness[index] + p.margin, p.dt,
                 data.particle_surface_max_speed[size_t{env} * p.surfaces_per_env + index],
-                data.dat_body_speed[size_t{env} * p.bodies_per_env + body], p.relaxation));
+                data.dat_body_speed[size_t{env} * p.bodies_per_env + body], p.relaxation), p.query_reach);
         tree->base = env * p.particles_per_env + info.vertex_offset;
         tree->vertex_count = info.vertex_count;
         tree->reach = (travel + other) / p.relaxation;
@@ -1575,7 +1574,7 @@ __global__ void DatQueueReachPairsKernel(DatTruncateParams p, ModelView model, D
     const float travel = data.dat_body_motion[owner] * p.dt;
     const float query = data.dat_body_query_radius[owner];
     if (info.triangle_count == 0u || info.node_count == 0u || !(travel > 0.0f) ||
-        !(query > 0.0f && query <= collision::kDatQueryRadiusMax)) return;
+        !(query > 0.0f && query <= p.query_reach)) return;
     {
         bool allowed = true;
         if (target >= p.surfaces_per_env) {
@@ -1774,7 +1773,7 @@ __global__ void DatArticPairsKernel(DatTruncateParams p, ModelView model, DataVi
     const uint32_t frame = DatCommonFrame(p, model, env, source, target);
     if (frame == ~0u) return;
     const float radius = collision::DatQueryRadius(
-        DatArticMotionRadius(p, model, data, env, source, target, frame, data.dat_prev_q));
+        DatArticMotionRadius(p, model, data, env, source, target, frame, data.dat_prev_q), p.query_reach);
     const float travel = p.dt *
         (DatChainSpeed(p, model, data, env, source, frame, nullptr, data.dat_prev_q) +
          DatChainSpeed(p, model, data, env, target, frame, nullptr, data.dat_prev_q));

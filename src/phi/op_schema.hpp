@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include "phi/articulation_contract.hpp"
+#include "collision/dat_geometry.hpp"
 #include "collision/mesh_surface_types.hpp"
 #include "sensor/observation_types.hpp"
 #include "sensor/state_types.hpp"
@@ -213,6 +214,7 @@ struct MimicReduceParams {
 // views are pure pointer aggregates).
 struct BuildAabbsParams {
     float dt = 0.0f;
+    float query_reach = collision::kDatQueryRadiusMax;
     float    margin;            // AABB inflation margin
     uint32_t family;            // kContactFamily* (PairDriven => build)
     uint32_t env_count;
@@ -276,6 +278,7 @@ struct OgcDetectParams {
     float dt = 0.0f;
     float margin = 0.0f;
     float relaxation = kDatRelaxation;
+    float query_reach = collision::kDatQueryRadiusMax;
     uint32_t env_count = 0u;
     uint32_t particles_per_env = 0u;
     uint32_t surfaces_per_env = 0u;
@@ -311,6 +314,7 @@ struct DatTruncateParams {
     float dt = 0.0f;
     float relaxation = kDatRelaxation;
     float margin = 0.0f;
+    float query_reach = collision::kDatQueryRadiusMax;
     uint64_t workspace_bytes = 0u;
     uint32_t env_count = 0u;
     uint32_t particles_per_env = 0u;
@@ -418,6 +422,7 @@ struct NarrowphasePrimitivesParams {
     uint32_t num_material_buckets;
     uint32_t contact_pairs = 0u;  // authored pair key count (contact_pair_keys)
     float dt = 0.0f;
+    float query_reach = collision::kDatQueryRadiusMax;
     uint8_t max_contacts_per_pair;
     // first batch (foot sphere x ground plane, the production Go2/H1 path):
     float    ground_height;
@@ -516,6 +521,7 @@ struct NarrowphaseBodyParticleParams {
     uint32_t vbd_particle_count;
     uint32_t particle_surfaces;
     float    dt;
+    float    query_reach = collision::kDatQueryRadiusMax;
     // 1 == launch ONE WARP per particle (the giant-hull SupportHull scan runs warp-
     // cooperatively); 0 == one thread per particle (analytic-only collider worlds,
     // no wide hull to split). BOTH paths are byte-identical; set by the cook-time max

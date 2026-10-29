@@ -127,7 +127,7 @@ __global__ void OgcBodyQueryKernel(OgcDetectParams p, ModelView model, DataView 
     const uint32_t body = item % p.bodies_per_env;
     const float speed = OgcBodySpeed(p, data, env, body);
     if (lane == 0u) data.dat_body_speed[item] = speed;
-    float radius = collision::kDatQueryRadiusMax;
+    float radius = p.query_reach;
     if (model.mesh_surface_info[body].vertex_count > 0u) {
         for (uint32_t s = lane; s < p.surfaces_per_env; s += kOgcQueryLanes) {
             if (model.particle_surface_info[s].vertex_count == 0u) continue;
@@ -135,7 +135,7 @@ __global__ void OgcBodyQueryKernel(OgcDetectParams p, ModelView model, DataView 
                 size_t{env} * p.surfaces_per_env + s];
             radius = fminf(radius, collision::DatQueryRadius(collision::DatMotionRadius(
                 model.particle_surface_thickness[s] + p.margin, p.dt, speed, other,
-                p.relaxation)));
+                p.relaxation), p.query_reach));
         }
         // Links of one articulation are bounded per pair, relative to their common ancestor.
         for (uint32_t other = lane; other < p.bodies_per_env; other += kOgcQueryLanes) {
@@ -144,7 +144,7 @@ __global__ void OgcBodyQueryKernel(OgcDetectParams p, ModelView model, DataView 
                 DatCommonFrame(p, model, env, body, other) != ~0u) continue;
             radius = fminf(radius, collision::DatQueryRadius(collision::DatMotionRadius(
                 collision::kRigidContactSeparation + p.margin, p.dt, speed, OgcBodySpeed(p, data, env, other),
-                p.relaxation)));
+                p.relaxation), p.query_reach));
         }
     }
     for (uint32_t offset = kOgcQueryLanes / 2u; offset > 0u; offset /= 2u)
@@ -363,7 +363,7 @@ __device__ bool OgcPairPotential(const OgcDetectParams& p, const ModelView& mode
         const auto bl = data.body_aabb_lo[bi], bh = data.body_aabb_hi[bi];
         const math::Vec3 gap{fmaxf(0.0f, fmaxf(al.x - bh.x, bl.x - ah.x)),
             fmaxf(0.0f, fmaxf(al.y - bh.y, bl.y - ah.y)), fmaxf(0.0f, fmaxf(al.z - bh.z, bl.z - ah.z))};
-        const float reach = collision::kDatQueryRadiusMax + 1.0e-6f;
+        const float reach = p.query_reach + 1.0e-6f;
         if (gap.LengthSq() > reach * reach || !OgcBodyPairAllowed(p, model, a, b)) return false;
     }
     return true;
@@ -384,7 +384,7 @@ __device__ void OgcPreparePair(const OgcDetectParams& p, const ModelView& model,
         pair->body_query = collision::DatQueryRadius(frame != ~0u
             ? DatArticMotionRadius(p, model, data, env, a, b, frame, data.q)
             : collision::DatMotionRadius(collision::kRigidContactSeparation + p.margin, p.dt,
-                pair->source.speed, pair->target.speed, p.relaxation));
+                pair->source.speed, pair->target.speed, p.relaxation), p.query_reach);
     }
     pair->active = true;
 }
@@ -392,7 +392,7 @@ __device__ void OgcPreparePair(const OgcDetectParams& p, const ModelView& model,
 __device__ float OgcSurfaceQuery(const OgcDetectParams& p, const OgcSurfacePair& pair, float radius) {
     return !pair.source.particle && !pair.target.particle ? pair.body_query
         : collision::DatQueryRadius(collision::DatMotionRadius(radius + p.margin, p.dt,
-            pair.source.speed, pair.target.speed, p.relaxation));
+            pair.source.speed, pair.target.speed, p.relaxation), p.query_reach);
 }
 
 struct OgcMixedCandidate { uint32_t source, target; };

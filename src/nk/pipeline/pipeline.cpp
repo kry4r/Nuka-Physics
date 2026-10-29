@@ -165,6 +165,9 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     float contact_margin = cfg.contact_margin;
     for (const auto& bucket : model.material_buckets)
         contact_margin = std::max(contact_margin, bucket.Profile().margin);
+    const auto& surface_thickness = model.particles.surface_thickness;
+    const float query_reach = collision::DatQueryReach(surface_thickness.empty() ? 0.0f :
+        *std::max_element(surface_thickness.begin(), surface_thickness.end()), contact_margin);
 
     const bool has_articulation = cap.dofs_per_env > 0 || cap.links_per_env > 0;
     const bool has_bodies       = cap.bodies_per_env > 0;
@@ -489,6 +492,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         (split_positions && has_contacts && family == phi::kContactFamilyPairDriven &&
          cfg.pos_iters > 0u) ? 1u : 0u;
     coupling_ctx.p_np_body_particle = &p_np_body_particle_;
+    p_np_body_particle_.query_reach = query_reach;
     coupling_ctx.p_part_finalize = &p_part_finalize_;
     coupling_ctx.p_mpm = &p_mpm_;
     coupling_ctx.has_mpm = has_mpm ? 1u : 0u;
@@ -546,6 +550,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         const uint32_t bodies_per_env = cap.bodies_per_env;
         p_aabbs_.margin = std::max(contact_margin, collision::kRigidContactSeparation);
         p_aabbs_.dt = cfg.dt;
+        p_aabbs_.query_reach = query_reach;
         p_aabbs_.family = family;
         p_aabbs_.env_count = env_count;
         p_aabbs_.bodies_per_env = bodies_per_env;
@@ -597,6 +602,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
 
     if (has_collidables) {
         p_np_prim_.contact_margin = contact_margin;
+        p_np_prim_.query_reach = query_reach;
         p_np_prim_.num_material_buckets = cap.num_material_buckets;
         p_np_prim_.contact_pairs = cap.max_contact_pairs;
         p_np_prim_.dt = cfg.dt;
@@ -715,6 +721,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_ogc_detect_.num_material_buckets = cap.num_material_buckets;
         p_ogc_detect_.ogc_body_pairs = HasMeshContactPairs(model, collision::MeshContactRoute::Ogc);
         p_ogc_detect_.margin = contact_margin;
+        p_ogc_detect_.query_reach = query_reach;
         p_ogc_detect_.env_count = env_count;
         p_ogc_detect_.particles_per_env = cap.particles_per_env;
         p_ogc_detect_.surfaces_per_env = cap.particle_surfaces_per_env;
@@ -863,6 +870,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_dat_truncate_.dt = cfg.dt;
         p_dat_truncate_.workspace_bytes = cap.contact_cache_scratch_bytes;
         p_dat_truncate_.margin = contact_margin;
+        p_dat_truncate_.query_reach = query_reach;
         p_dat_truncate_.env_count = env_count;
         p_dat_truncate_.particles_per_env = cap.particles_per_env;
         p_dat_truncate_.vbd_particle_begin = cap.vbd_particle_begin;

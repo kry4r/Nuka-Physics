@@ -176,7 +176,7 @@ __global__ void BuildAabbsKernel(const float* __restrict__ shape_table,
                                  const collision::MeshBvhNode* __restrict__ mesh_nodes,
                                  uint32_t total_bodies,
                                  uint32_t bodies_per_env,
-                                 float margin, float dt,
+                                 float margin, float dt, float query_reach,
                                  const math::Vec3* __restrict__ linear_velocity,
                                  const math::Vec3* __restrict__ angular_velocity,
                                  const float* __restrict__ previous_motion,
@@ -264,7 +264,7 @@ __global__ void BuildAabbsKernel(const float* __restrict__ shape_table,
     const float speed = fmaxf(previous_motion != nullptr ? previous_motion[gid] : 0.0f,
         sqrtf(linear_velocity[gid].LengthSq()) + sqrtf(angular_velocity[gid].LengthSq()) * radius);
     const float m = fmaxf(margin, collision::DatQueryRadius(
-        collision::DatMotionRadius(margin, dt, speed, 0.0f, kDatRelaxation)));
+        collision::DatMotionRadius(margin, dt, speed, 0.0f, kDatRelaxation), query_reach));
     out_lo[gid] = {c.x - he.x - m, c.y - he.y - m, c.z - he.z - m};
     out_hi[gid] = {c.x + he.x + m, c.y + he.y + m, c.z + he.z + m};
 }
@@ -563,7 +563,7 @@ Status OpBuildAabbs(const ModelView& model, const DataView& data,
                static_cast<const math::Transform*>(data.body_pose),
                static_cast<const collision::MeshSurfaceInfo*>(model.mesh_surface_info),
                static_cast<const collision::MeshBvhNode*>(model.mesh_bvh_nodes),
-               total, p->bodies_per_env, p->margin, p->dt,
+               total, p->bodies_per_env, p->margin, p->dt, p->query_reach,
                data.body_linear_velocity, data.body_angular_velocity, data.dat_body_motion,
                data.body_aabb_lo, data.body_aabb_hi);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;

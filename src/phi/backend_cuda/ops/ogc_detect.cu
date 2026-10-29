@@ -62,7 +62,7 @@ __device__ float OgcParticleQuery(const OgcDetectParams& p, const ModelView& mod
         size_t{env} * p.surfaces_per_env + source_surface];
     const float target_speed = data.particle_surface_max_speed[
         size_t{env} * p.surfaces_per_env + target_surface];
-    return collision::DatQueryRadius(radius + p.margin + p.dt * (source_speed + target_speed));
+    return collision::DatQueryRadius(radius + p.margin + p.dt * (source_speed + target_speed), p.query_reach);
 }
 
 __device__ void OgcEmitParticleFace(const OgcDetectParams& p, const ModelView& model,
