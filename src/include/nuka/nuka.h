@@ -896,7 +896,11 @@ typedef enum nuka_state_field_t {
     NUKA_FIELD_JOINT_LIMIT_MARGIN = 116,
     NUKA_FIELD_BODY_INVWEIGHT0 = 117,
     NUKA_FIELD_DOF_INVWEIGHT0 = 118,
-    NUKA_FIELD_CONTACT_PROFILES = 119
+    NUKA_FIELD_CONTACT_PROFILES = 119,
+    // READ/WRITE per link: a spherical joint's rotation of the child in its parent joint frame (wxyz; identity
+    // elsewhere) and its three DOF velocities, the relative angular velocity in the child frame (rad/s).
+    NUKA_FIELD_JOINT_ROTATION = 120,
+    NUKA_FIELD_JOINT_ANGULAR_VELOCITY = 121
 } nuka_state_field_t;
 
 typedef enum nuka_vbd_element_kind_t {
@@ -1124,7 +1128,9 @@ typedef enum nuka_kinematic_joint_t {
     NUKA_KINEMATIC_ROOT = 0,
     NUKA_KINEMATIC_FIXED = 1,
     NUKA_KINEMATIC_REVOLUTE = 2,
-    NUKA_KINEMATIC_PRISMATIC = 3
+    NUKA_KINEMATIC_PRISMATIC = 3,
+    // Three rotational DOFs; the joint's rotation is NUKA_FIELD_JOINT_ROTATION at the child link.
+    NUKA_KINEMATIC_SPHERICAL = 4
 } nuka_kinematic_joint_t;
 
 // Immutable encoder kinematics in cooked per-environment link order; roots have parent_index UINT32_MAX.

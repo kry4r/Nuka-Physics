@@ -1086,7 +1086,7 @@ __device__ void InitializeTile(ArticulationDeviceState state, DataView data, Blo
             const bool located = dof < p.max_dof &&
                 ArticulationDofLocation(state, articulation, dof, &link, &component);
             const float value = located
-                ? (component != ~0u ? state.link_velocity[link].v[component] : state.qdot[link]) : 0.0f;
+                ? DofVelocity(state, link, component) : 0.0f;
             const bool root = located && (p.mimic_couplings == 0u || data.mimic_root_dof[base + dof] == dof);
             const uint32_t roots = __ballot_sync(~0u, root);
             if (root) {
@@ -2070,8 +2070,7 @@ __device__ void FinishTile(ArticulationDeviceState state, DataView data, BlockDe
             if (dof >= p.max_dof) continue;
             data.qdot_flat[base + dof] = value[r];
             if (!located[r]) continue;
-            if (component[r] == ~0u) state.qdot[link[r]] = value[r];
-            else state.link_velocity[link[r]].v[component[r]] = value[r];
+            DofVelocity(state, link[r], component[r]) = value[r];
         }
     }
     for (uint32_t k = c.lane; k < c.bodies; k += kTileLanes) {

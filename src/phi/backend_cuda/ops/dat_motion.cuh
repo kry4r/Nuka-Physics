@@ -24,11 +24,6 @@ struct DatPairPoses {
     DatBodyMotion a_motion, b_motion;
 };
 
-__device__ float DatQuatArc(math::Quat a, math::Quat b) {
-    const float dot = fabsf(a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z);
-    return 2.0f * acosf(fminf(1.0f, fmaxf(0.0f, dot)));
-}
-
 __device__ math::Quat DatSlerp(math::Quat a, math::Quat b, float s) {
     float dot = a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z;
     if (dot < 0.0f) {
@@ -88,7 +83,8 @@ __device__ math::Transform DatBodyPoseAt(const DatTruncateParams& p,
                 (data.q[link] - data.dat_prev_q[link]) * s;
             const auto relative = nkops::JointRelativeFrame(type,
                 model.joint_axis[link], model.link_local_pose[link],
-                model.parent_offset[link], q);
+                model.parent_offset[link], q,
+                DatSlerp(data.dat_prev_joint_rotation[link], data.joint_rotation[link], s));
             result = nkops::ComposeFrame(relative, result);
             if (parent == ~0u) return result;
             if (parent >= count) break;
@@ -257,6 +253,11 @@ __device__ DatBodyMotion DatBodyMotionBounds(const DatTruncateParams& p, const M
                 result.turn += delta;
             }
             if (type == ArticulationJointType::Prismatic) result.translation += delta;
+            if (type == ArticulationJointType::Spherical) {
+                const float arc = DatQuatArc(data.dat_prev_joint_rotation[link], data.joint_rotation[link]);
+                result.translation += arc * radius;
+                result.turn += arc;
+            }
             radius += sqrtf((model.link_local_pose[link].position + model.parent_offset[link]).LengthSq());
             if (type == ArticulationJointType::Prismatic)
                 radius += fmaxf(fabsf(data.dat_prev_q[link]), fabsf(data.q[link]));

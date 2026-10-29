@@ -209,6 +209,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         if (a.parent_link[link] == ~0u) independent_dof = 0u;
         const auto type = static_cast<phi::ArticulationJointType>(a.joint_type[link]);
         if (type == phi::ArticulationJointType::FloatingBase) independent_dof += 6u;
+        else if (type == phi::ArticulationJointType::Spherical) independent_dof += 3u;
         else if ((type == phi::ArticulationJointType::Revolute ||
                   type == phi::ArticulationJointType::Prismatic) &&
                  (mimic_couplings == 0u || a.mimic_source_link[link] == ~0u))

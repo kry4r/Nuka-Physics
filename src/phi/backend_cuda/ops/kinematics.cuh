@@ -20,20 +20,23 @@ __device__ inline math::Transform ComposeFrame(math::Transform parent, math::Tra
     return result;
 }
 
-// Joint axes are expressed in the child joint frame for both motion and spatial transforms.
+// Joint axes are expressed in the child joint frame for both motion and spatial transforms; a spherical
+// joint turns the child by its own rotation.
 __device__ inline math::Transform JointRelativeFrame(ArticulationJointType type, math::Vec3 axis,
-    math::Transform local, math::Vec3 parent_offset, float coordinate) {
+    math::Transform local, math::Vec3 parent_offset, float coordinate, math::Quat rotation) {
     math::Transform result = local;
     result.position = math::gpu::Add(local.position, parent_offset);
     axis = JointUnitAxis(axis);
     if (type == ArticulationJointType::Revolute) {
         const float half = 0.5f * coordinate;
         const float sine = sinf(half);
-        const auto rotation = math::gpu::MakeQuat(cosf(half), axis.x * sine, axis.y * sine, axis.z * sine);
-        result.rotation = math::gpu::QuatNormalizeRsqrt(math::gpu::QuatMul(local.rotation, rotation), 1.0e-12f);
+        const auto turn = math::gpu::MakeQuat(cosf(half), axis.x * sine, axis.y * sine, axis.z * sine);
+        result.rotation = math::gpu::QuatNormalizeRsqrt(math::gpu::QuatMul(local.rotation, turn), 1.0e-12f);
     } else if (type == ArticulationJointType::Prismatic) {
         result.position = math::gpu::Add(result.position, math::gpu::RotateByQuatNormalized(
             local.rotation, math::gpu::Scale(axis, coordinate)));
+    } else if (type == ArticulationJointType::Spherical) {
+        result.rotation = math::gpu::QuatNormalizeRsqrt(math::gpu::QuatMul(local.rotation, rotation), 1.0e-12f);
     }
     return result;
 }

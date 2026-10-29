@@ -1611,7 +1611,7 @@ __global__ void PackBlockArticulationVelocityKernel(ArticulationDeviceState stat
         uint32_t link = 0u, component = 0u;
         const float value = ArticulationDofLocation(state, articulation,
                 static_cast<uint32_t>(at % p.max_dof), &link, &component)
-            ? (component != ~0u ? state.link_velocity[link].v[component] : state.qdot[link]) : 0.0f;
+            ? DofVelocity(state, link, component) : 0.0f;
         data.qdot_flat[at] = value;
         s.articulation_free[at] = value;
         s.articulation_snapshot[at] = value;

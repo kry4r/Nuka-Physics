@@ -10,8 +10,10 @@
 
 namespace nuka::nk {
 
-// One environment's world link poses from its per-link coordinates and per-articulation base poses.
+// One environment's world link poses from its per-link coordinates, spherical joint rotations and
+// per-articulation base poses.
 std::vector<math::Transform> ArticulationLinkPoses(const ModelArticulation& art, const float* q,
+                                                   const math::Quat* rotations,
                                                    const math::Transform* base_poses);
 
 // A link point that should reach a world position and, when `orient`, the link frame's world rotation.
@@ -46,7 +48,8 @@ struct IkSolution {
 
 // Damped least squares from `q` over the revolute and prismatic joints between the root and the
 // targets, a mimic follower moving with its source; false when a target's link is not below the root.
-bool SolveArticulationIk(const ModelArticulation& art, const float* q, const math::Transform* base_poses,
+bool SolveArticulationIk(const ModelArticulation& art, const float* q, const math::Quat* rotations,
+                         const math::Transform* base_poses,
                          const std::vector<IkTarget>& targets, const IkOptions& options, IkSolution* out);
 
 }  // namespace nuka::nk

@@ -277,6 +277,8 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
         kWireDtypeF32, nk::FieldId::BodyInvweight0},
     {NUKA_FIELD_DOF_INVWEIGHT0, kStrideF32, kWireDtypeF32, nk::FieldId::DofInvweight0},
     {NUKA_FIELD_CONTACT_PROFILES, kStrideF32, kWireDtypeF32, nk::FieldId::MatBuckets},
+    {NUKA_FIELD_JOINT_ROTATION, static_cast<uint32_t>(4u * sizeof(float)), kWireDtypeF32, nk::FieldId::JointRotation},
+    {NUKA_FIELD_JOINT_ANGULAR_VELOCITY, kStrideVec3, kWireDtypeF32, nk::FieldId::JointAngularVelocity},
 };
 
 inline constexpr size_t kDlpackFieldCount =

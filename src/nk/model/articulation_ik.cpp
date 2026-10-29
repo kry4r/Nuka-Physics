@@ -25,8 +25,8 @@ math::Vec3 UnitAxis(math::Vec3 axis) {
     return length_sq > 1.0e-12f ? axis * (1.0f / std::sqrt(length_sq)) : math::Vec3::Zero();
 }
 
-// The link frame in its parent's at coordinate q, as JointRelativeFrame poses it.
-math::Transform RelativeFrame(const ModelArticulation& art, uint32_t link, float q) {
+// The link frame in its parent's at coordinate q or spherical rotation, as JointRelativeFrame poses it.
+math::Transform RelativeFrame(const ModelArticulation& art, uint32_t link, float q, const math::Quat& rotation) {
     const math::Transform& local = art.link_local_pose[link];
     math::Transform result{local.position + art.parent_offset[link], local.rotation};
     const math::Vec3 axis = UnitAxis(art.joint_axis[link]);
@@ -36,6 +36,8 @@ math::Transform RelativeFrame(const ModelArticulation& art, uint32_t link, float
         result.rotation = (local.rotation * turn).Normalized();
     } else if (TypeOf(art, link) == JointType::Prismatic) {
         result.position += local.rotation.Normalized().Rotate(axis * q);
+    } else if (TypeOf(art, link) == JointType::Spherical) {
+        result.rotation = (local.rotation * rotation).Normalized();
     }
     return result;
 }
@@ -83,10 +85,10 @@ Topology BuildTopology(const ModelArticulation& art) {
 }
 
 std::vector<math::Transform> Poses(const ModelArticulation& art, const Topology& t, const float* q,
-                                   const math::Transform* base_poses) {
+                                   const math::Quat* rotations, const math::Transform* base_poses) {
     std::vector<math::Transform> pose(t.parent.size());
     for (uint32_t link = 0u; link < pose.size(); ++link) {
-        const math::Transform relative = RelativeFrame(art, link, q[link]);
+        const math::Transform relative = RelativeFrame(art, link, q[link], rotations[link]);
         if (t.parent[link] != kNoLink)
             pose[link] = pose[t.parent[link]] * relative;
         else
@@ -129,11 +131,13 @@ void SolveSpd(std::vector<double>& m, std::vector<double>& g, size_t n) {
 }  // namespace
 
 std::vector<math::Transform> ArticulationLinkPoses(const ModelArticulation& art, const float* q,
+                                                   const math::Quat* rotations,
                                                    const math::Transform* base_poses) {
-    return Poses(art, BuildTopology(art), q, base_poses);
+    return Poses(art, BuildTopology(art), q, rotations, base_poses);
 }
 
-bool SolveArticulationIk(const ModelArticulation& art, const float* q0, const math::Transform* base_poses,
+bool SolveArticulationIk(const ModelArticulation& art, const float* q0, const math::Quat* rotations,
+                         const math::Transform* base_poses,
                          const std::vector<IkTarget>& targets, const IkOptions& o, IkSolution* out) {
     const Topology t = BuildTopology(art);
     const auto count = static_cast<uint32_t>(t.parent.size());
@@ -184,7 +188,7 @@ bool SolveArticulationIk(const ModelArticulation& art, const float* q0, const ma
     for (const IkTarget& g : targets) rows += g.orient ? 6u : 3u;
     // Poses the links and measures the targets; true once every target is within tolerance.
     const auto measure = [&] {
-        pose = Poses(art, t, q.data(), base_poses);
+        pose = Poses(art, t, q.data(), rotations, base_poses);
         bool done = true;
         for (size_t i = 0; i < targets.size(); ++i) {
             const IkTarget& g = targets[i];

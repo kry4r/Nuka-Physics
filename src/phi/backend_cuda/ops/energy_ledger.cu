@@ -91,10 +91,18 @@ __global__ void EnergyLinkFramesKernel(ModelView m, DataView d, ReadoutEnergyLed
             const float coordinate = d.q[link];
             const float no_position = coordinate -
                 (p.stage == EnergyStage::Projected && p.pos_pass ? p.dt * d.qdot_pseudo[link] : 0.0f);
+            const math::Quat rotation = d.joint_rotation[link];
+            math::Quat no_turn = rotation;
+            if (type == ArticulationJointType::Spherical && p.stage == EnergyStage::Projected && p.pos_pass) {
+                const auto pseudo = d.link_velocity_pseudo[link].v;
+                const float h = -0.5f * p.dt;
+                no_turn = mg::QuatNormalizeRsqrt(
+                    mg::QuatMul(rotation, mg::MakeQuat(1.0f, h * pseudo[0], h * pseudo[1], h * pseudo[2])), 1.0e-12f);
+            }
             pose = JointRelativeFrame(type, m.joint_axis[link], m.link_local_pose[link],
-                                       m.parent_offset[link], coordinate);
+                                       m.parent_offset[link], coordinate, rotation);
             unprojected = JointRelativeFrame(type, m.joint_axis[link], m.link_local_pose[link],
-                                              m.parent_offset[link], no_position);
+                                              m.parent_offset[link], no_position, no_turn);
             if (parent != ~0u) {
                 const uint32_t parent_link = offset + parent;
                 const auto pv = d.energy_link_velocity[parent_link];
@@ -107,6 +115,8 @@ __global__ void EnergyLinkFramesKernel(ModelView m, DataView d, ReadoutEnergyLed
             const Vec3 axis = mg::RotateByQuatNormalized(pose.rotation, JointUnitAxis(m.joint_axis[link]));
             if (type == ArticulationJointType::Revolute) angular += axis * d.qdot[link];
             if (type == ArticulationJointType::Prismatic) linear += axis * d.qdot[link];
+            if (type == ArticulationJointType::Spherical)
+                angular += mg::RotateByQuatNormalized(pose.rotation, d.joint_angular_velocity[link]);
         }
         d.energy_link_pose[link] = pose;
         d.energy_link_unprojected_pose[link] = unprojected;

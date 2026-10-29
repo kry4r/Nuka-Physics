@@ -1235,6 +1235,7 @@ nuka_result_t nuka_world_get_kinematic_link(nuka_world_handle world,
                 case ArticulationJointType::Fixed: result.joint_type = NUKA_KINEMATIC_FIXED; break;
                 case ArticulationJointType::Revolute: result.joint_type = NUKA_KINEMATIC_REVOLUTE; break;
                 case ArticulationJointType::Prismatic: result.joint_type = NUKA_KINEMATIC_PRISMATIC; break;
+                case ArticulationJointType::Spherical: result.joint_type = NUKA_KINEMATIC_SPHERICAL; break;
                 default: return NUKA_RESULT_NOT_SUPPORTED;
             }
             const auto& local = model.link_local_pose.at(link_index);
@@ -1575,13 +1576,17 @@ nuka_result_t nuka_world_solve_ik(nuka_world_handle world, const nuka_ik_request
         const uint64_t row = uint64_t{request->env} * links * sizeof(float);
         const uint64_t bytes = links * sizeof(float);
         std::vector<float> q(links), values(links);
+        std::vector<nuka::math::Quat> rotations(links);
         std::vector<Transform> bases(trees);
         if (!data.DownloadField(nk::FieldId::Q, q.data(), bytes, row) ||
+            !data.DownloadField(nk::FieldId::JointRotation, rotations.data(), links * sizeof(nuka::math::Quat),
+                                uint64_t{request->env} * links * sizeof(nuka::math::Quat)) ||
             !data.DownloadField(nk::FieldId::BasePose, bases.data(), trees * sizeof(Transform),
                                 uint64_t{request->env} * trees * sizeof(Transform)))
             return NUKA_RESULT_INTERNAL;
         nk::IkSolution solution;
-        if (!nk::SolveArticulationIk(model.articulation, q.data(), bases.data(), targets, options, &solution))
+        if (!nk::SolveArticulationIk(model.articulation, q.data(), rotations.data(), bases.data(), targets,
+                                     options, &solution))
             return NUKA_RESULT_INVALID_ARG;
         // Each write keeps the row's other links as they are.
         const auto write = [&](nk::FieldId field, bool solved) {

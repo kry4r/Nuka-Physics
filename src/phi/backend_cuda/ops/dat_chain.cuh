@@ -11,6 +11,12 @@
 namespace nuka::phi {
 namespace {
 
+// Rotation angle between two unit quaternions.
+__device__ float DatQuatArc(math::Quat a, math::Quat b) {
+    const float dot = fabsf(a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z);
+    return 2.0f * acosf(fminf(1.0f, fmaxf(0.0f, dot)));
+}
+
 template <class Params>
 __device__ bool DatBodyLink(const Params& p, const ModelView& model,
                             uint32_t env, uint32_t body, uint32_t* link,
@@ -81,6 +87,9 @@ __device__ float DatChainSpeed(const Params& p, const ModelView& model, const Da
         const float rate = rates ? rates[link] : fabsf(data.q[link] - start[link]) / p.dt;
         if (type == ArticulationJointType::Revolute) speed += rate * radius;
         if (type == ArticulationJointType::Prismatic) speed += rate;
+        if (type == ArticulationJointType::Spherical)
+            speed += radius * (rates ? rates[link] : DatQuatArc(data.dat_prev_joint_rotation[link],
+                                                                 data.joint_rotation[link]) / p.dt);
         radius += sqrtf((model.link_local_pose[link].position +
                          model.parent_offset[link]).LengthSq());
         if (type == ArticulationJointType::Prismatic)

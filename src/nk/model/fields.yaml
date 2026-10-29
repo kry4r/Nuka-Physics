@@ -32,6 +32,9 @@ fields:
   - {name: qddot,                 dtype: f32,       per: link, arena: persistent, owner: data}
   - {name: tau,                   dtype: f32,       per: link, arena: persistent, owner: data}
   - {name: link_velocity,         dtype: spatial6,  per: link, arena: persistent, owner: data}
+  # A spherical joint's rotation (child in parent joint frame) and its three DOF velocities in the child frame.
+  - {name: joint_rotation,        dtype: quat,      per: link, arena: persistent, owner: data}
+  - {name: joint_angular_velocity, dtype: vec3,     per: link, arena: persistent, owner: data}
   - {name: link_acceleration,     dtype: spatial6,  per: link, arena: scratch,    owner: data}
   - {name: link_velocity_bias,    dtype: spatial6,  per: link, arena: scratch,    owner: data}
   - {name: link_xup,              dtype: mat36,     per: link, arena: scratch,    owner: data}
@@ -53,6 +56,8 @@ fields:
   - {name: snapshot_q,             dtype: f32,       per: link, arena: persistent, owner: data}
   - {name: snapshot_qdot,          dtype: f32,       per: link, arena: persistent, owner: data}
   - {name: snapshot_link_velocity, dtype: spatial6,  per: link, arena: persistent, owner: data}
+  - {name: snapshot_joint_rotation, dtype: quat,     per: link, arena: persistent, owner: data}
+  - {name: snapshot_joint_angular_velocity, dtype: vec3, per: link, arena: persistent, owner: data}
   # snapshot_base_pose mirrors base_pose 1:1 (the Reset restore source), so it MUST
   # carry the same per:articulation count (else SnapshotState/RestoreState would
   # round-trip a size mismatch). K==1 collapses to per:env bytes.
@@ -737,6 +742,7 @@ fields:
   # bits in high32, then limiting body << 16 | counterpart; all ones when the bound never applied.
   - {name: dat_artic_witness, dtype: u64, per: articulation, elem: 4, arena: scratch, owner: data}
   - {name: dat_prev_q, dtype: f32, per: link, arena: scratch, owner: data}
+  - {name: dat_prev_joint_rotation, dtype: quat, per: link, arena: scratch, owner: data}
   - {name: dat_prev_base_pose, dtype: transform, per: articulation, arena: scratch, owner: data}
   - {name: dat_prev_body_pose, dtype: transform, per: body, arena: scratch, owner: data}
   - {name: dat_body_speed, dtype: f32, per: body, arena: scratch, owner: data}

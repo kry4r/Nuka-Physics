@@ -65,6 +65,8 @@ struct ArticulationDeviceState {
     float* qdot = nullptr;
     float* qddot = nullptr;
     float* tau = nullptr;
+    math::Quat* joint_rotation = nullptr;
+    math::Vec3* joint_angular_velocity = nullptr;
     float* joint_damping = nullptr;
     float* joint_armature = nullptr;
     float* joint_frictionloss = nullptr;
@@ -105,6 +107,8 @@ __forceinline__ __device__ uint32_t JointDofCountDevice(ArticulationJointType ty
             return 0u;
         case ArticulationJointType::FloatingBase:
             return 6u;  // T8a: free-floating root contributes 6 DOF.
+        case ArticulationJointType::Spherical:
+            return 3u;
     }
     return 0u;
 }
@@ -143,6 +147,15 @@ __device__ inline bool ArticulationDofLocation(
         dof -= width;
     }
     return false;
+}
+
+// A DOF's velocity: a scalar joint's qdot, a spherical joint's relative spin or a floating root's twist.
+__forceinline__ __device__ float& DofVelocity(const ArticulationDeviceState& state, uint32_t link,
+                                             uint32_t component) {
+    if (component == ~0u) return state.qdot[link];
+    if (state.joint_type[link] == ArticulationJointType::Spherical)
+        return (&state.joint_angular_velocity[link].x)[component];
+    return state.link_velocity[link].v[component];
 }
 
 // The free joint a mimic chain ends at, with q_link = scale * q_root + shift along it.
@@ -200,6 +213,18 @@ __forceinline__ __device__ void AccumulateChainJointForce(
         }
         return;
     }
+    if (type == ArticulationJointType::Spherical) {
+        // Columns are the child frame's axes through the joint origin.
+        const math::Quat rotation = state.link_pose[link].rotation;
+        const math::Vec3 lever = mg::Sub(point, state.link_pose[link].position);
+        const math::Vec3 moment = mg::Add(mg::Cross(lever, f), tau);
+        const math::Vec3 local = mg::RotateByQuatNormalized(
+            mg::MakeQuat(rotation.w, -rotation.x, -rotation.y, -rotation.z), moment);
+        const float entries[3] = {local.x, local.y, local.z};
+        for (uint32_t b = 0u; b < 3u; ++b)
+            if (dof_index + b < dof_stride) out[dof_index + b] += entries[b];
+        return;
+    }
     const math::Vec3 axis_world =
         mg::RotateByQuatNormalized(state.link_pose[link].rotation, state.joint_axis[link]);
     float entry = 0.0f;
@@ -235,6 +260,8 @@ inline ArticulationDeviceState MakeArticulationDeviceState(
     s.qdot = data.qdot;
     s.qddot = data.qddot;
     s.tau = data.tau;
+    s.joint_rotation = data.joint_rotation;
+    s.joint_angular_velocity = data.joint_angular_velocity;
     s.joint_damping = model.joint_damping;
     s.joint_armature = model.joint_armature;
     s.joint_frictionloss = model.joint_frictionloss;

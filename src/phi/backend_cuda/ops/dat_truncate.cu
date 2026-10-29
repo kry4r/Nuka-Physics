@@ -1802,7 +1802,10 @@ __global__ void DatSnapshotKernel(DatTruncateParams p, DataView data) {
     const uint32_t links = p.env_count * p.links_per_env;
     const uint32_t articulations = p.env_count * p.articulations_per_env;
     const uint32_t bodies = p.env_count * p.bodies_per_env;
-    if (item < links) data.dat_prev_q[item] = data.q[item];
+    if (item < links) {
+        data.dat_prev_q[item] = data.q[item];
+        data.dat_prev_joint_rotation[item] = data.joint_rotation[item];
+    }
     if (item < articulations)
         data.dat_prev_base_pose[item] = data.base_pose[item];
     if (item < bodies) data.dat_prev_body_pose[item] = data.body_pose[item];
@@ -1883,13 +1886,17 @@ __global__ void ApplyDatArticulationKernel(DatTruncateParams p, ModelView model,
     const uint32_t count = model.articulation_link_count[articulation];
     for (uint32_t i = 0u; i < count; ++i)
         data.dat_joint_motion[offset + i] =
-            fabsf(data.q[offset + i] - data.dat_prev_q[offset + i]) / p.dt;
+            (static_cast<ArticulationJointType>(model.joint_type[offset + i]) == ArticulationJointType::Spherical
+                 ? DatQuatArc(data.dat_prev_joint_rotation[offset + i], data.joint_rotation[offset + i])
+                 : fabsf(data.q[offset + i] - data.dat_prev_q[offset + i])) / p.dt;
     if (!(beta < 1.0f)) return;
     for (uint32_t i = 0u; i < count; ++i) {
         const uint32_t link = offset + i;
         data.q[link] = data.dat_prev_q[link] +
             (data.q[link] - data.dat_prev_q[link]) * beta;
         data.qdot[link] *= beta;
+        data.joint_rotation[link] = DatSlerp(data.dat_prev_joint_rotation[link], data.joint_rotation[link], beta);
+        data.joint_angular_velocity[link] = data.joint_angular_velocity[link] * beta;
     }
     if (count > 0u && model.parent_link[offset] == ~0u &&
         static_cast<ArticulationJointType>(model.joint_type[offset]) ==

@@ -23,13 +23,17 @@ ArticulationJointType ToArticulationJointType(scene::JointType type) {
     if (type == scene::JointType::Fixed) {
         return ArticulationJointType::Fixed;
     }
+    if (type == scene::JointType::Spherical) {
+        return ArticulationJointType::Spherical;
+    }
     return ArticulationJointType::Revolute;
 }
 
 bool IsSupportedJoint(scene::JointType type) {
     return type == scene::JointType::Revolute ||
            type == scene::JointType::Prismatic ||
-           type == scene::JointType::Fixed;
+           type == scene::JointType::Fixed ||
+           type == scene::JointType::Spherical;
 }
 
 [[noreturn]] void RejectJoint(uint32_t joint_index, const char* reason) {

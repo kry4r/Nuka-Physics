@@ -202,7 +202,7 @@ __global__ void PackQdotFlatMultiKernel(ArticulationDeviceState state, uint32_t 
         qdot_flat[gid] = 0.0f;
         return;
     }
-    qdot_flat[gid] = component != ~0u ? state.link_velocity[link].v[component] : state.qdot[link];
+    qdot_flat[gid] = DofVelocity(state, link, component);
 }
 
 // A coupled DOF moves with its root, v_t = s v_root, so each row's Jacobian folds onto the

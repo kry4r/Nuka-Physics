@@ -615,6 +615,9 @@ bool World::SeedInitialState() {
                                host.size() * sizeof(math::Transform))) {
             return false;
         }
+        const std::vector<math::Quat> rotation(static_cast<size_t>(L) * E, math::Quat::Identity());
+        if (!data_.UploadField(FieldId::JointRotation, rotation.data(), rotation.size() * sizeof(math::Quat)))
+            return false;
     }
     {
         // Each environment stores K roots at e*K+k, matching FK indexing.

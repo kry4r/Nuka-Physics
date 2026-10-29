@@ -58,6 +58,8 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::Qddot:               v.qddot = static_cast<float*>(p); break;
         case FieldId::Tau:                 v.tau = static_cast<float*>(p); break;
         case FieldId::LinkVelocity:        v.link_velocity = static_cast<Spatial6*>(p); break;
+        case FieldId::JointRotation:       v.joint_rotation = static_cast<math::Quat*>(p); break;
+        case FieldId::JointAngularVelocity: v.joint_angular_velocity = static_cast<math::Vec3*>(p); break;
         case FieldId::LinkAcceleration:    v.link_acceleration = static_cast<Spatial6*>(p); break;
         case FieldId::LinkVelocityBias:    v.link_velocity_bias = static_cast<Spatial6*>(p); break;
         case FieldId::LinkXup:             v.link_xup = static_cast<Mat36*>(p); break;
@@ -85,6 +87,8 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::SnapshotQ:           v.snapshot_q = static_cast<float*>(p); break;
         case FieldId::SnapshotQdot:        v.snapshot_qdot = static_cast<float*>(p); break;
         case FieldId::SnapshotLinkVelocity:v.snapshot_link_velocity = static_cast<Spatial6*>(p); break;
+        case FieldId::SnapshotJointRotation: v.snapshot_joint_rotation = static_cast<math::Quat*>(p); break;
+        case FieldId::SnapshotJointAngularVelocity: v.snapshot_joint_angular_velocity = static_cast<math::Vec3*>(p); break;
         case FieldId::SnapshotBasePose:    v.snapshot_base_pose = static_cast<math::Transform*>(p); break;
         case FieldId::SnapshotBodyPose:    v.snapshot_body_pose = static_cast<math::Transform*>(p); break;
         case FieldId::SnapshotBodyLinearVelocity:  v.snapshot_body_linear_velocity = static_cast<math::Vec3*>(p); break;
@@ -208,6 +212,7 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::DatArticParent: v.dat_artic_parent = static_cast<uint32_t*>(p); break;
         case FieldId::DatArticWitness: v.dat_artic_witness = static_cast<uint64_t*>(p); break;
         case FieldId::DatPrevQ: v.dat_prev_q = static_cast<float*>(p); break;
+        case FieldId::DatPrevJointRotation: v.dat_prev_joint_rotation = static_cast<math::Quat*>(p); break;
         case FieldId::DatPrevBasePose: v.dat_prev_base_pose = static_cast<math::Transform*>(p); break;
         case FieldId::DatPrevBodyPose: v.dat_prev_body_pose = static_cast<math::Transform*>(p); break;
         case FieldId::DatBodySpeed: v.dat_body_speed = static_cast<float*>(p); break;

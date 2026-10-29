@@ -267,7 +267,9 @@ __device__ LinkSpatialTransform JointTransform(const ArticulationDeviceState& st
     if (type == ArticulationJointType::Revolute) {
         joint_rotation = RotationFromAxisAngle(axis, state.q[link]);
     } else if (type == ArticulationJointType::Prismatic) {
-        translation = JointRelativeFrame(type, axis, local_pose, parent_offset, state.q[link]).position;
+        translation = JointRelativeFrame(type, axis, local_pose, parent_offset, state.q[link], {}).position;
+    } else if (type == ArticulationJointType::Spherical) {
+        joint_rotation = RotationFromQuat(state.joint_rotation[link]);
     }
     const Mat3 local_rotation = RotationFromQuat(local_pose.rotation);
     const Mat3 rotation = Mat3Mul(local_rotation, joint_rotation);
@@ -290,6 +292,17 @@ __device__ void SubtractLinkWrench(const ArticulationDeviceState& state, uint32_
     bias_force[3] -= force.x;
     bias_force[4] -= force.y;
     bias_force[5] -= force.z;
+}
+
+// A joint's own spatial velocity in its child frame: S qdot, or a spherical joint's spin.
+__device__ void JointVelocity(const ArticulationDeviceState& state, uint32_t link, const float* subspace,
+                              float* out) {
+    for (uint32_t i = 0u; i < 6u; ++i) out[i] = subspace[i] * state.qdot[link];
+    if (state.joint_type[link] != ArticulationJointType::Spherical) return;
+    const math::Vec3 w = state.joint_angular_velocity[link];
+    out[0] = w.x;
+    out[1] = w.y;
+    out[2] = w.z;
 }
 
 // Joint transforms and bias forces are per link; only the velocity sweep runs root to leaf.
@@ -334,9 +347,7 @@ __device__ void PrepareArticulationKinematics(ArticulationDeviceState state,
             float transformed_parent[6];
             TransformMotion(state.link_xup[link], v_parent, transformed_parent);
             float joint_velocity[6];
-            for (uint32_t i = 0u; i < 6u; ++i) {
-                joint_velocity[i] = state.joint_motion_subspace[link].s[i] * state.qdot[link];
-            }
+            JointVelocity(state, link, state.joint_motion_subspace[link].s, joint_velocity);
 
             float velocity[6];
             for (uint32_t i = 0u; i < 6u; ++i) {
@@ -511,11 +522,13 @@ __global__ void ArticulationDynamicsKernel(ArticulationDeviceState state, DataVi
         if (d >= dof) { bias[d] = 0.0f; continue; }
         const uint32_t link = dof_link[d], component = dof_component[d];
         const bool scalar = component == kInvalidLink;
-        velocity[d] = scalar ? state.qdot[link] : state.link_velocity[link].v[component];
+        velocity[d] = DofVelocity(state, link, component);
         bias[d] = scalar ? Dot6(state.joint_motion_subspace[link].s, state.link_bias_force[link].p)
                          : state.link_bias_force[link].p[component];
+        const bool spherical = state.joint_type[link] == ArticulationJointType::Spherical;
         const float damping = scalar ? state.joint_damping[link] +
-            (p.fold_drive_damping != 0u ? data.drive_dissipation[link] : 0.0f) : 0.0f;
+            (p.fold_drive_damping != 0u ? data.drive_dissipation[link] : 0.0f)
+            : spherical ? state.joint_damping[link] : 0.0f;
         const float spring = scalar ?
             state.joint_stiffness[link] * (state.q[link] - state.joint_spring_reference[link]) : 0.0f;
         acceleration[d] = (scalar ? state.tau[link] : 0.0f) - bias[d] - damping * velocity[d] - spring;
@@ -547,7 +560,7 @@ __global__ void ArticulationDynamicsKernel(ArticulationDeviceState state, DataVi
             const uint32_t i = component % 3u, j = (i + 1u) % 3u, k = (i + 2u) % 3u;
             const float transport = component < 3u ? 0.0f :
                 velocity[d - component + j] * velocity[d - i + k] - velocity[d - component + k] * velocity[d - i + j];
-            state.link_velocity[link].v[component] = velocity[d] + p.dt * (acceleration[d] + transport);
+            DofVelocity(state, link, component) = velocity[d] + p.dt * (acceleration[d] + transport);
         }
     }
     __syncthreads();
@@ -572,6 +585,8 @@ __global__ void ArticulationDynamicsKernel(ArticulationDeviceState state, DataVi
                 for (uint32_t c = 0u; c < 6u; ++c)
                     a[c] += state.link_velocity_bias[link].v[c] +
                             state.joint_motion_subspace[link].s[c] * state.qddot[link];
+                if (state.joint_type[link] == ArticulationJointType::Spherical)
+                    for (uint32_t c = 0u; c < 3u; ++c) a[c] += acceleration[link_dof[local] + c];
             }
             ArrayToAccel(a, &state.link_acceleration[link]);
         }
@@ -612,6 +627,11 @@ __global__ void FkLinkVelocitiesKernel(ArticulationDeviceState state, Articulati
             TransformMotion(transform, parent_velocity, velocity);
             for (uint32_t component = 0u; component < 6u; ++component)
                 velocity[component] += subspace[component] * state.qdot[link];
+            if (state.joint_type[link] == ArticulationJointType::Spherical) {
+                velocity[0] += state.joint_angular_velocity[link].x;
+                velocity[1] += state.joint_angular_velocity[link].y;
+                velocity[2] += state.joint_angular_velocity[link].z;
+            }
             ArrayToSpatial(velocity, &state.link_velocity[link]);
         }
         __syncthreads();
@@ -706,6 +726,18 @@ __global__ void IntegratePositionArticulationKernel(ArticulationDeviceState stat
     if (state.parent_link[link] == kInvalidLink &&
         state.joint_type[link] == ArticulationJointType::FloatingBase)
         IntegrateFloatingBasePose(state, link, state.link_to_articulation[link], link_velocity_pseudo, dt);
+    if (state.joint_type[link] == ArticulationJointType::Spherical) {
+        math::Vec3 w = state.joint_angular_velocity[link];
+        if (link_velocity_pseudo != nullptr)
+            w = Add(w, MakeVec3(link_velocity_pseudo[link].v[0], link_velocity_pseudo[link].v[1],
+                                link_velocity_pseudo[link].v[2]));
+        math::Quat turn;
+        turn.w = 1.0f;
+        turn.x = 0.5f * w.x * dt;
+        turn.y = 0.5f * w.y * dt;
+        turn.z = 0.5f * w.z * dt;
+        state.joint_rotation[link] = QuatNormalizeForward(QuatMulForward(state.joint_rotation[link], turn));
+    }
 }
 
 struct DriveControlView {
@@ -865,13 +897,14 @@ __global__ void ArticulationDampingKernel(ArticulationDeviceState state, DataVie
     for (uint32_t d = threadIdx.x; d < dof; d += blockDim.x) {
         const uint32_t link = dof_link[d], component = dof_component[d];
         const bool scalar = component == kInvalidLink;
-        float value = scalar ? state.joint_damping[link] : 0.0f;
+        const bool spherical = state.joint_type[link] == ArticulationJointType::Spherical;
+        float value = scalar || spherical ? state.joint_damping[link] : 0.0f;
         // Only the actuator's own range drops the derivative; a joint range keeps it, as in MuJoCo.
         if (scalar && p.actuator_derivative != 0u &&
             !(drive.force_limit[link] > 0.0f && fabsf(drive.command[link]) > drive.force_limit[link]))
             value += control == ArticulationControlMode::PDPosition ? drive.damping[link]
                    : control == ArticulationControlMode::Velocity ? drive.stiffness[link] : 0.0f;
-        const float velocity = scalar ? state.qdot[link] : state.link_velocity[link].v[component];
+        const float velocity = DofVelocity(state, link, component);
         damping[d] = p.dt * value;
         change[d] = damping[d] * (velocity - data.step_qdot_flat[base + d]);
         damped |= value != 0.0f;
@@ -881,7 +914,7 @@ __global__ void ArticulationDampingKernel(ArticulationDeviceState state, DataVie
     SolveMassBlock(work, change, dof);
     for (uint32_t d = threadIdx.x; d < dof; d += blockDim.x) {
         const uint32_t link = dof_link[d], component = dof_component[d];
-        float& velocity = component == kInvalidLink ? state.qdot[link] : state.link_velocity[link].v[component];
+        float& velocity = DofVelocity(state, link, component);
         velocity -= change[d];
         data.qdot_flat[base + d] = velocity;
     }
@@ -1049,7 +1082,7 @@ __device__ math::Transform ComposeTransform(const math::Transform& lhs,
 __device__ math::Transform RelativeTransform(const ArticulationDeviceState& state,
                                              uint32_t link) {
     return JointRelativeFrame(state.joint_type[link], state.joint_axis[link],
-        state.link_local_pose[link], state.parent_offset[link], state.q[link]);
+        state.link_local_pose[link], state.parent_offset[link], state.q[link], state.joint_rotation[link]);
 }
 
 constexpr uint32_t kTaskDimension = 6u;
@@ -1328,6 +1361,13 @@ __global__ void ApplyDynamicsDriveKernel(ArticulationDeviceState state,
                     const auto axis = RotateByQuat(state.base_pose[articulation].rotation, basis[c]);
                     StoreTaskColumn(jacobian, stride, dof + c, Cross3(axis, lever), axis);
                     StoreTaskColumn(jacobian, stride, dof + 3u + c, axis, {});
+                }
+            } else if (type == ArticulationJointType::Spherical) {
+                const math::Vec3 basis[3] = {{1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}};
+                for (uint32_t c = 0u; c < 3u; ++c) {
+                    const auto axis = RotateByQuat(state.link_pose[walk].rotation, basis[c]);
+                    StoreTaskColumn(jacobian, stride, dof + c, Cross3(axis, lever), axis);
+                    chain[dof + c] = 1u;
                 }
             } else if (JointDofCountDevice(type) == 1u) {
                 const auto axis = RotateByQuat(state.link_pose[walk].rotation, state.joint_axis[walk]);

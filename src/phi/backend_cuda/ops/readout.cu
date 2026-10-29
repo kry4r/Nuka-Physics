@@ -392,6 +392,8 @@ __global__ void ResetEnvsKernel(DataView data, ResetEnvsParams p) {
         data.actuator_effort[link] = 0.0f;
         data.actuator_saturated[link] = 0.0f;
         data.link_velocity[link] = data.snapshot_link_velocity[link];
+        data.joint_rotation[link] = data.snapshot_joint_rotation[link];
+        data.joint_angular_velocity[link] = data.snapshot_joint_angular_velocity[link];
         data.qdot_pseudo[link] = 0.0f;
         data.link_velocity_pseudo[link] = {};
         data.link_contact_wrench[link] = {};
@@ -672,7 +674,11 @@ Status OpSnapshotState(const ModelView& /*model*/, const DataView& data,
          cudaMemcpyAsync(data.snapshot_q, data.q, nl * sizeof(float),
                          cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
          cudaMemcpyAsync(data.snapshot_qdot, data.qdot, nl * sizeof(float),
-                         cudaMemcpyDeviceToDevice, stream) != cudaSuccess)) {
+                         cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
+         cudaMemcpyAsync(data.snapshot_joint_rotation, data.joint_rotation, nl * sizeof(math::Quat),
+                         cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
+         cudaMemcpyAsync(data.snapshot_joint_angular_velocity, data.joint_angular_velocity,
+                         nl * sizeof(Vec3), cudaMemcpyDeviceToDevice, stream) != cudaSuccess)) {
         return Status::Failed;
     }
     // Snapshot body state in environment order.

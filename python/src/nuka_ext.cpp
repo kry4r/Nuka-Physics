@@ -2264,6 +2264,8 @@ NB_MODULE(_nuka_ext, m) {
         .value("BODY_INVWEIGHT0", NUKA_FIELD_BODY_INVWEIGHT0)
         .value("DOF_INVWEIGHT0", NUKA_FIELD_DOF_INVWEIGHT0)
         .value("CONTACT_PROFILES", NUKA_FIELD_CONTACT_PROFILES)
+        .value("JOINT_ROTATION", NUKA_FIELD_JOINT_ROTATION)
+        .value("JOINT_ANGULAR_VELOCITY", NUKA_FIELD_JOINT_ANGULAR_VELOCITY)
         .value("VBD_SOLVE_AUDIT", NUKA_FIELD_VBD_SOLVE_AUDIT)
         .value("UCONTACT_ROW_RANGE", NUKA_FIELD_UCONTACT_ROW_RANGE)
         .value("CONTACT_WARM_START_COUNTS", NUKA_FIELD_CONTACT_WARM_START_COUNTS)
@@ -2854,6 +2856,7 @@ NB_MODULE(_nuka_ext, m) {
                     case NUKA_KINEMATIC_FIXED: row["joint_type"] = "fixed"; break;
                     case NUKA_KINEMATIC_REVOLUTE: row["joint_type"] = "revolute"; break;
                     case NUKA_KINEMATIC_PRISMATIC: row["joint_type"] = "prismatic"; break;
+                    case NUKA_KINEMATIC_SPHERICAL: row["joint_type"] = "spherical"; break;
                 }
                 row["local_pose"] = std::vector<float>(link.local_pose, link.local_pose + 7);
                 row["axis"] = std::vector<float>(link.axis, link.axis + 3);

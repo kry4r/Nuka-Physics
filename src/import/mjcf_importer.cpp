@@ -1081,9 +1081,9 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
     if (const char* quat_attr = body_elem->Attribute("quat")) {
         rec.local_transform.rotation = ParseQuat(quat_attr);
     }
-    // MuJoCo turns a hinge about its pos in the body frame; the link frame moves onto that anchor. Several
-    // hinges/slides apply in order (mj_kinematics): every joint but the last moves a massless link on its own
-    // anchor, and the body hangs off the last one. A slide keeps the previous anchor (its pos moves nothing).
+    // MuJoCo turns a hinge or ball about its pos in the body frame; the link frame moves onto that anchor.
+    // Several joints apply in order (mj_kinematics): every joint but the last moves a massless link on its
+    // own anchor, and the body hangs off the last one. A slide keeps the previous anchor (its pos moves nothing).
     std::vector<std::pair<tinyxml2::XMLElement*, math::Vec3>> chain;
     math::Vec3 anchor = math::Vec3::Zero();
     for (auto* joint = body_elem->FirstChildElement("joint"); joint != nullptr;
@@ -1091,8 +1091,8 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         const char* joint_class = joint->Attribute("class");
         const scene::JointType type = joint->Attribute("type") ? MjcfJointType(joint->Attribute("type"))
             : DefaultClassOrRoot(context.defaults, joint_class ? joint_class : child_class).joint.type;
-        if (type != scene::JointType::Revolute && type != scene::JointType::Prismatic) continue;
-        if (type == scene::JointType::Revolute && joint->Attribute("pos")) anchor = ParseVec3(joint->Attribute("pos"));
+        if (type == scene::JointType::Free || type == scene::JointType::Fixed) continue;
+        if (type != scene::JointType::Prismatic && joint->Attribute("pos")) anchor = ParseVec3(joint->Attribute("pos"));
         chain.emplace_back(joint, anchor);
     }
     rec.local_transform.position = rec.local_transform.position + AnchorShift(context, parent_id);
@@ -1237,6 +1237,11 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         const bool limits_enabled = has_range && limited != 0;
         jrec.has_lower_limit = limits_enabled;
         jrec.has_upper_limit = limits_enabled;
+        // A ball joint's cone limit, quaternion spring and dry friction have no articulation rows yet.
+        if (jrec.type == scene::JointType::Spherical &&
+            (limits_enabled || jrec.stiffness != 0.0f || jrec.frictionloss != 0.0f))
+            throw std::runtime_error("MJCF: ball joint '" + jrec.name +
+                                     "' has a range, stiffness or frictionloss the articulation does not model");
 
         const scene::JointId joint_id = scene.AddJoint(std::move(jrec));
         context.joint_ids[scene.GetJoint(joint_id).name] = joint_id;
@@ -1462,6 +1467,8 @@ void ParseActuators(tinyxml2::XMLElement* mujoco,
         record.joint_id = ResolveJoint(actuator->Attribute("joint"), context);
         if (record.joint_id == scene::kInvalidJoint)
             throw std::runtime_error("MJCF: actuator '" + record.name + "' needs a known joint transmission");
+        if (scene.GetJoint(record.joint_id).type == scene::JointType::Spherical)
+            throw std::runtime_error("MJCF: actuator '" + record.name + "' drives a ball joint, which has no drive rows");
         // A positive velocity bias on a position servo is MuJoCo's damping ratio over the reflected inertia.
         if (affine && gain > 0.0f && gain == -bias[1] && bias[2] > 0.0f)
             bias[2] = -bias[2] * 2.0f * std::sqrt(gain * JointInertiaAtRest(scene, record.joint_id) / (gear * gear));

@@ -103,8 +103,7 @@ __global__ void DescendArticulationsKernel(
     const float next = static_cast<float>(value);
     data.qdot_flat[base + dof] = next;
     if (!located) return;
-    if (component == ~0u) state.qdot[link] = next;
-    else state.link_velocity[link].v[component] = next;
+    DofVelocity(state, link, component) = next;
 }
 
 __global__ void WriteBlockJointLimitImpulsesKernel(DataView data, BlockDescentSolveParams p) {

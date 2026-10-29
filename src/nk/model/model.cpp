@@ -1437,6 +1437,7 @@ phi::Status Model::ValidateTopology(std::string* reason) const {
                 switch (type) {
                     case Joint::Fixed: break;
                     case Joint::Revolute: case Joint::Prismatic: width = 1u; break;
+                    case Joint::Spherical: width = 3u; break;
                     case Joint::FloatingBase:
                         if (local != 0u)
                             return reject(Status::InvalidArgument, "floating joint must be an articulation root");
@@ -1448,7 +1449,7 @@ phi::Status Model::ValidateTopology(std::string* reason) const {
                 if (tree == 0u) {
                     for (uint32_t component = 0u; component < width; ++component) {
                         expected_links.push_back(link);
-                        expected_components.push_back(width == 6u ? component : ~0u);
+                        expected_components.push_back(width > 1u ? component : ~0u);
                     }
                 }
             }

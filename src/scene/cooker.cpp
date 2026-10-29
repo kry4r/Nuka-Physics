@@ -564,7 +564,7 @@ void BuildFilteredPairPolicy(const SceneIR& scene, CookedBlob& blob) {
     // -- system_pairs: default all-enabled (SystemPairMatrix ctor). ----------
 }
 
-// Joints must form trees of revolute, prismatic and fixed joints rooted at fixed or free bodies.
+// Joints must form trees of revolute, prismatic, spherical and fixed joints rooted at fixed or free bodies.
 void ValidateJointTopology(const SceneIR& scene) {
     const auto& bodies = scene.Bodies();
     const auto& joints = scene.Joints();
@@ -582,9 +582,6 @@ void ValidateJointTopology(const SceneIR& scene) {
         if (joint.child_body >= body_count || joint.child_body == joint.parent_body)
             throw std::invalid_argument(name + " needs a child body distinct from its parent");
         const std::string child = "body '" + bodies[joint.child_body].name + "'";
-        if (joint.type == JointType::Spherical)
-            throw std::invalid_argument(name + " is spherical; articulations support revolute, "
-                                        "prismatic, fixed and free joints");
         if (incoming[joint.child_body] != kInvalidJoint)
             throw std::invalid_argument(name + " gives " + child + " a second parent joint after '" +
                                         joints[incoming[joint.child_body]].name + "'");

@@ -59,7 +59,7 @@ __global__ void ReadoutLinkMotionKernel(nkops::ArticulationDeviceState state, Re
             frame.linear_velocity = mg::RotateByQuatNormalized(frame.pose.rotation, {v.v[3], v.v[4], v.v[5]});
         } else {
             const auto relative = nkops::JointRelativeFrame(type, state.joint_axis[link],
-                state.link_local_pose[link], state.parent_offset[link], state.q[link]);
+                state.link_local_pose[link], state.parent_offset[link], state.q[link], state.joint_rotation[link]);
             if (parent == ~0u) frame.pose = relative;
             else {
                 const auto p = params.frames[frame_offset + offset + parent - env * params.links_per_env];
@@ -73,6 +73,9 @@ __global__ void ReadoutLinkMotionKernel(nkops::ArticulationDeviceState state, Re
                 frame.angular_velocity = mg::Add(frame.angular_velocity, mg::Scale(axis, state.qdot[link]));
             if (type == ArticulationJointType::Prismatic)
                 frame.linear_velocity = mg::Add(frame.linear_velocity, mg::Scale(axis, state.qdot[link]));
+            if (type == ArticulationJointType::Spherical)
+                frame.angular_velocity = mg::Add(frame.angular_velocity,
+                    mg::RotateByQuatNormalized(frame.pose.rotation, state.joint_angular_velocity[link]));
         }
         params.frames[frame_offset + link - env * params.links_per_env] = frame;
     }

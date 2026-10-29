@@ -9,6 +9,8 @@ enum class ArticulationJointType : uint8_t {
     Prismatic = 1,
     Fixed = 2,
     FloatingBase = 3,
+    // Three rotational DOFs: the child's angular velocity relative to its parent, in the child frame.
+    Spherical = 4,
 };
 
 enum class ArticulationControlMode : uint8_t {

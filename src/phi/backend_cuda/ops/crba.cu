@@ -68,9 +68,9 @@ __global__ void MimicReduceKernel(ArticulationDeviceState state,
         for (uint32_t local = 0u; local < count; ++local) {
             const uint32_t link = offset + local;
             const ArticulationJointType type = state.joint_type[link];
-            if (local == 0u && state.parent_link[link] == kInvalidLink &&
-                type == ArticulationJointType::FloatingBase) {
-                for (uint32_t b = 0u; b < 6u; ++b) {
+            if ((local == 0u && state.parent_link[link] == kInvalidLink &&
+                 type == ArticulationJointType::FloatingBase) || type == ArticulationJointType::Spherical) {
+                for (uint32_t b = 0u; b < JointDofCountDevice(type); ++b) {
                     dof_link[dof] = link;
                     dof_component[dof] = b;
                     root[dof] = dof;
@@ -170,9 +170,7 @@ __global__ void MimicReduceKernel(ArticulationDeviceState state,
     // The M-orthogonal projection of the step velocity onto the coupled coordinates is the reduced
     // dynamics, so an ideal coupling does no work on the motion it admits.
     for (uint32_t k = lane; k < dof; k += blockDim.x) {
-        velocity[k] = dof_component[k] != kInvalidLink
-                          ? state.link_velocity[dof_link[k]].v[dof_component[k]]
-                          : state.qdot[dof_link[k]];
+        velocity[k] = DofVelocity(state, dof_link[k], dof_component[k]);
     }
     __syncthreads();
     for (uint32_t r = lane; r < dof; r += blockDim.x) {
@@ -197,11 +195,7 @@ __global__ void MimicReduceKernel(ArticulationDeviceState state,
         projected[r] = scale[r] * reduced_velocity[compact[root[r]]];
     __syncthreads();
     for (uint32_t k = lane; k < dof; k += blockDim.x) {
-        if (dof_component[k] != kInvalidLink) {
-            state.link_velocity[dof_link[k]].v[dof_component[k]] = projected[k];
-        } else {
-            state.qdot[dof_link[k]] = projected[k];
-        }
+        DofVelocity(state, dof_link[k], dof_component[k]) = projected[k];
     }
 }
 

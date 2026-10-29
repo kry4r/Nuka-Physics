@@ -716,7 +716,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
                     host.link_inertia[l].I[k];
             }
         }
-        // DOF count (Revolute/Prismatic = 1, Fixed = 0, FloatingBase = 6) — the
+        // DOF count (Revolute/Prismatic = 1, Fixed = 0, Spherical = 3, FloatingBase = 6) — the
         // legacy ArticulationDofCount semantics (inlined: that symbol lives in
         // the GPU lib, which the pure cook must not link), i.e. max_dof.
         //
@@ -731,6 +731,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             switch (jt) {
                 case articulation::ArticulationJointType::Fixed: return 0u;
                 case articulation::ArticulationJointType::FloatingBase: return 6u;
+                case articulation::ArticulationJointType::Spherical: return 3u;
                 default: return 1u;
             }
         };
@@ -1539,6 +1540,12 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count,
                 case articulation::ArticulationJointType::Prismatic:
                     model.dof_to_link.push_back(l);
                     model.dof_to_component.push_back(~uint32_t(0));
+                    break;
+                case articulation::ArticulationJointType::Spherical:
+                    for (uint32_t b = 0; b < 3u; ++b) {
+                        model.dof_to_link.push_back(l);
+                        model.dof_to_component.push_back(b);
+                    }
                     break;
                 default:
                     break;  // Fixed (0 DOF) / non-root FloatingBase: no entry.

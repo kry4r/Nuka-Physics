@@ -181,53 +181,73 @@ __device__ inline void ComputeArticulationMass(ArticulationDeviceState state,
         if (local == 0u && floating_root) {
             continue;
         }
-        const uint32_t dof_i = link_dof[local];
-        if (dof_i >= max_dof) {
-            continue;
-        }
-
-        float force[6];
-        Mat66MulVec6Local(composite[link].I, state.joint_motion_subspace[link].s, force);
-
-        float diagonal = Dot6Local(state.joint_motion_subspace[link].s, force);
-        diagonal += state.joint_armature[link];
-        if (joint_damping != nullptr) {
-            diagonal += dt * joint_damping[link];
-        }
-        M[static_cast<size_t>(dof_i) * max_dof + dof_i] = diagonal;
-
-        uint32_t walk = link;
-        while (true) {
-            const uint32_t parent_local = state.parent_link[walk];
-            if (parent_local == ~0u) {
-                break;
-            }
-            float pushed[6];
-            TransformForceTransposeLocal(state.link_xup[walk], force, pushed);
-            for (uint32_t i = 0u; i < 6u; ++i) {
-                force[i] = pushed[i];
-            }
-            walk = offset + parent_local;
-            if (JointDofCountDevice(state.joint_type[walk]) == 0u) {
+        const uint32_t dof_link = link_dof[local];
+        // A spherical joint's columns are the child frame's three rotation axes.
+        const bool spherical = state.joint_type[link] == ArticulationJointType::Spherical;
+        for (uint32_t column = 0u; column < (spherical ? 3u : 1u); ++column) {
+            const uint32_t dof_i = dof_link + column;
+            if (dof_i >= max_dof) {
                 continue;
             }
-            const uint32_t dof_j = link_dof[walk - offset];
-            if (dof_j >= max_dof) {
-                continue;
+
+            float force[6];
+            float diagonal = state.joint_armature[link];
+            if (spherical) {
+                for (uint32_t i = 0u; i < 6u; ++i) force[i] = composite[link].I[i * 6u + column];
+                for (uint32_t r = 0u; r < 3u; ++r)
+                    if (r != column && dof_link + r < max_dof)
+                        M[static_cast<size_t>(dof_i) * max_dof + dof_link + r] = force[r];
+                diagonal += force[column];
+            } else {
+                Mat66MulVec6Local(composite[link].I, state.joint_motion_subspace[link].s, force);
+                diagonal = Dot6Local(state.joint_motion_subspace[link].s, force);
+                diagonal += state.joint_armature[link];
             }
-            if (walk == offset && floating_root) {
-                for (uint32_t b = 0u; b < 6u; ++b) {
-                    if (b >= max_dof) {
-                        break;
-                    }
-                    M[static_cast<size_t>(dof_i) * max_dof + b] = force[b];
-                    M[static_cast<size_t>(b) * max_dof + dof_i] = force[b];
+            if (joint_damping != nullptr) {
+                diagonal += dt * joint_damping[link];
+            }
+            M[static_cast<size_t>(dof_i) * max_dof + dof_i] = diagonal;
+
+            uint32_t walk = link;
+            while (true) {
+                const uint32_t parent_local = state.parent_link[walk];
+                if (parent_local == ~0u) {
+                    break;
                 }
-                continue;
+                float pushed[6];
+                TransformForceTransposeLocal(state.link_xup[walk], force, pushed);
+                for (uint32_t i = 0u; i < 6u; ++i) {
+                    force[i] = pushed[i];
+                }
+                walk = offset + parent_local;
+                if (JointDofCountDevice(state.joint_type[walk]) == 0u) {
+                    continue;
+                }
+                const uint32_t dof_j = link_dof[walk - offset];
+                if (dof_j >= max_dof) {
+                    continue;
+                }
+                if (walk == offset && floating_root) {
+                    for (uint32_t b = 0u; b < 6u; ++b) {
+                        if (b >= max_dof) {
+                            break;
+                        }
+                        M[static_cast<size_t>(dof_i) * max_dof + b] = force[b];
+                        M[static_cast<size_t>(b) * max_dof + dof_i] = force[b];
+                    }
+                    continue;
+                }
+                if (state.joint_type[walk] == ArticulationJointType::Spherical) {
+                    for (uint32_t r = 0u; r < 3u && dof_j + r < max_dof; ++r) {
+                        M[static_cast<size_t>(dof_i) * max_dof + dof_j + r] = force[r];
+                        M[static_cast<size_t>(dof_j + r) * max_dof + dof_i] = force[r];
+                    }
+                    continue;
+                }
+                const float entry = Dot6Local(state.joint_motion_subspace[walk].s, force);
+                M[static_cast<size_t>(dof_i) * max_dof + dof_j] = entry;
+                M[static_cast<size_t>(dof_j) * max_dof + dof_i] = entry;
             }
-            const float entry = Dot6Local(state.joint_motion_subspace[walk].s, force);
-            M[static_cast<size_t>(dof_i) * max_dof + dof_j] = entry;
-            M[static_cast<size_t>(dof_j) * max_dof + dof_i] = entry;
         }
     }
 }
