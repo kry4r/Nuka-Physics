@@ -39,6 +39,7 @@ struct UrdfImportResult {
 // Choices the URDF text does not carry.
 struct UrdfImportOptions {
     bool fix_base = false;                   // every link no joint carries becomes static
+    bool collapse_fixed_joints = false;      // fold each fixed joint's child link into its parent
     std::vector<std::string> package_paths;  // "<pkg>=<dir>" names a package's folder; other entries are
                                              // searched for package://<pkg>/... before ROS_PACKAGE_PATH
 };

@@ -360,6 +360,16 @@ typedef struct nuka_media_desc_t {
 // nuka_scene_destroy (the SAME destroy the load handle uses).
 nuka_scene_handle nuka_scene_create(const char* base_scene_path);
 
+// URDF import options: a fixed base (every link no joint carries is static) and folding each fixed
+// joint's child link into its parent.
+typedef struct nuka_urdf_import_options_t {
+    uint32_t fix_base;
+    uint32_t collapse_fixed_joints;
+} nuka_urdf_import_options_t;
+
+// nuka_scene_create for a .urdf base imported with `options`; NULL on a load failure.
+nuka_scene_handle nuka_scene_create_urdf(const char* urdf_path, const nuka_urdf_import_options_t* options);
+
 // Add a rigid collision primitive (one body + one shape) to the built scene via
 // SceneIR::AddRigidBody + AddCollisionShape (the records the file cook also reads).
 // Returns NULL_HANDLE on a bad handle, INVALID_ARG on a NULL / unknown-kind desc.

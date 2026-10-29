@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <optional>
@@ -52,6 +53,131 @@ math::Transform ParseOrigin(const tinyxml2::XMLElement* element) {
             math::Quat::FromAxisAngle({1, 0, 0}, angle.x)).Normalized();
     }
     return result;
+}
+
+// A URDF origin's xyz and fixed-axis roll-pitch-yaw.
+void WriteOrigin(tinyxml2::XMLElement* owner, const math::Transform& t) {
+    auto* origin = owner->FirstChildElement("origin");
+    if (origin == nullptr) origin = owner->InsertFirstChild(owner->GetDocument()->NewElement("origin"))->ToElement();
+    const math::Quat& q = t.rotation;
+    const double w = q.w, x = q.x, y = q.y, z = q.z;
+    const double roll = std::atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y));
+    const double pitch = std::asin(std::clamp(2.0 * (w * y - z * x), -1.0, 1.0));
+    const double yaw = std::atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z));
+    char text[128];
+    std::snprintf(text, sizeof(text), "%.9g %.9g %.9g", t.position.x, t.position.y, t.position.z);
+    origin->SetAttribute("xyz", text);
+    std::snprintf(text, sizeof(text), "%.17g %.17g %.17g", roll, pitch, yaw);
+    origin->SetAttribute("rpy", text);
+}
+
+// A link's mass, center and inertia tensor about that center, in the frame `pose` places the link in.
+struct LinkInertia {
+    double mass = 0.0;
+    double com[3] = {0.0, 0.0, 0.0};
+    double tensor[3][3] = {};
+};
+
+LinkInertia ReadInertia(const tinyxml2::XMLElement* link, const math::Transform& pose) {
+    LinkInertia out;
+    const auto* inertial = link->FirstChildElement("inertial");
+    if (inertial == nullptr) return out;
+    if (const auto* mass = inertial->FirstChildElement("mass")) mass->QueryDoubleAttribute("value", &out.mass);
+    const math::Transform frame = pose * ParseOrigin(inertial->FirstChildElement("origin"));
+    out.com[0] = frame.position.x, out.com[1] = frame.position.y, out.com[2] = frame.position.z;
+    double local[3][3] = {};
+    if (const auto* inertia = inertial->FirstChildElement("inertia")) {
+        const char* keys[3][3] = {{"ixx", "ixy", "ixz"}, {"ixy", "iyy", "iyz"}, {"ixz", "iyz", "izz"}};
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c) inertia->QueryDoubleAttribute(keys[r][c], &local[r][c]);
+    }
+    double axes[3][3];
+    for (int c = 0; c < 3; ++c) {
+        const math::Vec3 e = frame.rotation.Rotate(math::Vec3{c == 0 ? 1.0f : 0.0f, c == 1 ? 1.0f : 0.0f,
+                                                              c == 2 ? 1.0f : 0.0f});
+        axes[0][c] = e.x, axes[1][c] = e.y, axes[2][c] = e.z;
+    }
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+            for (int i = 0; i < 3; ++i)
+                for (int j = 0; j < 3; ++j) out.tensor[r][c] += axes[r][i] * local[i][j] * axes[c][j];
+    return out;
+}
+
+// Folds each fixed joint's child link into its parent: mass, center and inertia combine in the parent frame,
+// the child's collisions and visuals move by the joint origin, and its joints and excludes re-root there.
+void CollapseFixedJoints(tinyxml2::XMLElement* robot) {
+    tinyxml2::XMLDocument* doc = robot->GetDocument();
+    std::unordered_map<std::string, tinyxml2::XMLElement*> links;
+    for (auto* link = robot->FirstChildElement("link"); link; link = link->NextSiblingElement("link"))
+        if (const char* name = link->Attribute("name")) links[name] = link;
+    const auto end_link = [](const tinyxml2::XMLElement* joint, const char* tag) {
+        const auto* element = joint->FirstChildElement(tag);
+        return element && element->Attribute("link") ? std::string(element->Attribute("link")) : std::string();
+    };
+    for (auto* joint = robot->FirstChildElement("joint"); joint;) {
+        auto* next = joint->NextSiblingElement("joint");
+        const char* type = joint->Attribute("type");
+        const std::string parent = end_link(joint, "parent"), child = end_link(joint, "child");
+        if (type == nullptr || std::string(type) != "fixed" || !links.count(parent) || !links.count(child)) {
+            joint = next;
+            continue;
+        }
+        tinyxml2::XMLElement* into = links[parent];
+        tinyxml2::XMLElement* from = links[child];
+        const math::Transform weld = ParseOrigin(joint->FirstChildElement("origin"));
+        const LinkInertia a = ReadInertia(into, math::Transform::Identity()), b = ReadInertia(from, weld);
+        if (b.mass > 0.0) {
+            const double mass = a.mass + b.mass;
+            double com[3], tensor[3][3] = {};
+            for (int k = 0; k < 3; ++k) com[k] = (a.mass * a.com[k] + b.mass * b.com[k]) / mass;
+            for (const LinkInertia* part : {&a, &b}) {
+                double d[3], d2 = 0.0;
+                for (int k = 0; k < 3; ++k) d[k] = part->com[k] - com[k], d2 += d[k] * d[k];
+                for (int r = 0; r < 3; ++r)
+                    for (int c = 0; c < 3; ++c)
+                        tensor[r][c] += part->tensor[r][c] + part->mass * ((r == c ? d2 : 0.0) - d[r] * d[c]);
+            }
+            if (auto* old = into->FirstChildElement("inertial")) into->DeleteChild(old);
+            auto* inertial = into->InsertFirstChild(doc->NewElement("inertial"))->ToElement();
+            math::Transform center = math::Transform::Identity();
+            center.position = math::Vec3{static_cast<float>(com[0]), static_cast<float>(com[1]),
+                                         static_cast<float>(com[2])};
+            WriteOrigin(inertial, center);
+            inertial->InsertEndChild(doc->NewElement("mass"))->ToElement()->SetAttribute("value", mass);
+            auto* inertia = inertial->InsertEndChild(doc->NewElement("inertia"))->ToElement();
+            const char* keys[6] = {"ixx", "iyy", "izz", "ixy", "ixz", "iyz"};
+            const double values[6] = {tensor[0][0], tensor[1][1], tensor[2][2], tensor[0][1], tensor[0][2],
+                                      tensor[1][2]};
+            for (int k = 0; k < 6; ++k) inertia->SetAttribute(keys[k], values[k]);
+        }
+        for (const char* tag : {"collision", "visual"}) {
+            for (auto* element = from->FirstChildElement(tag); element;) {
+                auto* following = element->NextSiblingElement(tag);
+                WriteOrigin(element, weld * ParseOrigin(element->FirstChildElement("origin")));
+                into->InsertEndChild(element);
+                element = following;
+            }
+        }
+        for (auto* other = robot->FirstChildElement("joint"); other; other = other->NextSiblingElement("joint")) {
+            if (other == joint || end_link(other, "parent") != child) continue;
+            WriteOrigin(other, weld * ParseOrigin(other->FirstChildElement("origin")));
+            other->FirstChildElement("parent")->SetAttribute("link", parent.c_str());
+        }
+        for (auto* exclude = robot->FirstChildElement("nuka:exclude"); exclude;) {
+            auto* following = exclude->NextSiblingElement("nuka:exclude");
+            for (const char* key : {"link1", "link2"})
+                if (exclude->Attribute(key) && child == exclude->Attribute(key)) exclude->SetAttribute(key, parent.c_str());
+            if (exclude->Attribute("link1") && exclude->Attribute("link2") &&
+                std::string(exclude->Attribute("link1")) == exclude->Attribute("link2"))
+                robot->DeleteChild(exclude);
+            exclude = following;
+        }
+        links.erase(child);
+        robot->DeleteChild(from);
+        robot->DeleteChild(joint);
+        joint = next;
+    }
 }
 
 // Where package://<pkg>/... looks: the folders "<pkg>=<dir>" entries name, then the other entries and
@@ -214,6 +340,7 @@ static scene::SceneIR ParseUrdf(tinyxml2::XMLElement* robot, const std::string& 
                                 const UrdfImportOptions& options) {
     scene::SceneIR scene;
     const PackageLookup packages = PackageRoots(options.package_paths);
+    if (options.collapse_fixed_joints) CollapseFixedJoints(robot);
 
     // Map from link name -> BodyId for joint resolution
     std::unordered_map<std::string, scene::BodyId> link_map;

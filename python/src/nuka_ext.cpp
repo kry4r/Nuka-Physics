@@ -1684,11 +1684,13 @@ private:
 // ---------------------------------------------------------------------------
 class SceneBuilder {
 public:
-    static SceneBuilder* create(const std::string& base_path) {
+    static SceneBuilder* create(const std::string& base_path, bool fix_base, bool collapse_fixed_joints) {
         // "" => an EMPTY scene (robot-free); a non-empty path imports that base
         // scene (the robot) so primitives/media are added ON TOP.
-        nuka_scene_handle h =
-            nuka_scene_create(base_path.empty() ? nullptr : base_path.c_str());
+        const nuka_urdf_import_options_t urdf{fix_base ? 1u : 0u, collapse_fixed_joints ? 1u : 0u};
+        const bool options = fix_base || collapse_fixed_joints;
+        nuka_scene_handle h = options ? nuka_scene_create_urdf(base_path.c_str(), &urdf)
+                                      : nuka_scene_create(base_path.empty() ? nullptr : base_path.c_str());
         if (h == nullptr) {
             throw std::runtime_error(
                 "SceneBuilder: nuka_scene_create failed (bad base scene path?)");
@@ -3568,12 +3570,14 @@ NB_MODULE(_nuka_ext, m) {
 
     nb::class_<SceneBuilder>(m, "SceneBuilder")
         .def_static("create", &SceneBuilder::create, nb::arg("base_path") = std::string(),
+                    nb::arg("fix_base") = false, nb::arg("collapse_fixed_joints") = false,
                     nb::rv_policy::take_ownership,
                     "Create a built-scene authoring handle. base_path=\"\" (default) "
                     "starts an EMPTY scene (robot-free soft/fluid); a non-empty path "
                     "imports that base scene (e.g. a robot .nks/.xml/.urdf/.usd) so "
                     "primitives/media are added ON TOP. The general media authoring "
-                    "substrate -- one cook, one nk::World.")
+                    "substrate -- one cook, one nk::World. fix_base and "
+                    "collapse_fixed_joints are URDF import options.")
         .def("add_rigid_primitive", &SceneBuilder::add_rigid_primitive,
              nb::arg("kind"), nb::arg("dims") = std::vector<float>{},
              nb::arg("pos") = std::vector<float>{},

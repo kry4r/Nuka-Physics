@@ -17,6 +17,7 @@
 
 #include "c_abi/handle_table.hpp"
 #include "c_abi/internal.hpp"
+#include "import/urdf_importer.hpp"
 
 #include "math/quat.hpp"
 #include "math/transform.hpp"
@@ -214,6 +215,20 @@ nuka_scene_handle nuka_scene_create(const char* base_scene_path) {
     try {
         auto record = std::make_unique<SceneRecord>();
         record->scene = std::make_unique<nscene::SceneIR>();
+        return SceneTable().Insert(std::move(record));
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+nuka_scene_handle nuka_scene_create_urdf(const char* urdf_path, const nuka_urdf_import_options_t* options) {
+    if (urdf_path == nullptr || options == nullptr) return nullptr;
+    try {
+        nuka::import::UrdfImportOptions import;
+        import.fix_base = options->fix_base != 0u;
+        import.collapse_fixed_joints = options->collapse_fixed_joints != 0u;
+        auto record = std::make_unique<SceneRecord>();
+        record->scene = std::make_unique<nscene::SceneIR>(nuka::import::LoadUrdf(urdf_path, import));
         return SceneTable().Insert(std::move(record));
     } catch (...) {
         return nullptr;
