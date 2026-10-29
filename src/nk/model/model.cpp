@@ -1414,8 +1414,7 @@ phi::Status Model::ValidateTopology(std::string* reason) const {
             (k > 1u && a.base_poses.size() != k) ||
             (!a.link_to_articulation.empty() && a.link_to_articulation.size() != n))
             return reject(Status::InvalidArgument, "articulation ownership tables are incomplete");
-        uint32_t covered = 0u;
-        const uint32_t reference_count = implicit_span ? n : a.articulation_link_count[0];
+        uint32_t covered = 0u, widest = 0u;
         std::vector<uint32_t> expected_links, expected_components;
         for (uint32_t tree = 0u; tree < k; ++tree) {
             const uint32_t offset = implicit_span ? 0u : a.articulation_link_offset[tree];
@@ -1452,16 +1451,17 @@ phi::Status Model::ValidateTopology(std::string* reason) const {
                         expected_components.push_back(width == 6u ? component : ~0u);
                     }
                 }
-                if (tree > 0u && (count != reference_count ||
-                    a.joint_type[link] != a.joint_type[local] || parent != a.parent_link[local]))
-                    return reject(Status::Unsupported, "heterogeneous articulation topology requires independent DOF maps");
             }
-            if (dofs != cap.dofs_per_env || dofs != a.dof_count)
-                return reject(Status::Unsupported, "actual articulation DOFs disagree with the shared DOF stride");
+            // Each articulation builds its own DOF map inside the shared per-articulation stride.
+            if (dofs > cap.dofs_per_env)
+                return reject(Status::Unsupported, "actual articulation DOFs exceed the shared DOF stride");
+            widest = std::max(widest, dofs);
             covered += count;
         }
         if (covered != n)
             return reject(Status::InvalidArgument, "articulation spans leave uncovered links");
+        if (widest != cap.dofs_per_env || widest != a.dof_count)
+            return reject(Status::Unsupported, "widest articulation disagrees with the shared DOF stride");
         if ((!dof_to_link.empty() || !dof_to_component.empty()) &&
             (dof_to_link != expected_links || dof_to_component != expected_components))
             return reject(Status::InvalidArgument, "DOF map does not match the articulation joint layout");

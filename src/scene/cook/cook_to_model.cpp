@@ -1512,15 +1512,12 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count,
     // articulation's link slice [0, links_per_articulation)); the multi-tile solver
     // applies it per co-resident articulation with that artic's link offset. Mirrors
     // union_nk_model.cpp's DofIndexOf^-1 (FloatingBase root -> 6 components, scalar
-    // joint -> component ~0u). Only the FIRST articulation's links since every
-    // co-resident articulation is the same template (dofs_per_env is per-artic DOF).
+    // joint -> component ~0u). It covers the first articulation's own link span.
     {
         namespace articulation = runtime::articulation;
         const nk::ModelArticulation& m = model.articulation;
-        const uint32_t k = model.capacities.articulations_per_env == 0u
-                               ? 1u : model.capacities.articulations_per_env;
         const uint32_t links_per_articulation =
-            (k > 0u && m.link_count >= k) ? (m.link_count / k) : m.link_count;
+            m.articulation_link_count.empty() ? m.link_count : m.articulation_link_count[0];
         model.dof_to_link.clear();
         model.dof_to_component.clear();
         for (uint32_t l = 0; l < links_per_articulation && l < m.joint_type.size(); ++l) {
