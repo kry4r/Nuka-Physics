@@ -568,6 +568,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_lbvh_query_.filter_cross_env = model.filter_cross_env ? 1u : 0u;
         p_lbvh_query_.excluded_count =
             static_cast<uint32_t>(model.excluded_pairs.size());
+        p_lbvh_query_.contact_pair_count = cap.max_contact_pairs;
         add(phi::NkOp::LbvhQueryPairs, &p_lbvh_query_);
     }
 
@@ -597,6 +598,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     if (has_collidables) {
         p_np_prim_.contact_margin = contact_margin;
         p_np_prim_.num_material_buckets = cap.num_material_buckets;
+        p_np_prim_.contact_pairs = cap.max_contact_pairs;
         p_np_prim_.dt = cfg.dt;
         p_np_prim_.max_contacts_per_pair = kMaxContactsPerPair;
         p_np_prim_.ground_height = model.ground_height;
@@ -732,6 +734,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_ogc_detect_.mesh_edges = cap.max_mesh_edges;
         p_ogc_detect_.mesh_edge_nodes = cap.max_mesh_edge_nodes;
         p_ogc_detect_.excluded_pairs = cap.max_excluded_pairs;
+        p_ogc_detect_.contact_pairs = cap.max_contact_pairs;
         p_ogc_detect_.slot_stride = cap.max_contacts_per_env;
         p_ogc_detect_.slot_base = rigid_cap;
         p_ogc_detect_.slot_capacity = cap.ogc_contacts_per_env;
@@ -790,6 +793,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         for (int k = 0; k < 2; ++k) p_assemble_.solref[k] = model.contact_solref[k];
         for (int k = 0; k < 5; ++k) p_assemble_.solimp[k] = model.contact_solimp[k];
         p_assemble_.num_material_buckets = cap.num_material_buckets;
+        p_assemble_.contact_pairs = cap.max_contact_pairs;
         p_assemble_.impratio = model.solver_options.impratio;
         p_assemble_.refsafe = model.solver_options.refsafe;
         p_assemble_.cone = static_cast<uint32_t>(model.solver_options.cone);
@@ -882,6 +886,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_dat_truncate_.mesh_vertex_sources = cap.mesh_vertex_source_count;
         p_dat_truncate_.mesh_edge_sources = cap.mesh_edge_source_count;
         p_dat_truncate_.excluded_pairs = cap.max_excluded_pairs;
+        p_dat_truncate_.contact_pairs = cap.max_contact_pairs;
         p_dat_truncate_.slot_stride = cap.max_contacts_per_env;
         p_dat_truncate_.slot_base = rigid_cap;
         p_dat_truncate_.slot_capacity = cap.ogc_contacts_per_env;

@@ -77,12 +77,16 @@ struct ProxyCollidableSpec {
     uint32_t shape_row   = ~0u;  // cooked ModelShape / blob shape index.
 };
 
+// A shape collides when its filter masks can match, or when an authored pair names it.
 static bool ShapeCollides(const CookedBlob& blob, uint32_t shape) {
     const uint32_t ct = shape < blob.contact_params.contypes.size()
                             ? blob.contact_params.contypes[shape] : 1u;
     const uint32_t ca = shape < blob.contact_params.conaffinities.size()
                             ? blob.contact_params.conaffinities[shape] : 1u;
-    return (ct != 0u) || (ca != 0u);
+    const ShapeId source = blob.shapes.source_ids[shape];
+    return (ct != 0u) || (ca != 0u) ||
+           std::any_of(blob.filter_policy.explicit_pairs.begin(), blob.filter_policy.explicit_pairs.end(),
+                       [&](const CookedExplicitPair& pair) { return pair.geom1 == source || pair.geom2 == source; });
 }
 
 // resolve the AUTHORED initial-condition for the cooked articulation
@@ -187,6 +191,41 @@ uint32_t BucketFor(const CookedBlob& blob, uint32_t shape_row,
             ") requires finite values, nonnegative friction, condim 1/3, and nonnegative margin/gap");
     }
     buckets.push_back(row);
+    return static_cast<uint32_t>(buckets.size() - 1u);
+}
+
+// An authored pair's profile, under the MuJoCo law when either named shape takes it.
+uint32_t PairBucketFor(const CookedBlob& blob, const CookedExplicitPair& pair,
+                       std::vector<nk::ModelMaterialBucket>& buckets, std::vector<std::string>& names) {
+    const auto& ids = blob.shapes.source_ids;
+    const auto row1 = std::find(ids.begin(), ids.end(), pair.geom1);
+    const auto row2 = std::find(ids.begin(), ids.end(), pair.geom2);
+    if (row1 == ids.end() || row2 == ids.end())
+        throw std::runtime_error("CookToModel: a contact pair names a shape without cooked collision rows");
+    const auto& cp = blob.contact_params;
+    const uint32_t a = static_cast<uint32_t>(row1 - ids.begin()), b = static_cast<uint32_t>(row2 - ids.begin());
+    const std::string name = cp.names[a] + "|" + cp.names[b];
+    const MergedContactParams& p = pair.params;
+    nk::ContactProfileV1 profile;
+    profile.flags = blob.solver_options.refsafe ? nk::kContactProfileFlagRefsafe : 0u;
+    profile.law_source = cp.law_sources[a] == constraint::LawSource::MuJoCo ? cp.law_sources[a] : cp.law_sources[b];
+    profile.mu1 = p.mu1;
+    profile.mu2 = p.mu2;
+    profile.friction_spin = p.friction_spin;
+    profile.friction_roll = p.friction_roll;
+    for (uint32_t i = 0u; i < 2u; ++i) profile.solref[i] = p.solref[i];
+    for (uint32_t i = 0u; i < 2u; ++i) profile.solreffriction[i] = p.solreffriction[i];
+    for (uint32_t i = 0u; i < 5u; ++i) profile.solimp[i] = p.solimp[i];
+    profile.margin = p.margin;
+    profile.gap = p.gap;
+    profile.condim = p.condim;
+    nk::ModelMaterialBucket source(profile), row;
+    if (!nk::CanonicalizeContactProfileForUpload(source, &row))
+        throw std::runtime_error("CookToModel: contact pair " + name + " (condim " + std::to_string(p.condim) +
+                                 ") requires finite values, nonnegative friction, condim 1/3, and nonnegative "
+                                 "margin/gap");
+    buckets.push_back(row);
+    names.push_back(name);
     return static_cast<uint32_t>(buckets.size() - 1u);
 }
 
@@ -328,10 +367,6 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
     // 1. Drive the existing cook (the heavy lifting: V-HACD / SDF / filters).
     const auto cooked_blob = std::make_shared<const CookedBlob>(CookScene(scene, cook_options));
     const CookedBlob& blob = *cooked_blob;
-    if (!blob.filter_policy.explicit_pairs.empty()) {
-        throw std::runtime_error(
-            "CookToModel: PairDriven explicit contact pairs require source-shape provenance");
-    }
 
     // 2. Articulation topology (kinematic tree) from the cooked joints/bodies.
     const std::vector<runtime::articulation::ArticulationCookedTopology> arts =
@@ -942,6 +977,9 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             body_first_bucket[sh.body_row] = sh.material_bucket;
         }
     }
+    std::vector<uint32_t> pair_buckets;
+    for (const CookedExplicitPair& pair : blob.filter_policy.explicit_pairs)
+        pair_buckets.push_back(PairBucketFor(blob, pair, model.material_buckets, model.contact_profile_shapes));
 
     // SceneMap: SOURCE shape entity -> first cooked row + piece count via
     // bp_group. The cooker preserves source-shape order; a V-HACD source expands
@@ -1072,6 +1110,8 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
     // pair-driven SDF scene. These tables are sized AFTER the contact
     // capacity (max_bodies_total == bodies_per_env, the shape_table stride).
     cap.max_bodies_total = cap.bodies_per_env;
+    // The cooked shape behind each collidable row (~0u for a row that does not collide).
+    std::vector<uint32_t> collidable_shape(cap.bodies_per_env, ~0u);
     {
         // shape_table: one row per body, from its FIRST shape's primitive + the
         // contype/conaffinity (from the cooked filter groups when present).
@@ -1171,6 +1211,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             row.body_id = static_cast<int32_t>(sh.body_row);
             row.group = 0u;
             row.contact_profile_index = sh.material_bucket;
+            if (body_proxied[b] == 0u) collidable_shape[sh.body_row] = s;
         }
 
         // Distance fields retain their explicit cooked identity.
@@ -1376,6 +1417,8 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         // Re-append the preserved trailing static rows AFTER the proxy leaves, so a
         // non-terrain scene's ground plane keeps its one-past-the-leaves position.
         for (const auto& t : trailing_static) model.shape_table_rows.push_back(t);
+        collidable_shape.resize(base);
+        for (const ProxyCollidableSpec& px : link_proxies) collidable_shape.push_back(px.shape_row);
 
         // Grow the capacities: the new leaves join the LBVH + candidate budget.
         // Body<->body only; a coupled world's disjoint body<->particle reserve is
@@ -1387,6 +1430,35 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         cap.max_excluded_pairs = static_cast<uint32_t>(model.excluded_pairs.size());
     }
 
+    // An authored pair binds each collidable row cooked from one named shape to each row of the other.
+    collidable_shape.resize(model.shape_table_rows.size(), ~0u);
+    {
+        std::vector<std::pair<uint64_t, uint32_t>> pairs;
+        const auto source_of = [&](uint32_t row) {
+            return collidable_shape[row] == ~0u ? kInvalidShape : blob.shapes.source_ids[collidable_shape[row]];
+        };
+        for (size_t i = 0; i < blob.filter_policy.explicit_pairs.size(); ++i) {
+            const CookedExplicitPair& ep = blob.filter_policy.explicit_pairs[i];
+            for (uint32_t a = 0u; a < collidable_shape.size(); ++a) {
+                if (source_of(a) != ep.geom1) continue;
+                for (uint32_t b = 0u; b < collidable_shape.size(); ++b)
+                    if (b != a && source_of(b) == ep.geom2)
+                        pairs.emplace_back((uint64_t{std::min(a, b)} << 32u) | std::max(a, b), pair_buckets[i]);
+            }
+        }
+        std::sort(pairs.begin(), pairs.end());
+        for (size_t i = 1; i < pairs.size(); ++i)
+            if (pairs[i].first == pairs[i - 1u].first)
+                throw std::runtime_error("CookToModel: two contact pairs name the same collidable rows");
+        model.contact_pair_keys.clear();
+        model.contact_pair_profiles.clear();
+        for (const auto& [key, profile] : pairs) {
+            model.contact_pair_keys.push_back(key);
+            model.contact_pair_profiles.push_back(profile);
+        }
+        cap.max_contact_pairs = static_cast<uint32_t>(pairs.size());
+    }
+
     const auto rigid_capacity = nk::ComputeRigidContactCapacity(model);
     const uint64_t rigid_pairs = enable_contacts ? rigid_capacity.CandidateCount() : 0u;
     const uint64_t rigid_rows = rigid_capacity.RowsForSlots(rigid_pairs);
@@ -1394,15 +1466,22 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
     cap.rigid_contact_rows_per_env = static_cast<uint32_t>(rigid_rows);
     cap.max_contacts_per_env = static_cast<uint32_t>(rigid_pairs);
 
+    // A row also collides when an authored pair names it.
+    const auto paired = [&](uint32_t row) {
+        return std::any_of(model.contact_pair_keys.begin(), model.contact_pair_keys.end(), [&](uint64_t key) {
+            return (key >> 32u) == row || (key & 0xFFFFFFFFu) == row;
+        });
+    };
     cap.analytic_collidable_bodies = 0u;
     for (uint32_t body = 0u; body < cap.bodies_per_env && body < model.shape_table_rows.size(); ++body)
-        if ((model.shape_table_rows[body].contype | model.shape_table_rows[body].conaffinity) != 0u &&
+        if (((model.shape_table_rows[body].contype | model.shape_table_rows[body].conaffinity) != 0u ||
+             paired(body)) &&
             (body >= model.mesh_surface_info.size() || model.mesh_surface_info[body].vertex_count == 0u))
             ++cap.analytic_collidable_bodies;
     for (uint32_t body = 0u; body < cap.bodies_per_env; ++body) {
         if (body >= model.shape_table_rows.size() ||
-            model.shape_table_rows[body].contype == 0u ||
-            model.shape_table_rows[body].conaffinity == 0u) continue;
+            ((model.shape_table_rows[body].contype == 0u ||
+              model.shape_table_rows[body].conaffinity == 0u) && !paired(body))) continue;
         if (body < model.mesh_surface_info.size()) {
             const auto& surface = model.mesh_surface_info[body];
             for (uint32_t vertex = 0u; vertex < surface.vertex_count; ++vertex)

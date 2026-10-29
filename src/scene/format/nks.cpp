@@ -1181,8 +1181,9 @@ void Save(const SceneIR& scene, const std::string& nks_path, const SaveOptions& 
             o.Set("geom1", Value::Int(static_cast<int64_t>(cp.geom1)));
             o.Set("geom2", Value::Int(static_cast<int64_t>(cp.geom2)));
             o.Set("condim", Value::Int(cp.condim));
-            o.Set("friction_mu", Value::Float(cp.friction_mu));
+            o.Set("friction", FloatArray(cp.friction, 5));
             o.Set("solref", FloatArray(cp.solref, 2));
+            o.Set("solreffriction", FloatArray(cp.solreffriction, 2));
             o.Set("solimp", FloatArray(cp.solimp, 5));
             o.Set("margin", Value::Float(cp.margin));
             o.Set("gap", Value::Float(cp.gap));
@@ -1847,9 +1848,11 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             ov.geom1 = OffsetId(static_cast<ShapeId>(cp.At("geom1").AsInt()), shape_offset);
             ov.geom2 = OffsetId(static_cast<ShapeId>(cp.At("geom2").AsInt()), shape_offset);
             ov.condim = static_cast<uint8_t>(cp.At("condim").AsInt());
-            ov.friction_mu = cp.At("friction_mu").AsFloat();
+            for (int k = 0; k < 5; ++k) ov.friction[k] = FloatAt(cp.At("friction"), k, "friction");
             ov.solref[0] = FloatAt(cp.At("solref"), 0, "solref");
             ov.solref[1] = FloatAt(cp.At("solref"), 1, "solref");
+            ov.solreffriction[0] = FloatAt(cp.At("solreffriction"), 0, "solreffriction");
+            ov.solreffriction[1] = FloatAt(cp.At("solreffriction"), 1, "solreffriction");
             for (int k = 0; k < 5; ++k) ov.solimp[k] = FloatAt(cp.At("solimp"), k, "solimp");
             ov.margin = cp.At("margin").AsFloat();
             ov.gap = cp.At("gap").AsFloat();

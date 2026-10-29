@@ -334,20 +334,16 @@ struct ActuatorRecord {
     float damping                          = std::numeric_limits<float>::quiet_NaN();
 };
 
-// An authored <contact><pair> explicit contact override (v0.8 C1b). MuJoCo's
-// <pair> always carries a concrete parameter set (an absent attribute uses the
-// MuJoCo default, NOT the per-shape -1 friction sentinel), so the fields below
-// are initialized to MuJoCo's pair defaults. friction_mu holds only the FIRST
-// (isotropic tangential) friction component; spin/roll friction is dropped (see
-// the importer comment). geom1/geom2 are the resolved ShapeIds of the two named
-// geoms. The filter/merge POLICY that consumes these overrides is C1c; C1b only
-// stores them.
+// An authored <contact><pair>: the full parameter set of one geom pair's contacts, which bypass the filters.
+// Absent attributes keep MuJoCo's pair defaults; friction is (slide1, slide2, spin, roll1, roll2).
 struct ContactPairOverride {
     ShapeId geom1       = kInvalidShape;
     ShapeId geom2       = kInvalidShape;
     uint8_t condim      = 3;
-    float   friction_mu = 1.0f;                          // <pair friction>[0]
+    float   friction[5] = {1.0f, 1.0f, 0.005f, 0.0001f, 0.0001f};
     float   solref[2]   = {0.02f, 1.0f};
+    // Elliptic friction rows use this reference unless both entries are zero.
+    float   solreffriction[2] = {0.0f, 0.0f};
     float   solimp[5]   = {0.9f, 0.95f, 0.001f, 0.5f, 2.0f};
     float   margin      = 0.0f;
     float   gap         = 0.0f;

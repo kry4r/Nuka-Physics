@@ -20,7 +20,7 @@ fields:
   - {name: articulation_bias, dtype: f32, per: articulation_dof, arena: scratch, owner: data}
   - {name: m_factor,         dtype: f32,       per: articulation_dof2, arena: scratch, owner: data}
   - {name: particle_pos,  dtype: vec3,      per: particle,     arena: persistent, owner: data}
-  - {name: mat_buckets,   dtype: f32,       per: scalar, count: "num_buckets*20*env_count", arena: persistent, owner: data, flags: [param]}
+  - {name: mat_buckets,   dtype: f32,       per: scalar, count: "num_buckets*22*env_count", arena: persistent, owner: data, flags: [param]}
   - {name: mat_index,     dtype: u32,       per: body,         arena: persistent, owner: data,  flags: [param]}
   - {name: link_contact_wrench, dtype: spatial6, per: link,    arena: scratch,    owner: data,  flags: [readout]}
 
@@ -218,6 +218,9 @@ fields:
   # =========================================================================
   - {name: shape_table,      dtype: f32, per: scalar, count: "max_bodies_total*13",      arena: persistent, owner: model}
   - {name: excluded_pairs,   dtype: u64, per: scalar, count: "max_excluded_pairs",       arena: persistent, owner: model}
+  # Authored contact pairs: sorted (lo<<32|hi) collidable-row keys and the contact profile each pair uses.
+  - {name: contact_pair_keys,     dtype: u64, per: scalar, count: "max_contact_pairs", arena: persistent, owner: model}
+  - {name: contact_pair_profiles, dtype: u32, per: scalar, count: "max_contact_pairs", arena: persistent, owner: model}
 
   # =========================================================================
   # M5 — SDF main path (NarrowphaseSdf op; plan §3.5 Genesis-style sampling).

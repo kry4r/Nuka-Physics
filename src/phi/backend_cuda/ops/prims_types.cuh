@@ -68,6 +68,21 @@ __forceinline__ __device__ PrimShapeDev LoadPrimShape(const float* table,
     return s;
 }
 
+// The contact profile of the authored pair between collidable rows a and b, or ~0u when none is authored.
+__forceinline__ __device__ uint32_t AuthoredPairProfile(const uint64_t* keys, const uint32_t* profiles,
+                                                        uint32_t count, uint32_t a, uint32_t b) {
+    const uint64_t key = (uint64_t{a < b ? a : b} << 32u) | (a < b ? b : a);
+    uint32_t first = 0u, last = count;
+    while (first < last) {
+        const uint32_t mid = first + (last - first) / 2u;
+        const uint64_t value = keys[mid];
+        if (value < key) first = mid + 1u;
+        else if (value > key) last = mid;
+        else return profiles[mid];
+    }
+    return ~0u;
+}
+
 // Quat rotate — EXACT host math::Quat::Rotate expression (matches BuildPrimFrame
 // columns at the FP floor; same posture as union_types.cuh::RotateQuatHostExpr).
 __forceinline__ __device__ math::Vec3 PrimRotate(math::Quat q, math::Vec3 v) {

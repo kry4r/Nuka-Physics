@@ -31,7 +31,9 @@ enum ContactProfileLane : uint32_t {
     kContactProfileSpin = 17u,
     kContactProfileRoll = 18u,
     kContactProfileFrictionStiffness = 19u,
-    kContactProfileWordCount = 20u,
+    kContactProfileFrictionSolref0 = 20u,
+    kContactProfileFrictionSolref1 = 21u,
+    kContactProfileWordCount = 22u,
 };
 
 struct ContactProfileV1 {
@@ -51,6 +53,8 @@ struct ContactProfileV1 {
     float friction_roll = 0.0001f;
     // Force-space friction slope; a negative value leaves elliptic tangents on solref.
     float friction_stiffness = -1.0f;
+    // Elliptic friction rows use this reference unless both entries are zero.
+    float solreffriction[2] = {0.0f, 0.0f};
 };
 
 static_assert(sizeof(ContactProfileV1) == kContactProfileWordCount * sizeof(uint32_t),
@@ -87,6 +91,8 @@ inline void PackContactProfile(const ContactProfileV1& profile, float* words) {
     raw[kContactProfileSpin] = ContactProfileFloatBits(profile.friction_spin);
     raw[kContactProfileRoll] = ContactProfileFloatBits(profile.friction_roll);
     raw[kContactProfileFrictionStiffness] = ContactProfileFloatBits(profile.friction_stiffness);
+    raw[kContactProfileFrictionSolref0] = ContactProfileFloatBits(profile.solreffriction[0]);
+    raw[kContactProfileFrictionSolref1] = ContactProfileFloatBits(profile.solreffriction[1]);
     std::memcpy(words, raw, sizeof(raw));
 }
 
@@ -111,6 +117,8 @@ inline ContactProfileV1 UnpackContactProfile(const float* words) {
     profile.friction_spin = ContactProfileBitsFloat(raw[kContactProfileSpin]);
     profile.friction_roll = ContactProfileBitsFloat(raw[kContactProfileRoll]);
     profile.friction_stiffness = ContactProfileBitsFloat(raw[kContactProfileFrictionStiffness]);
+    profile.solreffriction[0] = ContactProfileBitsFloat(raw[kContactProfileFrictionSolref0]);
+    profile.solreffriction[1] = ContactProfileBitsFloat(raw[kContactProfileFrictionSolref1]);
     return profile;
 }
 

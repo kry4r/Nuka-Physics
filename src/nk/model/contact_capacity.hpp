@@ -12,6 +12,17 @@
 
 namespace nuka::nk {
 
+// An authored pair always collides; any other row pair must pass the shape filter and the exclude list.
+inline bool ContactPairAdmitted(const Model& model, uint32_t a, uint32_t b) {
+    const uint64_t key = (uint64_t{std::min(a, b)} << 32u) | std::max(a, b);
+    if (std::binary_search(model.contact_pair_keys.begin(), model.contact_pair_keys.end(), key)) return true;
+    const auto& sa = model.shape_table_rows[a];
+    const auto& sb = model.shape_table_rows[b];
+    return ::nuka::collision::ShapeFilterAdmits(sa.contype, sa.conaffinity, sa.group,
+                                                sb.contype, sb.conaffinity, sb.group) &&
+           !std::binary_search(model.excluded_pairs.begin(), model.excluded_pairs.end(), key);
+}
+
 inline uint32_t RigidManifoldPointCapacity(uint32_t a, uint32_t b) {
     using namespace ::nuka::collision;
     if (a > b) std::swap(a, b);
@@ -48,11 +59,7 @@ inline RigidContactCapacity ComputeRigidContactCapacity(const Model& model) {
         const auto& sa = model.shape_table_rows[a];
         for (uint32_t b = a + 1u; b < count; ++b) {
             const auto& sb = model.shape_table_rows[b];
-            if ((sa.body_id < 0 && sb.body_id < 0) ||
-                !::nuka::collision::ShapeFilterAdmits(sa.contype, sa.conaffinity, sa.group,
-                    sb.contype, sb.conaffinity, sb.group) ||
-                std::binary_search(model.excluded_pairs.begin(), model.excluded_pairs.end(),
-                                   (uint64_t{a} << 32u) | b)) continue;
+            if ((sa.body_id < 0 && sb.body_id < 0) || !ContactPairAdmitted(model, a, b)) continue;
             ++capacity.slots[RigidManifoldPointCapacity(sa.kind, sb.kind)];
         }
     }
@@ -68,10 +75,7 @@ inline bool ConvexContactPairs(const Model& model) {
         for (uint32_t b = a + 1u; b < count; ++b) {
             const auto& sa = rows[a];
             const auto& sb = rows[b];
-            if ((sa.body_id < 0 && sb.body_id < 0) ||
-                !ShapeFilterAdmits(sa.contype, sa.conaffinity, sa.group, sb.contype, sb.conaffinity, sb.group) ||
-                std::binary_search(model.excluded_pairs.begin(), model.excluded_pairs.end(),
-                                   (uint64_t{a} << 32u) | b)) continue;
+            if ((sa.body_id < 0 && sb.body_id < 0) || !ContactPairAdmitted(model, a, b)) continue;
             if (RouteMeshContact(sa.kind, sb.kind, sa.mesh_contact_mode, sb.mesh_contact_mode) ==
                     MeshContactRoute::Analytic &&
                 TakesConvexManifold(sa.kind, sb.kind))
@@ -87,11 +91,7 @@ inline bool HasMeshContactPairs(const Model& model, collision::MeshContactRoute 
         const auto& sa = rows[a];
         for (uint32_t b = a + 1u; b < rows.size(); ++b) {
             const auto& sb = rows[b];
-            if ((sa.body_id < 0 && sb.body_id < 0) ||
-                !collision::ShapeFilterAdmits(sa.contype, sa.conaffinity, sa.group,
-                    sb.contype, sb.conaffinity, sb.group) ||
-                std::binary_search(model.excluded_pairs.begin(), model.excluded_pairs.end(),
-                                   (uint64_t{a} << 32u) | b)) continue;
+            if ((sa.body_id < 0 && sb.body_id < 0) || !ContactPairAdmitted(model, a, b)) continue;
             if (route == collision::MeshContactRoute::Ogc &&
                 (a >= model.mesh_surface_info.size() || b >= model.mesh_surface_info.size() ||
                  model.mesh_surface_info[a].vertex_count == 0u ||
@@ -119,10 +119,7 @@ inline uint64_t PairedMeshFeatureCount(const Model& model) {
                 model.mesh_surface_info[b].vertex_count > 0u &&
                 ::nuka::collision::RouteMeshContact(sa.kind, sb.kind, sa.mesh_contact_mode,
                     sb.mesh_contact_mode) == ::nuka::collision::MeshContactRoute::Ogc &&
-                ::nuka::collision::ShapeFilterAdmits(sa.contype, sa.conaffinity, sa.group,
-                    sb.contype, sb.conaffinity, sb.group) &&
-                !std::binary_search(model.excluded_pairs.begin(), model.excluded_pairs.end(),
-                                    (uint64_t{std::min(a, b)} << 32u) | std::max(a, b));
+                ContactPairAdmitted(model, a, b);
         }
         if (paired) features += model.mesh_surface_info[a].vertex_count + model.mesh_edge_info[a].edge_count;
     }
@@ -149,11 +146,7 @@ inline bool ArticulatedContactPairs(const Model& model) {
     for (uint32_t a = 0u; a < count; ++a) {
         if (!articulated(a)) continue;
         for (uint32_t b = a + 1u; b < count; ++b)
-            if (articulated(b) &&
-                ::nuka::collision::ShapeFilterAdmits(rows[a].contype, rows[a].conaffinity, rows[a].group,
-                    rows[b].contype, rows[b].conaffinity, rows[b].group) &&
-                !std::binary_search(model.excluded_pairs.begin(), model.excluded_pairs.end(),
-                                    (uint64_t{a} << 32u) | b)) return true;
+            if (articulated(b) && ContactPairAdmitted(model, a, b)) return true;
     }
     return false;
 }
@@ -185,10 +178,7 @@ inline RigidContactCapacity DistinctOwnerContactCapacity(const Model& model) {
     for (uint32_t a = 0u; a < count; ++a) {
         for (uint32_t b = a + 1u; b < count; ++b) {
             if (owners[a] == ~uint64_t{0u} || owners[b] == ~uint64_t{0u} || owners[a] == owners[b] ||
-                !::nuka::collision::ShapeFilterAdmits(rows[a].contype, rows[a].conaffinity, rows[a].group,
-                    rows[b].contype, rows[b].conaffinity, rows[b].group) ||
-                std::binary_search(model.excluded_pairs.begin(), model.excluded_pairs.end(),
-                                   (uint64_t{a} << 32u) | b)) continue;
+                !ContactPairAdmitted(model, a, b)) continue;
             ++capacity.slots[RigidManifoldPointCapacity(rows[a].kind, rows[b].kind)];
         }
     }

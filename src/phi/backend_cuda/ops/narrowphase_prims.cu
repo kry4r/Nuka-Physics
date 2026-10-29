@@ -217,6 +217,8 @@ __global__ void PairDrivenNarrowphaseKernel(
     const uint32_t* __restrict__ pair_count,        
     const float* __restrict__ shape_table,
     const float* __restrict__ mat_buckets, uint32_t num_material_buckets,
+    const uint64_t* __restrict__ authored_keys, const uint32_t* __restrict__ authored_profiles,
+    uint32_t authored_count,
     const uint8_t* __restrict__ mesh_contact_mode,
     const math::Transform* __restrict__ body_pose,
     const math::Vec3* __restrict__ linear_velocity,
@@ -286,16 +288,20 @@ __global__ void PairDrivenNarrowphaseKernel(
         sa = LoadPrimShape(shape_table, a);
         sb = LoadPrimShape(shape_table, b);
         const float* profiles = mat_buckets + size_t{env} * num_material_buckets * nk::kContactProfileWordCount;
-        const uint32_t source_a = __float_as_uint(profiles[
-            size_t{sa.contact_profile_index} * nk::kContactProfileWordCount + nk::kContactProfileLawSource]);
-        const uint32_t source_b = __float_as_uint(profiles[
-            size_t{sb.contact_profile_index} * nk::kContactProfileWordCount + nk::kContactProfileLawSource]);
+        // An authored pair's single profile replaces both shape profiles.
+        const uint32_t authored = AuthoredPairProfile(authored_keys, authored_profiles, authored_count, a, b);
+        const float* profile_a = profiles +
+            size_t{authored != ~0u ? authored : sa.contact_profile_index} * nk::kContactProfileWordCount;
+        const float* profile_b = profiles +
+            size_t{authored != ~0u ? authored : sb.contact_profile_index} * nk::kContactProfileWordCount;
+        const uint32_t source_a = __float_as_uint(profile_a[nk::kContactProfileLawSource]);
+        const uint32_t source_b = __float_as_uint(profile_b[nk::kContactProfileLawSource]);
         if (source_a == static_cast<uint32_t>(constraint::LawSource::MuJoCo) ||
             source_b == static_cast<uint32_t>(constraint::LawSource::MuJoCo))
             law = nk::kContactLawCompliant;
-        const float* profile_a = profiles + size_t{sa.contact_profile_index} * nk::kContactProfileWordCount;
-        const float* profile_b = profiles + size_t{sb.contact_profile_index} * nk::kContactProfileWordCount;
-        if (law == nk::kContactLawCompliant)
+        if (law == nk::kContactLawCompliant && authored != ~0u)
+            query_margin = profile_a[nk::kContactProfileMargin] + profile_a[nk::kContactProfileGap];
+        else if (law == nk::kContactLawCompliant)
             query_margin = profile_a[nk::kContactProfileMargin] + profile_b[nk::kContactProfileMargin] +
                            profile_a[nk::kContactProfileGap] + profile_b[nk::kContactProfileGap];
         const auto route = RouteMeshContact(sa.kind, sb.kind, mesh_contact_mode[a],
@@ -433,7 +439,10 @@ Status LaunchPairDrivenNarrowphase(const ModelView& model, const DataView& data,
                    dim3(blocks), dim3(kBlock), 0u, stream,
                    data.candidate_pairs, data.pair_count,
                    static_cast<const float*>(model.shape_table),
-                   static_cast<const float*>(data.mat_buckets), p.num_material_buckets, model.mesh_contact_mode,
+                   static_cast<const float*>(data.mat_buckets), p.num_material_buckets,
+                   static_cast<const uint64_t*>(model.contact_pair_keys),
+                   static_cast<const uint32_t*>(model.contact_pair_profiles), p.contact_pairs,
+                   model.mesh_contact_mode,
                    static_cast<const math::Transform*>(data.body_pose),
                    data.body_linear_velocity, data.body_angular_velocity,
                    data.body_aabb_lo, data.body_aabb_hi, data.dat_body_motion,

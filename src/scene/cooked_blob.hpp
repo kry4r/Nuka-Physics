@@ -68,6 +68,8 @@ struct CookedShapeTable {
     // Index into the shared triangle geometry table; primitives have no entry.
     std::vector<uint32_t>        convex_geometry_indices;
     std::vector<uint8_t>         mesh_contact_modes;
+    // The SceneIR shape each row was cooked from; a decomposed mesh repeats its id.
+    std::vector<ShapeId>         source_ids;
 };
 
 // Shared geometry for convex pieces and authored triangle meshes.

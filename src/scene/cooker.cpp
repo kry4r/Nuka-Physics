@@ -445,6 +445,7 @@ void PushShapeRow(CookedShapeTable& shapes,
     shapes.half_heights.push_back(src.half_height);
     shapes.convex_geometry_indices.push_back(convex_geometry_index);
     shapes.mesh_contact_modes.push_back(static_cast<uint8_t>(src.mesh_contact));
+    shapes.source_ids.push_back(src.id);
 
     // Parallel contact-param row (copied verbatim except the resolved friction).
     contact_params.contypes.push_back(src.contype);
@@ -545,13 +546,19 @@ void BuildFilteredPairPolicy(const SceneIR& scene, CookedBlob& blob) {
         ep.geom1 = ov.geom1;
         ep.geom2 = ov.geom2;
         if (ep.geom2 < ep.geom1) std::swap(ep.geom1, ep.geom2);  // canonical
-        ep.params.condim      = ov.condim;
-        ep.params.friction_mu = ov.friction_mu;
-        ep.params.solref[0]   = ov.solref[0];
-        ep.params.solref[1]   = ov.solref[1];
+        // The contact profile carries one rolling coefficient for both tangent axes.
+        if (ov.friction[4] != ov.friction[3])
+            throw std::runtime_error("Contact pair rolling friction must be equal about both tangent axes");
+        ep.params.condim        = ov.condim;
+        ep.params.mu1           = ov.friction[0];
+        ep.params.mu2           = ov.friction[1];
+        ep.params.friction_spin = ov.friction[2];
+        ep.params.friction_roll = ov.friction[3];
+        for (int k = 0; k < 2; ++k) ep.params.solref[k] = ov.solref[k];
+        for (int k = 0; k < 2; ++k) ep.params.solreffriction[k] = ov.solreffriction[k];
         for (int k = 0; k < 5; ++k) ep.params.solimp[k] = ov.solimp[k];
-        ep.params.margin      = ov.margin;
-        ep.params.gap         = ov.gap;
+        ep.params.margin        = ov.margin;
+        ep.params.gap           = ov.gap;
         explicit_pairs.push_back(ep);
     }
     std::sort(explicit_pairs.begin(), explicit_pairs.end(),

@@ -72,6 +72,8 @@ __device__ bool OgcBodyPairAllowed(const OgcDetectParams& p,
     if (nkops::RouteMeshContact(sa.kind, sb.kind, model.mesh_contact_mode[a],
                                 model.mesh_contact_mode[b]) != nkops::MeshContactRoute::Ogc)
         return false;
+    if (nkops::AuthoredPairProfile(model.contact_pair_keys, model.contact_pair_profiles, p.contact_pairs, a, b) != ~0u)
+        return true;
     if (((sa.contype & sb.conaffinity) | (sb.contype & sa.conaffinity)) == 0u)
         return false;
     const int32_t ga = static_cast<int32_t>(sa.group);
@@ -157,10 +159,17 @@ __device__ float OgcBodyFriction(const ModelView& model, const DataView& data,
                             nk::kContactProfileWordCount + nk::kContactProfileMu1];
 }
 
-__device__ float OgcPairFriction(bool source_particle, bool target_particle,
-                                 float source_mu, float target_mu) {
+// Two bodies under an authored pair slide with the pair's coefficient.
+__device__ float OgcPairFriction(const OgcDetectParams& p, const ModelView& model, const DataView& data,
+                                 uint32_t env, bool source_particle, bool target_particle,
+                                 uint32_t source_owner, uint32_t target_owner, float source_mu, float target_mu) {
     if (source_particle != target_particle) return scene::ParticleBodyFriction(
         source_particle ? source_mu : target_mu, source_particle ? target_mu : source_mu);
+    const uint32_t authored = source_particle ? ~0u : nkops::AuthoredPairProfile(
+        model.contact_pair_keys, model.contact_pair_profiles, p.contact_pairs, source_owner, target_owner);
+    if (authored != ~0u)
+        return data.mat_buckets[(size_t{env} * p.num_material_buckets + authored) *
+                                nk::kContactProfileWordCount + nk::kContactProfileMu1];
     return fmaxf(source_mu, target_mu);
 }
 
@@ -470,7 +479,8 @@ __global__ void OgcMixedVertexFaceKernel(OgcDetectParams p, ModelView model, Dat
             OgcEmitMixedFace(p, model, data, env, ordinal, a.particle,
                 env * p.particles_per_env + particle, a.owner, c.source, b.particle, b.owner, b.owner,
                 b.view, b.info, c.target, source, b.particle ? source_radius + face.half_thickness : radius,
-                OgcPairFriction(a.particle, b.particle, a.particle ? model.particle_friction[particle] : a.friction,
+                OgcPairFriction(p, model, data, env, a.particle, b.particle, a.owner, b.owner,
+                    a.particle ? model.particle_friction[particle] : a.friction,
                     b.particle ? face.friction : b.friction), feature);
         });
     }
@@ -638,7 +648,7 @@ __global__ void OgcMixedEdgeEdgeKernel(OgcDetectParams p, ModelView model, DataV
             const uint32_t ordinal = OgcClaimSlot(p, data, env);
             if (ordinal < p.slot_capacity) OgcEmitMixedEdge(p, model, data, env, ordinal, a.particle,
                 a.owner, a.owner, c.source, b.owner, c.target, edge_a, contact_radius,
-                OgcPairFriction(a.particle, false, mu, b.friction), contact);
+                OgcPairFriction(p, model, data, env, a.particle, false, a.owner, b.owner, mu, b.friction), contact);
         });
     }
 }

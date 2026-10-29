@@ -235,6 +235,7 @@ struct LbvhQueryPairsParams {
     uint32_t max_contacts_per_env;  // candidate_pairs slot stride / env
     uint32_t filter_cross_env;  // 1 => drop pairs spanning envs (env-major)
     uint32_t excluded_count;    // sorted exclude-list length (excluded_pairs)
+    uint32_t contact_pair_count = 0u;  // authored pair key count (contact_pair_keys)
     // Rigid emission cap (<= the slot stride): body<->body pairs fill only
     // [0, rigid_slot_cap); the body<->particle narrowphase owns [rigid_slot_cap,
     // stride). Equals the stride when no particles -> byte-identical.
@@ -293,6 +294,7 @@ struct OgcDetectParams {
     uint32_t mesh_edges = 0u;
     uint32_t mesh_edge_nodes = 0u;
     uint32_t excluded_pairs = 0u;
+    uint32_t contact_pairs = 0u;
     uint32_t slot_stride = 0u;
     uint32_t slot_base = 0u;
     uint32_t slot_capacity = 0u;
@@ -331,6 +333,7 @@ struct DatTruncateParams {
     uint32_t mesh_vertex_sources = 0u;
     uint32_t mesh_edge_sources = 0u;
     uint32_t excluded_pairs = 0u;
+    uint32_t contact_pairs = 0u;
     uint32_t slot_stride = 0u;
     uint32_t slot_base = 0u;
     uint32_t slot_capacity = 0u;
@@ -413,6 +416,7 @@ inline constexpr uint32_t kContactFamilyPairDriven = 2u;
 struct NarrowphasePrimitivesParams {
     float contact_margin;
     uint32_t num_material_buckets;
+    uint32_t contact_pairs = 0u;  // authored pair key count (contact_pair_keys)
     float dt = 0.0f;
     uint8_t max_contacts_per_pair;
     // first batch (foot sphere x ground plane, the production Go2/H1 path):
@@ -597,6 +601,7 @@ struct AssembleRowsParams {
     uint32_t cone;
     uint32_t particles_per_env; // particle coupling (kUSlotParticleSphere*).
     uint32_t num_material_buckets;  // 0 == no authored materials -> model defaults.
+    uint32_t contact_pairs = 0u;    // authored pair key count (contact_pair_keys)
     // Cap on the contact normal aref so a deep contact recovers over several steps,
     // not in one fling. +inf default == non-binding (byte-identical). Model property.
     float    baumgarte_max_velocity;

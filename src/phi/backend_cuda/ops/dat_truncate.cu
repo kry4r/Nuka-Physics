@@ -159,6 +159,8 @@ __device__ bool DatBodyPairAllowed(DatTruncateParams p, ModelView model,
     if (route != nkops::MeshContactRoute::Ogc && !(include_convex &&
         route == nkops::MeshContactRoute::Analytic && collision::TakesConvexManifold(sa.kind, sb.kind)))
         return false;
+    if (nkops::AuthoredPairProfile(model.contact_pair_keys, model.contact_pair_profiles, p.contact_pairs, a, b) != ~0u)
+        return true;
     if (((sa.contype & sb.conaffinity) | (sb.contype & sa.conaffinity)) == 0u)
         return false;
     const int32_t ga = static_cast<int32_t>(sa.group);

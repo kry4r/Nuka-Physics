@@ -350,22 +350,6 @@ void ApplyGeneralDefault(tinyxml2::XMLElement* general_elem, MjcfDefaultClass* d
         defaults->general.affine = std::string(bias) == "affine";
 }
 
-// Read the first component of a MuJoCo `friction` list (slide,spin,roll[,...]).
-// MuJoCo geom/pair friction is a vector; v0.8 models tangential friction as a
-// single isotropic μ, so we take ONLY friction[0] and DROP the spin/roll (and
-// any further) components. Returns true if at least one value was present.
-bool ParseFrictionFirst(const char* text, float& out_mu) {
-    if (!text) {
-        return false;
-    }
-    float v;
-    if (ParseFloatList(text, &v, 1) == 1) {
-        out_mu = v;
-        return true;
-    }
-    return false;
-}
-
 // Read the C1b contact attributes from a <default>'s <geom> child into the
 // class's geom-default struct, setting the matching has_* flag for each attr
 // that is actually present (absent attrs leave both the value and flag alone, so
@@ -1660,9 +1644,9 @@ void ParseContact(tinyxml2::XMLElement* mujoco,
         pair->QueryFloatAttribute("margin", &ov.margin);
         pair->QueryFloatAttribute("gap", &ov.gap);
         ParseFloatList(pair->Attribute("solref"), ov.solref, 2);
+        ParseFloatList(pair->Attribute("solreffriction"), ov.solreffriction, 2);
         ParseFloatList(pair->Attribute("solimp"), ov.solimp, 5);
-        // friction: first (isotropic tangential) component only; spin/roll dropped.
-        ParseFrictionFirst(pair->Attribute("friction"), ov.friction_mu);
+        ParseFloatList(pair->Attribute("friction"), ov.friction, 5);
         scene.AddContactPair(ov);
     }
 }

@@ -315,6 +315,9 @@ __global__ void EnvQueryPairsKernel(const cg::LbvhNode* __restrict__ nodes,
                                     const float* __restrict__ shape_table,
                                     const uint64_t* __restrict__ excluded,
                                     uint32_t excluded_count,
+                                    const uint64_t* __restrict__ pair_keys,
+                                    const uint32_t* __restrict__ pair_profiles,
+                                    uint32_t pair_count,
                                     uint32_t bodies_per_env,
                                     uint32_t slot_stride,
                                     uint32_t rigid_slot_cap,
@@ -361,13 +364,16 @@ __global__ void EnvQueryPairsKernel(const cg::LbvhNode* __restrict__ nodes,
                     // pair so static terrain never consumes the candidate/row budget
                     // against another static.
                     if (sa.body_id < 0 && sb.body_id < 0) continue;
-                    if (!collision::ShapeFilterAdmits(sa.contype, sa.conaffinity, sa.group,
-                                                      sb.contype, sb.conaffinity, sb.group)) continue;
                     const uint32_t a32 = static_cast<uint32_t>(my_body);
                     const uint32_t b32 = static_cast<uint32_t>(ob);
+                    // An authored pair bypasses the shape filter and the exclude list.
+                    const bool authored =
+                        nkops::AuthoredPairProfile(pair_keys, pair_profiles, pair_count, a32, b32) != ~0u;
+                    if (!authored && !collision::ShapeFilterAdmits(sa.contype, sa.conaffinity, sa.group,
+                                                                   sb.contype, sb.conaffinity, sb.group)) continue;
                     const uint64_t key =
                         (static_cast<uint64_t>(a32) << 32) | static_cast<uint64_t>(b32);
-                    if (excluded_count > 0u &&
+                    if (!authored && excluded_count > 0u &&
                         IsExcluded(excluded, excluded_count, key)) {
                         continue;
                     }
@@ -404,6 +410,9 @@ __global__ void EnvAllPairsKernel(const math::Vec3* __restrict__ aabb_lo,
                                   const float* __restrict__ shape_table,
                                   const uint64_t* __restrict__ excluded,
                                   uint32_t excluded_count,
+                                  const uint64_t* __restrict__ pair_keys,
+                                  const uint32_t* __restrict__ pair_profiles,
+                                  uint32_t pair_count,
                                   uint32_t bodies_per_env,
                                   uint32_t slot_stride,
                                   uint32_t rigid_slot_cap,
@@ -430,10 +439,12 @@ __global__ void EnvAllPairsKernel(const math::Vec3* __restrict__ aabb_lo,
             const ShapeDev sa = LoadShape(shape_table, a32);
             const ShapeDev sb = LoadShape(shape_table, b32);
             const uint64_t key = (static_cast<uint64_t>(a32) << 32) | static_cast<uint64_t>(b32);
+            const bool authored =
+                nkops::AuthoredPairProfile(pair_keys, pair_profiles, pair_count, a32, b32) != ~0u;
             emit = !(sa.body_id < 0 && sb.body_id < 0) &&
-                   collision::ShapeFilterAdmits(sa.contype, sa.conaffinity, sa.group,
-                                                sb.contype, sb.conaffinity, sb.group) &&
-                   !(excluded_count > 0u && IsExcluded(excluded, excluded_count, key));
+                   (authored || (collision::ShapeFilterAdmits(sa.contype, sa.conaffinity, sa.group,
+                                                              sb.contype, sb.conaffinity, sb.group) &&
+                                 !(excluded_count > 0u && IsExcluded(excluded, excluded_count, key))));
         }
     }
     const uint32_t lanes = __ballot_sync(~0u, emit);
@@ -599,14 +610,18 @@ Status OpLbvhQueryPairs(const ModelView& model, const DataView& data,
                    stream, static_cast<const math::Vec3*>(data.body_aabb_lo),
                    static_cast<const math::Vec3*>(data.body_aabb_hi), static_cast<const float*>(model.shape_table),
                    static_cast<const uint64_t*>(model.excluded_pairs),
-                   p->excluded_count, N, p->max_contacts_per_env, p->rigid_slot_cap,
+                   p->excluded_count, static_cast<const uint64_t*>(model.contact_pair_keys),
+                   static_cast<const uint32_t*>(model.contact_pair_profiles), p->contact_pair_count,
+                   N, p->max_contacts_per_env, p->rigid_slot_cap,
                    p->max_pairs, data.candidate_pairs, data.pair_count, data.env_status);
     } else {
         LaunchCuda(EnvQueryPairsKernel, dim3((N + kBlockSize - 1u) / kBlockSize, E), dim3(kBlockSize), 0u, stream,
                    reinterpret_cast<const cg::LbvhNode*>(data.lbvh_nodes),
                    static_cast<const float*>(model.shape_table),
                    static_cast<const uint64_t*>(model.excluded_pairs),
-                   p->excluded_count, N, p->max_contacts_per_env, p->rigid_slot_cap,
+                   p->excluded_count, static_cast<const uint64_t*>(model.contact_pair_keys),
+                   static_cast<const uint32_t*>(model.contact_pair_profiles), p->contact_pair_count,
+                   N, p->max_contacts_per_env, p->rigid_slot_cap,
                    p->max_pairs, data.candidate_pairs, data.pair_count, data.env_status);
     }
     // Canonicalize the emitted stream: the atomicAdd slot claim above orders

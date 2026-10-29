@@ -30,6 +30,7 @@ struct ContactParamsIn {
     float   margin      = 0.0f;
     float   gap         = 0.0f;
     float   friction_stiffness = -1.0f;
+    float   solreffriction[2] = {0.0f, 0.0f};
 };
 
 // The MERGE OUTPUT: a single resolved contact-parameter set (no priority/solmix;
@@ -45,6 +46,8 @@ struct MergedContactParams {
     float   margin      = 0.0f;
     float   gap         = 0.0f;
     float   friction_stiffness = -1.0f;
+    // Elliptic friction rows use this reference unless both entries are zero.
+    float   solreffriction[2] = {0.0f, 0.0f};
 };
 
 // --- tiny HD arithmetic (avoid <algorithm> / std:: in the device path) -----
@@ -55,6 +58,23 @@ NUKA_CF_HD inline float CfMinF(float a, float b) { return (a < b) ? a : b; }
 NUKA_CF_HD inline bool PassesContactBitmask(uint32_t contypeA, uint32_t conaffA,
                                             uint32_t contypeB, uint32_t conaffB) {
     return ((contypeA & conaffB) != 0u) || ((contypeB & conaffA) != 0u);
+}
+
+// An authored pair's parameters apply as they stand, without mixing.
+NUKA_CF_HD inline MergedContactParams AuthoredContactParams(const ContactParamsIn& P) {
+    MergedContactParams out;
+    out.condim = P.condim;
+    out.friction_mu = P.friction_mu;
+    out.mu2 = P.mu2;
+    out.friction_spin = P.friction_spin;
+    out.friction_roll = P.friction_roll;
+    for (int i = 0; i < 2; ++i) out.solref[i] = P.solref[i];
+    for (int i = 0; i < 5; ++i) out.solimp[i] = P.solimp[i];
+    out.margin = P.margin;
+    out.gap = P.gap;
+    out.friction_stiffness = P.friction_stiffness;
+    for (int i = 0; i < 2; ++i) out.solreffriction[i] = P.solreffriction[i];
+    return out;
 }
 
 // Unauthored pairs mix references by priority and solmix; margins and gaps add across shapes.

@@ -65,7 +65,8 @@ bool CanonicalizeContactProfileForUpload(const ModelMaterialBucket& source,
     float* values[] = {&p.mu1, &p.mu2, &p.solref[0], &p.solref[1],
                        &p.solimp[0], &p.solimp[1], &p.solimp[2],
                        &p.solimp[3], &p.solimp[4], &p.solmix,
-                       &p.margin, &p.gap, &p.friction_stiffness};
+                       &p.margin, &p.gap, &p.friction_stiffness,
+                       &p.solreffriction[0], &p.solreffriction[1]};
     for (float* value : values) {
         if (!std::isfinite(*value)) return false;
         *value = CanonicalZero(*value);
@@ -269,6 +270,9 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         }
         if (id == FieldId::ExcludedPairs) {
             return static_cast<uint64_t>(max_excluded_pairs);
+        }
+        if (id == FieldId::ContactPairKeys || id == FieldId::ContactPairProfiles) {
+            return static_cast<uint64_t>(max_contact_pairs);
         }
         if (id == FieldId::SampPoints) {
             return static_cast<uint64_t>(max_samp_points) * 3ull;
@@ -830,6 +834,16 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             }
             break;
         }
+        case FieldId::ContactPairKeys: {
+            if (!contact_pair_keys.empty())
+                std::memcpy(dst, contact_pair_keys.data(), contact_pair_keys.size() * sizeof(uint64_t));
+            break;
+        }
+        case FieldId::ContactPairProfiles: {
+            if (!contact_pair_profiles.empty())
+                std::memcpy(dst, contact_pair_profiles.data(), contact_pair_profiles.size() * sizeof(uint32_t));
+            break;
+        }
         case FieldId::SampPoints: {
             if (!samp_points.empty()) {
                 const size_t n = std::min(samp_points.size(),
@@ -1174,6 +1188,8 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::MeshVertexReach: v.mesh_vertex_reach = static_cast<float*>(p); break;
         case FieldId::ShapeTable:            v.shape_table = static_cast<float*>(p); break;
         case FieldId::ExcludedPairs:         v.excluded_pairs = static_cast<uint64_t*>(p); break;
+        case FieldId::ContactPairKeys:       v.contact_pair_keys = static_cast<uint64_t*>(p); break;
+        case FieldId::ContactPairProfiles:   v.contact_pair_profiles = static_cast<uint32_t*>(p); break;
         case FieldId::SampPoints:            v.samp_points = static_cast<float*>(p); break;
         case FieldId::SampRanges:            v.samp_ranges = static_cast<uint32_t*>(p); break;
         case FieldId::SdfHeaders:            v.sdf_headers = static_cast<float*>(p); break;
@@ -1900,6 +1916,8 @@ void MoveModelMembers(Model& dst, Model&& src) {
     // M5 pair-driven / SDF tables (review fix: these were MISSING — a moved
     // Model silently dropped every pair-driven collision table, staging zeros).
     dst.excluded_pairs = std::move(src.excluded_pairs);
+    dst.contact_pair_keys = std::move(src.contact_pair_keys);
+    dst.contact_pair_profiles = std::move(src.contact_pair_profiles);
     dst.shape_table_rows = std::move(src.shape_table_rows);
     dst.samp_points = std::move(src.samp_points);
     dst.samp_ranges = std::move(src.samp_ranges);

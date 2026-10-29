@@ -70,6 +70,8 @@ __device__ scene::ContactParamsIn ReadContactProfile(
     out.priority = static_cast<int32_t>(__float_as_uint(w[nk::kContactProfilePriority]));
     out.condim = static_cast<uint8_t>(__float_as_uint(w[nk::kContactProfileCondim]));
     out.friction_stiffness = w[nk::kContactProfileFrictionStiffness];
+    out.solreffriction[0] = w[nk::kContactProfileFrictionSolref0];
+    out.solreffriction[1] = w[nk::kContactProfileFrictionSolref1];
     return out;
 }
 
@@ -93,6 +95,8 @@ __device__ uint64_t HashMergedContactProfile(const scene::MergedContactParams& p
     hash = HashContactProfileWord(hash, __float_as_uint(p.gap));
     hash = HashContactProfileWord(hash, p.condim);
     if (p.friction_stiffness >= 0.0f) hash = HashContactProfileWord(hash, __float_as_uint(p.friction_stiffness));
+    if (p.solreffriction[0] != 0.0f || p.solreffriction[1] != 0.0f)
+        for (uint32_t i = 0u; i < 2u; ++i) hash = HashContactProfileWord(hash, __float_as_uint(p.solreffriction[i]));
     return hash == 0u ? 0x9e3779b97f4a7c15ull : hash;
 }
 
@@ -407,6 +411,9 @@ __global__ void EmitPairDrivenRowsKernel(
     const float* __restrict__ body_invweight0,
     const float* __restrict__ mat_buckets,
     uint32_t num_material_buckets,
+    const uint64_t* __restrict__ pair_keys,
+    const uint32_t* __restrict__ pair_profiles,
+    uint32_t pair_count,
     uint64_t* __restrict__ contact_material,
     uint32_t particles_per_env, uint32_t grid_nodes_per_env,
     uint32_t endpoints_per_env, uint32_t terms_per_env,
@@ -533,7 +540,15 @@ __global__ void EmitPairDrivenRowsKernel(
         side_a = DefaultProfile(endpoint_mu, solref0, solref1, default_solimp);
     if (kind_b == kNkSideGrid || kind_b == kNkSidePointEndpoint || side_kind_b == nk::kUContactSideBoundary)
         side_b = DefaultProfile(endpoint_mu, solref0, solref1, default_solimp);
-    scene::MergedContactParams merged = scene::MergeContactParams(side_a, side_b);
+    // An authored pair between two shapes applies its own profile instead of mixing the shapes'.
+    const uint32_t authored = side_kind_a == nk::kUContactSideBody && side_kind_b == nk::kUContactSideBody &&
+                              local_a < bodies_per_env && local_b < bodies_per_env
+        ? AuthoredPairProfile(pair_keys, pair_profiles, pair_count, local_a, local_b) : ~0u;
+    scene::MergedContactParams merged = authored != ~0u
+        ? scene::AuthoredContactParams(ReadContactProfile(
+              mat_buckets + size_t{env} * num_material_buckets * nk::kContactProfileWordCount,
+              num_material_buckets, authored, default_profile))
+        : scene::MergeContactParams(side_a, side_b);
     if (mujoco) {
         merged.mu1 = fmaxf(1.0e-5f, merged.mu1);
         merged.mu2 = fmaxf(1.0e-5f, merged.mu2);
@@ -570,6 +585,10 @@ __global__ void EmitPairDrivenRowsKernel(
         frame_axis = PrimRotate(body_pose[env * bodies_per_env + local_b].rotation, math::Vec3{0.0f, 0.0f, 1.0f});
     // The slope's elliptic tangent reference: timeconst 2 / (kf invweight ((1 - dmax) / impratio + dmax)).
     float friction_reference[2] = {solref[0], solref[1]};
+    if (mujoco && cone == 1u && (merged.solreffriction[0] != 0.0f || merged.solreffriction[1] != 0.0f)) {
+        friction_reference[0] = merged.solreffriction[0];
+        friction_reference[1] = merged.solreffriction[1];
+    }
     if (friction_slope && merged.friction_stiffness > 0.0f) {
         const float denominator = merged.friction_stiffness * invweight *
             ((1.0f - solimp[1]) / impratio + solimp[1]);
@@ -1538,7 +1557,10 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    model.link_body,
                    model.body_invweight0,
                    static_cast<const float*>(data.mat_buckets),
-                   p->num_material_buckets, data.contact_material,
+                   p->num_material_buckets,
+                   static_cast<const uint64_t*>(model.contact_pair_keys),
+                   static_cast<const uint32_t*>(model.contact_pair_profiles), p->contact_pairs,
+                   data.contact_material,
                    p->particles_per_env, p->grid_nodes_per_env,
                    p->point_endpoints_per_env, p->point_endpoint_terms_per_env,
                    data.point_endpoint_ranges, data.point_endpoint_terms,

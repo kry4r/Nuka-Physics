@@ -106,6 +106,7 @@ struct ModelCapacities {
     // for a scene with no SdfMesh collision shape (the union scene).
     uint32_t max_bodies_total     = 0;  // collidable body rows / env (shape_table).
     uint32_t max_excluded_pairs   = 0;  // cooked filter exclude-list length.
+    uint32_t max_contact_pairs    = 0;  // authored contact pair count.
     uint32_t max_samp_points      = 0;  // SDF sampling-point pool size.
     uint32_t max_sdf_grids        = 0;  // cooked sparse-SDF grid count.
     uint32_t max_sdf_cells        = 0;  // total cooked narrow-band SDF cells.
@@ -492,6 +493,9 @@ public:
     // list (staged into the excluded_pairs field) for the pair-driven query.
     bool filter_cross_env = false;
     std::vector<uint64_t> excluded_pairs;   // SORTED ascending canonical keys.
+    // Authored contact pairs: SORTED canonical row keys, each with its contact profile.
+    std::vector<uint64_t> contact_pair_keys;
+    std::vector<uint32_t> contact_pair_profiles;
 
     // -- M5: pair-driven generalized collision tables (the union slot-template
     // family leaves these empty). shape_table_rows: one PairDrivenShape per
