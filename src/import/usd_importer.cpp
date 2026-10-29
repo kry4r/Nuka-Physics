@@ -1174,6 +1174,8 @@ bool SceneBuilder::ReadD6(const PrimData& prim, Joint& joint) {
         joint.drive = kDofNames[dof];
     } else if (free.size() == 3u && rotations == 3) {
         joint.type = scene::JointType::Spherical;
+    } else if (free.size() == 6u) {
+        joint.type = scene::JointType::Free;
     } else {
         std::string list;
         for (const std::string& n : names) {
@@ -1257,7 +1259,8 @@ void SceneBuilder::ReadJoint(size_t index) {
     } else if (prim.type == "PhysicsFixedJoint") {
         joint.type = scene::JointType::Fixed;
     } else if (prim.type == "PhysicsJoint") {
-        if (!ReadD6(prim, joint)) {
+        // A joint that frees all six axes constrains nothing; its bodies move on their own.
+        if (!ReadD6(prim, joint) || joint.type == scene::JointType::Free) {
             return;
         }
     } else {
