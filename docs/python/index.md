@@ -139,6 +139,19 @@ Physical state and control fields use float32; indices, counts and status flags 
 `nuka.Field` lists them all, including the solver and contact diagnostics. Downloads and DLPack views
 retain each field's dtype.
 
+Contact geometry can be captured through `DiagnosticSession(state_fields=...)` using
+`UCONTACT_COUNT`, `UCONTACT_POINT`, `UCONTACT_NORMAL`, `UCONTACT_DEPTH`,
+`UCONTACT_WITNESS_A`, `UCONTACT_WITNESS_B`, `UCONTACT_LAW` and `UCONTACT_FRICTION`.
+Each slot reserves four points; only its first `UCONTACT_COUNT` entries are valid.
+Normals point toward side A and depths are signed metres (positive for overlap). OGC witnesses are
+world positions on each side's geometry; other detectors do not define these witness fields.
+Law values are available as `nuka.ContactLaw`: `COMPLIANT` (`0`), `VELOCITY` (`1`) and
+`SPECULATIVE` (`2`). Detector friction overrides are defined for OGC and MPM contacts; the solver
+can instead obtain friction from a mixed or authored contact profile.
+These records describe the geometry used to assemble the step's constraints, before integration.
+Check contact sampling, force laws and time integration before judging a reference trajectory;
+a scene's final-state check alone does not establish matching physical inputs.
+
 ## Control modes
 
 `control_mode` at creation picks how joints are driven:

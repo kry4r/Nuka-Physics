@@ -3,6 +3,7 @@
 #include "collision/dat_geometry.hpp"
 #include "collision/ogc_geometry.hpp"
 #include "nk/contact/contact_profile.hpp"
+#include "nk/solve/point_endpoint.hpp"
 #include "scene/contact_filter.hpp"
 #include "phi/backend_cuda/ops/dat_chain.cuh"
 #include "phi/backend_cuda/ops/prims_types.cuh"
@@ -60,6 +61,68 @@ __device__ collision::MeshSurfaceView OgcBodyView(
     return {model.hull_verts, model.mesh_triangles, model.mesh_bvh_nodes,
             {p.mesh_vertices, p.mesh_triangles, p.mesh_nodes},
             pose.position, pose.rotation, true};
+}
+
+// Surface impulses include the rotational velocity of their offset from the triangle midsurface.
+__device__ bool OgcTriangleEndpoint(const OgcDetectParams& p, const ModelView& model, DataView data,
+    uint32_t env, const collision::MeshSurfaceInfo& info, uint32_t triangle, math::Vec3 barycentric,
+    math::Vec3 point, uint32_t endpoint, uint32_t first) {
+    const size_t at = (size_t{info.triangle_offset} + triangle) * nk::kTriangleEndpointTerms;
+    uint32_t indices[nk::kTriangleEndpointTerms];
+    math::Vec3 vertices[nk::kTriangleEndpointTerms];
+    for (uint32_t j = 0u; j < nk::kTriangleEndpointTerms; ++j) {
+        indices[j] = env * p.particles_per_env + info.vertex_offset + model.particle_surface_triangles[at + j];
+        vertices[j] = data.particle_pos[indices[j]];
+    }
+    if (!nk::BuildTrianglePointEndpoint(indices, vertices, barycentric, point, data.point_endpoint_terms + first)) {
+        atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
+        return false;
+    }
+    const uint32_t count = nk::CanonicalizePointEndpointTerms(data.point_endpoint_terms + first,
+                                                            nk::kTriangleEndpointTerms);
+    data.point_endpoint_ranges[endpoint] = {first, count};
+    return true;
+}
+
+__device__ bool OgcEdgeEndpoint(const OgcDetectParams& p, const ModelView& model, DataView data,
+    uint32_t env, const collision::MeshSurfaceInfo& info, const collision::MeshEdge& edge, float weight,
+    math::Vec3 point, uint32_t endpoint, uint32_t first) {
+    if (edge.triangle0 < info.triangle_count) {
+        const size_t at = (size_t{info.triangle_offset} + edge.triangle0) * nk::kTriangleEndpointTerms;
+        math::Vec3 barycentric{};
+        float* weights = &barycentric.x;
+        for (uint32_t j = 0u; j < nk::kTriangleEndpointTerms; ++j) {
+            const uint32_t vertex = model.particle_surface_triangles[at + j];
+            weights[j] = vertex == edge.vertex0 ? 1.0f - weight : vertex == edge.vertex1 ? weight : 0.0f;
+        }
+        return OgcTriangleEndpoint(p, model, data, env, info, edge.triangle0, barycentric, point, endpoint, first);
+    }
+    const uint32_t vertices[2] = {edge.vertex0, edge.vertex1};
+    for (uint32_t j = 0u; j < 2u; ++j)
+        data.point_endpoint_terms[first + j] = nk::WeightedPointEndpointTerm(nk::kNkSideParticle,
+            env * p.particles_per_env + info.vertex_offset + vertices[j], j == 0u ? 1.0f - weight : weight);
+    const uint32_t count = nk::CanonicalizePointEndpointTerms(data.point_endpoint_terms + first, 2u);
+    data.point_endpoint_ranges[endpoint] = {first, count};
+    return true;
+}
+
+__device__ bool OgcVertexEndpoint(const OgcDetectParams& p, const ModelView& model, DataView data,
+    uint32_t env, const collision::MeshSurfaceInfo& info, uint32_t vertex, math::Vec3 point,
+    uint32_t endpoint, uint32_t first) {
+    const uint32_t local = info.vertex_offset + vertex;
+    for (uint32_t i = model.particle_surface_vertex_triangle_offsets[local];
+         i < model.particle_surface_vertex_triangle_offsets[local + 1u]; ++i) {
+        const uint32_t entry = model.particle_surface_vertex_triangles[i];
+        const uint32_t triangle = (entry >> 2u) - info.triangle_offset;
+        if (triangle >= info.triangle_count || (entry & 3u) >= nk::kTriangleEndpointTerms) continue;
+        math::Vec3 barycentric{};
+        (&barycentric.x)[entry & 3u] = 1.0f;
+        return OgcTriangleEndpoint(p, model, data, env, info, triangle, barycentric, point, endpoint, first);
+    }
+    data.point_endpoint_terms[first] = nk::WeightedPointEndpointTerm(
+        nk::kNkSideParticle, env * p.particles_per_env + local, 1.0f);
+    data.point_endpoint_ranges[endpoint] = {first, 1u};
+    return true;
 }
 
 __device__ bool OgcBodyPairAllowed(const OgcDetectParams& p,
@@ -223,7 +286,6 @@ __device__ void OgcEmitMixedFace(
     uint32_t env, uint64_t ordinal, bool source_particle,
     uint32_t source_index, uint32_t source_body, uint32_t source_vertex,
     bool target_particle, uint32_t target_index, uint32_t target_body,
-    const collision::MeshSurfaceView& target_view,
     const collision::MeshSurfaceInfo& target_info, uint32_t triangle,
     math::Vec3 source_point, float radius, float friction,
     const collision::OgcTriangleFeature& feature) {
@@ -242,23 +304,21 @@ __device__ void OgcEmitMixedFace(
     data.ucontact_a[at] = source_particle ? source_index : source_body;
     data.ucontact_a_kind[at] = source_particle
         ? nk::kUContactSideParticle : nk::kUContactSideBody;
+    if (source_particle && !target_particle) {
+        const uint32_t endpoint = env * p.point_endpoints_per_env + p.point_endpoint_first + ordinal * 2u;
+        const uint32_t first = env * p.point_endpoint_terms_per_env + p.point_endpoint_term_first + ordinal * 6u;
+        if (!OgcVertexEndpoint(p, model, data, env, model.particle_surface_info[source_body], source_vertex,
+                               feature.point, endpoint, first)) return;
+        data.ucontact_a[at] = endpoint;
+        data.ucontact_a_kind[at] = nk::kUContactSidePointEndpoint;
+    }
     if (target_particle) {
         const uint32_t endpoint = env * p.point_endpoints_per_env + p.point_endpoint_first +
                                   ordinal * 2u + 1u;
         const uint32_t first = env * p.point_endpoint_terms_per_env + p.point_endpoint_term_first +
                                ordinal * 6u + 3u;
-        const size_t tri_at = (size_t{target_info.triangle_offset} + triangle) * 3u;
-        const float weights[3] = {feature.barycentric.x, feature.barycentric.y,
-                                  feature.barycentric.z};
-        for (uint32_t j = 0u; j < 3u; ++j) {
-            const uint32_t particle = env * p.particles_per_env +
-                target_info.vertex_offset + target_view.triangles[tri_at + j];
-            data.point_endpoint_terms[first + j] =
-                nk::WeightedPointEndpointTerm(nk::kNkSideParticle, particle, weights[j]);
-        }
-        const uint32_t terms = nk::CanonicalizePointEndpointTerms(
-            data.point_endpoint_terms + first, 3u);
-        data.point_endpoint_ranges[endpoint] = {first, terms};
+        if (!OgcTriangleEndpoint(p, model, data, env, target_info, triangle,
+            feature.barycentric, source_point, endpoint, first)) return;
         data.ucontact_b[at] = endpoint;
         data.ucontact_b_kind[at] = nk::kUContactSidePointEndpoint;
     } else {
@@ -481,7 +541,7 @@ __global__ void OgcMixedVertexFaceKernel(OgcDetectParams p, ModelView model, Dat
                 : OgcParticleMaterial{};
             OgcEmitMixedFace(p, model, data, env, ordinal, a.particle,
                 env * p.particles_per_env + particle, a.owner, c.source, b.particle, b.owner, b.owner,
-                b.view, b.info, c.target, source, b.particle ? source_radius + face.half_thickness : radius,
+                b.info, c.target, source, b.particle ? source_radius + face.half_thickness : radius,
                 OgcPairFriction(p, model, data, env, a.particle, b.particle, a.owner, b.owner,
                     a.particle ? model.particle_friction[particle] : a.friction,
                     b.particle ? face.friction : b.friction), feature);
@@ -513,16 +573,8 @@ __device__ void OgcEmitMixedEdge(
         const uint32_t first = env * p.point_endpoint_terms_per_env + p.point_endpoint_term_first +
                                ordinal * 6u;
         const auto info = model.particle_surface_info[source_surface];
-        const uint32_t vertices[2] = {edge_a.vertex0, edge_a.vertex1};
-        for (uint32_t j = 0u; j < 2u; ++j) {
-            const uint32_t particle = env * p.particles_per_env + info.vertex_offset + vertices[j];
-            data.point_endpoint_terms[first + j] = nk::WeightedPointEndpointTerm(
-                nk::kNkSideParticle, particle,
-                j == 0u ? 1.0f - pair.weight_a : pair.weight_a);
-        }
-        const uint32_t terms = nk::CanonicalizePointEndpointTerms(
-            data.point_endpoint_terms + first, 2u);
-        data.point_endpoint_ranges[endpoint] = {first, terms};
+        if (!OgcEdgeEndpoint(p, model, data, env, info, edge_a, pair.weight_a,
+                             pair.point_b, endpoint, first)) return;
         data.ucontact_a[at] = endpoint;
         data.ucontact_a_kind[at] = nk::kUContactSidePointEndpoint;
     } else {

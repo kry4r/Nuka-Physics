@@ -909,8 +909,24 @@ typedef enum nuka_state_field_t {
     // Per particle, environment-major: APIC velocity gradient C (row-major, s^-1), rest volume (m^3), material ID.
     NUKA_FIELD_PARTICLE_AFFINE_VELOCITY = 125,
     NUKA_FIELD_PARTICLE_REST_VOLUME = 126,
-    NUKA_FIELD_PARTICLE_MATERIAL_ID = 127
+    NUKA_FIELD_PARTICLE_MATERIAL_ID = 127,
+    // READ: four world normals per contact slot, directed toward side A; entries below UCONTACT_COUNT are valid.
+    NUKA_FIELD_UCONTACT_NORMAL = 128,
+    // READ: four signed depths per contact slot (m); positive means overlap, negative means separation.
+    NUKA_FIELD_UCONTACT_DEPTH = 129,
+    // READ: four world geometry witnesses per OGC contact slot on side A and side B; undefined for other detectors.
+    NUKA_FIELD_UCONTACT_WITNESS_A = 130,
+    NUKA_FIELD_UCONTACT_WITNESS_B = 131,
+    // READ: per contact slot, nuka_contact_law_t and the detector's friction override (OGC and MPM contacts).
+    NUKA_FIELD_UCONTACT_LAW = 132,
+    NUKA_FIELD_UCONTACT_FRICTION = 133
 } nuka_state_field_t;
+
+typedef enum nuka_contact_law_t {
+    NUKA_CONTACT_LAW_COMPLIANT = 0,
+    NUKA_CONTACT_LAW_VELOCITY = 1,
+    NUKA_CONTACT_LAW_SPECULATIVE = 2
+} nuka_contact_law_t;
 
 typedef enum nuka_vbd_element_kind_t {
     NUKA_VBD_TRIANGLE = 0, NUKA_VBD_HINGE = 1, NUKA_VBD_SPRING = 2, NUKA_VBD_ROD_BEND = 3,

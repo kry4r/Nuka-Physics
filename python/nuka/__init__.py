@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 from ._nuka_ext import (  # noqa: F401
     Device,
     Field,
+    ContactLaw,
     ContactSideKind,
     GyroStatus,
     ENV_STATUS_DAT_FAILURE,
@@ -352,6 +353,7 @@ __all__ = [
     "surfaces",
     "SimOptions",
     "Field",
+    "ContactLaw",
     "ContactSideKind",
     "sync",
     "__engine_version__",

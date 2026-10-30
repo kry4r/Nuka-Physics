@@ -23,6 +23,9 @@ static_assert(NUKA_CONTACT_SIDE_PARTICLE == nk::kNkSideParticle);
 static_assert(NUKA_CONTACT_SIDE_STATIC == nk::kNkSideStatic);
 static_assert(NUKA_CONTACT_SIDE_GRID == nk::kNkSideGrid);
 static_assert(NUKA_CONTACT_SIDE_POINT_ENDPOINT == nk::kNkSidePointEndpoint);
+static_assert(NUKA_CONTACT_LAW_COMPLIANT == nk::kContactLawCompliant);
+static_assert(NUKA_CONTACT_LAW_VELOCITY == nk::kContactLawVelocity);
+static_assert(NUKA_CONTACT_LAW_SPECULATIVE == nk::kContactLawSpeculative);
 static_assert(sizeof(nuka_point_endpoint_range_t) == sizeof(nk::PointEndpointRange));
 static_assert(sizeof(nuka_point_endpoint_term_t) == sizeof(nk::PointEndpointTerm));
 static_assert(offsetof(nuka_point_endpoint_term_t, column) == offsetof(nk::PointEndpointTerm, column));
@@ -289,6 +292,16 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
     {NUKA_FIELD_PARTICLE_AFFINE_VELOCITY, kStrideMat3, kWireDtypeF32, nk::FieldId::ParticleC},
     {NUKA_FIELD_PARTICLE_REST_VOLUME, kStrideF32, kWireDtypeF32, nk::FieldId::ParticleVol0},
     {NUKA_FIELD_PARTICLE_MATERIAL_ID, kStrideU32, kWireDtypeU32, nk::FieldId::ParticleMaterialId},
+    {NUKA_FIELD_UCONTACT_NORMAL, nk::LayoutOf(nk::FieldId::UcontactNormal).elem_size,
+        kWireDtypeF32, nk::FieldId::UcontactNormal},
+    {NUKA_FIELD_UCONTACT_DEPTH, nk::LayoutOf(nk::FieldId::UcontactDepth).elem_size,
+        kWireDtypeF32, nk::FieldId::UcontactDepth},
+    {NUKA_FIELD_UCONTACT_WITNESS_A, nk::LayoutOf(nk::FieldId::UcontactWitnessA).elem_size,
+        kWireDtypeF32, nk::FieldId::UcontactWitnessA},
+    {NUKA_FIELD_UCONTACT_WITNESS_B, nk::LayoutOf(nk::FieldId::UcontactWitnessB).elem_size,
+        kWireDtypeF32, nk::FieldId::UcontactWitnessB},
+    {NUKA_FIELD_UCONTACT_LAW, kStrideU32, kWireDtypeU32, nk::FieldId::UcontactLaw},
+    {NUKA_FIELD_UCONTACT_FRICTION, kStrideF32, kWireDtypeF32, nk::FieldId::UcontactFriction},
 };
 
 inline constexpr size_t kDlpackFieldCount =

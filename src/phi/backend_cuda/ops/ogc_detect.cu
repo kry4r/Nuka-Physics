@@ -98,13 +98,13 @@ __device__ void OgcEmitParticleFace(const OgcDetectParams& p, const ModelView& m
     if (!(feature.feasible && feature.owner_triangle == triangle &&
           feature.distance <= query && feature.distance > 0.0f)) return;
     const uint32_t source_local = item - env * p.particles_per_env;
-    const size_t tri_at = (size_t{target_info.triangle_offset} + triangle) * 3u;
     const auto face = OgcParticleFaceMaterial(model, model.particle_self_half_thickness, view, target_info, triangle,
                                               feature.barycentric);
     const float radius = model.particle_self_half_thickness[source_local] + face.half_thickness;
     if (c.source_surface == target_surface) {
         // Features of one surface within their contact distance at rest, and near along the surface, are
         // neighbours, not contacts; rest-close layers of a fold or roll stay contacts.
+        const size_t tri_at = (size_t{target_info.triangle_offset} + triangle) * 3u;
         uint32_t corner[3];
         math::Vec3 rest[3];
         for (uint32_t j = 0u; j < 3u; ++j) {
@@ -129,18 +129,8 @@ __device__ void OgcEmitParticleFace(const OgcDetectParams& p, const ModelView& m
                               ordinal * 2u + 1u;
     const uint32_t first = env * p.point_endpoint_terms_per_env + p.point_endpoint_term_first +
                            ordinal * 6u + 3u;
-    const float weights[3] = {feature.barycentric.x, feature.barycentric.y,
-                              feature.barycentric.z};
-    for (uint32_t j = 0u; j < 3u; ++j) {
-        const uint32_t local = view.triangles[tri_at + j];
-        const uint32_t particle = env * p.particles_per_env +
-            target_info.vertex_offset + local;
-        data.point_endpoint_terms[first + j] =
-            nk::WeightedPointEndpointTerm(nk::kNkSideParticle, particle, weights[j]);
-    }
-    const uint32_t terms = nk::CanonicalizePointEndpointTerms(
-        data.point_endpoint_terms + first, 3u);
-    data.point_endpoint_ranges[endpoint] = {first, terms};
+    if (!OgcTriangleEndpoint(p, model, data, env, target_info, triangle,
+        feature.barycentric, source, endpoint, first)) return;
     data.ucontact_point[at] = (source + feature.point) * 0.5f;
     data.ucontact_witness_a[at] = source;
     data.ucontact_witness_b[at] = feature.point;
@@ -233,17 +223,12 @@ __device__ void OgcEmitParticleEdge(const OgcDetectParams& p, const ModelView& m
         const float weight_b = j == 0u ? 1.0f - pair.weight_b : pair.weight_b;
         mu_a += weight_a * model.particle_friction[local_a];
         mu_b += weight_b * model.particle_friction[local_b];
-        data.point_endpoint_terms[first_a + j] = nk::WeightedPointEndpointTerm(
-            nk::kNkSideParticle, env * p.particles_per_env + local_a, weight_a);
-        data.point_endpoint_terms[first_b + j] = nk::WeightedPointEndpointTerm(
-            nk::kNkSideParticle, env * p.particles_per_env + local_b, weight_b);
     }
-    const uint32_t count_a = nk::CanonicalizePointEndpointTerms(
-        data.point_endpoint_terms + first_a, 2u);
-    const uint32_t count_b = nk::CanonicalizePointEndpointTerms(
-        data.point_endpoint_terms + first_b, 2u);
-    data.point_endpoint_ranges[endpoint_a] = {first_a, count_a};
-    data.point_endpoint_ranges[endpoint_b] = {first_b, count_b};
+    const math::Vec3 reaction_point = (pair.point_a + pair.point_b) * 0.5f;
+    if (!OgcEdgeEndpoint(p, model, data, env, source_info, edge_a, pair.weight_a,
+                         reaction_point, endpoint_a, first_a) ||
+        !OgcEdgeEndpoint(p, model, data, env, target_info, edge_b, pair.weight_b,
+                         reaction_point, endpoint_b, first_b)) return;
     data.ucontact_point[at] = (pair.point_a + pair.point_b) * 0.5f;
     data.ucontact_witness_a[at] = pair.point_a;
     data.ucontact_witness_b[at] = pair.point_b;

@@ -7,8 +7,8 @@ Rigid bodies, articulations, MLS-MPM and VBD cloth exchange contact impulses thr
 | Rigid ↔ articulation | Collider manifolds; rigid inertia and articulation Jacobians |
 | Rigid ↔ MLS-MPM | Material points against colliders; interpolated grid response and rigid inertia |
 | Articulation ↔ MLS-MPM | Material points against colliders; interpolated grid response and articulation Jacobians |
-| Rigid ↔ VBD | Particle spheres against colliders; particle mass and rigid inertia |
-| Articulation ↔ VBD | Particle spheres against colliders; particle mass and articulation Jacobians |
+| Rigid ↔ VBD | Surface features or particle spheres against colliders; vertex reactions and rigid inertia |
+| Articulation ↔ VBD | Surface features or particle spheres against colliders; vertex reactions and articulation Jacobians |
 | MLS-MPM ↔ VBD | Material points against the deformed triangle surface; grid response and interpolated vertex reactions |
 
 Cloth, tetrahedral soft bodies and cable slabs retain their authored surface topology when cooked. A point cloud or cable centreline alone does not define a collision surface. Multiple VBD media can share a world with one MLS-MPM medium.
@@ -52,6 +52,10 @@ The material integration remains explicit. Contact exchanges do not iterate the 
 
 `POINT_ENDPOINT_TERMS` exposes the bytes of `nuka_point_endpoint_term_t` from `nuka.h`. Each 44-byte record contains a `uint32 kind`, a `uint32 index` and a column-major 3×3 float velocity map. The map interpolates endpoint velocity; its transpose distributes contact impulse to that term's point mass. Only records referenced by a nonempty range are valid.
 
+Triangle surface endpoints include the angular velocity of the contact point's offset from the midsurface. Their maps reproduce rigid translation and rotation, so an impulse distributed to the vertices has the same total force and moment as the reaction at the opposing endpoint. Mesh edge and vertex contacts use an incident triangle when available; a wire without triangles retains its point-mass interpolation.
+
+`UCONTACT_COUNT`, `UCONTACT_NORMAL`, `UCONTACT_DEPTH`, `UCONTACT_WITNESS_A` and `UCONTACT_WITNESS_B` expose the geometry used to assemble the constraints. Each slot reserves four points; only its counted entries are valid. Witness fields are defined for OGC mesh contacts. The geometry and velocity maps are frozen before integration, so their positions can differ from the state read after the step.
+
 Python DLPack views have shapes `[env, endpoint_capacity, 2]` for ranges and `[env, term_capacity, 44]` for bytes. A host download can be decoded with:
 
 ```python
@@ -61,7 +65,7 @@ term_dtype = np.dtype([
 terms = world.download_field(nuka.POINT_ENDPOINT_TERMS).view(term_dtype)
 ```
 
-Reset clears the selected environments' ranges, terms and contact outputs while preserving the addresses of existing views.
+Reset clears the selected environments' ranges and terms and invalidates contact outputs while preserving the addresses of existing views.
 
 ## Resolution limits
 
@@ -71,8 +75,12 @@ MLS-MPM grid bounds describe allocated storage, not container walls. Containers 
 
 Liquid render surfaces are reconstructed from current particle positions. The shared mesher reflects the density field at rigid solid boundaries and closes the surface just inside the solid, preventing missing kernel support from rounding the water away from pool walls. This reconstruction changes neither particle positions nor material history. Display rendering and camera sensors use the same reconstruction and live boundary poses.
 
-The surface and its velocity maps are rebuilt each physical substep and held fixed during the contact solve. Thin layers sharing an MLS-MPM grid cell still share one grid velocity. Surface CCD and multilayer self-contact are not provided by this coupling. Rigid/VBD collision currently samples particle spheres rather than the full cloth surface.
+The surface and its velocity maps are rebuilt each physical substep and held fixed during the contact solve. Thin layers sharing an MLS-MPM grid cell still share one grid velocity. Surface CCD and multilayer self-contact are not provided by the MLS-MPM coupling. Rigid/VBD mesh contacts query deformed triangles, edges and vertices; analytic colliders can instead sample particle spheres. Contact sampling and force laws must match before a reference trajectory can establish physical equivalence.
 
 Large mass ratios and nearly redundant friction contacts can require substantially more solver iterations. Assess contact residuals and timestep convergence for the intended load and geometry. Offline `render_beauty` and camera sensors include the registered deforming surfaces.
+
+BDF2 cloth and first-order rigid integration do not currently preserve the same physical impulse at a newly activated contact. Per-vertex history restarts can also mix effective integration steps within one elastic body. Use the explicit backward Euler cloth setting when checking coupled physical momentum, and report the integrator alongside the solver budget.
+
+Geometric motion truncation scales accepted displacements and velocities and can remove momentum or increase elastic energy. A zero environment status certifies neither conservation nor convergence. Check truncation counts, stage momentum, the energy ledger and timestep convergence; a run that relies on truncation cannot establish a conservative coupled-physics baseline.
 
 APIC transfer dissipates velocity modes that the grid cannot represent. A smaller timestep repeats that transfer more often, so elastic vibration at a fixed grid resolution can change even after the contact solve converges. Elastic surface-loading timestep convergence remains unresolved; this coupling should not yet serve as a converged elastic performance benchmark. Assess grid resolution, particle sampling and timestep together.
