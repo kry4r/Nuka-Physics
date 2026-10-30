@@ -40,7 +40,9 @@ inline void RequireStep(nk::World& world, const std::string& message, uint32_t i
 constexpr float kContactDMin = 0.030f;
 constexpr uint32_t kClothNx = 13u;          // 13x13 = 169 cloth particles.
 constexpr float kClothSpacing = 0.016f;     // ~0.19 m square (spans both front feet).
-constexpr float kClothParticleMass = 0.01f; // 10 g per particle (light cloth).
+constexpr float kClothSurfaceDensity = 0.4f;
+constexpr float kHoldStiffness = 40.0f;
+constexpr float kHoldDamping = 2.0f;
 
 constexpr uint32_t kSettleSteps = 250u;     // settle the robot stance + the media.
 constexpr uint32_t kHoldSteps = 200u;       // co-step the held stance over the media.
@@ -85,7 +87,13 @@ inline cook::VbdCookInput BuildCloth(float cx, float cy, float z, uint32_t nx = 
     cook::VbdCookInput in;
     in.positions = rest;
     in.velocities.assign(rest.size(), Vec3::Zero());
-    in.inv_mass.assign(rest.size(), 1.0f / kClothParticleMass);
+    std::vector<float> mass(rest.size(), 0.0f);
+    for (const auto& tri : tris) {
+        const float share = kClothSurfaceDensity *
+            (rest[tri.v[1]] - rest[tri.v[0]]).Cross(rest[tri.v[2]] - rest[tri.v[0]]).Length() / 6.0f;
+        for (uint32_t vertex : tri.v) mass[vertex] += share;
+    }
+    for (float value : mass) in.inv_mass.push_back(1.0f / value);
     const uint32_t last = nx - 1u;
     for (uint32_t k = 0; k < nx; ++k) {
         in.inv_mass[idx(k, 0)] = 0.0f; in.inv_mass[idx(k, last)] = 0.0f;
@@ -132,6 +140,14 @@ struct SceneVisuals {
     std::vector<cook::MediaRenderSurface> material_surfaces;
 };
 
+inline void SetHoldControl(nk::Model& model) {
+    for (size_t i = 0u; i < model.hold_drives.stiffness.size(); ++i)
+        if (model.hold_drives.stiffness[i] > 0.0f) {
+            model.hold_drives.stiffness[i] = kHoldStiffness;
+            model.hold_drives.damping[i] = kHoldDamping;
+        }
+}
+
 inline nk::Model CookRobot(const std::filesystem::path& path, bool with_free_body = false,
                            SceneVisuals* visuals = nullptr) {
     cook::CookToModelOptions opt;
@@ -139,6 +155,7 @@ inline nk::Model CookRobot(const std::filesystem::path& path, bool with_free_bod
     auto scene = RobotScene(path, with_free_body);
     auto cooked = cook::CookToModel(scene, 1, opt);
     nk::Model model = std::move(cooked.model);
+    SetHoldControl(model);
     model.capacities.max_contacts_per_env = 32u;
     model.capacities.max_rows_per_env =
         model.capacities.max_contacts_per_env * nk::kPairDrivenRowsPerSlot;
@@ -160,6 +177,7 @@ struct PreparedScene {
     std::vector<float> settled_q, settled_qdot;
     std::vector<Transform> settled_bases;
     std::vector<float> settled_link_velocity;
+    Vec3 front_foot;
 };
 
 inline PreparedScene Prepare(const std::filesystem::path& path, phi::Device* device,
@@ -206,16 +224,18 @@ inline PreparedScene Prepare(const std::filesystem::path& path, phi::Device* dev
     Vec3 front_centre{0, 0, 0}; uint32_t nf = 0;
     uint32_t front_link = foot_links[0];
     float cloth_z = 0.0f;
+    Vec3 front_foot{};
     for (size_t i = 0; i < foot_world.size(); ++i)
         if (foot_world[i].x > mid_x) {
             front_centre = front_centre + foot_world[i]; ++nf;
             front_link = foot_links[i]; cloth_z = foot_world[i].z;
+            front_foot = foot_world[i];
         }
     front_centre = front_centre * (1.0f / static_cast<float>(nf));
     std::fprintf(stderr, "[robot-coupling] front_centre=(%.4f,%.4f) cloth_z=%.4f\n",
                  front_centre.x, front_centre.y, cloth_z);
     return {path, config, front_centre, cloth_z, front_link, link_geom_local,
-        std::move(settled_q), std::move(settled_qdot), std::move(settled_bases), std::move(settled_link_velocity)};
+        std::move(settled_q), std::move(settled_qdot), std::move(settled_bases), std::move(settled_link_velocity), front_foot};
 }
 
 inline nk::Model CookPrepared(const PreparedScene& scene, uint32_t envs = 1u,
@@ -273,17 +293,17 @@ inline nk::Model CookMpmPrepared(const PreparedScene& prepared, uint32_t envs,
     body.mass = mass;
     body.inertia = Vec3{1, 1, 1} * (0.4f * mass * radius * radius);
     body.inertial_transform = Transform::Identity();
-    body.local_transform.position = {prepared.front_centre.x + 0.039f,
-                                     prepared.front_centre.y, cloth_z + radius};
+    body.local_transform.position = {prepared.front_foot.x + 0.039f,
+                                     prepared.front_foot.y, cloth_z + radius};
     std::vector<nuka::scene::ShapeId> shapes;
     for (const auto& shape : scene.Shapes())
         if (shape.body_id == free_body) shapes.push_back(shape.id);
     for (auto id : shapes) scene.GetShapeMut(id).radius = radius;
-    const float cloth_x = 0.5f * (prepared.front_centre.x + body.local_transform.position.x);
-    const float cloth_span = body.local_transform.position.x - prepared.front_centre.x + 0.25f * radius;
+    const float cloth_x = 0.5f * (prepared.front_foot.x + body.local_transform.position.x);
+    const float cloth_span = body.local_transform.position.x - prepared.front_foot.x + 0.25f * radius;
     auto impact_body = body;
     impact_body.name = "impact_body";
-    impact_body.local_transform.position.x = prepared.front_centre.x - radius - dx;
+    impact_body.local_transform.position.x = prepared.front_foot.x - radius - dx;
     const auto impact_id = scene.AddRigidBody(impact_body);
     nuka::scene::CollisionShapeRecord impact_shape;
     impact_shape.body_id = impact_id;
@@ -297,18 +317,19 @@ inline nk::Model CookMpmPrepared(const PreparedScene& prepared, uint32_t envs,
     Require(impact_ref != nullptr, "impact body is missing from the cooked scene map");
     cooked.model.body_init.at(impact_ref->body_row).linear_velocity = {0.5f, 0.0f, 0.0f};
     nk::Model model = std::move(cooked.model);
+    SetHoldControl(model);
     model.articulation.initial_q = prepared.settled_q;
     model.articulation.initial_qdot = prepared.settled_qdot;
     model.articulation.base_poses = prepared.settled_bases;
     model.articulation.base_pose = prepared.settled_bases.front();
     model.articulation.initial_link_velocity = prepared.settled_link_velocity;
     // The membrane reaches past both contact points, so half of each body's footprint stays over bare material.
-    auto cloth = BuildCloth(cloth_x, prepared.front_centre.y, cloth_z, kClothNx,
+    auto cloth = BuildCloth(cloth_x, prepared.front_foot.y, cloth_z, kClothNx,
                             cloth_span / float(kClothNx - 1u));
     cloth.aero_drag_normal = cloth.aero_drag_tangent = cloth.aero_drag_max_dv = 0.0f;
     cook::MpmCookInput mpm;
     mpm.implicit_stress = implicit_stress;
-    const Vec3 centre{prepared.front_centre.x + 0.01f, prepared.front_centre.y, cloth_z};
+    const Vec3 centre{prepared.front_foot.x + 0.01f, prepared.front_foot.y, cloth_z};
     const float spacing = 0.5f * dx;
     constexpr std::array<uint32_t, 3> dimensions{13u, 9u, 4u};
     for (uint32_t z = 0u; z < dimensions[2]; ++z)

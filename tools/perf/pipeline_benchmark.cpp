@@ -294,6 +294,25 @@ std::vector<uint8_t> State(nk::World& world, bool cache = true) {
     return result;
 }
 
+Json StateLayout(const nk::World& world) {
+    Json fields = Json::Array();
+    uint64_t offset = 0u;
+    for (const auto field : StateFields(true)) {
+        const uint64_t count = world.GetModel().capacities.ElementCount(field);
+        const uint64_t bytes = count * nk::LayoutOf(field).elem_size;
+        Json item = Json::Object();
+        item.Set("name", Json::Str(nk::FieldName(field)));
+        item.Set("field_id", Json::Int(static_cast<uint32_t>(field)));
+        item.Set("offset", Json::Int(offset));
+        item.Set("bytes", Json::Int(bytes));
+        item.Set("element_count", Json::Int(count));
+        item.Set("element_bytes", Json::Int(nk::LayoutOf(field).elem_size));
+        fields.PushBack(std::move(item));
+        offset += bytes;
+    }
+    return fields;
+}
+
 Json StateDifferences(nk::World& world, const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
     fixture::Require(a.size() == b.size(), "state extent changed during replay");
     Json differences = Json::Array();
@@ -1737,6 +1756,9 @@ Json Run(const Options& options) {
     configuration.Set("fixture_dt", Json::Float(fixture_config.dt));
     configuration.Set("fixture_substeps", Json::Int(fixture_config.substeps));
     configuration.Set("fixture_vel_iters", Json::Int(fixture_config.vel_iters));
+    configuration.Set("cloth_surface_density_kg_m2", Json::Float(fixture::kClothSurfaceDensity));
+    configuration.Set("hold_stiffness_Nm_rad", Json::Float(fixture::kHoldStiffness));
+    configuration.Set("hold_damping_Nms_rad", Json::Float(fixture::kHoldDamping));
     configuration.Set("fixture_velocity_iterations_override", Json::Bool(fixture_config.velocity_iterations_override));
     configuration.Set("fixture_actual_iterations_status", Json::Str("unmeasured"));
     configuration.Set("seed", Json::Int(options.seed));
@@ -1879,6 +1901,7 @@ Json Run(const Options& options) {
     quality.Set("authoritative_state_fnv1a64", Json::Str(Digest(
         std::vector<uint8_t>(replay_state.begin(), replay_state.begin() + initial.size()))));
     quality.Set("authoritative_state_bytes", Json::Int(initial.size()));
+    quality.Set("state_fields", StateLayout(world));
     quality.Set("replica_state_equal", Json::Bool(mismatched_envs.empty()));
     Json replica_errors = Json::Array();
     for (uint32_t env : mismatched_envs) replica_errors.PushBack(Json::Int(env));
