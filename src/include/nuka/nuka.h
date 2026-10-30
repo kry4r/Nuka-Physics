@@ -900,7 +900,12 @@ typedef enum nuka_state_field_t {
     // READ/WRITE per link: a spherical joint's rotation of the child in its parent joint frame (wxyz; identity
     // elsewhere) and its three DOF velocities, the relative angular velocity in the child frame (rad/s).
     NUKA_FIELD_JOINT_ROTATION = 120,
-    NUKA_FIELD_JOINT_ANGULAR_VELOCITY = 121
+    NUKA_FIELD_JOINT_ANGULAR_VELOCITY = 121,
+    // READ: the vertex-block coarse hierarchy: each level's first node (levels + 1 entries), then per level and
+    // vertex up to three parent nodes (UINT32_MAX unused) and their interpolation weights.
+    NUKA_FIELD_VBD_COARSE_LEVEL_NODES = 122,
+    NUKA_FIELD_VBD_COARSE_PARENTS = 123,
+    NUKA_FIELD_VBD_COARSE_WEIGHTS = 124
 } nuka_state_field_t;
 
 typedef enum nuka_vbd_element_kind_t {

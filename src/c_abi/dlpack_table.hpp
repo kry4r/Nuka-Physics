@@ -282,6 +282,9 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
     {NUKA_FIELD_CONTACT_PROFILES, kStrideF32, kWireDtypeF32, nk::FieldId::MatBuckets},
     {NUKA_FIELD_JOINT_ROTATION, static_cast<uint32_t>(4u * sizeof(float)), kWireDtypeF32, nk::FieldId::JointRotation},
     {NUKA_FIELD_JOINT_ANGULAR_VELOCITY, kStrideVec3, kWireDtypeF32, nk::FieldId::JointAngularVelocity},
+    {NUKA_FIELD_VBD_COARSE_LEVEL_NODES, kStrideU32, kWireDtypeU32, nk::FieldId::VbdCoarseLevelNodes},
+    {NUKA_FIELD_VBD_COARSE_PARENTS, kStrideU32, kWireDtypeU32, nk::FieldId::VbdCoarseParents},
+    {NUKA_FIELD_VBD_COARSE_WEIGHTS, kStrideF32, kWireDtypeF32, nk::FieldId::VbdCoarseWeights},
 };
 
 inline constexpr size_t kDlpackFieldCount =
