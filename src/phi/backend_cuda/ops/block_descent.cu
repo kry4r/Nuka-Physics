@@ -129,12 +129,22 @@ constexpr uint32_t kMultilevelElementHessian = 45u;
 constexpr uint32_t kMultilevelCorrectThreads = 256u;
 // Vertex-block particles one row group may move; a group with more fails its environment.
 constexpr uint32_t kMultilevelRowPoints = 8u;
+// A coarse node moves its children by a translation and a small rotation about their weighted center.
+constexpr uint32_t kMultilevelNodeDofs = 6u;
+constexpr uint32_t kMultilevelNodeEntries = kMultilevelNodeDofs * (kMultilevelNodeDofs + 1u) / 2u;
+
+// A node's step-start center of its children and the inverse of its largest child distance, which scales
+// rotations so every child arm stays within the unit ball; a node without extent gets zero.
+struct MultilevelFrame {
+    Vec3 center;
+    float inverse_radius;
+};
 
 // Operator words per environment: a symmetric block per node above the dense level, then the packed
 // upper triangle of the dense level.
 __host__ __device__ inline uint64_t MultilevelOperatorEntries(const VertexBlockLayout& l) {
-    const uint64_t rank = 3u * uint64_t{l.coarse_dense_nodes};
-    return 6u * uint64_t{l.coarse_nodes - l.coarse_dense_nodes} + rank * (rank + 1u) / 2u;
+    const uint64_t rank = kMultilevelNodeDofs * uint64_t{l.coarse_dense_nodes};
+    return kMultilevelNodeEntries * uint64_t{l.coarse_nodes - l.coarse_dense_nodes} + rank * (rank + 1u) / 2u;
 }
 
 // Words of one environment's dense factor: the upper factor by columns, then its scales.
@@ -320,9 +330,10 @@ struct BlockScratch {
     Vec3* multilevel_force;
     Vec3* multilevel_direction;
     Vec3* multilevel_previous;
-    Vec3* multilevel_correction;
+    float* multilevel_correction;
     float* multilevel_restricted;
-    SymmetricMat3* multilevel_block_inverse;
+    float* multilevel_block_inverse;
+    MultilevelFrame* multilevel_frame;
     float* multilevel_dense_factor;
     float* multilevel_dense_inverse;
     float* multilevel_element_hessian;
@@ -567,7 +578,7 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     if (multilevel && element_slots > uint64_t{std::numeric_limits<uint32_t>::max()} - kThreads + 1u)
         return 0u;
     const uint64_t vertex_words = multilevel ? 3u * uint64_t{layout.vertices} * p.env_count : 0u;
-    const uint64_t rank = 3u * uint64_t{layout.coarse_dense_nodes};
+    const uint64_t rank = kMultilevelNodeDofs * uint64_t{layout.coarse_dense_nodes};
     at = (at + 1u) & ~uint64_t{1u};
     s.multilevel = reinterpret_cast<MultilevelState*>(take(
         multilevel ? uint64_t{p.env_count} * sizeof(MultilevelState) / sizeof(uint32_t) : 0u));
@@ -580,11 +591,13 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     s.multilevel_force = reinterpret_cast<Vec3*>(take(vertex_words));
     s.multilevel_direction = reinterpret_cast<Vec3*>(take(vertex_words));
     s.multilevel_previous = reinterpret_cast<Vec3*>(take(vertex_words));
-    s.multilevel_correction = reinterpret_cast<Vec3*>(take(
-        multilevel ? 3u * uint64_t{layout.coarse_nodes} * p.env_count : 0u));
+    s.multilevel_correction = reinterpret_cast<float*>(take(
+        multilevel ? kMultilevelNodeDofs * uint64_t{layout.coarse_nodes} * p.env_count : 0u));
     s.multilevel_restricted = reinterpret_cast<float*>(take(multilevel ? rank * p.env_count : 0u));
-    s.multilevel_block_inverse = reinterpret_cast<SymmetricMat3*>(take(multilevel
-        ? 6u * uint64_t{layout.coarse_nodes - layout.coarse_dense_nodes} * p.env_count : 0u));
+    s.multilevel_block_inverse = reinterpret_cast<float*>(take(multilevel
+        ? kMultilevelNodeEntries * uint64_t{layout.coarse_nodes - layout.coarse_dense_nodes} * p.env_count : 0u));
+    s.multilevel_frame = reinterpret_cast<MultilevelFrame*>(take(multilevel
+        ? uint64_t{layout.coarse_nodes} * p.env_count * sizeof(MultilevelFrame) / sizeof(uint32_t) : 0u));
     s.multilevel_dense_inverse = reinterpret_cast<float*>(take(multilevel ? rank * rank * p.env_count : 0u));
     s.multilevel_dense_factor = reinterpret_cast<float*>(
         take(multilevel ? MultilevelDenseFactorWords(static_cast<uint32_t>(rank)) * p.env_count : 0u));
@@ -2646,7 +2659,7 @@ cudaError_t LaunchMultilevelCorrection(const ModelView& model, const DataView& d
     const VertexBlockLayout& l = p.vertex_blocks;
     const uint32_t vertices = l.vertices * p.env_count;
     const uint32_t jacobi = (l.coarse_nodes - l.coarse_dense_nodes) * p.env_count;
-    const uint32_t rank = 3u * l.coarse_dense_nodes, packed = rank * (rank + 1u) / 2u;
+    const uint32_t rank = kMultilevelNodeDofs * l.coarse_dense_nodes, packed = rank * (rank + 1u) / 2u;
     const dim3 parts(p.env_count * s.multilevel_parts);
     cudaError_t status = LaunchWork(MultilevelRowsKernel, s.rows, kThreads / kRowAxisLanes, stream, data, p, s);
     if (status == cudaSuccess)
@@ -2658,6 +2671,12 @@ cudaError_t LaunchMultilevelCorrection(const ModelView& model, const DataView& d
     if (status == cudaSuccess && assemble) {
         status = FillWords(s.multilevel_operator, size_t{p.env_count} *
                            MultilevelOperatorEntries(l) * sizeof(unsigned long long), 0u, stream);
+        if (status == cudaSuccess) {
+            const uint32_t correct_parts = MultilevelCorrectParts(l);
+            LaunchCuda(MultilevelFrameKernel, dim3(p.env_count * correct_parts), dim3(kMultilevelCorrectThreads),
+                       0u, stream, model, data, p, s, correct_parts);
+            status = cudaGetLastError();
+        }
         if (status == cudaSuccess) {
             LaunchCuda(MultilevelBoundKernel, parts, dim3(kThreads), 0u, stream, model, data, p, s);
             status = cudaGetLastError();
@@ -2701,7 +2720,7 @@ cudaError_t LaunchMultilevelCorrection(const ModelView& model, const DataView& d
     if (status == cudaSuccess) {
         const uint32_t correct_parts = MultilevelCorrectParts(l);
         LaunchCuda(MultilevelCorrectKernel, dim3(p.env_count * correct_parts), dim3(kMultilevelCorrectThreads),
-                   0u, stream, model, p, s, correct_parts);
+                   0u, stream, model, data, p, s, correct_parts);
         status = cudaGetLastError();
     }
     if (status == cudaSuccess && rank > 0u) {

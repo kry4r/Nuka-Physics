@@ -42,9 +42,11 @@ struct ElementCurvature {
     float stress[3] = {};
     float barrier = 0.0f;
     MembraneTangent tangent;
-    // A Neo-Hookean triangle weighs the area change by `volume` and the area normal change by `cofactor`.
-    bool neo_hookean = false;
-    float volume = 0.0f, cofactor = 0.0f;
+    // A Neo-Hookean triangle keeps its Hessian modes in F = U S V^T: `stress` holds the scaling block, then
+    // twist, flip and the two out-of-plane weights; a collapsed one (not `modal`) keeps mu |dF|^2.
+    bool neo_hookean = false, modal = false;
+    Vec3 u0, u1;
+    float cosine = 1.0f, sine = 0.0f, twist = 0.0f, flip = 0.0f, out[2] = {};
     // Hinges and bent rods act through angle gradients, springs along `normal` with a lateral share and
     // straight rods through their segment projectors with the segment-order sign.
     Vec3 q[4];
@@ -61,7 +63,34 @@ struct ElementVariation {
     float g00 = 0.0f, g11 = 0.0f, g01 = 0.0f, s = 0.0f;
 };
 
-// The Gauss-Newton curvature of ElementBlock, with the full stress clamped to its positive part.
+// The Neo-Hookean membrane Hessian by its analytic eigensystem (Smith et al. 2019), each mode clamped to its
+// nonnegative part: with s = dpsi/dJ, twist mu + s, flip mu - s and out-of-plane mu + s S_other / S_own.
+NUKA_VBD_HD inline void NeoHookeanModes(float mu, float lambda, const TriangleStrain& t, ElementCurvature* c) {
+    const Vec3 n = t.f0.Cross(t.f1);
+    const float length = Norm(n), J = 1.0f + t.area_change;
+    if (!(length > 0.0f && J > 0.0f)) return;
+    const float c00 = t.f0.Dot(t.f0), c01 = t.f0.Dot(t.f1), c11 = t.f1.Dot(t.f1);
+    const float half = 0.5f * (c00 - c11);
+    const float high = 0.5f * (c00 + c11) + sqrtf(half * half + c01 * c01);
+    const float s1 = sqrtf(high), s2 = J / s1, s = (lambda + mu) * t.area_change - mu;
+    const float angle = 0.5f * atan2f(c01, half);
+    c->cosine = cosf(angle);
+    c->sine = sinf(angle);
+    c->u0 = (t.f0 * c->cosine + t.f1 * c->sine) / s1;
+    c->u1 = (t.f1 * c->cosine - t.f0 * c->sine) / s2;
+    c->normal = n / length;
+    PositiveStress(mu + (lambda + mu) * s2 * s2, (lambda + mu) * J + s, mu + (lambda + mu) * high, c->stress);
+    // mu + s = (lambda + mu) dA, so the weights near rest are formed without cancelling mu.
+    const float growth = (lambda + mu) * t.area_change, gap = mu * s1 * (s1 - s2);
+    c->twist = fmaxf(growth, 0.0f);
+    c->flip = fmaxf(2.0f * mu - growth, 0.0f);
+    c->out[0] = fmaxf((gap + growth * J) / high, 0.0f);
+    c->out[1] = fmaxf((growth * high - gap) / J, 0.0f);
+    c->modal = true;
+}
+
+// The Gauss-Newton curvature of ElementBlock, with the full stress clamped to its positive part; Neo-Hookean
+// triangles take their projected Hessian.
 NUKA_VBD_HD inline ElementCurvature GaussNewtonCurvature(const VbdElement& e, const ElementGeometry& g,
                                                          const MembraneStartState* start = nullptr) {
     ElementCurvature c;
@@ -71,15 +100,8 @@ NUKA_VBD_HD inline ElementCurvature GaussNewtonCurvature(const VbdElement& e, co
         c.f0 = t.f0;
         c.f1 = t.f1;
         if (NeoHookean(e)) {
-            const Vec3 n = t.f0.Cross(t.f1);
-            const float length = Norm(n), J = 1.0f + t.area_change;
             c.neo_hookean = true;
-            c.volume = lambda + mu;
-            if (!(length > 0.0f && J > 0.0f)) return c;
-            c.normal = n / length;
-            const float s = c.volume * t.area_change - mu;
-            c.cofactor = s > 0.0f ? s / J : 0.0f;
-            c.volume -= c.cofactor;
+            NeoHookeanModes(mu, lambda, t, &c);
             return c;
         }
         if (e.rest[7] > 0.0f) {
@@ -210,15 +232,32 @@ NUKA_VBD_HD inline ElementVariation Vary(const VbdElement& e, const ElementCurva
     return v;
 }
 
+// A variation's coordinates along the Neo-Hookean modes: the two scalings, twist, flip and out-of-plane.
+NUKA_VBD_HD inline void NeoHookeanModeCoordinates(const ElementCurvature& c, const ElementVariation& x,
+                                                  float (&m)[6]) {
+    const Vec3 g0 = x.a * c.cosine + x.b * c.sine, g1 = x.b * c.cosine - x.a * c.sine;
+    const float w10 = c.u1.Dot(g0), w01 = c.u0.Dot(g1), r = 0.70710678118654752f;
+    m[0] = c.u0.Dot(g0);
+    m[1] = c.u1.Dot(g1);
+    m[2] = (w10 - w01) * r;
+    m[3] = (w10 + w01) * r;
+    m[4] = c.normal.Dot(g0);
+    m[5] = c.normal.Dot(g1);
+}
+
 // The element's symmetric bilinear form between two displacement fields given by their variations.
 NUKA_VBD_HD inline float ElementForm(const VbdElement& e, const ElementCurvature& c,
                                      const ElementVariation& x, const ElementVariation& y) {
     if (e.kind == kVbdTriangle) {
         const float mu = e.rest[5], lambda = e.rest[6];
         if (c.neo_hookean) {
-            const Vec3 nx = x.a.Cross(c.f1) + c.f0.Cross(x.b), ny = y.a.Cross(c.f1) + c.f0.Cross(y.b);
-            return e.rest[4] * (mu * (x.a.Dot(y.a) + x.b.Dot(y.b)) + c.volume * x.s * y.s +
-                                c.cofactor * nx.Dot(ny));
+            if (!c.modal) return e.rest[4] * mu * (x.a.Dot(y.a) + x.b.Dot(y.b));
+            float mx[6], my[6];
+            NeoHookeanModeCoordinates(c, x, mx);
+            NeoHookeanModeCoordinates(c, y, my);
+            return e.rest[4] * (c.stress[0] * mx[0] * my[0] + c.stress[1] * (mx[0] * my[1] + mx[1] * my[0]) +
+                                c.stress[2] * mx[1] * my[1] + c.twist * mx[2] * my[2] + c.flip * mx[3] * my[3] +
+                                c.out[0] * mx[4] * my[4] + c.out[1] * mx[5] * my[5]);
         }
         if (e.rest[7] > 0.0f) {
             float s[3];

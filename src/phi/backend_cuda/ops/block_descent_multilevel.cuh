@@ -11,7 +11,7 @@ constexpr float kMultilevelRowJacobian = 65536.0f;
 constexpr uint8_t kMultilevelTouchOverflow = 0x80u;
 // Largest dense-level rank. The factor kernel takes it in panels of 32 pivot rows; an inverse column keeps
 // it in lane-strided register slots, lane x holding rows x + 32k in slot k.
-constexpr uint32_t kMultilevelDenseRank = 3u * nk::kVbdCoarseDenseNodes;
+constexpr uint32_t kMultilevelDenseRank = kMultilevelNodeDofs * nk::kVbdCoarseDenseNodes;
 constexpr uint32_t kMultilevelFactorWarps = 16u;
 constexpr uint32_t kMultilevelFactorPanel = 32u;
 constexpr uint32_t kMultilevelFactorColumns = (kMultilevelDenseRank + 31u) / 32u;
@@ -22,8 +22,11 @@ constexpr uint32_t kMultilevelInverseWarps = 4u;
 constexpr uint32_t kMultilevelBacktracks = 3u;
 // The plane is solved when its curvature determinant keeps this share of the diagonal product.
 constexpr double kMultilevelIndependence = 1.0e-6;
-// Pivots of the scaled single-precision factor below this are rounding noise.
+// Jacobi-scaled pivots at or below this belong to directions the earlier ones span, such as rotations about
+// the line of collinear children; they take no step.
 constexpr float kMultilevelPivot = 1.0e-6f;
+// Node maps have entries of at most 2 in magnitude, so a coupling grows at most fourfold through them.
+constexpr float kMultilevelMapGrowth = 4.0f;
 constexpr int32_t kMultilevelUnassembled = INT32_MIN;
 static_assert(kMultilevelCorrectThreads % 32u == 0u && kMultilevelFactorPanel == 32u &&
               kMultilevelRowPoints < kMultilevelTouchOverflow);
@@ -96,6 +99,17 @@ __device__ inline uint32_t MultilevelPacked(uint32_t i, uint32_t j) { return j *
 
 __device__ inline float AxisComponent(Vec3 v, uint32_t axis) {
     return axis == 0u ? v.x : axis == 1u ? v.y : v.z;
+}
+
+__device__ inline Vec3 UnitAxis(uint32_t axis) {
+    return {axis == 0u ? 1.0f : 0.0f, axis == 1u ? 1.0f : 0.0f, axis == 2u ? 1.0f : 0.0f};
+}
+
+// A child's arm about a node: its step-start offset from the node center in node radii.
+__device__ inline Vec3 MultilevelArm(const BlockScratch& s, uint32_t nodes, uint32_t env, uint32_t node,
+                                     Vec3 start) {
+    const MultilevelFrame frame = s.multilevel_frame[size_t{env} * nodes + node];
+    return (start - frame.center) * frame.inverse_radius;
 }
 
 // Vertices the color sweeps descend; the correction moves only these.
@@ -241,14 +255,16 @@ __device__ inline double RowForm(const float* c, Vec3 x, Vec3 y) {
            double(c[3]) * (double(x.y) * y.z + double(x.z) * y.y);
 }
 
-// Coupling of two coarse nodes through a row's curvature, given each node's axis Jacobians.
-__device__ inline void RowCoarseBlock(const Vec3* row, const Vec3* column, const float* c, float scale,
-                                      float (&block)[3][3]) {
-    for (uint32_t i = 0u; i < 3u; ++i)
-        for (uint32_t j = 0u; j < 3u; ++j) {
-            const float x1 = AxisComponent(row[1], i), x2 = AxisComponent(row[2], i);
-            const float y1 = AxisComponent(column[1], j), y2 = AxisComponent(column[2], j);
-            block[i][j] = scale * (c[0] * AxisComponent(row[0], i) * AxisComponent(column[0], j) +
+// Coupling of two coarse nodes through a row's curvature, given each node's axis Jacobians on its
+// translation, then its rotation.
+__device__ inline void RowCoarseBlock(const Vec3 (&row)[2][3], const Vec3 (&column)[2][3], const float* c,
+                                      float scale, float (&block)[kMultilevelNodeDofs][kMultilevelNodeDofs]) {
+    for (uint32_t i = 0u; i < kMultilevelNodeDofs; ++i)
+        for (uint32_t j = 0u; j < kMultilevelNodeDofs; ++j) {
+            const uint32_t a = i / 3u, b = j / 3u, ai = i % 3u, bj = j % 3u;
+            const float x1 = AxisComponent(row[a][1], ai), x2 = AxisComponent(row[a][2], ai);
+            const float y1 = AxisComponent(column[b][1], bj), y2 = AxisComponent(column[b][2], bj);
+            block[i][j] = scale * (c[0] * AxisComponent(row[a][0], ai) * AxisComponent(column[b][0], bj) +
                                    c[1] * x1 * y1 + c[2] * x2 * y2 + c[3] * (x1 * y2 + x2 * y1));
         }
 }
@@ -513,40 +529,92 @@ __device__ inline uint32_t SlotNode(const uint32_t (&node)[kMultilevelElementNod
     return value;
 }
 
-// A node's weights at element vertices 1 to 3 less its weight at vertex 0, from the parent slots.
-__device__ inline void RelativeWeights(const uint32_t (&node)[kMultilevelElementNodes],
-                                       const float (&weight)[kMultilevelElementNodes], uint32_t target,
-                                       float (&relative)[3]) {
+// A node's map of element vertices 1 to 3 relative to vertex 0: each moves by its weight times the node
+// translation plus the node rotation crossed with its moment, less vertex 0's move.
+struct RelativeMap {
+    float weight[3];
+    Vec3 moment[3];
+};
+__device__ inline RelativeMap RelativeNodeMap(const uint32_t (&node)[kMultilevelElementNodes],
+                                              const float (&weight)[kMultilevelElementNodes],
+                                              const Vec3 (&moment)[kMultilevelElementNodes], uint32_t target) {
     float at[4];
+    Vec3 arm[4];
 #pragma unroll
     for (uint32_t j = 0u; j < 4u; ++j) {
         at[j] = 0.0f;
+        arm[j] = {};
 #pragma unroll
         for (uint32_t k = 0u; k < nk::kVbdCoarseParents; ++k)
-            if (node[nk::kVbdCoarseParents * j + k] == target) at[j] = weight[nk::kVbdCoarseParents * j + k];
+            if (node[nk::kVbdCoarseParents * j + k] == target) {
+                at[j] = weight[nk::kVbdCoarseParents * j + k];
+                arm[j] = moment[nk::kVbdCoarseParents * j + k];
+            }
     }
+    RelativeMap map;
 #pragma unroll
-    for (uint32_t j = 0u; j < 3u; ++j) relative[j] = at[j + 1u] - at[0];
+    for (uint32_t j = 0u; j < 3u; ++j) {
+        map.weight[j] = at[j + 1u] - at[0];
+        map.moment[j] = arm[j + 1u] - arm[0];
+    }
+    return map;
 }
 
-// Coupling block of two nodes through an element's relative Hessian, given their relative weights.
-__device__ inline void ElementNodeBlock(const float (&h)[kMultilevelElementHessian], const float (&row)[3],
-                                        const float (&column)[3], float (&block)[3][3]) {
+// Coupling block of two nodes through an element's relative Hessian, a column at a time: the column node's
+// relative move along one coordinate, the Hessian's action on it, then the row node's adjoint of that.
+__device__ inline void ElementNodeBlock(const float (&h)[kMultilevelElementHessian], const RelativeMap& row,
+                                        const RelativeMap& column,
+                                        float (&block)[kMultilevelNodeDofs][kMultilevelNodeDofs]) {
 #pragma unroll
-    for (uint32_t i = 0u; i < 3u; ++i)
+    for (uint32_t c = 0u; c < kMultilevelNodeDofs; ++c) {
+        Vec3 v[3];
 #pragma unroll
-        for (uint32_t k = 0u; k < 3u; ++k) {
-            float value = 0.0f;
+        for (uint32_t m = 0u; m < 3u; ++m)
+            v[m] = c < 3u ? UnitAxis(c) * column.weight[m] : UnitAxis(c - 3u).Cross(column.moment[m]);
+        Vec3 linear{}, angular{};
 #pragma unroll
-            for (uint32_t j = 0u; j < 3u; ++j)
+        for (uint32_t j = 0u; j < 3u; ++j) {
+            float t[3];
 #pragma unroll
-                for (uint32_t m = 0u; m < 3u; ++m) {
-                    const uint32_t a = 3u * j + i, c = 3u * m + k;
-                    value = fmaf(row[j] * column[m],
-                                 h[a <= c ? MultilevelPacked(a, c) : MultilevelPacked(c, a)], value);
-                }
-            block[i][k] = value;
+            for (uint32_t i = 0u; i < 3u; ++i) {
+                float value = 0.0f;
+#pragma unroll
+                for (uint32_t m = 0u; m < 3u; ++m)
+#pragma unroll
+                    for (uint32_t k = 0u; k < 3u; ++k) {
+                        const uint32_t a = 3u * j + i, b = 3u * m + k;
+                        value = fmaf(h[a <= b ? MultilevelPacked(a, b) : MultilevelPacked(b, a)],
+                                     AxisComponent(v[m], k), value);
+                    }
+                t[i] = value;
+            }
+            const Vec3 action{t[0], t[1], t[2]};
+            linear += action * row.weight[j];
+            angular += row.moment[j].Cross(action);
         }
+        block[0][c] = linear.x;
+        block[1][c] = linear.y;
+        block[2][c] = linear.z;
+        block[3][c] = angular.x;
+        block[4][c] = angular.y;
+        block[5][c] = angular.z;
+    }
+}
+
+// Inertia coupling of two parents of one vertex, `value` times the transposed row map on the column map.
+__device__ inline void ArmBlock(Vec3 row, Vec3 column, float value,
+                                float (&block)[kMultilevelNodeDofs][kMultilevelNodeDofs]) {
+#pragma unroll
+    for (uint32_t c = 0u; c < kMultilevelNodeDofs; ++c) {
+        const Vec3 v = c < 3u ? UnitAxis(c) : UnitAxis(c - 3u).Cross(column);
+        const Vec3 w = row.Cross(v);
+        block[0][c] = value * v.x;
+        block[1][c] = value * v.y;
+        block[2][c] = value * v.z;
+        block[3][c] = value * w.x;
+        block[4][c] = value * w.y;
+        block[5][c] = value * w.z;
+    }
 }
 
 // A row group's moving vertex-block particles with their axis Jacobians.
@@ -582,27 +650,38 @@ struct OperatorSink {
                 atomicAdd(entries + at[k], static_cast<unsigned long long>(fixed[k]));
     }
 
-    __device__ void AddBlock(uint32_t row, uint32_t column, const float (&block)[3][3]) const {
+    __device__ void AddBlock(uint32_t row, uint32_t column,
+                             const float (&block)[kMultilevelNodeDofs][kMultilevelNodeDofs]) const {
+        constexpr uint32_t kDofs = kMultilevelNodeDofs;
         if (row < dense_first) {
-            const size_t at[6] = {6u * size_t{row}, 6u * size_t{row} + 1u, 6u * size_t{row} + 2u,
-                                  6u * size_t{row} + 3u, 6u * size_t{row} + 4u, 6u * size_t{row} + 5u};
-            const float value[6] = {block[0][0], block[1][1], block[2][2], block[0][1], block[0][2], block[1][2]};
-            Add(at, value);
+#pragma unroll
+            for (uint32_t j = 0u; j < kDofs; ++j) {
+                size_t at[kDofs];
+                float value[kDofs];
+#pragma unroll
+                for (uint32_t i = 0u; i < kDofs; ++i) {
+                    at[i] = i <= j ? kMultilevelNodeEntries * size_t{row} + MultilevelPacked(i, j) : 0u;
+                    value[i] = i <= j ? block[i][j] : 0.0f;
+                }
+                Add(at, value);
+            }
             return;
         }
         const bool swap = row > column;
         const uint32_t a = (swap ? column : row) - dense_first, c = (swap ? row : column) - dense_first;
-        size_t at[9];
-        float value[9];
 #pragma unroll
-        for (uint32_t i = 0u; i < 3u; ++i)
+        for (uint32_t i = 0u; i < kDofs; ++i) {
+            size_t at[kDofs];
+            float value[kDofs];
 #pragma unroll
-            for (uint32_t j = 0u; j < 3u; ++j) {
-                const bool upper = 3u * a + i <= 3u * c + j;
-                at[3u * i + j] = upper ? 6u * size_t{dense_first} + MultilevelPacked(3u * a + i, 3u * c + j) : 0u;
-                value[3u * i + j] = upper ? (swap ? block[j][i] : block[i][j]) : 0.0f;
+            for (uint32_t j = 0u; j < kDofs; ++j) {
+                const bool upper = kDofs * a + i <= kDofs * c + j;
+                at[j] = upper ? kMultilevelNodeEntries * size_t{dense_first} +
+                                MultilevelPacked(kDofs * a + i, kDofs * c + j) : 0u;
+                value[j] = upper ? (swap ? block[j][i] : block[i][j]) : 0.0f;
             }
-        Add(at, value);
+            Add(at, value);
+        }
     }
 };
 
@@ -613,8 +692,10 @@ __device__ inline float MultilevelPowerOfTwo(int32_t k) { return __int_as_float(
 __device__ inline void AssembleVertex(const ModelView& model, const BlockScratch& s, const VertexBlockView& b,
                                       const OperatorSink& sink, uint32_t env, uint32_t vertex,
                                       uint32_t level, bool pairs) {
-    if (!MultilevelDynamic(s, b.Particle(env, vertex))) return;
+    const uint32_t particle = b.Particle(env, vertex);
+    if (!MultilevelDynamic(s, particle)) return;
     const float inertia = b.inertia[b.Slot(env, vertex)];
+    const Vec3 start = b.start[particle];
     const size_t at = (size_t{level} * b.layout.vertices + vertex) * nk::kVbdCoarseParents;
     for (uint32_t a = 0u; a < nk::kVbdCoarseParents; ++a)
         for (uint32_t c = a; c < (pairs ? nk::kVbdCoarseParents : a + 1u); ++c) {
@@ -622,7 +703,9 @@ __device__ inline void AssembleVertex(const ModelView& model, const BlockScratch
             const uint32_t column = model.vbd_coarse_parents[at + c];
             if (row == ~0u || column == ~0u) continue;
             const float value = inertia * model.vbd_coarse_weights[at + a] * model.vbd_coarse_weights[at + c];
-            const float block[3][3] = {{value, 0.0f, 0.0f}, {0.0f, value, 0.0f}, {0.0f, 0.0f, value}};
+            float block[kMultilevelNodeDofs][kMultilevelNodeDofs];
+            ArmBlock(MultilevelArm(s, b.layout.coarse_nodes, env, row, start),
+                     MultilevelArm(s, b.layout.coarse_nodes, env, column, start), value, block);
             sink.AddBlock(row, column, block);
         }
 }
@@ -648,17 +731,24 @@ __device__ inline void AssembleElement(const ModelView& model, const BlockScratc
 #pragma unroll
     for (uint32_t k = 0u; k < kMultilevelElementHessian; ++k)
         h[k] = k < dofs * (dofs + 1u) / 2u ? in[k * stride] : 0.0f;
+    Vec3 start[4];
+#pragma unroll
+    for (uint32_t j = 0u; j < 4u; ++j) start[j] = live[j] ? b.start[b.Particle(env, element.vertex[j])] : Vec3{};
     for (uint32_t level = 0u; level < b.layout.coarse_levels; ++level) {
         uint32_t node[kMultilevelElementNodes];
         float weight[kMultilevelElementNodes];
+        Vec3 moment[kMultilevelElementNodes];
 #pragma unroll
         for (uint32_t j = 0u; j < 4u; ++j) {
             const size_t at = (size_t{level} * b.layout.vertices + (live[j] ? element.vertex[j] : 0u)) *
                               nk::kVbdCoarseParents;
 #pragma unroll
             for (uint32_t k = 0u; k < nk::kVbdCoarseParents; ++k) {
-                node[nk::kVbdCoarseParents * j + k] = live[j] ? model.vbd_coarse_parents[at + k] : ~0u;
-                weight[nk::kVbdCoarseParents * j + k] = live[j] ? model.vbd_coarse_weights[at + k] : 0.0f;
+                const uint32_t slot = nk::kVbdCoarseParents * j + k;
+                node[slot] = live[j] ? model.vbd_coarse_parents[at + k] : ~0u;
+                weight[slot] = node[slot] != ~0u ? model.vbd_coarse_weights[at + k] : 0.0f;
+                moment[slot] = node[slot] != ~0u
+                    ? MultilevelArm(s, b.layout.coarse_nodes, env, node[slot], start[j]) * weight[slot] : Vec3{};
             }
         }
         uint32_t firsts = 0u;
@@ -672,8 +762,8 @@ __device__ inline void AssembleElement(const ModelView& model, const BlockScratc
         const bool pairs = dense && level + 1u == b.layout.coarse_levels;
         for (uint32_t rest = firsts; rest != 0u; rest &= rest - 1u) {
             const uint32_t row = SlotNode(node, __ffs(rest) - 1u);
-            float a[3], block[3][3];
-            RelativeWeights(node, weight, row, a);
+            float block[kMultilevelNodeDofs][kMultilevelNodeDofs];
+            const RelativeMap a = RelativeNodeMap(node, weight, moment, row);
             if (!pairs) {
                 ElementNodeBlock(h, a, a, block);
                 sink.AddBlock(row, row, block);
@@ -681,9 +771,7 @@ __device__ inline void AssembleElement(const ModelView& model, const BlockScratc
             }
             for (uint32_t more = rest; more != 0u; more &= more - 1u) {
                 const uint32_t column = SlotNode(node, __ffs(more) - 1u);
-                float c[3];
-                RelativeWeights(node, weight, column, c);
-                ElementNodeBlock(h, a, c, block);
+                ElementNodeBlock(h, a, RelativeNodeMap(node, weight, moment, column), block);
                 sink.AddBlock(row, column, block);
             }
         }
@@ -697,10 +785,11 @@ static_assert(32u % kMultilevelRowNodeLanes == 0u && kMultilevelRowNodes <= 32u 
               kMultilevelRowPoints <= kMultilevelRowNodeLanes);
 struct MultilevelRowNodeTile {
     Vec3 touch[kMultilevelRowPoints][3];
+    Vec3 start[kMultilevelRowPoints];
     uint32_t parent[kMultilevelRowNodes];
     float weight[kMultilevelRowNodes];
     uint32_t node[kMultilevelRowNodes];
-    Vec3 jacobian[kMultilevelRowNodes][3];
+    Vec3 jacobian[kMultilevelRowNodes][2][3];
 };
 // Resident assembly blocks per multiprocessor, as many as their shared row tiles allow.
 constexpr uint32_t kMultilevelAssembleBlocks = 4u;
@@ -738,6 +827,7 @@ __device__ inline void AssembleRow(const ModelView& model, const DataView& data,
     if (lane < touched) {
         // A curved row assembles, so its first parents load beside its Jacobians.
         if (curved) load_parents(0u);
+        tile.start[lane] = data.particle_prev_pos[env * l.particles_per_env + l.begin + vertex];
         for (uint32_t axis = 0u; axis < 3u; ++axis) {
             const Vec3 jacobian = LoadPointIncidenceJacobian(s, entry.y, axis);
             tile.touch[lane][axis] = jacobian;
@@ -774,27 +864,31 @@ __device__ inline void AssembleRow(const ModelView& model, const DataView& data,
             uint32_t rest = firsts;
             for (uint32_t prior = 0u; prior < i; ++prior) rest &= rest - 1u;
             const uint32_t node = tile.parent[__ffs(rest) - 1u];
-            Vec3 coarse[3] = {};
+            Vec3 coarse[2][3] = {};
             for (uint32_t touch = 0u; touch < touched; ++touch)
                 for (uint32_t k = 0u; k < nk::kVbdCoarseParents; ++k) {
                     const uint32_t at = touch * nk::kVbdCoarseParents + k;
-                    if (tile.parent[at] == node)
-                        for (uint32_t axis = 0u; axis < 3u; ++axis)
-                            coarse[axis] += tile.touch[touch][axis] * tile.weight[at];
+                    if (tile.parent[at] != node) continue;
+                    const Vec3 arm = MultilevelArm(s, l.coarse_nodes, env, node, tile.start[touch]);
+                    for (uint32_t axis = 0u; axis < 3u; ++axis) {
+                        coarse[0][axis] += tile.touch[touch][axis] * tile.weight[at];
+                        coarse[1][axis] += arm.Cross(tile.touch[touch][axis]) * tile.weight[at];
+                    }
                 }
             tile.node[i] = node;
-            for (uint32_t axis = 0u; axis < 3u; ++axis) tile.jacobian[i][axis] = coarse[axis];
+            for (uint32_t part = 0u; part < 2u; ++part)
+                for (uint32_t axis = 0u; axis < 3u; ++axis) tile.jacobian[i][part][axis] = coarse[part][axis];
         }
         __syncwarp(mask);
         const bool pairs = dense && level + 1u == l.coarse_levels;
         for (uint32_t row = lane; row < count; row += kMultilevelRowNodeLanes) {
             if (!pairs) {
-                float block[3][3];
+                float block[kMultilevelNodeDofs][kMultilevelNodeDofs];
                 RowCoarseBlock(tile.jacobian[row], tile.jacobian[row], stored, scale, block);
                 sink.AddBlock(tile.node[row], tile.node[row], block);
             } else {
                 for (uint32_t column = row; column < count; ++column) {
-                    float block[3][3];
+                    float block[kMultilevelNodeDofs][kMultilevelNodeDofs];
                     RowCoarseBlock(tile.jacobian[row], tile.jacobian[column], stored, scale, block);
                     sink.AddBlock(tile.node[row], tile.node[column], block);
                 }
@@ -883,7 +977,7 @@ __global__ void MultilevelScaleKernel(DataView data, BlockDescentSolveParams p, 
     for (uint32_t env = blockIdx.x * blockDim.x + threadIdx.x; env < p.env_count;
          env += gridDim.x * blockDim.x) {
         MultilevelState& state = s.multilevel[env];
-        const double total = double(__uint_as_float(state.bound)) * terms;
+        const double total = double(__uint_as_float(state.bound)) * kMultilevelMapGrowth * terms;
         if (!(total <= DBL_MAX)) {
             state.exponent = kMultilevelUnassembled;
             atomicOr(data.env_status + env, kEnvStatusSolverFailure);
@@ -895,11 +989,61 @@ __global__ void MultilevelScaleKernel(DataView data, BlockDescentSolveParams p, 
     }
 }
 
-// Inverts each node block above the dense level; a block that is not positive definite takes no step. Items
-// past them give the dense level's rows their Jacobi scales in single precision, kept after its factor.
+// Pseudo-inverse of a packed node block by its Jacobi-scaled Cholesky factor in double precision; a pivot at
+// or below kMultilevelPivot drops its coordinate, so the directions the children do not span take no step.
+__device__ inline void MultilevelNodeInverse(const double (&a)[kMultilevelNodeEntries],
+                                             float (&inverse)[kMultilevelNodeEntries]) {
+    constexpr uint32_t kDofs = kMultilevelNodeDofs;
+    double scale[kDofs], factor[kDofs][kDofs] = {};
+    for (uint32_t i = 0u; i < kDofs; ++i) {
+        const double diagonal = a[MultilevelPacked(i, i)];
+        scale[i] = diagonal > 0.0 && diagonal <= DBL_MAX ? 1.0 / sqrt(diagonal) : 0.0;
+    }
+    for (uint32_t j = 0u; j < kDofs; ++j) {
+        double pivot = a[MultilevelPacked(j, j)] * scale[j] * scale[j];
+        for (uint32_t k = 0u; k < j; ++k) pivot -= factor[j][k] * factor[j][k];
+        const double root = pivot > double(kMultilevelPivot) ? sqrt(pivot) : 0.0;
+        factor[j][j] = root;
+        for (uint32_t i = j + 1u; i < kDofs && root > 0.0; ++i) {
+            double value = a[MultilevelPacked(j, i)] * scale[i] * scale[j];
+            for (uint32_t k = 0u; k < j; ++k) value -= factor[i][k] * factor[j][k];
+            factor[i][j] = value / root;
+        }
+    }
+    for (uint32_t c = 0u; c < kDofs; ++c) {
+        double y[kDofs];
+        for (uint32_t i = 0u; i < kDofs; ++i) {
+            double value = i == c ? 1.0 : 0.0;
+            for (uint32_t k = 0u; k < i; ++k) value -= factor[i][k] * y[k];
+            y[i] = factor[i][i] > 0.0 ? value / factor[i][i] : 0.0;
+        }
+        for (uint32_t i = kDofs; i-- > 0u;) {
+            double value = y[i];
+            for (uint32_t k = i + 1u; k < kDofs; ++k) value -= factor[k][i] * y[k];
+            y[i] = factor[i][i] > 0.0 ? value / factor[i][i] : 0.0;
+        }
+        for (uint32_t i = 0u; i <= c; ++i)
+            inverse[MultilevelPacked(i, c)] = static_cast<float>(y[i] * scale[i] * scale[c]);
+    }
+}
+
+// The packed symmetric node inverse applied to a node residual.
+__device__ inline void MultilevelNodeMultiply(const float* inverse, const float (&residual)[kMultilevelNodeDofs],
+                                              float* out) {
+    for (uint32_t i = 0u; i < kMultilevelNodeDofs; ++i) {
+        float value = 0.0f;
+        for (uint32_t j = 0u; j < kMultilevelNodeDofs; ++j)
+            value = fmaf(inverse[i <= j ? MultilevelPacked(i, j) : MultilevelPacked(j, i)], residual[j], value);
+        out[i] = value;
+    }
+}
+
+// Inverts each node block above the dense level. Items past them give the dense level's rows their Jacobi
+// scales in single precision, kept after its factor.
 __global__ void MultilevelJacobiFactorKernel(BlockDescentSolveParams p, BlockScratch s) {
     const VertexBlockLayout& l = p.vertex_blocks;
-    const uint32_t jacobi = l.coarse_nodes - l.coarse_dense_nodes, rank = 3u * l.coarse_dense_nodes;
+    const uint32_t jacobi = l.coarse_nodes - l.coarse_dense_nodes;
+    const uint32_t rank = kMultilevelNodeDofs * l.coarse_dense_nodes;
     for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < (jacobi + rank) * p.env_count;
          item += gridDim.x * blockDim.x) {
         const uint32_t env = item / (jacobi + rank), node = item % (jacobi + rank);
@@ -908,23 +1052,24 @@ __global__ void MultilevelJacobiFactorKernel(BlockDescentSolveParams p, BlockScr
         if (node >= jacobi) {
             if (exponent == kMultilevelUnassembled) continue;
             const uint32_t i = node - jacobi;
-            const double diagonal = ldexp(
-                double(static_cast<long long>(entries[6u * size_t{jacobi} + MultilevelPacked(i, i)])), -exponent);
+            const double diagonal = ldexp(double(static_cast<long long>(
+                entries[kMultilevelNodeEntries * size_t{jacobi} + MultilevelPacked(i, i)])), -exponent);
             const double scale = diagonal > 0.0 ? 1.0 / sqrt(diagonal) : 0.0;
             float* scales = s.multilevel_dense_factor + size_t{env} * MultilevelDenseFactorWords(rank) +
                             rank * (rank + 1u) / 2u;
             scales[i] = scale <= double(FLT_MAX) ? static_cast<float>(scale) : 0.0f;
             continue;
         }
-        SymmetricMat3 inverse{};
+        float inverse[kMultilevelNodeEntries] = {};
         if (exponent != kMultilevelUnassembled) {
-            float values[6];
-            for (uint32_t k = 0u; k < 6u; ++k)
-                values[k] = static_cast<float>(
-                    ldexp(double(static_cast<long long>(entries[6u * size_t{node} + k])), -exponent));
-            nk::vbd::Invert({values[0], values[1], values[2], values[3], values[4], values[5]}, 0.0f, &inverse);
+            double values[kMultilevelNodeEntries];
+            for (uint32_t k = 0u; k < kMultilevelNodeEntries; ++k)
+                values[k] = ldexp(
+                    double(static_cast<long long>(entries[kMultilevelNodeEntries * size_t{node} + k])), -exponent);
+            MultilevelNodeInverse(values, inverse);
         }
-        s.multilevel_block_inverse[size_t{env} * jacobi + node] = inverse;
+        float* out = s.multilevel_block_inverse + (size_t{env} * jacobi + node) * kMultilevelNodeEntries;
+        for (uint32_t k = 0u; k < kMultilevelNodeEntries; ++k) out[k] = inverse[k];
     }
 }
 
@@ -932,7 +1077,7 @@ __global__ void MultilevelJacobiFactorKernel(BlockDescentSolveParams p, BlockScr
 // children keeps a unit row, so its step stays zero.
 __global__ void MultilevelDenseScaleKernel(BlockDescentSolveParams p, BlockScratch s) {
     const VertexBlockLayout& l = p.vertex_blocks;
-    const uint32_t first = l.coarse_nodes - l.coarse_dense_nodes, rank = 3u * l.coarse_dense_nodes;
+    const uint32_t first = l.coarse_nodes - l.coarse_dense_nodes, rank = kMultilevelNodeDofs * l.coarse_dense_nodes;
     const uint32_t packed = rank * (rank + 1u) / 2u;
     for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < packed * p.env_count;
          item += gridDim.x * blockDim.x) {
@@ -944,8 +1089,8 @@ __global__ void MultilevelDenseScaleKernel(BlockDescentSolveParams p, BlockScrat
         while ((j + 1u) * (j + 2u) / 2u <= k) ++j;
         const uint32_t i = k - j * (j + 1u) / 2u;
         float* factor = s.multilevel_dense_factor + size_t{env} * MultilevelDenseFactorWords(rank);
-        const unsigned long long entry =
-            s.multilevel_operator[size_t{env} * MultilevelOperatorEntries(l) + 6u * size_t{first} + k];
+        const size_t dense = size_t{env} * MultilevelOperatorEntries(l) + kMultilevelNodeEntries * size_t{first};
+        const unsigned long long entry = s.multilevel_operator[dense + k];
         const double value = ldexp(double(static_cast<long long>(entry)), -exponent);
         factor[k] = i == j ? 1.0f
                            : static_cast<float>(value * double(factor[packed + i]) * double(factor[packed + j]));
@@ -1032,8 +1177,8 @@ __device__ __forceinline__ void MultilevelDiagonalRow(float4 (&row)[kMultilevelF
     }
 }
 
-// Pivot kStep and the later ones of a diagonal block `width` wide: every lane roots the broadcast pivot, lanes
-// past it divide; the pivot row goes to row kStep of `rows` and updates all rows below, the next pivot first.
+// Pivot kStep onward of a `width`-wide diagonal block: lanes past the broadcast pivot divide by its root (infinite
+// when dropped, zeroing its column); its row goes to row kStep of `rows` and updates those below, next pivot first.
 template <uint32_t kStep>
 __device__ __forceinline__ void MultilevelDiagonalPivots(float (&d)[kMultilevelFactorPanel], float* rows,
                                                          uint32_t width, uint32_t lane, float pivot,
@@ -1041,8 +1186,8 @@ __device__ __forceinline__ void MultilevelDiagonalPivots(float (&d)[kMultilevelF
     constexpr uint32_t kPanel = kMultilevelFactorPanel;
     if constexpr (kStep < kPanel) {
         if (kStep < width) {
-            const float root = sqrtf(pivot);
-            *failed |= !(pivot > kMultilevelPivot);
+            const float root = pivot > kMultilevelPivot ? sqrtf(pivot) : INFINITY;
+            *failed |= pivot != pivot;
             const float divided = math::Quotient(lane > kStep ? d[kStep] : 0.0f, root);
             d[kStep] = lane == kStep ? root : divided;
             float next = 0.0f;
@@ -1226,7 +1371,7 @@ MultilevelDenseFactorKernel(BlockDescentSolveParams p, BlockScratch s) {
     __shared__ __align__(16) float factor_rows[kPanel * kPanel];
     __shared__ bool factor_failed;
     const VertexBlockLayout& l = p.vertex_blocks;
-    const uint32_t rank = 3u * l.coarse_dense_nodes;
+    const uint32_t rank = kMultilevelNodeDofs * l.coarse_dense_nodes;
     const uint32_t packed = rank * (rank + 1u) / 2u, stride = MultilevelFactorPanelStride(rank);
     float* scaled = reinterpret_cast<float*>(factor_words);
     float* panel = reinterpret_cast<float*>(reinterpret_cast<char*>(factor_words) + MultilevelFactorPanelOffset(rank));
@@ -1281,7 +1426,7 @@ __global__ void __launch_bounds__(32u * kMultilevelInverseWarps)
 MultilevelDenseInverseKernel(BlockDescentSolveParams p, BlockScratch s) {
     extern __shared__ float factor[];
     const VertexBlockLayout& l = p.vertex_blocks;
-    const uint32_t rank = 3u * l.coarse_dense_nodes, packed = rank * (rank + 1u) / 2u;
+    const uint32_t rank = kMultilevelNodeDofs * l.coarse_dense_nodes, packed = rank * (rank + 1u) / 2u;
     const uint32_t groups = (rank + kMultilevelInverseWarps - 1u) / kMultilevelInverseWarps;
     const uint32_t lane = threadIdx.x % 32u, warp = threadIdx.x / 32u;
     const float* scales = factor + packed;
@@ -1353,17 +1498,51 @@ MultilevelDenseInverseKernel(BlockDescentSolveParams p, BlockScratch s) {
 // still add in the lane's stride order.
 constexpr uint32_t kMultilevelRestrictBatch = 8u;
 
-// A node's restricted residual, summed by one warp in a fixed lane-strided order; every lane gets it.
-__device__ inline Vec3 RestrictedResidual(const ModelView& model, const BlockScratch& s, uint32_t vertices,
-                                          uint32_t env, uint32_t node, uint32_t lane) {
-    const Vec3* force = s.multilevel_force + size_t{env} * vertices;
+// Step-start frames of all coarse nodes, one warp per node: the weighted center of its children, then the
+// inverse of their largest distance from it.
+__global__ void MultilevelFrameKernel(ModelView model, DataView data, BlockDescentSolveParams p,
+                                      BlockScratch s, uint32_t parts) {
+    const VertexBlockLayout& l = p.vertex_blocks;
+    const uint32_t lane = threadIdx.x % 32u, warp = threadIdx.x / 32u, warps = blockDim.x / 32u;
+    const uint32_t env = blockIdx.x / parts, node = blockIdx.x % parts * warps + warp;
+    if (node >= l.coarse_nodes) return;
+    const Vec3* start = data.particle_prev_pos + size_t{env} * l.particles_per_env + l.begin;
+    const uint32_t begin = model.vbd_coarse_child_offsets[node], end = model.vbd_coarse_child_offsets[node + 1u];
+    Vec3 sum{};
+    float total = 0.0f;
+    for (uint32_t i = begin + lane; i < end; i += 32u) {
+        const float weight = model.vbd_coarse_child_weights[i];
+        sum += start[model.vbd_coarse_children[i]] * weight;
+        total += weight;
+    }
+    sum = {WarpSum(sum.x), WarpSum(sum.y), WarpSum(sum.z)};
+    total = WarpSum(total);
+    const Vec3 center = total > 0.0f ? sum / total : Vec3{};
+    float reach = 0.0f;
+    for (uint32_t i = begin + lane; i < end; i += 32u)
+        reach = fmaxf(reach, (start[model.vbd_coarse_children[i]] - center).LengthSq());
+    for (uint32_t offset = 16u; offset > 0u; offset /= 2u)
+        reach = fmaxf(reach, __shfl_xor_sync(0xffffffffu, reach, offset));
+    if (lane != 0u) return;
+    const float radius = sqrtf(reach);
+    s.multilevel_frame[size_t{env} * l.coarse_nodes + node] = {
+        center, radius > 0.0f && radius <= FLT_MAX ? 1.0f / radius : 0.0f};
+}
+
+// A node's restricted residual, the force and the torque of its children's residuals about its center, summed
+// by one warp in a fixed lane-strided order; every lane gets it.
+__device__ inline void RestrictedResidual(const ModelView& model, const DataView& data, const BlockScratch& s,
+                                          const VertexBlockLayout& l, uint32_t env, uint32_t node, uint32_t lane,
+                                          float (&out)[kMultilevelNodeDofs]) {
+    const Vec3* force = s.multilevel_force + size_t{env} * l.vertices;
+    const Vec3* start = data.particle_prev_pos + size_t{env} * l.particles_per_env + l.begin;
     const uint32_t end = model.vbd_coarse_child_offsets[node + 1u];
-    Vec3 residual{};
+    Vec3 residual{}, torque{};
     for (uint32_t base = model.vbd_coarse_child_offsets[node] + lane; base < end;
          base += 32u * kMultilevelRestrictBatch) {
         uint32_t child[kMultilevelRestrictBatch];
         float weight[kMultilevelRestrictBatch];
-        Vec3 value[kMultilevelRestrictBatch];
+        Vec3 value[kMultilevelRestrictBatch], arm[kMultilevelRestrictBatch];
 #pragma unroll
         for (uint32_t k = 0u; k < kMultilevelRestrictBatch; ++k) {
             const uint32_t i = base + 32u * k;
@@ -1372,35 +1551,42 @@ __device__ inline Vec3 RestrictedResidual(const ModelView& model, const BlockScr
         }
 #pragma unroll
         for (uint32_t k = 0u; k < kMultilevelRestrictBatch; ++k)
-            if (base + 32u * k < end) value[k] = force[child[k]];
+            if (base + 32u * k < end) {
+                value[k] = force[child[k]];
+                arm[k] = MultilevelArm(s, l.coarse_nodes, env, node, start[child[k]]);
+            }
 #pragma unroll
         for (uint32_t k = 0u; k < kMultilevelRestrictBatch; ++k)
-            if (base + 32u * k < end) residual += value[k] * weight[k];
+            if (base + 32u * k < end) {
+                residual += value[k] * weight[k];
+                torque += arm[k].Cross(value[k]) * weight[k];
+            }
     }
-    return {WarpSum(residual.x), WarpSum(residual.y), WarpSum(residual.z)};
+    const float sums[kMultilevelNodeDofs] = {residual.x, residual.y, residual.z, torque.x, torque.y, torque.z};
+    for (uint32_t k = 0u; k < kMultilevelNodeDofs; ++k) out[k] = WarpSum(sums[k]);
 }
 
 // Restricted residuals of all coarse nodes, one warp per node; the dense level is staged separately
 // so its matrix product reads a complete input before any output is written.
-__global__ void MultilevelCorrectKernel(ModelView model, BlockDescentSolveParams p,
+__global__ void MultilevelCorrectKernel(ModelView model, DataView data, BlockDescentSolveParams p,
                                         BlockScratch s, uint32_t parts) {
     const VertexBlockLayout& l = p.vertex_blocks;
-    const uint32_t first = l.coarse_nodes - l.coarse_dense_nodes, rank = 3u * l.coarse_dense_nodes;
+    const uint32_t first = l.coarse_nodes - l.coarse_dense_nodes;
+    const uint32_t rank = kMultilevelNodeDofs * l.coarse_dense_nodes;
     const uint32_t lane = threadIdx.x % 32u, warp = threadIdx.x / 32u, warps = blockDim.x / 32u;
     // Coarser nodes restrict more children, so their blocks come first.
     const uint32_t env = blockIdx.x / parts, node = (parts - 1u - blockIdx.x % parts) * warps + warp;
     if (node >= l.coarse_nodes) return;
-    const Vec3 residual = RestrictedResidual(model, s, l.vertices, env, node, lane);
+    float residual[kMultilevelNodeDofs];
+    RestrictedResidual(model, data, s, l, env, node, lane, residual);
     if (lane != 0u) return;
     if (node < first)
-        s.multilevel_correction[size_t{env} * l.coarse_nodes + node] =
-            s.multilevel_block_inverse[size_t{env} * first + node].Multiply(residual);
-    else {
-        float* out = s.multilevel_restricted + size_t{env} * rank + 3u * (node - first);
-        out[0] = residual.x;
-        out[1] = residual.y;
-        out[2] = residual.z;
-    }
+        MultilevelNodeMultiply(s.multilevel_block_inverse + (size_t{env} * first + node) * kMultilevelNodeEntries,
+                               residual,
+                               s.multilevel_correction + (size_t{env} * l.coarse_nodes + node) * kMultilevelNodeDofs);
+    else
+        for (uint32_t k = 0u; k < kMultilevelNodeDofs; ++k)
+            s.multilevel_restricted[size_t{env} * rank + kMultilevelNodeDofs * (node - first) + k] = residual[k];
 }
 
 // Warps share 32 contiguous outputs; each keeps the original lane-strided FMA partials, then sums
@@ -1413,7 +1599,7 @@ MultilevelDenseCorrectKernel(BlockDescentSolveParams p, BlockScratch s, uint32_t
     __shared__ float restricted[kMultilevelDenseRank];
     __shared__ float partial[warps][32];
     const VertexBlockLayout& l = p.vertex_blocks;
-    const uint32_t rank = 3u * l.coarse_dense_nodes, first = l.coarse_nodes - l.coarse_dense_nodes;
+    const uint32_t rank = kMultilevelNodeDofs * l.coarse_dense_nodes, first = l.coarse_nodes - l.coarse_dense_nodes;
     const uint32_t env = blockIdx.x / tiles, lane = threadIdx.x % 32u, warp = threadIdx.x / 32u;
     const uint32_t i = blockIdx.x % tiles * 32u + lane;
     for (uint32_t k = threadIdx.x; k < rank; k += blockDim.x)
@@ -1434,31 +1620,35 @@ MultilevelDenseCorrectKernel(BlockDescentSolveParams p, BlockScratch s, uint32_t
     if (warp < 2u) partial[warp][lane] = __fadd_rn(partial[warp][lane], partial[warp + 2u][lane]);
     __syncthreads();
     if (warp != 0u || i >= rank) return;
-    const float value = __fadd_rn(partial[0][lane], partial[1][lane]);
-    Vec3& out = s.multilevel_correction[size_t{env} * l.coarse_nodes + first + i / 3u];
-    if (i % 3u == 0u) out.x = value;
-    else if (i % 3u == 1u) out.y = value;
-    else out.z = value;
+    s.multilevel_correction[(size_t{env} * l.coarse_nodes + first) * kMultilevelNodeDofs + i] =
+        __fadd_rn(partial[0][lane], partial[1][lane]);
 }
 
-// The summed level corrections interpolated to every moving vertex as a rate direction.
+// The summed level corrections interpolated to every moving vertex as a rate direction: each parent's
+// translation plus its rotation about the vertex's arm.
 __global__ void MultilevelProlongKernel(ModelView model, DataView data, BlockDescentSolveParams p,
                                         BlockScratch s) {
     const VertexBlockLayout& l = p.vertex_blocks;
     for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < l.vertices * p.env_count;
          item += gridDim.x * blockDim.x) {
         const uint32_t env = item / l.vertices, vertex = item % l.vertices;
+        const uint32_t particle = env * l.particles_per_env + l.begin + vertex;
         Vec3 direction{};
-        if (MultilevelDynamic(s, env * l.particles_per_env + l.begin + vertex))
+        if (MultilevelDynamic(s, particle)) {
+            const Vec3 start = data.particle_prev_pos[particle];
             for (uint32_t level = 0u; level < l.coarse_levels; ++level) {
                 const size_t at = (size_t{level} * l.vertices + vertex) * nk::kVbdCoarseParents;
                 for (uint32_t k = 0u; k < nk::kVbdCoarseParents; ++k) {
                     const uint32_t node = model.vbd_coarse_parents[at + k];
                     if (node == ~0u) continue;
-                    direction += s.multilevel_correction[size_t{env} * l.coarse_nodes + node] *
+                    const float* c =
+                        s.multilevel_correction + (size_t{env} * l.coarse_nodes + node) * kMultilevelNodeDofs;
+                    const Vec3 arm = MultilevelArm(s, l.coarse_nodes, env, node, start);
+                    direction += (Vec3{c[0], c[1], c[2]} + Vec3{c[3], c[4], c[5]}.Cross(arm)) *
                                  model.vbd_coarse_weights[at + k];
                 }
             }
+        }
         s.multilevel_direction[item] = direction / p.dt;
     }
 }
