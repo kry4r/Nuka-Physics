@@ -29,6 +29,20 @@ __device__ bool VertexInTriangle(const collision::MeshSurfaceView& view,
            view.triangles[at + 2u] == vertex;
 }
 
+// Whether `other` is among the cooked surface neighbours of environment particle `vertex`.
+__device__ bool OgcSurfaceNeighbour(const ModelView& model, uint32_t vertex, uint32_t other) {
+    uint32_t low = model.particle_surface_neighbour_offsets[vertex];
+    uint32_t high = model.particle_surface_neighbour_offsets[vertex + 1u];
+    while (low < high) {
+        const uint32_t middle = low + (high - low) / 2u;
+        const uint32_t value = model.particle_surface_neighbours[middle];
+        if (value == other) return true;
+        if (value < other) low = middle + 1u;
+        else high = middle;
+    }
+    return false;
+}
+
 __global__ void ClearOgcSlotsKernel(OgcDetectParams p, DataView data) {
     const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t total = p.env_count * p.slot_capacity;
@@ -89,13 +103,20 @@ __device__ void OgcEmitParticleFace(const OgcDetectParams& p, const ModelView& m
                                               feature.barycentric);
     const float radius = model.particle_self_half_thickness[source_local] + face.half_thickness;
     if (c.source_surface == target_surface) {
-        // Features of one surface already within their contact distance at rest are neighbours, not contacts.
+        // Features of one surface within their contact distance at rest, and near along the surface, are
+        // neighbours, not contacts; rest-close layers of a fold or roll stay contacts.
+        uint32_t corner[3];
         math::Vec3 rest[3];
-        for (uint32_t j = 0u; j < 3u; ++j)
-            rest[j] = model.particle_rest_pos[target_info.vertex_offset + view.triangles[tri_at + j]];
+        for (uint32_t j = 0u; j < 3u; ++j) {
+            corner[j] = target_info.vertex_offset + view.triangles[tri_at + j];
+            rest[j] = model.particle_rest_pos[corner[j]];
+        }
         const math::Vec3 source_rest = model.particle_rest_pos[source_local];
         if ((collision::ClosestTrianglePoint(source_rest, rest[0], rest[1], rest[2]).point - source_rest)
-                .LengthSq() < radius * radius) return;
+                .LengthSq() < radius * radius &&
+            (OgcSurfaceNeighbour(model, source_local, corner[0]) ||
+             OgcSurfaceNeighbour(model, source_local, corner[1]) ||
+             OgcSurfaceNeighbour(model, source_local, corner[2]))) return;
     }
     const uint32_t ordinal = OgcClaimSlot(p, data, env);
     if (ordinal >= p.slot_capacity) {
@@ -185,10 +206,12 @@ __device__ void OgcEmitParticleEdge(const OgcDetectParams& p, const ModelView& m
     }
     if (source_surface == target_surface) {
         const auto* rest = model.particle_rest_pos;
+        const uint32_t a0 = source_info.vertex_offset + vertices_a[0];
+        const uint32_t b0 = target_info.vertex_offset + vertices_b[0], b1 = target_info.vertex_offset + vertices_b[1];
         const auto at_rest = collision::OgcClosestSegments(
-            rest[source_info.vertex_offset + vertices_a[0]], rest[source_info.vertex_offset + vertices_a[1]],
-            rest[target_info.vertex_offset + vertices_b[0]], rest[target_info.vertex_offset + vertices_b[1]]);
-        if ((at_rest.a - at_rest.b).LengthSq() < radius * radius) return;
+            rest[a0], rest[source_info.vertex_offset + vertices_a[1]], rest[b0], rest[b1]);
+        if ((at_rest.a - at_rest.b).LengthSq() < radius * radius &&
+            (OgcSurfaceNeighbour(model, a0, b0) || OgcSurfaceNeighbour(model, a0, b1))) return;
     }
     const uint32_t ordinal = OgcClaimSlot(p, data, env);
     if (ordinal >= p.slot_capacity) {
@@ -435,7 +458,7 @@ Status OpOgcDetect(const ModelView& model, const DataView& data,
                                        !data.particle_surface_edge_nodes)) ||
              !model.particle_surface_edge_info || !model.particle_surface_thickness ||
              !model.particle_half_thickness || !model.particle_friction || !model.particle_rest_pos ||
-             !data.particle_pos ||
+             !model.particle_surface_neighbour_offsets || !data.particle_pos ||
              !data.particle_surface_max_speed)) ||
         (mixed && (!model.mesh_surface_info || !model.mesh_edge_info ||
                    !model.mesh_triangles || !model.mesh_bvh_nodes ||

@@ -65,6 +65,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -613,6 +614,17 @@ Value SaveMedia(const MediaRecord& m, MeshSink& sink) {
     Value pins = Value::Array();
     for (uint32_t vertex : m.cloth_mesh.pinned_vertices) pins.PushBack(Value::Int(vertex));
     cm.Set("pinned_vertices", std::move(pins));
+    if (!m.cloth_mesh.hinge_rest_angles.empty()) {
+        Value hinges = Value::Array();
+        for (const auto& hinge : m.cloth_mesh.hinge_rest_angles) {
+            Value entry = Value::Array();
+            entry.PushBack(Value::Int(hinge.a));
+            entry.PushBack(Value::Int(hinge.b));
+            entry.PushBack(Value::Float(hinge.angle));
+            hinges.PushBack(std::move(entry));
+        }
+        cm.Set("hinge_rest_angles", std::move(hinges));
+    }
     o.Set("cloth_mesh", std::move(cm));
 
     Value cg = Value::Object();
@@ -660,6 +672,8 @@ Value SaveMedia(const MediaRecord& m, MeshSink& sink) {
         xp.Set("half_thickness", Value::Float(mv.half_thickness));
         if (mv.self_half_thickness != 0.0f) xp.Set("self_half_thickness", Value::Float(mv.self_half_thickness));
         if (!mv.self_contact) xp.Set("self_contact", Value::Bool(false));
+        if (mv.contact_pairs_per_vertex != 0u)
+            xp.Set("contact_pairs_per_vertex", Value::Int(static_cast<int64_t>(mv.contact_pairs_per_vertex)));
         xp.Set("friction", Value::Float(mv.friction));
         xp.Set("stretch_stiffness", Value::Float(mv.stretch_stiffness));
         xp.Set("poisson", Value::Float(mv.poisson));
@@ -1917,6 +1931,18 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                             throw std::invalid_argument("Cloth pinned vertex is out of range");
                         rec.cloth_mesh.pinned_vertices.push_back(static_cast<uint32_t>(id));
                     }
+                if (const Value* hinges = cm->Find("hinge_rest_angles"))
+                    for (const Value& entry : hinges->Elements()) {
+                        if (entry.Elements().size() != 3u)
+                            throw std::invalid_argument("Cloth hinge rest angle needs [a, b, angle]");
+                        const auto from = entry.Elements()[0].AsInt(), to = entry.Elements()[1].AsInt();
+                        const float angle = entry.Elements()[2].AsFloat();
+                        if (from < 0 || to < 0 || static_cast<uint64_t>(from) > UINT32_MAX ||
+                            static_cast<uint64_t>(to) > UINT32_MAX || !std::isfinite(angle))
+                            throw std::invalid_argument("Cloth hinge rest angle is out of range");
+                        rec.cloth_mesh.hinge_rest_angles.push_back(
+                            {static_cast<uint32_t>(from), static_cast<uint32_t>(to), angle});
+                    }
             }
 
             if (const Value* cg = mv.Find("cloth_grid")) {
@@ -1965,6 +1991,12 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                 out.half_thickness = f(xp, "half_thickness", out.half_thickness);
                 out.self_half_thickness = f(xp, "self_half_thickness", out.self_half_thickness);
                 out.self_contact = b(xp, "self_contact", out.self_contact);
+                if (const Value* budget = xp.Find("contact_pairs_per_vertex")) {
+                    const auto count = budget->AsInt();
+                    if (count < 0 || static_cast<uint64_t>(count) > UINT32_MAX)
+                        throw std::invalid_argument("Mesh contact pairs per vertex is out of range");
+                    out.contact_pairs_per_vertex = static_cast<uint32_t>(count);
+                }
                 out.friction = f(xp, "friction", out.friction);
                 out.stretch_stiffness = f(xp, "stretch_stiffness", out.stretch_stiffness);
                 out.poisson = f(xp, "poisson", out.poisson);

@@ -91,7 +91,7 @@ inline cook::VbdCookInput BuildCloth(float cx, float cy, float z, uint32_t nx = 
         in.inv_mass[idx(k, 0)] = 0.0f; in.inv_mass[idx(k, last)] = 0.0f;
         in.inv_mass[idx(0, k)] = 0.0f; in.inv_mass[idx(last, k)] = 0.0f;
     }
-    soft::BuildClothVertexBlocks(rest, tris, {}, std::vector<soft::ShellMaterial>(tris.size(), shell),
+    soft::BuildClothVertexBlocks(rest, tris, {}, {}, std::vector<soft::ShellMaterial>(tris.size(), shell),
                                  in.vbd_elements);
     in.vbd_count = static_cast<uint32_t>(rest.size());
     for (const auto& triangle : tris)

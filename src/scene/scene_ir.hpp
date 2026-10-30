@@ -366,6 +366,8 @@ struct MediaVbdMaterial {
     // Particle-particle contact half distance (m); 0 shares half_thickness, the body contact distance.
     float    self_half_thickness = 0.0f;
     bool     self_contact      = true;   // contact with particle surfaces, its own included
+    // Mesh contact pairs reserved per surface vertex; below one per vertex and edge, that count stands.
+    uint32_t contact_pairs_per_vertex = 0u;
     float    friction          = 0.6f;   // body<->soft contact mu
     float    stretch_stiffness = 0.0f;   // cloth Young's modulus times thickness (N/m); cable EA (N)
     float    poisson           = 0.0f;   // cloth membrane Poisson ratio
@@ -456,6 +458,13 @@ struct MediaRecord {
         math::Transform local_transform{};
         AssetRef material_mesh;
         std::vector<uint32_t> pinned_vertices;
+        // Rest dihedral of mesh edge (a, b) in radians, signed under the mesh's own face winding; hinges not
+        // listed rest at the mesh's dihedral, or flat when a material pattern is given.
+        struct HingeRest {
+            uint32_t a = 0u, b = 0u;
+            float angle = 0.0f;
+        };
+        std::vector<HingeRest> hinge_rest_angles;
     };
     struct TetSphere {
         math::Vec3 center{0.0f, 0.0f, 0.0f};

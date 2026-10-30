@@ -854,3 +854,6 @@ fields:
   - {name: joint_limit_margin, dtype: f32, per: link, arena: persistent, owner: model, flags: [param]}
   - {name: body_invweight0, dtype: f32, per: body, elem: 2, arena: persistent, owner: model, flags: [param]}
   - {name: dof_invweight0, dtype: f32, per: articulation_dof, arena: persistent, owner: model, flags: [param]}
+  # Each environment particle's sorted surface neighbours (ModelParticles::surface_neighbours), by particle.
+  - {name: particle_surface_neighbour_offsets, dtype: u32, per: scalar, count: "particles_per_env+1", arena: persistent, owner: model}
+  - {name: particle_surface_neighbours, dtype: u32, per: scalar, count: "particle_surface_neighbours_per_env", arena: persistent, owner: model}

@@ -117,6 +117,7 @@ struct CookParticleSurface {
     std::vector<uint32_t> triangles;
     std::vector<uint32_t> edges;
     bool self_contact = true;   // contact with particle surfaces, this one included
+    uint32_t contact_pairs_per_vertex = 0u;  // mesh contact pairs reserved per vertex
 };
 
 struct VbdCookInput {

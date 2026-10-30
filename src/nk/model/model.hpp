@@ -80,6 +80,7 @@ struct ModelCapacities {
     uint32_t particle_surface_nodes_per_env = 0u;
     uint32_t particle_surface_edges_per_env = 0u;
     uint32_t particle_surface_edge_nodes_per_env = 0u;
+    uint32_t particle_surface_neighbours_per_env = 0u;
     uint32_t point_endpoints_per_env = 0u;
     uint32_t point_endpoint_terms_per_env = 0u;
     // Vertex blocks occupy particles [vbd_particle_begin, + vbd_vertices_per_env) of each env.
@@ -130,6 +131,8 @@ struct ModelCapacities {
     uint32_t mpm_grid_nodes_per_env = 0;
     uint32_t mpm_contact_capacity_per_env = 0;  // Shared pool; multiple contacts may use one material point.
     uint32_t ogc_contacts_per_env = 0u;
+    // Mesh contact slots particle surfaces reserve beyond one per vertex and edge, from their pair budgets.
+    uint32_t ogc_surface_reserve_per_env = 0u;
     // Implicit stress cells, one row block per occupied grid cell, at the tail of each env's row span.
     uint32_t mpm_stress_cells_per_env = 0;
     // Byte size of the mpm_sort_scratch field (the P2G deterministic-gather cub
@@ -379,6 +382,10 @@ public:
         std::vector<float> surface_thickness;
         std::vector<float> surface_self_thickness;
         std::vector<uint32_t> surface_self_contact;   // 1 where the surface meets particle surfaces
+        // Sorted rest-edge neighbours per particle, within twice (self contact distance + longest edge).
+        // Rest-close features among these neighbours do not generate self contacts.
+        std::vector<uint32_t> surface_neighbour_offsets;
+        std::vector<uint32_t> surface_neighbours;
         // Per-particle contact half thickness against bodies and against particle surfaces, and friction;
         // each surface thickness is the maximum over its vertices.
         std::vector<float> half_thickness;

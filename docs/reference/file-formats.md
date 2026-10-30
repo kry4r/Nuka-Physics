@@ -10,6 +10,15 @@ pulls in by path) and the contact filters `exclude_pairs` and `contact_pairs`.
 **`.nka`** sits beside an `.nks` with the same name and holds its binary payload: meshes and, in a
 packaged scene, every image ([Package Scene](../editor/documents.md#saving)). Keep the two together.
 
+VBD cloth and cable media may set `vbd.contact_pairs_per_vertex` to reserve mesh contact pairs per surface
+vertex. The cook keeps at least one slot per vertex and surface edge; `0` uses that estimate. Larger budgets
+help dense folds and layered surfaces, at the cost of more contact storage.
+
+For baked cloth, `cloth_mesh.hinge_rest_angles` accepts `[a, b, angle]` entries: the two vertex indices of an
+interior edge and its signed rest dihedral in radians under the mesh's face winding. Each edge may appear
+once. These angles override the rest angles derived from the mesh, including the flat angles otherwise used
+with `cloth_mesh.material_mesh`. Omitted edges keep their derived angles.
+
 The editor and the engine also read:
 
 | Format | Read | Written |

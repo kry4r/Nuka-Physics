@@ -217,6 +217,9 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
             return particle_surface_edges_per_env > 0u ? uint64_t{particles_per_env} + 1u : 0u;
         if (id == FieldId::ParticleSurfaceVertexTriangleOffsets)
             return particle_surface_triangles > 0u ? uint64_t{particles_per_env} + 1u : 0u;
+        if (id == FieldId::ParticleSurfaceNeighbourOffsets)
+            return particle_surfaces_per_env > 0u ? uint64_t{particles_per_env} + 1u : 0u;
+        if (id == FieldId::ParticleSurfaceNeighbours) return particle_surface_neighbours_per_env;
         if (id == FieldId::ParticleSurfaceTree) return particle_surface_nodes_per_env;
         if (id == FieldId::ParticleSurfaceEdges) return particle_surface_edges_per_env;
         if (id == FieldId::ParticleSurfaceEdgeTree) return particle_surface_edge_nodes_per_env;
@@ -695,6 +698,14 @@ void Model::StageModelField(FieldId id, const Segment& seg,
                 });
             break;
         }
+        case FieldId::ParticleSurfaceNeighbourOffsets:
+            if (!particles.surface_neighbour_offsets.empty()) std::memcpy(dst,
+                particles.surface_neighbour_offsets.data(), particles.surface_neighbour_offsets.size() * sizeof(uint32_t));
+            break;
+        case FieldId::ParticleSurfaceNeighbours:
+            if (!particles.surface_neighbours.empty()) std::memcpy(dst, particles.surface_neighbours.data(),
+                particles.surface_neighbours.size() * sizeof(uint32_t));
+            break;
         case FieldId::ParticleSurfaceThickness:
             if (!particles.surface_thickness.empty()) std::memcpy(dst, particles.surface_thickness.data(),
                 particles.surface_thickness.size() * sizeof(float));
@@ -1181,6 +1192,9 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::ParticleSurfaceVertexEdges: v.particle_surface_vertex_edges = static_cast<uint32_t*>(p); break;
         case FieldId::ParticleSurfaceVertexTriangleOffsets: v.particle_surface_vertex_triangle_offsets = static_cast<uint32_t*>(p); break;
         case FieldId::ParticleSurfaceVertexTriangles: v.particle_surface_vertex_triangles = static_cast<uint32_t*>(p); break;
+        case FieldId::ParticleSurfaceNeighbourOffsets:
+            v.particle_surface_neighbour_offsets = static_cast<uint32_t*>(p); break;
+        case FieldId::ParticleSurfaceNeighbours: v.particle_surface_neighbours = static_cast<uint32_t*>(p); break;
         case FieldId::ParticleSurfaceThickness: v.particle_surface_thickness = static_cast<float*>(p); break;
         case FieldId::ParticleHalfThickness: v.particle_half_thickness = static_cast<float*>(p); break;
         case FieldId::ParticleSelfHalfThickness: v.particle_self_half_thickness = static_cast<float*>(p); break;
@@ -1327,6 +1341,22 @@ phi::Status Model::ValidateTopology(std::string* reason) const {
         particles.surface_triangles.size() != uint64_t{cap.particle_surface_triangles} * 3u ||
         particles.surface_tree.size() != cap.particle_surface_nodes_per_env)
         return reject(Status::InvalidArgument, "particle surface topology counts disagree");
+    const auto& neighbour_offsets = particles.surface_neighbour_offsets;
+    if (cap.particle_surfaces_per_env == 0u
+            ? !neighbour_offsets.empty() || !particles.surface_neighbours.empty() ||
+              cap.particle_surface_neighbours_per_env != 0u
+            : neighbour_offsets.size() != uint64_t{cap.particles_per_env} + 1u || neighbour_offsets.front() != 0u ||
+              neighbour_offsets.back() != particles.surface_neighbours.size() ||
+              particles.surface_neighbours.size() != cap.particle_surface_neighbours_per_env ||
+              !std::is_sorted(neighbour_offsets.begin(), neighbour_offsets.end()) ||
+              std::any_of(particles.surface_neighbours.begin(), particles.surface_neighbours.end(),
+                          [&](uint32_t particle) { return particle >= cap.particles_per_env; }))
+        return reject(Status::InvalidArgument, "particle surface neighbours disagree with the particle count");
+    if (cap.particle_surfaces_per_env > 0u)
+        for (uint32_t particle = 0u; particle < cap.particles_per_env; ++particle)
+            if (!std::is_sorted(particles.surface_neighbours.begin() + neighbour_offsets[particle],
+                                particles.surface_neighbours.begin() + neighbour_offsets[particle + 1u]))
+                return reject(Status::InvalidArgument, "particle surface neighbours must be sorted per particle");
     if (particles.half_thickness.size() != cap.particles_per_env ||
         particles.self_half_thickness.size() != cap.particles_per_env ||
         particles.friction.size() != cap.particles_per_env)

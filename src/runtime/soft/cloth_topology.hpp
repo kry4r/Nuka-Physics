@@ -5,6 +5,8 @@
 
 #include <array>
 #include <cstdint>
+#include <map>
+#include <utility>
 #include <vector>
 
 namespace nuka::runtime::soft {
@@ -30,11 +32,12 @@ struct RodMaterial {
     float damping = 0.0f;
 };
 
-// StVK membrane triangles of per-face materials and one dihedral hinge per interior edge at the
-// mean of its faces; planar material faces, when given, set the rest metric and a flat rest angle.
+// Membrane triangles of per-face materials and one dihedral hinge per interior edge at the mean of its
+// faces; material faces set the rest metric and a flat rest angle, which `rest_angles` overrides per edge.
 void BuildClothVertexBlocks(const std::vector<math::Vec3>& rest_positions,
                             const std::vector<ClothTriangle>& triangles,
                             const std::vector<std::array<math::Vec3, 3>>& material_faces,
+                            const std::map<std::pair<uint32_t, uint32_t>, float>& rest_angles,
                             const std::vector<ShellMaterial>& materials,
                             std::vector<nk::VbdElement>& out);
 

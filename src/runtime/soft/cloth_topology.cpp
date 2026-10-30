@@ -40,6 +40,7 @@ nk::VbdElement VertexBlockSpring(uint32_t a, uint32_t b, float rest_length, floa
 void BuildClothVertexBlocks(const std::vector<math::Vec3>& rest_positions,
                             const std::vector<ClothTriangle>& triangles,
                             const std::vector<std::array<math::Vec3, 3>>& material_faces,
+                            const std::map<std::pair<uint32_t, uint32_t>, float>& rest_angles,
                             const std::vector<ShellMaterial>& materials,
                             std::vector<nk::VbdElement>& out) {
     if (materials.size() != triangles.size())
@@ -129,7 +130,9 @@ void BuildClothVertexBlocks(const std::vector<math::Vec3>& rest_positions,
         nk::VbdElement e;
         e.kind = nk::kVbdHinge;
         e.vertex[0] = x0; e.vertex[1] = x1; e.vertex[2] = x2; e.vertex[3] = x3;
-        e.rest[0] = material_faces.empty()
+        const auto given = rest_angles.find(entry.first);
+        e.rest[0] = given != rest_angles.end() ? given->second
+            : material_faces.empty()
             ? DihedralAngle(rest_positions[x0], rest_positions[x1], rest_positions[x2], rest_positions[x3])
             : 0.0f;
         e.rest[1] = bend * 3.0f * edge_len * edge_len / (areas[fa] + areas[fb]);

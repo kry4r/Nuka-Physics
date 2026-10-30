@@ -35,6 +35,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
+#include <queue>
 #include <stdexcept>
 
 #include "collision/shape_kind.hpp"  // nuka::collision::ShapeKind (R2: one enum)
@@ -338,12 +340,13 @@ static uint32_t RigidContactBase(const nk::Model& model) {
     return cap.max_contacts_per_env - static_cast<uint32_t>(compact);
 }
 
-// Mesh contact slots: each cloth vertex and surface edge, again against body mesh features when bodies carry them.
+// Mesh contact slots: each cloth vertex and surface edge plus the surfaces' reserves, again against body mesh
+// features when bodies carry them.
 static void SetParticleOgcCapacity(nk::ModelCapacities& cap, uint32_t cloth_vertices) {
     const bool has_body_mesh = cap.mesh_vertex_source_count > 0u ||
                                cap.mesh_edge_source_count > 0u;
     const uint64_t cloth_sources = uint64_t{cloth_vertices} +
-                                   cap.particle_surface_edges_per_env;
+                                   cap.particle_surface_edges_per_env + cap.ogc_surface_reserve_per_env;
     const uint64_t body_features = uint64_t{cap.mesh_vertex_source_count} +
                                    cap.mesh_edge_source_count;
     const uint64_t ogc_slots = cloth_sources +
@@ -352,6 +355,68 @@ static void SetParticleOgcCapacity(nk::ModelCapacities& cap, uint32_t cloth_vert
         throw std::invalid_argument("mesh contact capacity exceeds device indexing");
     cap.ogc_contacts_per_env = cap.particle_surfaces_per_env > 0u || has_body_mesh
         ? static_cast<uint32_t>(ogc_slots) : 0u;
+}
+
+// Rest edge paths bound each self-contacting vertex's neighbours by twice (contact distance + longest edge).
+// The edge allowance includes the corners of nearby faces; edge paths overestimate surface distance.
+static void SetParticleSurfaceNeighbours(nk::Model::ModelParticles& mp, nk::ModelCapacities& cap) {
+    mp.surface_neighbour_offsets.clear();
+    mp.surface_neighbours.clear();
+    cap.particle_surface_neighbours_per_env = 0u;
+    if (mp.surface_info.empty()) return;
+    std::vector<std::vector<uint32_t>> lists(mp.initial_pos.size());
+    std::vector<float> distance;
+    std::vector<uint32_t> reached;
+    using Entry = std::pair<float, uint32_t>;
+    for (size_t surface = 0u; surface < mp.surface_info.size(); ++surface) {
+        if (mp.surface_self_contact[surface] == 0u) continue;
+        const auto& edges = mp.surface_edge_info[surface];
+        const uint32_t begin = edges.vertex_offset, count = mp.surface_info[surface].vertex_count;
+        std::vector<std::vector<std::pair<uint32_t, float>>> adjacent(count);
+        float longest = 0.0f;
+        for (uint32_t e = 0u; e < edges.edge_count; ++e) {
+            const auto& edge = mp.surface_edges[edges.edge_offset + e];
+            const float length = (mp.initial_pos[begin + edge.vertex1] - mp.initial_pos[begin + edge.vertex0]).Length();
+            adjacent[edge.vertex0].push_back({edge.vertex1, length});
+            adjacent[edge.vertex1].push_back({edge.vertex0, length});
+            longest = std::max(longest, length);
+        }
+        const float reach = 2.0f * (2.0f * mp.surface_self_thickness[surface] + longest);
+        distance.assign(count, INFINITY);
+        for (uint32_t source = 0u; source < count; ++source) {
+            std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> queue;
+            distance[source] = 0.0f;
+            reached.assign(1u, source);
+            queue.push({0.0f, source});
+            while (!queue.empty()) {
+                const auto [at, vertex] = queue.top();
+                queue.pop();
+                if (at > distance[vertex]) continue;
+                for (const auto& [next, length] : adjacent[vertex]) {
+                    const float along = at + length;
+                    if (!(along <= reach) || !(along < distance[next])) continue;
+                    if (distance[next] == INFINITY) reached.push_back(next);
+                    distance[next] = along;
+                    queue.push({along, next});
+                }
+            }
+            auto& list = lists[begin + source];
+            for (const uint32_t vertex : reached) {
+                list.push_back(begin + vertex);
+                distance[vertex] = INFINITY;
+            }
+            std::sort(list.begin(), list.end());
+        }
+    }
+    mp.surface_neighbour_offsets.reserve(lists.size() + 1u);
+    mp.surface_neighbour_offsets.push_back(0u);
+    for (const auto& list : lists) {
+        mp.surface_neighbours.insert(mp.surface_neighbours.end(), list.begin(), list.end());
+        if (mp.surface_neighbours.size() > std::numeric_limits<uint32_t>::max())
+            throw std::invalid_argument("particle surface neighbours exceed device indexing");
+        mp.surface_neighbour_offsets.push_back(static_cast<uint32_t>(mp.surface_neighbours.size()));
+    }
+    cap.particle_surface_neighbours_per_env = static_cast<uint32_t>(mp.surface_neighbours.size());
 }
 
 void SetOgcContactCapacity(nk::Model& model, uint32_t capacity) {
@@ -1840,6 +1905,7 @@ void CookVbdParticles(nk::Model& model, uint32_t env_count,
     mp.surface_thickness.clear();
     mp.surface_self_thickness.clear();
     mp.surface_self_contact.clear();
+    uint64_t surface_reserve = 0u;
     for (const auto& surface : in.surfaces) {
         if ((surface.triangles.empty() && surface.edges.empty()) ||
             surface.triangles.size() % 3u != 0u || surface.edges.size() % 2u != 0u ||
@@ -1892,12 +1958,19 @@ void CookVbdParticles(nk::Model& model, uint32_t env_count,
         mp.surface_self_thickness.push_back(*std::max_element(mp.self_half_thickness.begin() + begin,
                                                               mp.self_half_thickness.begin() + begin + count));
         mp.surface_self_contact.push_back(surface.self_contact ? 1u : 0u);
+        const uint64_t budget = uint64_t{surface.contact_pairs_per_vertex} * count;
+        const uint64_t features = uint64_t{count} + cooked_edges.info.edge_count;
+        surface_reserve += budget > features ? budget - features : 0u;
     }
+    if (surface_reserve > std::numeric_limits<uint32_t>::max())
+        throw std::invalid_argument("mesh contact capacity exceeds device indexing");
+    cap.ogc_surface_reserve_per_env = static_cast<uint32_t>(surface_reserve);
     cap.particle_surfaces_per_env = static_cast<uint32_t>(mp.surface_info.size());
     cap.particle_surface_triangles = static_cast<uint32_t>(mp.surface_triangles.size() / 3u);
     cap.particle_surface_nodes_per_env = static_cast<uint32_t>(mp.surface_tree.size());
     cap.particle_surface_edges_per_env = static_cast<uint32_t>(mp.surface_edges.size());
     cap.particle_surface_edge_nodes_per_env = static_cast<uint32_t>(mp.surface_edge_tree.size());
+    SetParticleSurfaceNeighbours(mp, cap);
 
     const uint32_t rigid_base = RigidContactBase(model);
     cap.particles_per_env = static_cast<uint32_t>(mp.initial_pos.size());
@@ -1930,7 +2003,10 @@ void CookMpmParticles(nk::Model& model, uint32_t env_count,
     mp.surface_thickness.clear();
     mp.surface_self_thickness.clear();
     mp.surface_self_contact.clear();
+    mp.surface_neighbour_offsets.clear();
+    mp.surface_neighbours.clear();
     cap.particle_surfaces_per_env = 0u;
+    cap.particle_surface_neighbours_per_env = 0u;
     cap.particle_surface_triangles = 0u;
     cap.particle_surface_nodes_per_env = 0u;
     cap.point_endpoints_per_env = 0u;
@@ -2141,12 +2217,14 @@ void CookMpmVbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
     cap.particle_surface_edges_per_env = xtmp.capacities.particle_surface_edges_per_env;
     cap.particle_surface_edge_nodes_per_env = xtmp.capacities.particle_surface_edge_nodes_per_env;
     cap.particle_surface_nodes_per_env = xtmp.capacities.particle_surface_nodes_per_env;
+    cap.ogc_surface_reserve_per_env = xtmp.capacities.ogc_surface_reserve_per_env;
 
     // 3) The body<->particle cloth contact radius + the co-residence schema.
     mp.pp_contact_d_min = contact_d_min;
     mp.mode = nk::Model::ParticleMode::MpmVbd;
     mp.n_mpm_particles = n_mpm;
     cap.particles_per_env = n_mpm + n_vbd;
+    SetParticleSurfaceNeighbours(mp, cap);
     SetParticleOgcCapacity(cap, n_vbd);
     cap.aero_tris_per_env = xtmp.capacities.aero_tris_per_env;
     StageVertexBlocks(model, soft, n_mpm);
@@ -2215,6 +2293,7 @@ struct ClothGeometry {
     std::vector<math::Vec3> rest;
     std::vector<runtime::soft::ClothTriangle> triangles;
     std::vector<std::array<math::Vec3, 3>> material_faces;
+    std::map<std::pair<uint32_t, uint32_t>, float> hinge_rest;  // signed under the cooked winding
 };
 
 NkaMesh ReadClothMesh(const AssetRef& ref) {
@@ -2309,8 +2388,28 @@ ClothGeometry BuildClothGeometry(const MediaRecord& media) {
             if (!out.material_faces.empty() && oriented[at + 1u] != original[at + 1u])
                 std::swap(out.material_faces[face][1], out.material_faces[face][2]);
         }
+        if (!media.cloth_mesh.hinge_rest_angles.empty()) {
+            // The first incident face sets each hinge's direction; rewinding it negates the signed dihedral.
+            std::map<std::pair<uint32_t, uint32_t>, bool> rewound;
+            for (size_t face = 0u; face < out.triangles.size(); ++face) {
+                const auto& v = out.triangles[face].v;
+                for (uint32_t j = 0u; j < 3u; ++j)
+                    rewound.try_emplace({std::min(v[j], v[(j + 1u) % 3u]), std::max(v[j], v[(j + 1u) % 3u])},
+                                        oriented[face * 3u + 1u] != original[face * 3u + 1u]);
+            }
+            for (const auto& hinge : media.cloth_mesh.hinge_rest_angles) {
+                const auto edge = std::make_pair(std::min(hinge.a, hinge.b), std::max(hinge.a, hinge.b));
+                const auto found = rewound.find(edge);
+                if (found == rewound.end() || edges.at(edge) != 2u || !std::isfinite(hinge.angle))
+                    throw std::invalid_argument("Cloth hinge rest angle needs a finite angle on an interior edge");
+                if (!out.hinge_rest.emplace(edge, found->second ? -hinge.angle : hinge.angle).second)
+                    throw std::invalid_argument("Cloth hinge rest angles repeat an edge");
+            }
+        }
         return out;
     }
+    if (!media.cloth_mesh.hinge_rest_angles.empty())
+        throw std::invalid_argument("Cloth hinge rest angles need a baked cloth mesh");
     const auto& g = media.cloth_grid;
     if (g.nx < 2u || g.ny < 2u || g.spacing <= 0.0f) return out;
     const float x0 = g.origin.x - 0.5f * static_cast<float>(g.nx - 1u) * g.spacing;
@@ -2380,7 +2479,8 @@ VbdCookInput BuildClothVertexBlockInput(const MediaRecord& media) {
         shells[f].compression_ratio = face_material[f]->compression_ratio;
         shells[f].membrane = static_cast<uint32_t>(face_material[f]->membrane);
     }
-    runtime::soft::BuildClothVertexBlocks(rest, tris, geometry.material_faces, shells, in.vbd_elements);
+    runtime::soft::BuildClothVertexBlocks(rest, tris, geometry.material_faces, geometry.hinge_rest, shells,
+                                          in.vbd_elements);
     in.vbd_begin = 0u;
     in.vbd_count = static_cast<uint32_t>(rest.size());
 
@@ -2389,6 +2489,7 @@ VbdCookInput BuildClothVertexBlockInput(const MediaRecord& media) {
     for (const auto& tri : tris)
         collision_surface.triangles.insert(collision_surface.triangles.end(), {tri.v[0], tri.v[1], tri.v[2]});
     collision_surface.self_contact = media.vbd.self_contact;
+    collision_surface.contact_pairs_per_vertex = media.vbd.contact_pairs_per_vertex;
     in.surfaces.push_back(std::move(collision_surface));
     in.velocities.assign(rest.size(), math::Vec3::Zero());
     std::vector<float> masses(rest.size(), 0.0f);
@@ -2665,6 +2766,7 @@ VbdCookInput BuildCableVertexBlockInput(const MediaRecord& media) {
     in.friction.assign(np, media.vbd.friction);
     CookParticleSurface wire;
     wire.self_contact = media.vbd.self_contact;
+    wire.contact_pairs_per_vertex = media.vbd.contact_pairs_per_vertex;
     wire.edges.reserve(size_t(c.segments) * 2u);
     for (uint32_t i = 0u; i < c.segments; ++i) {
         wire.edges.push_back(i);
@@ -2694,7 +2796,8 @@ VbdCookInput BuildCableVertexBlockInput(const MediaRecord& media) {
         for (uint32_t k = 4u; k < 8u; ++k)  // the 4 top corners (iz == 1).
             in.vbd_elements.push_back(runtime::soft::VertexBlockSpring(end_p, base + k,
                 (corners[k] - in.positions[end_p]).Length(), stiffness, media.vbd.damping));
-        in.surfaces.push_back({CableSlabBoxTriangles(base), {}, media.vbd.self_contact});
+        in.surfaces.push_back({CableSlabBoxTriangles(base), {}, media.vbd.self_contact,
+                              media.vbd.contact_pairs_per_vertex});
     }
 
     in.velocities.assign(in.positions.size(), math::Vec3::Zero());
