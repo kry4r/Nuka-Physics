@@ -395,7 +395,7 @@ struct MediaMpmMaterial {
     float density      = 0.0f;
     float dp_friction  = 0.0f;   // granular internal friction angle (deg).
     float dp_cohesion  = 0.0f;   // granular cohesion stress (Pa; 0 = cohesionless).
-    float model_kind   = 0.0f;   // 0 corotated, 2 Neo-Hookean, 3 fluid, 4 DP, 5 Hencky J2
+    float model_kind   = 0.0f;   // 0 corotated, 2 Neo-Hookean, 3 fluid, 4 DP, 5 J2, 6 Hencky elastic
     float bulk_modulus = 0.0f;
     float tait_gamma   = 0.0f;
     float viscosity    = 0.0f;

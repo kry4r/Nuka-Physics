@@ -2973,7 +2973,8 @@ static MpmCookInput BuildMpmInputFills(const MediaRecord& media) {
         const MediaRecord::FluidBox& b = f.box;
         if (!(b.spacing > 0.0f && b.max.x > b.min.x && b.max.y > b.min.y &&
               b.max.z > b.min.z)) continue;  // empty/invalid sub-box: contributes nothing.
-        const float density = f.material.model_kind == nk::MpmMaterial::kHenckyJ2 ?
+        const float density = (f.material.model_kind == nk::MpmMaterial::kHenckyJ2 ||
+                               f.material.model_kind == nk::MpmMaterial::kHenckyElastic) ?
             f.material.density : (f.material.density > 0.0f ? f.material.density : 1000.0f);
         import::cooker::ParticleVolumeSpec spec;
         spec.min_corner = b.min;
@@ -3119,7 +3120,8 @@ MpmCookInput BuildMpmInput(const MediaRecord& media) {
     if (!media.mpm_fills.empty()) return BuildMpmInputFills(media);
     MpmCookInput in;
     const MediaMpmMaterial& mp = media.mpm;
-    const float density = mp.model_kind == nk::MpmMaterial::kHenckyJ2 ?
+    const float density = (mp.model_kind == nk::MpmMaterial::kHenckyJ2 ||
+                           mp.model_kind == nk::MpmMaterial::kHenckyElastic) ?
         mp.density : (mp.density > 0.0f ? mp.density : 1000.0f);
     math::Vec3 lo{0.0f, 0.0f, 0.0f}, hi{0.0f, 0.0f, 0.0f};  // geometry AABB.
     float vol0 = 0.0f;                                       // per-particle sampling volume.

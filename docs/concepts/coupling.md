@@ -42,7 +42,33 @@ The contact capacity is an explicit storage budget. Check `ENV_STATUS` and `GRID
 
 MLS-MPM evaluates stress from the accepted particle history during particle-to-grid transfer. Contacts modify the grid velocity; the final grid velocity drives particle transfer and the material history update. Constitutive evaluation reads the accepted history into a separate trial, and a successful trial commits once per physical interval. Repeated trial evaluation leaves the accepted history unchanged.
 
-The material integration remains explicit. Contact exchanges do not iterate the material stress to convergence, so their count does not remove the material stiffness restriction on the timestep.
+Zero inverse mass marks a prescribed MPM sample. Before each physical interval,
+set `PARTICLE_KINEMATIC_TARGET` to its end position and supply any affine velocity
+in `PARTICLE_AFFINE_VELOCITY`. The grid stencil takes the rest-volume/kernel-weighted
+average of the prescribed translational plus affine velocities with zero inverse
+mass response. Physical grid mass remains separate from this boundary weight.
+Commit reaches the target while preserving its F, C and plastic history. The
+external support absorbs reaction momentum and supplies work; this boundary work
+is not covered by the full-system energy ledger yet. Initial targets equal cooked
+positions. A policy step with several physical intervals consumes the target in
+its first interval; publish separate targets between intervals to resolve motion.
+
+`Soft.MPM(model_kind=6, youngs=..., poisson=..., density=...)` selects compressible
+elastic Hencky stress and energy, without yield caps or plastic state. It accepts
+positive E and density, and -1 < nu < 0.5. Model 5 remains the Hencky J2 solid.
+`ParticleSet(implicit_stress=True)` places elastic and viscous stress in the
+shared constraint solve. Explicit stress remains subject to an elastic timestep
+restriction; matching a reference's material parameters also requires reporting
+its stress integration, grid discretization and boundary motion interval.
+An external engine's pressure-dependent plasticity, damping, incompressibility,
+discretization and coupling schedule need independent matching; equal elastic
+stress alone does not establish equal trajectories. Scalar plastic volume does
+not determine a complete J2 plastic deformation gradient.
+
+The deformation update uses the final velocity gradient once per physical interval.
+Implicit stress rows linearize the accepted material state; they do not iterate
+nonlinear constitutive history to convergence. Assess timestep and grid convergence
+alongside the contact solver budget.
 
 ## Contact readout
 

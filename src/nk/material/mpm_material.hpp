@@ -24,9 +24,10 @@ inline constexpr uint32_t kMpmStressRowsPerCell = 1u + kMpmDeviatorComponents;
 struct MpmMaterial {
     static constexpr uint32_t kValueCount = 11u;
     static constexpr float kHenckyJ2 = 5.0f;
+    static constexpr float kHenckyElastic = 6.0f;
     float youngs = 0.0f, poisson = 0.0f, density = 0.0f;
     float dp_friction = 0.0f, dp_cohesion = 0.0f;
-    // 0 corotated, 2 Neo-Hookean, 3 Tait fluid, 4 Drucker-Prager, 5 Hencky J2.
+    // 0 corotated, 2 Neo-Hookean, 3 Tait, 4 Drucker-Prager, 5 Hencky J2, 6 elastic Hencky.
     float model_kind = 0.0f;
     float bulk_modulus = 0.0f, tait_gamma = 0.0f, viscosity = 0.0f;
     float yield_stress = 0.0f, hardening_modulus = 0.0f;

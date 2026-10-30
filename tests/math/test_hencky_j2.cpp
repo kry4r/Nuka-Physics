@@ -43,6 +43,60 @@ void ExpectMatrixNear(const Matrix& actual, const Matrix& expected, float relati
 }
 }  // namespace
 
+TEST(HenckyElastic, AnalyticStressEnergyAndObjectivity) {
+    constexpr material::HenckyElasticParameters parameters{30000.0f, 0.3f};
+    const double mu = parameters.youngs / (2.0 * (1.0 + parameters.poisson));
+    const double lambda = parameters.youngs * parameters.poisson /
+        ((1.0 + parameters.poisson) * (1.0 - 2.0 * parameters.poisson));
+    const double strain[3] = {0.35, -0.2, 0.08};
+    const double trace = strain[0] + strain[1] + strain[2];
+    Matrix stretch{}, expected{};
+    double energy = 0.5 * lambda * trace * trace;
+    for (int i = 0; i < 3; ++i) {
+        stretch[4*i] = std::exp(strain[i]);
+        expected[4*i] = 2 * mu * strain[i] + lambda * trace;
+        energy += mu * strain[i] * strain[i];
+    }
+    for (float angle : {0.0f, 0.3f, 1.7f, 2.6f}) {
+        const Matrix rotation = Rotation(angle);
+        const Matrix deformation = Multiply(rotation, stretch);
+        material::HenckyResponse response;
+        ASSERT_EQ(material::EvaluateHenckyElastic(deformation.data(), parameters, response),
+                  material::ConstitutiveStatus::Ok);
+        Matrix transpose{};
+        for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) transpose[3*i+j] = rotation[3*j+i];
+        Matrix stress;
+        std::copy(response.kirchhoff, response.kirchhoff + 9, stress.begin());
+        ExpectMatrixNear(stress, Multiply(Multiply(rotation, expected), transpose), 2e-6f);
+        EXPECT_NEAR(response.elastic_energy, energy, energy * 2e-6);
+    }
+    for (int axis = 0; axis < 3; ++axis) {
+        Matrix plus = stretch, minus = stretch;
+        constexpr float delta = 1e-3f;
+        plus[4*axis] *= std::exp(delta);
+        minus[4*axis] *= std::exp(-delta);
+        material::HenckyResponse positive, negative;
+        ASSERT_EQ(material::EvaluateHenckyElastic(plus.data(), parameters, positive), material::ConstitutiveStatus::Ok);
+        ASSERT_EQ(material::EvaluateHenckyElastic(minus.data(), parameters, negative), material::ConstitutiveStatus::Ok);
+        EXPECT_NEAR((positive.elastic_energy - negative.elastic_energy) / (2 * delta), expected[4*axis], 1.0f);
+    }
+    nuka::nk::MpmMaterial elastic;
+    elastic.model_kind = nuka::nk::MpmMaterial::kHenckyElastic;
+    elastic.youngs = parameters.youngs;
+    elastic.poisson = parameters.poisson;
+    elastic.density = 1000;
+    material::MpmMaterialTrial trial;
+    const Matrix rate{1, 2, 0, 0, -.5f, 0, 0, 0, 0};
+    ASSERT_EQ(material::EvaluateMpmMaterialTrial(elastic, {stretch.data()}, rate.data(), .01f, trial),
+              material::ConstitutiveStatus::Ok);
+    EXPECT_FALSE(trial.has_plastic_history);
+    Matrix committed;
+    EXPECT_TRUE(material::CommitMpmMaterialTrial(trial, committed.data(), nullptr, nullptr));
+    EXPECT_TRUE(material::ValidMpmMaterial(elastic));
+    elastic.poisson = .5f;
+    EXPECT_FALSE(material::ValidMpmMaterial(elastic));
+}
+
 TEST(HenckyJ2, ClosedFormYieldHardeningAndElasticUnload) {
     const double mu = double(kMaterial.youngs) / (2.0 * (1.0 + kMaterial.poisson));
     for (float strain : {0.003f, 0.03f, 0.2f, 0.7f}) {

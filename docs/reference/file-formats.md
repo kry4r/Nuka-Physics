@@ -46,7 +46,9 @@ define the rest shape. Absent inverse masses, density and rest volume determine 
 masses; zero inverse masses pin vertices. `PSET` requires nonnegative inverse mass and positive
 rest volume and determinants of F/Fp. Missing F/Fp are identity, velocities/C and plastic strain
 are zero. Nontrivial Fp and equivalent plastic strain require Hencky J2 material rows. Zero-mass
-MPM points do not impose a Dirichlet condition on neighboring grid nodes.
+MPM points impose volume-weighted Dirichlet velocities on their grid stencil. Their
+`PARTICLE_KINEMATIC_TARGET` is the physical interval's end position; the affine C
+is externally supplied. Their F, C and plastic history remain fixed during commit.
 
 Use [`nuka.assets`](../python/index.md#baked-continuum-media) to write these assets. Importing a
 particle set preserves geometry and state; comparing another engine also requires matching its

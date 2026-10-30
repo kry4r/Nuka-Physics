@@ -75,6 +75,7 @@ nk::Model BuildMpmModel(const Vec3& seed_vel, bool escape = false) {
     mp.initial_vol0.assign(n, kDx * kDx * kDx);
     mp.initial_material_id.assign(n, 0u);
     mp.half_thickness.assign(n, 0.0f);
+    mp.self_half_thickness.assign(n, 0.0f);
     mp.friction.assign(n, 0.0f);
 
     nk::MpmMaterial mat;  // one elastic material with recognizable nonzero values.
@@ -132,7 +133,69 @@ bool RunTransfer(nk::World& w, const nphi::MpmParams& p) {
 
 }  // namespace
 
-// (1) round-trip identity: clear -> P2G -> G2P with C=0/F=I reproduces velocity.
+TEST(MpmTransferRoundtrip, PrescribedSamplesDriveGridWithoutAddingPhysicalMass) {
+    if (GetBackend().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
+    Backend b = GetBackend();
+    nk::Model model = BuildMpmModel(Vec3::Zero());
+    auto& particles = model.particles;
+    const uint32_t count = model.capacities.particles_per_env;
+    const Vec3 position{.273f, .312f, .341f};
+    particles.initial_pos.assign(count, position);
+    particles.initial_C.assign(9u * count, 0.0f);
+    std::vector<Vec3> target(count, position);
+    std::vector<Vec3> prescribed(count, Vec3::Zero());
+    Vec3 mean = Vec3::Zero();
+    float weight = 0.0f;
+    const float dt = Cfg().dt;
+    for (uint32_t i = 0u; i < count / 2u; ++i) {
+        particles.inv_mass[i] = 0.0f;
+        particles.initial_vol0[i] *= float(i + 1u);
+        prescribed[i] = {.1f * float(i + 1u), -.2f, .3f};
+        target[i] = position + prescribed[i] * dt;
+        prescribed[i] = (target[i] - position) * (1.0f / dt);
+        mean += prescribed[i] * particles.initial_vol0[i];
+        weight += particles.initial_vol0[i];
+        particles.initial_C[9u*i + 1u] = -.4f;
+        particles.initial_C[9u*i + 3u] = .4f;
+    }
+    mean *= 1.0f / weight;
+    nk::World world(std::move(model), 1u, b.dev, b.backend, Cfg());
+    ASSERT_TRUE(world.Ready()) << world.CreationError();
+    const auto params = MakeParams(world.GetModel());
+    auto& data = world.GetData();
+    ASSERT_TRUE(data.UploadField(nk::FieldId::ParticleKinematicTarget, target.data(), target.size() * sizeof(Vec3)));
+    ASSERT_TRUE(RunTransfer(world, params));
+    std::vector<Vec3> velocity(count), advanced(count);
+    std::vector<float> deformation(9u * count), affine(9u * count);
+    ASSERT_TRUE(data.DownloadField(nk::FieldId::ParticleVel, velocity.data(), velocity.size() * sizeof(Vec3)));
+    ASSERT_TRUE(data.DownloadField(nk::FieldId::ParticlePos, advanced.data(), advanced.size() * sizeof(Vec3)));
+    ASSERT_TRUE(data.DownloadField(nk::FieldId::ParticleF, deformation.data(), deformation.size() * sizeof(float)));
+    ASSERT_TRUE(data.DownloadField(nk::FieldId::ParticleC, affine.data(), affine.size() * sizeof(float)));
+    for (uint32_t i = 0u; i < count; ++i) {
+        const bool pinned = i < count / 2u;
+        const Vec3 expected = pinned ? prescribed[i] : mean;
+        EXPECT_LT((velocity[i] - expected).Length(), 2e-5f);
+        EXPECT_LT((advanced[i] - (pinned ? target[i] : position + mean * params.dt)).Length(), 2e-6f);
+        if (pinned) {
+            for (uint32_t k = 0u; k < 9u; ++k)
+                EXPECT_FLOAT_EQ(deformation[9u*i+k], k % 4u == 0u ? 1.0f : 0.0f);
+            EXPECT_FLOAT_EQ(affine[9u*i+1u], -.4f);
+            EXPECT_FLOAT_EQ(affine[9u*i+3u], .4f);
+        }
+    }
+    const uint32_t nodes = world.GetModel().capacities.mpm_grid_nodes_per_env;
+    std::vector<float> mass(nodes), inverse_mass(nodes);
+    ASSERT_TRUE(data.DownloadField(nk::FieldId::GridMass, mass.data(), mass.size() * sizeof(float)));
+    ASSERT_TRUE(data.DownloadField(nk::FieldId::GridInvMass, inverse_mass.data(), inverse_mass.size() * sizeof(float)));
+    double total_mass = 0.0;
+    for (uint32_t i = 0u; i < nodes; ++i) {
+        total_mass += mass[i];
+        if (mass[i] > 0.0f) EXPECT_FLOAT_EQ(inverse_mass[i], 0.0f);
+    }
+    EXPECT_NEAR(total_mass, double(count / 2u), 1e-6);
+}
+
+// P2G followed by G2P reproduces a constant velocity with C=0 and F=I.
 TEST(MpmTransferRoundtrip, P2GThenG2PReproducesVelocity) {
     if (GetBackend().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
     Backend b = GetBackend();
@@ -293,6 +356,7 @@ TEST(MpmTransferRoundtrip, StressedTransferConservesLinearAndAngularMomentum) {
     particles.initial_vol0.assign(count, kDx * kDx * kDx);
     particles.initial_material_id.assign(count, 0u);
     particles.half_thickness.assign(count, 0.0f);
+    particles.self_half_thickness.assign(count, 0.0f);
     particles.friction.assign(count, 0.0f);
     particles.initial_F.assign(count * 9u, 0.0f);
     model.capacities.particles_per_env = count;
@@ -351,7 +415,7 @@ TEST(MpmTransferRoundtrip, StressedTransferConservesLinearAndAngularMomentum) {
     }
     const uint32_t nodes = model.capacities.mpm_grid_nodes_per_env;
     nk::World world(std::move(model), 1u, b.dev, b.backend, Cfg());
-    ASSERT_TRUE(world.Ready());
+    ASSERT_TRUE(world.Ready()) << world.CreationError();
     auto params = MakeParams(world.GetModel());
     std::vector<float> mass(nodes);
     std::vector<Vec3> momentum(nodes);
@@ -432,9 +496,16 @@ TEST(MpmTransferRoundtrip, SnapshotRestoreRoundTripsF) {
 }
 
 // Return the environment status after a complete transfer interval.
-uint32_t EscapeStatusAfterP2G(Backend& b, nk::Model m) {
+uint32_t EscapeStatusAfterP2G(Backend& b, nk::Model m, const Vec3* live_position = nullptr) {
     nk::World w(std::move(m), 1u, b.dev, b.backend, Cfg());
-    EXPECT_TRUE(w.Ready());
+    EXPECT_TRUE(w.Ready()) << w.CreationError();
+    if (!w.Ready()) return 0u;
+    if (live_position != nullptr) {
+        auto positions = w.GetModel().particles.initial_pos;
+        positions.back() = *live_position;
+        EXPECT_TRUE(w.GetData().UploadField(nk::FieldId::ParticlePos, positions.data(),
+                                            positions.size() * sizeof(Vec3)));
+    }
     nphi::MpmParams p = MakeParams(w.GetModel());
     EXPECT_TRUE(RunTransfer(w, p));
     uint32_t status = 0u;
@@ -466,8 +537,7 @@ TEST(MpmTransferRoundtrip, NonFinitePositionFlagsEnvStatus) {
     const float nan_x = std::numeric_limits<float>::quiet_NaN();
     for (const Vec3 bad : {Vec3{nan_x, 0.25f, 0.25f}, Vec3{1.0e30f, 0.25f, 0.25f}}) {
         nk::Model m = BuildMpmModel(Vec3{0.0f, 0.0f, 0.0f});
-        m.particles.initial_pos.back() = bad;  // poison one in-set particle.
-        const uint32_t status = EscapeStatusAfterP2G(b, std::move(m));
+        const uint32_t status = EscapeStatusAfterP2G(b, std::move(m), &bad);
         EXPECT_NE(0u, status & nphi::kEnvStatusMpmGridEscape)
             << "a non-finite MPM particle position must flag the escape bit";
     }

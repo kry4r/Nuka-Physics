@@ -251,10 +251,12 @@ NUKA_MPM_CONSTITUTIVE_HD inline ConstitutiveStatus EvaluateMpmKirchhoff(
     if (F == nullptr || stress == nullptr) return ConstitutiveStatus::InvalidState;
     const float youngs = material.youngs, poisson = material.poisson, kind = material.model_kind;
     const float bulk = material.bulk_modulus, tait_gamma = material.tait_gamma, visc = material.viscosity;
-    if (kind == MpmMaterial::kHenckyJ2) {
+    if (kind == MpmMaterial::kHenckyJ2 || kind == MpmMaterial::kHenckyElastic) {
         HenckyResponse response;
-        const auto status = EvaluateHenckyJ2(F,
-            {youngs, poisson, material.yield_stress, material.hardening_modulus}, response);
+        const auto status = kind == MpmMaterial::kHenckyElastic
+            ? EvaluateHenckyElastic(F, {youngs, poisson}, response)
+            : EvaluateHenckyJ2(F,
+                {youngs, poisson, material.yield_stress, material.hardening_modulus}, response);
         if (status != ConstitutiveStatus::Ok) return status;
         for (int k = 0; k < 9; ++k) stress[k] = response.kirchhoff[k];
     } else if (kind == 4.0f) {
@@ -422,7 +424,8 @@ NUKA_MPM_CONSTITUTIVE_HD inline ConstitutiveStatus EvaluateMpmMaterialTrial(
     if (history.elastic_f == nullptr || C == nullptr || !(dt > 0.0f) || !math::IsFinite(dt))
         return ConstitutiveStatus::InvalidState;
     const float kind = material.model_kind;
-    if (!(kind == 0.0f || kind == 2.0f || kind == 3.0f || kind == 4.0f || kind == MpmMaterial::kHenckyJ2))
+    if (!(kind == 0.0f || kind == 2.0f || kind == 3.0f || kind == 4.0f ||
+          kind == MpmMaterial::kHenckyJ2 || kind == MpmMaterial::kHenckyElastic))
         return ConstitutiveStatus::InvalidParameters;
     MpmMaterialTrial next;
     if (kind == MpmMaterial::kHenckyJ2) {
@@ -449,6 +452,12 @@ NUKA_MPM_CONSTITUTIVE_HD inline ConstitutiveStatus EvaluateMpmMaterialTrial(
         for (int k = 0; k < 9; ++k) map[k] = dt * C[k];
         map[0] += 1.0f; map[4] += 1.0f; map[8] += 1.0f;
         mpm_detail::Mat3Mul<Arithmetic>(map, history.elastic_f, next.elastic_f);
+        if (kind == MpmMaterial::kHenckyElastic) {
+            HenckyResponse response;
+            const auto status = EvaluateHenckyElastic(next.elastic_f,
+                {material.youngs, material.poisson}, response);
+            if (status != ConstitutiveStatus::Ok) return status;
+        }
         if (kind == 4.0f) {
             const float youngs = material.youngs, poisson = material.poisson;
             const float denom = (1.0f + poisson) * (1.0f - 2.0f * poisson);

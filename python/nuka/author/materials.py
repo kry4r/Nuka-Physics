@@ -179,6 +179,11 @@ class MpmMaterial:
         if self.model_kind != 5.0:
             if self.yield_stress != 0.0 or self.hardening_modulus != 0.0:
                 raise ValueError("Plasticity parameters require Hencky J2 (model_kind 5)")
+            if self.model_kind == 6.0:
+                if (not all(_math.isfinite(v) for v in (self.youngs, self.poisson, self.density, self.viscosity))
+                        or self.youngs <= 0 or not -1 < self.poisson < .5
+                        or self.density <= 0 or self.viscosity < 0):
+                    raise ValueError("Elastic Hencky requires finite E,rho > 0, -1 < nu < 0.5, viscosity >= 0")
             return
         values = (self.youngs, self.poisson, self.density,
                   self.yield_stress, self.hardening_modulus)
@@ -271,11 +276,8 @@ class Soft:
             floor_d: float = 0.0, floor_friction: float = 0.4,
             loft_headroom: float = 0.0, yield_stress: float = 0.0,
             hardening_modulus: float = 0.0) -> MpmMaterial:
-        """An MLS-MPM continuum solid: ``model_kind`` 0 corotated / 2 neo-hookean,
-        ``youngs`` / ``poisson`` elasticity, ``density`` kg/m^3, grid cell ``dx`` m,
-        ``substeps`` per step, and a separating floor at ``floor_normal . x =
-        floor_d``. ``dx`` must be > 0 for the background grid. ``loft_headroom`` m
-        raises the +z grid ceiling for lofted motion."""
+        """An MLS-MPM solid: model_kind 0 corotated, 2 Neo-Hookean, or 6 elastic Hencky.
+        Uses SI material/grid units and a separating floor at floor_normal . x = floor_d."""
         if dx <= 0.0:
             raise ValueError("Soft.MPM: dx must be > 0 (the background grid cell)")
         if substeps < 1:

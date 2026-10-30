@@ -245,8 +245,10 @@ struct MpmStressCellKey {
 struct alignas(float4) MpmCellTransfer {
     float mass;
     m::Vec3 momentum;
+    float boundary_weight;
+    m::Vec3 boundary_velocity;
 };
-static_assert(sizeof(MpmCellTransfer) == (1u + kSpatialComponents) * sizeof(float));
+static_assert(sizeof(MpmCellTransfer) == 2u * (1u + kSpatialComponents) * sizeof(float));
 
 // Particle records and grid indexing have independent capacities; sort outputs are reused.
 struct MpmSortScratchLayout {
@@ -579,6 +581,7 @@ __global__ void MpmPrepareTransferInputKernel(
     uint32_t particle_count, const uint32_t* __restrict__ sorted_idx,
     const m::Vec3* __restrict__ pos, const float* __restrict__ inv_mass,
     const m::Vec3* __restrict__ velocity, const float* __restrict__ affine,
+    const m::Vec3* __restrict__ target, float dt,
     const float* __restrict__ deformation, const float* __restrict__ volume,
     const uint32_t* __restrict__ material_ids, const nk::MpmMaterial* __restrict__ material_table,
     uint32_t material_count, float* __restrict__ particle_stress,
@@ -644,6 +647,8 @@ __global__ void MpmPrepareTransferInputKernel(
         cached.position = xp;
         cached.mass = inv_mass[p] > 0.0f ? 1.0f / inv_mass[p] : 0.0f;
         cached.velocity = velocity[p];
+        if (cached.mass == 0.0f && target != nullptr && dt > 0.0f)
+            cached.velocity = (target[p] - xp) * (1.0f / dt);
         cached.volume = volume[p];
         for (int i = 0; i < 9; ++i)
             cached.affine[i] = affine[static_cast<size_t>(p) * 9u + i];
@@ -712,6 +717,8 @@ __global__ void MpmP2GCellsKernel(
         const bool stress = cell_gradients != nullptr;
         float mass = 0.0f;
         m::Vec3 momentum = m::Vec3::Zero();
+        float boundary_weight = 0.0f;
+        m::Vec3 boundary_velocity = m::Vec3::Zero();
         m::Vec3 gradient = m::Vec3::Zero();
         MpmCellVolume volume = EmptyCellVolume();
         for (uint32_t tile = begin; tile < end; tile += kCudaWarpThreads) {
@@ -728,7 +735,6 @@ __global__ void MpmP2GCellsKernel(
                         words[word] = records[group][source * kWords + word];
                     MpmTransferInput cached;
                     memcpy(&cached, words, sizeof(cached));
-                    if (!(cached.mass > 0.0f)) continue;
                     if (stress && lane == 0u && cached.volume > 0.0f)
                         AddCellVolume(volume, cached.rows);
                     if (!valid_node) continue;
@@ -747,6 +753,13 @@ __global__ void MpmP2GCellsKernel(
                         C[0] * dpos.x + C[1] * dpos.y + C[2] * dpos.z,
                         C[3] * dpos.x + C[4] * dpos.y + C[5] * dpos.z,
                         C[6] * dpos.x + C[7] * dpos.y + C[8] * dpos.z};
+                    if (cached.mass == 0.0f) {
+                        const float weight = w * cached.volume;
+                        boundary_weight = __fadd_rn(boundary_weight, weight);
+                        boundary_velocity.x = __fadd_rn(boundary_velocity.x, weight * (cached.velocity.x + affine.x));
+                        boundary_velocity.y = __fadd_rn(boundary_velocity.y, weight * (cached.velocity.y + affine.y));
+                        boundary_velocity.z = __fadd_rn(boundary_velocity.z, weight * (cached.velocity.z + affine.z));
+                    }
                     mass = __fadd_rn(mass, wm);
                     momentum.x = __fadd_rn(momentum.x, wm * (cached.velocity.x + affine.x));
                     momentum.y = __fadd_rn(momentum.y, wm * (cached.velocity.y + affine.y));
@@ -775,7 +788,8 @@ __global__ void MpmP2GCellsKernel(
         }
         const uint32_t transfer_slot = CellTransferSlot(key, cell_begin, particle_count, total_cells);
         if (lane < kStencilNodes)
-            cell_transfers[static_cast<size_t>(transfer_slot) * kStencilNodes + lane] = {mass, momentum};
+            cell_transfers[static_cast<size_t>(transfer_slot) * kStencilNodes + lane] =
+                {mass, momentum, boundary_weight, boundary_velocity};
         if (stress && lane < kStencilNodes)
             cell_gradients[static_cast<size_t>(transfer_slot) * kStencilNodes + lane] = gradient;
         if (stress && lane == 0u) cell_volumes[transfer_slot] = volume;
@@ -805,6 +819,8 @@ __global__ void MpmGridFinalizeKernel(
         const int64_t halves[3] = {2 * int64_t{dims_x}, 2 * int64_t{dims_y}, 2 * int64_t{dims_z}};
         float mass = 0.0f;
         m::Vec3 momentum = m::Vec3::Zero();
+        float boundary_weight = 0.0f;
+        m::Vec3 boundary_velocity = m::Vec3::Zero();
         // Half-cells 2 (n - 1) + l .. 2 n + 1 + l place node n at corner 1 or 0 of lattice l.
         for (int64_t hz = 2 * n[2] - 2 + lattice; hz <= 2 * n[2] + 1 + lattice; ++hz) {
             if (hz < 0 || hz >= halves[2]) continue;
@@ -828,11 +844,20 @@ __global__ void MpmGridFinalizeKernel(
                     momentum.x = __fadd_rn(momentum.x, contribution.momentum.x);
                     momentum.y = __fadd_rn(momentum.y, contribution.momentum.y);
                     momentum.z = __fadd_rn(momentum.z, contribution.momentum.z);
+                    boundary_weight = __fadd_rn(boundary_weight, contribution.boundary_weight);
+                    boundary_velocity.x = __fadd_rn(boundary_velocity.x, contribution.boundary_velocity.x);
+                    boundary_velocity.y = __fadd_rn(boundary_velocity.y, contribution.boundary_velocity.y);
+                    boundary_velocity.z = __fadd_rn(boundary_velocity.z, contribution.boundary_velocity.z);
                 }
             }
         }
         grid_mass[node] = mass;
         grid_momentum[node] = momentum;
+        if (boundary_weight > 0.0f) {
+            grid_inv_mass[node] = 0.0f;
+            grid_velocity[node] = boundary_velocity * (1.0f / boundary_weight);
+            continue;
+        }
         if (mass < kMinNodeMass) { grid_velocity[node] = m::Vec3::Zero(); continue; }
         const float inv_mass = 1.0f / mass;
         grid_inv_mass[node] = inv_mass;
@@ -1019,6 +1044,7 @@ __global__ void MpmG2PGatherKernel(uint32_t mpm_count,
                                    uint32_t dims_x, uint32_t dims_y, uint32_t dims_z,
                                    float inv_dx, float dx, float dt, m::Vec3 origin,
                                    const float* __restrict__ inv_mass,
+                                   const m::Vec3* __restrict__ target,
                                    const m::Vec3* __restrict__ grid_velocity,
                                    const m::Vec3* __restrict__ grid_pseudo_velocity,
                                    m::Vec3* __restrict__ part_pos,
@@ -1029,6 +1055,13 @@ __global__ void MpmG2PGatherKernel(uint32_t mpm_count,
     uint32_t env = 0u;
     const uint32_t p = MpmSliceGlobal(t, mpm_per_env, particles_per_env, env);
     const m::Vec3 xp = part_pos[p];
+    if (inv_mass != nullptr && inv_mass[p] <= 0.0f) {
+        if (target != nullptr && dt > 0.0f) {
+            part_vel[p] = (target[p] - xp) * (1.0f / dt);
+            part_pos[p] = target[p];
+        }
+        return;
+    }
     const nk::MpmCompactAxis axes[3] = {nk::MpmCompactWeights((xp.x - origin.x) * inv_dx),
                                         nk::MpmCompactWeights((xp.y - origin.y) * inv_dx),
                                         nk::MpmCompactWeights((xp.z - origin.z) * inv_dx)};
@@ -1072,8 +1105,6 @@ __global__ void MpmG2PGatherKernel(uint32_t mpm_count,
         Cd[3 * r + 1] = b[0] * Dinv[3] + b[1] * Dinv[1] + b[2] * Dinv[5];
         Cd[3 * r + 2] = b[0] * Dinv[4] + b[1] * Dinv[5] + b[2] * Dinv[2];
     }
-    // Advect only a movable particle (a pinned inv_mass==0 sample holds position).
-    if (inv_mass != nullptr && inv_mass[p] <= 0.0f) { part_vel[p] = vp; return; }
     m::Vec3 np = xp + (vp + pseudo) * dt;
     part_vel[p] = vp;
     part_pos[p] = np;
@@ -1083,6 +1114,7 @@ __global__ void MpmG2PGatherKernel(uint32_t mpm_count,
 // Plastic return maps commit history once per completed grid interval.
 __global__ void MpmUpdateFKernel(uint32_t mpm_count, float dt,
                                  const float* __restrict__ part_C,
+                                 const float* __restrict__ inv_mass,
                                  const uint32_t* __restrict__ part_mat,
                                  const nk::MpmMaterial* __restrict__ material_table,
                                  uint32_t material_count, uint32_t particles_per_env,
@@ -1095,6 +1127,7 @@ __global__ void MpmUpdateFKernel(uint32_t mpm_count, float dt,
     if (t >= mpm_count) return;
     uint32_t env_unused = 0u;
     const uint32_t p = MpmSliceGlobal(t, mpm_per_env, particles_per_env, env_unused);
+    if (inv_mass != nullptr && inv_mass[p] <= 0.0f) return;
     const float* C = part_C + static_cast<size_t>(p) * 9u;
     float* F = part_F + static_cast<size_t>(p) * 9u;
     nk::MpmMaterial material;
@@ -1122,7 +1155,8 @@ __global__ void MpmCellVolumeAverageKernel(
     uint32_t cells_per_env, const uint32_t* __restrict__ cell_start,
     const uint32_t* __restrict__ cell_end, const uint32_t* __restrict__ sorted_idx,
     const uint32_t* __restrict__ stress_cells, const uint32_t* __restrict__ stress_count,
-    uint32_t lattice_nodes, const float* __restrict__ volume, float* __restrict__ part_F) {
+    uint32_t lattice_nodes, const float* __restrict__ volume,
+    const float* __restrict__ inv_mass, float* __restrict__ part_F) {
     const uint32_t lane = threadIdx.x % kCudaWarpThreads;
     const uint32_t warp = (blockIdx.x * blockDim.x + threadIdx.x) / kCudaWarpThreads;
     const uint32_t warps = gridDim.x * blockDim.x / kCudaWarpThreads;
@@ -1141,6 +1175,7 @@ __global__ void MpmCellVolumeAverageKernel(
         float weighted = 0.0f, total = 0.0f;
         for (uint32_t s = begin + lane; s < end; s += kCudaWarpThreads) {
             const uint32_t p = sorted_idx[s];
+            if (inv_mass != nullptr && inv_mass[p] <= 0.0f) continue;
             const float J = nk::material::mpm_detail::Mat3Det(part_F + static_cast<size_t>(p) * 9u);
             if (!(J > 0.0f) || !(volume[p] > 0.0f)) continue;
             weighted += volume[p] * J;
@@ -1153,6 +1188,7 @@ __global__ void MpmCellVolumeAverageKernel(
         if (!(total > 0.0f)) continue;
         const float mean = weighted / total;
         for (uint32_t s = begin + lane; s < end; s += kCudaWarpThreads) {
+            if (inv_mass != nullptr && inv_mass[sorted_idx[s]] <= 0.0f) continue;
             float* F = part_F + static_cast<size_t>(sorted_idx[s]) * 9u;
             const float J = nk::material::mpm_detail::Mat3Det(F);
             if (!(J > 0.0f)) continue;
@@ -1298,7 +1334,7 @@ cudaError_t LaunchMpmStage(const MpmParams& p, const ModelView& model,
         if (error != cudaSuccess) return error;
         launch(MpmStage::TransferInput, MpmPrepareTransferInputKernel, pblocks,
                mpm_count, scratch.idx_out, data.particle_pos, data.particle_inv_mass,
-               data.particle_vel, data.particle_C, data.particle_F,
+               data.particle_vel, data.particle_C, data.particle_kinematic_target, dt_sub, data.particle_F,
                data.particle_vol0, data.particle_material_id,
                reinterpret_cast<const nk::MpmMaterial*>(data.mpm_material_table),
                p.material_count, data.mpm_particle_stress, Ppe, data.env_status,
@@ -1399,10 +1435,10 @@ cudaError_t LaunchMpmStage(const MpmParams& p, const ModelView& model,
                scratch.reaction_heads, scratch.reaction_next, scratch.reaction_contributions);
         launch(MpmStage::G2P, MpmG2PGatherKernel, pblocks,
                mpm_count, Ppe, mpm_pe, p.nodes_per_env, p.grid_dims[0], p.grid_dims[1],
-               p.grid_dims[2], inv_dx, p.dx, dt_sub, origin, data.particle_inv_mass,
+               p.grid_dims[2], inv_dx, p.dx, dt_sub, origin, data.particle_inv_mass, data.particle_kinematic_target,
                data.grid_velocity, data.grid_pseudo_vel, data.particle_pos, data.particle_vel, data.particle_C);
         launch(MpmStage::UpdateF, MpmUpdateFKernel, pblocks, mpm_count,
-               dt_sub, data.particle_C, data.particle_material_id,
+               dt_sub, data.particle_C, data.particle_inv_mass, data.particle_material_id,
                reinterpret_cast<const nk::MpmMaterial*>(data.mpm_material_table),
                p.material_count, Ppe, mpm_pe, data.particle_F, data.particle_plastic_F,
                data.particle_plastic, data.env_status);
@@ -1415,7 +1451,7 @@ cudaError_t LaunchMpmStage(const MpmParams& p, const ModelView& model,
                    static_cast<const uint32_t*>(scratch.idx_out),
                    static_cast<const uint32_t*>(scratch.stress_cells),
                    static_cast<const uint32_t*>(scratch.stress_count),
-                   p.nodes_per_env / nk::kMpmLattices, data.particle_vol0, data.particle_F);
+                   p.nodes_per_env / nk::kMpmLattices, data.particle_vol0, data.particle_inv_mass, data.particle_F);
     }
     return error;
 }

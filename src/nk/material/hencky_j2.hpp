@@ -24,24 +24,38 @@ struct HenckyJ2Parameters {
     float youngs, poisson, yield_stress, hardening_modulus;
 };
 
+struct HenckyElasticParameters {
+    float youngs, poisson;
+};
+
 struct HenckyResponse {
     float kirchhoff[9] = {};
     float elastic_energy = 0.0f;
     float equivalent_stress = 0.0f;
 };
 
-NUKA_MATERIAL_HD inline bool ValidHenckyJ2(const HenckyJ2Parameters& p) {
+NUKA_MATERIAL_HD inline bool ValidHenckyElastic(const HenckyElasticParameters& p) {
     if (!math::IsFinite(p.youngs) || !(p.youngs > 0.0f) ||
-        !math::IsFinite(p.poisson) || !(p.poisson > -1.0f && p.poisson < 0.5f) ||
-        !math::IsFinite(p.yield_stress) || !(p.yield_stress > 0.0f) ||
-        !math::IsFinite(p.hardening_modulus) || p.hardening_modulus < 0.0f) return false;
+        !math::IsFinite(p.poisson) || !(p.poisson > -1.0f && p.poisson < 0.5f)) return false;
     const float mu = p.youngs / (2.0f * (1.0f + p.poisson));
     const float bulk = p.youngs / (3.0f * (1.0f - 2.0f * p.poisson));
-    return mu > 0.0f && bulk > 0.0f && math::IsFinite(mu) && math::IsFinite(bulk) &&
+    return mu > 0.0f && bulk > 0.0f && math::IsFinite(mu) && math::IsFinite(bulk);
+}
+
+NUKA_MATERIAL_HD inline bool ValidHenckyJ2(const HenckyJ2Parameters& p) {
+    const float mu = p.youngs / (2.0f * (1.0f + p.poisson));
+    return ValidHenckyElastic({p.youngs, p.poisson}) &&
+           math::IsFinite(p.yield_stress) && p.yield_stress > 0.0f &&
+           math::IsFinite(p.hardening_modulus) && p.hardening_modulus >= 0.0f &&
            math::IsFinite(3.0f * mu + p.hardening_modulus);
 }
 
 NUKA_MATERIAL_HD inline bool ValidMpmMaterial(const MpmMaterial& m) {
+    if (m.model_kind == MpmMaterial::kHenckyElastic)
+        return math::IsFinite(m.density) && m.density > 0.0f &&
+               math::IsFinite(m.viscosity) && m.viscosity >= 0.0f &&
+               m.yield_stress == 0.0f && m.hardening_modulus == 0.0f &&
+               ValidHenckyElastic({m.youngs, m.poisson});
     if (m.model_kind == MpmMaterial::kHenckyJ2)
         return math::IsFinite(m.density) && m.density > 0.0f &&
                ValidHenckyJ2({m.youngs, m.poisson, m.yield_stress, m.hardening_modulus});
@@ -145,9 +159,9 @@ NUKA_MATERIAL_HD inline void SpectralProduct(const double* left, const double* d
 
 }  // namespace detail
 
-NUKA_MATERIAL_HD inline ConstitutiveStatus EvaluateHenckyJ2(
-    const float* elastic_f, const HenckyJ2Parameters& p, HenckyResponse& response) {
-    if (!ValidHenckyJ2(p)) return ConstitutiveStatus::InvalidParameters;
+NUKA_MATERIAL_HD inline ConstitutiveStatus EvaluateHenckyElastic(
+    const float* elastic_f, const HenckyElasticParameters& p, HenckyResponse& response) {
+    if (!ValidHenckyElastic(p)) return ConstitutiveStatus::InvalidParameters;
     detail::PrincipalStretch principal;
     const auto status = detail::Decompose(elastic_f, principal);
     if (status != ConstitutiveStatus::Ok) return status;
@@ -168,6 +182,12 @@ NUKA_MATERIAL_HD inline ConstitutiveStatus EvaluateHenckyJ2(
         !math::IsFinite(output.equivalent_stress)) return ConstitutiveStatus::Overflow;
     response = output;
     return ConstitutiveStatus::Ok;
+}
+
+NUKA_MATERIAL_HD inline ConstitutiveStatus EvaluateHenckyJ2(
+    const float* elastic_f, const HenckyJ2Parameters& p, HenckyResponse& response) {
+    if (!ValidHenckyJ2(p)) return ConstitutiveStatus::InvalidParameters;
+    return EvaluateHenckyElastic(elastic_f, {p.youngs, p.poisson}, response);
 }
 
 // The return preserves total deformation and plastic volume; failure commits no state.
