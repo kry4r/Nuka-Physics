@@ -676,6 +676,8 @@ Value SaveMedia(const MediaRecord& m, MeshSink& sink) {
             xp.Set("contact_pairs_per_vertex", Value::Int(static_cast<int64_t>(mv.contact_pairs_per_vertex)));
         xp.Set("friction", Value::Float(mv.friction));
         xp.Set("stretch_stiffness", Value::Float(mv.stretch_stiffness));
+        if (mv.youngs != 0.0f) xp.Set("youngs", Value::Float(mv.youngs));
+        if (mv.density != 0.0f) xp.Set("density", Value::Float(mv.density));
         xp.Set("poisson", Value::Float(mv.poisson));
         xp.Set("bend_stiffness", Value::Float(mv.bend_stiffness));
         xp.Set("damping", Value::Float(mv.damping));
@@ -687,6 +689,11 @@ Value SaveMedia(const MediaRecord& m, MeshSink& sink) {
         return xp;
     };
     o.Set("vbd", vbd_json(m.vbd));
+    if (!m.tet_materials.empty()) {
+        Value materials = Value::Array();
+        for (const auto& material : m.tet_materials) materials.PushBack(vbd_json(material));
+        o.Set("tet_materials", std::move(materials));
+    }
     if (!m.cloth_regions.empty()) {
         Value regions = Value::Array();
         for (const MediaRecord::ClothRegion& region : m.cloth_regions) {
@@ -721,9 +728,21 @@ Value SaveMedia(const MediaRecord& m, MeshSink& sink) {
         mp.Set("yield_stress", Value::Float(mm.yield_stress));
         mp.Set("hardening_modulus", Value::Float(mm.hardening_modulus));
         if (mm.implicit_stress) mp.Set("implicit_stress", Value::Bool(true));
+        if (mm.grid_dims[0] || mm.grid_dims[1] || mm.grid_dims[2]) {
+            mp.Set("grid_origin", Vec3Json(mm.grid_origin));
+            Value dims = Value::Array();
+            for (uint32_t d : mm.grid_dims) dims.PushBack(Value::Int(d));
+            mp.Set("grid_dims", std::move(dims));
+        }
+        if (mm.particle_radius != 0.0f) mp.Set("particle_radius", Value::Float(mm.particle_radius));
         return mp;
     };
     o.Set("mpm", mpm_mat_json(m.mpm));
+    if (!m.mpm_materials.empty()) {
+        Value materials = Value::Array();
+        for (const auto& material : m.mpm_materials) materials.PushBack(mpm_mat_json(material));
+        o.Set("mpm_materials", std::move(materials));
+    }
 
     // Heterogeneous MLS-MPM sub-fills (additive; absent for a homogeneous medium).
     if (!m.mpm_fills.empty()) {
@@ -1910,6 +1929,19 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             mm.yield_stress = f(mp, "yield_stress", mm.yield_stress);
             mm.hardening_modulus = f(mp, "hardening_modulus", mm.hardening_modulus);
             mm.implicit_stress = b(mp, "implicit_stress", mm.implicit_stress);
+            mm.grid_origin = v3(mp, "grid_origin", mm.grid_origin);
+            mm.particle_radius = f(mp, "particle_radius", mm.particle_radius);
+            if (const Value* dims = mp.Find("grid_dims")) {
+                if (!dims->IsArray() || dims->Elements().size() != 3)
+                    throw std::invalid_argument("MPM grid_dims requires three integers");
+                for (size_t i = 0; i < 3; ++i) {
+                    if (dims->Elements()[i].type() != Value::Type::Int)
+                        throw std::invalid_argument("MPM grid dimensions must be integers");
+                    const auto d = dims->Elements()[i].AsInt();
+                    if (d < 0 || uint64_t(d) > UINT32_MAX) throw std::invalid_argument("MPM grid dimension is out of range");
+                    mm.grid_dims[i] = uint32_t(d);
+                }
+            }
         };
 
         for (const Value& mv : media->Elements()) {
@@ -1999,6 +2031,8 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                 }
                 out.friction = f(xp, "friction", out.friction);
                 out.stretch_stiffness = f(xp, "stretch_stiffness", out.stretch_stiffness);
+                out.youngs = f(xp, "youngs", out.youngs);
+                out.density = f(xp, "density", out.density);
                 out.poisson = f(xp, "poisson", out.poisson);
                 out.bend_stiffness = f(xp, "bend_stiffness", out.bend_stiffness);
                 out.damping = f(xp, "damping", out.damping);
@@ -2014,6 +2048,15 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                 out.aero_drag_max_dv = f(xp, "aero_drag_max_dv", out.aero_drag_max_dv);
             };
             if (const Value* xp = mv.Find("vbd")) read_vbd(*xp, rec.vbd);
+            if (const Value* materials = mv.Find("tet_materials")) {
+                if (!materials->IsArray()) throw std::invalid_argument("tet_materials requires an array");
+                for (const Value& value : materials->Elements()) {
+                    if (!value.IsObject()) throw std::invalid_argument("tet_materials requires material objects");
+                    MediaVbdMaterial material;
+                    read_vbd(value, material);
+                    rec.tet_materials.push_back(material);
+                }
+            }
             if (const Value* regions = mv.Find("cloth_regions"))
                 for (const Value& rv : regions->Elements()) {
                     MediaRecord::ClothRegion region;
@@ -2028,6 +2071,15 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                     rec.cloth_regions.push_back(std::move(region));
                 }
             if (const Value* mp = mv.Find("mpm")) read_mpm(*mp, rec.mpm);
+            if (const Value* materials = mv.Find("mpm_materials")) {
+                if (!materials->IsArray()) throw std::invalid_argument("mpm_materials requires an array");
+                for (const Value& value : materials->Elements()) {
+                    if (!value.IsObject()) throw std::invalid_argument("mpm_materials requires material objects");
+                    MediaMpmMaterial material;
+                    read_mpm(value, material);
+                    rec.mpm_materials.push_back(material);
+                }
+            }
             if (const Value* fills = mv.Find("mpm_fills")) {
                 if (fills->IsArray()) {
                     for (const Value& fv : fills->Elements()) {

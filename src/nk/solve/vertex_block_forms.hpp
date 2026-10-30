@@ -7,6 +7,7 @@
 #include <cstdint>
 
 #include "nk/solve/vertex_block.hpp"
+#include "math/spectral3.hpp"
 
 #if defined(__CUDACC__)
 #define NUKA_VBD_HD __host__ __device__
@@ -15,6 +16,32 @@
 #endif
 
 namespace nuka::nk::vbd {
+
+struct TetCurvature {
+    Vec3 u[3], v[3], f[3];
+    SymmetricMat3 scaling;
+    float spin[3]{}, shear[3]{};
+    bool viscous = false;
+};
+
+// The scaling block and the three twist/flip pairs form the complete isotropic 9x9 Hessian.
+NUKA_VBD_HD inline TetCurvature TetModes(const VbdElement& e, const TetStrain& t) {
+    TetCurvature c;
+    const TetRest r(e); const auto svd = math::ProperSvd3(t.f);
+    const float l = r.lambda + r.mu, stress = l * t.volume_change - r.mu;
+    float q[3];
+    for (uint32_t i = 0; i < 3; ++i) {
+        c.u[i] = svd.u[i]; c.v[i] = svd.v[i];
+        q[i] = svd.sigma[(i + 1) % 3] * svd.sigma[(i + 2) % 3];
+        const float other = svd.sigma[2 - i];
+        c.spin[i] = fmaxf(r.mu * (1.0f - other) + l * t.volume_change * other, 0.0f);
+        c.shear[i] = fmaxf(r.mu - stress * other, 0.0f);
+    }
+    c.scaling = math::PositivePart3({r.mu + l * q[0] * q[0], r.mu + l * q[1] * q[1],
+        r.mu + l * q[2] * q[2], l * q[0] * q[1] + stress * svd.sigma[2],
+        l * q[0] * q[2] + stress * svd.sigma[1], l * q[1] * q[2] + stress * svd.sigma[0]});
+    return c;
+}
 
 // Positive semidefinite part of the symmetric 2x2 stress (s00, s01, s11).
 NUKA_VBD_HD inline void PositiveStress(float s00, float s01, float s11, float* out) {
@@ -38,6 +65,7 @@ NUKA_VBD_HD inline void PositiveStress(float s00, float s01, float s11, float* o
 // One element's curvature: Gauss-Newton at the current geometry or the Rayleigh metric of the interval
 // start. Triangles keep F, the clamped stress, the unit normal, the area-barrier factor and the tangent.
 struct ElementCurvature {
+    TetCurvature tet;
     Vec3 f0, f1, normal;
     float stress[3] = {};
     float barrier = 0.0f;
@@ -59,7 +87,7 @@ struct ElementCurvature {
 
 // First-order change of an element's strain measures under per-vertex displacements.
 struct ElementVariation {
-    Vec3 a, b;
+    Vec3 a, b, c;
     float g00 = 0.0f, g11 = 0.0f, g01 = 0.0f, s = 0.0f;
 };
 
@@ -94,6 +122,7 @@ NUKA_VBD_HD inline void NeoHookeanModes(float mu, float lambda, const TriangleSt
 NUKA_VBD_HD inline ElementCurvature GaussNewtonCurvature(const VbdElement& e, const ElementGeometry& g,
                                                          const MembraneStartState* start = nullptr) {
     ElementCurvature c;
+    if (e.kind == kVbdTet) { c.tet = TetModes(e, TetrahedronStrain(e, g)); return c; }
     if (e.kind == kVbdTriangle) {
         const TriangleStrain t = start != nullptr ? MembraneStrain(e, g, *start) : MembraneStrain(e, g);
         const float mu = e.rest[5], lambda = e.rest[6], trace = t.g00 + t.g11;
@@ -151,6 +180,12 @@ NUKA_VBD_HD inline ElementCurvature GaussNewtonCurvature(const VbdElement& e, co
 NUKA_VBD_HD inline ElementCurvature RayleighCurvature(const VbdElement& e, const ElementGeometry& start,
                                                       const MembraneStartState* cached = nullptr) {
     ElementCurvature c;
+    if (e.kind == kVbdTet) {
+        const auto t = TetrahedronStrain(e, start);
+        for (uint32_t i = 0; i < 3; ++i) c.tet.f[i] = t.f[i];
+        c.tet.viscous = true;
+        return c;
+    }
     if (e.kind == kVbdTriangle) {
         const TriangleStrain t = cached != nullptr ? MembraneStrain(e, start, *cached)
                                                    : MembraneStrain(e, start);
@@ -207,6 +242,11 @@ NUKA_VBD_HD inline ElementCurvature RayleighCurvature(const VbdElement& e, const
 // Variations of the displacement field x, taken relative to vertex 0 against a large common motion.
 NUKA_VBD_HD inline ElementVariation Vary(const VbdElement& e, const ElementCurvature& c, const Vec3* x) {
     ElementVariation v;
+    if (e.kind == kVbdTet) {
+        Vec3 f[3]; TetRest(e).Columns(x, f);
+        v.a = f[0]; v.b = f[1]; v.c = f[2];
+        return v;
+    }
     if (e.kind == kVbdTriangle) {
         const Vec3 x1 = x[1] - x[0], x2 = x[2] - x[0];
         v.a = x1 * e.rest[0] + x2 * e.rest[2];
@@ -248,6 +288,30 @@ NUKA_VBD_HD inline void NeoHookeanModeCoordinates(const ElementCurvature& c, con
 // The element's symmetric bilinear form between two displacement fields given by their variations.
 NUKA_VBD_HD inline float ElementForm(const VbdElement& e, const ElementCurvature& c,
                                      const ElementVariation& x, const ElementVariation& y) {
+    if (e.kind == kVbdTet) {
+        const TetRest r(e); const auto& t = c.tet;
+        const Vec3 dx[3] = {x.a, x.b, x.c}, dy[3] = {y.a, y.b, y.c};
+        if (t.viscous) {
+            float product = 0.0f;
+            for (uint32_t i = 0; i < 3; ++i) for (uint32_t j = 0; j < 3; ++j)
+                product += (t.f[i].Dot(dx[j]) + dx[i].Dot(t.f[j])) *
+                           (t.f[i].Dot(dy[j]) + dy[i].Dot(t.f[j]));
+            return 0.5f * r.Volume() * r.mu * product;
+        }
+        float mx[3][3], my[3][3];
+        for (uint32_t j = 0; j < 3; ++j) {
+            const Vec3 a = dx[0] * t.v[j].x + dx[1] * t.v[j].y + dx[2] * t.v[j].z;
+            const Vec3 b = dy[0] * t.v[j].x + dy[1] * t.v[j].y + dy[2] * t.v[j].z;
+            for (uint32_t i = 0; i < 3; ++i) { mx[i][j] = t.u[i].Dot(a); my[i][j] = t.u[i].Dot(b); }
+        }
+        float product = Vec3{mx[0][0], mx[1][1], mx[2][2]}.Dot(
+            t.scaling.Multiply({my[0][0], my[1][1], my[2][2]}));
+        uint32_t pair = 0;
+        for (uint32_t i = 0; i < 2; ++i) for (uint32_t j = i + 1; j < 3; ++j, ++pair)
+            product += 0.5f * (t.spin[pair] * (mx[i][j] - mx[j][i]) * (my[i][j] - my[j][i]) +
+                               t.shear[pair] * (mx[i][j] + mx[j][i]) * (my[i][j] + my[j][i]));
+        return r.Volume() * product;
+    }
     if (e.kind == kVbdTriangle) {
         const float mu = e.rest[5], lambda = e.rest[6];
         if (c.neo_hookean) {
@@ -316,6 +380,13 @@ NUKA_VBD_HD inline float BendCosineDrop(const Vec3* x, const Vec3* move) {
 NUKA_VBD_HD inline float ElementMovesEnergyChange(const VbdElement& e, const ElementGeometry& g,
                                                   const Vec3* move,
                                                   const MembraneStartState* start = nullptr) {
+    if (e.kind == kVbdTet) {
+        const auto t = TetrahedronStrain(e, g); Vec3 df[3]; TetRest(e).Columns(move, df);
+        const float dj = t.cof[0].Dot(df[0]) + t.cof[1].Dot(df[1]) + t.cof[2].Dot(df[2]) +
+            t.f[0].Dot(df[1].Cross(df[2])) + df[0].Dot(t.f[1].Cross(df[2]) + df[1].Cross(t.f[2])) +
+            df[0].Dot(df[1].Cross(df[2]));
+        return TetEnergyChange(e, t, df, dj);
+    }
     if (e.kind == kVbdTriangle) {
         const TriangleStrain t = start != nullptr ? MembraneStrain(e, g, *start) : MembraneStrain(e, g);
         const Vec3 m1 = move[1] - move[0], m2 = move[2] - move[0];

@@ -31,6 +31,7 @@ static_assert(NUKA_VBD_TRIANGLE == nk::kVbdTriangle);
 static_assert(NUKA_VBD_HINGE == nk::kVbdHinge);
 static_assert(NUKA_VBD_SPRING == nk::kVbdSpring);
 static_assert(NUKA_VBD_ROD_BEND == nk::kVbdRodBend);
+static_assert(NUKA_VBD_TET == nk::kVbdTet);
 static_assert(offsetof(nuka_vbd_element_t, vertex) == offsetof(nk::VbdElement, vertex));
 static_assert(offsetof(nuka_vbd_element_t, rest) == offsetof(nk::VbdElement, rest));
 static_assert(offsetof(nuka_vbd_element_t, damping) == offsetof(nk::VbdElement, damping));
@@ -285,6 +286,9 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
     {NUKA_FIELD_VBD_COARSE_LEVEL_NODES, kStrideU32, kWireDtypeU32, nk::FieldId::VbdCoarseLevelNodes},
     {NUKA_FIELD_VBD_COARSE_PARENTS, kStrideU32, kWireDtypeU32, nk::FieldId::VbdCoarseParents},
     {NUKA_FIELD_VBD_COARSE_WEIGHTS, kStrideF32, kWireDtypeF32, nk::FieldId::VbdCoarseWeights},
+    {NUKA_FIELD_PARTICLE_AFFINE_VELOCITY, kStrideMat3, kWireDtypeF32, nk::FieldId::ParticleC},
+    {NUKA_FIELD_PARTICLE_REST_VOLUME, kStrideF32, kWireDtypeF32, nk::FieldId::ParticleVol0},
+    {NUKA_FIELD_PARTICLE_MATERIAL_ID, kStrideU32, kWireDtypeU32, nk::FieldId::ParticleMaterialId},
 };
 
 inline constexpr size_t kDlpackFieldCount =

@@ -443,11 +443,7 @@ bool World::SeedInitialState() {
                                inv_mass.size() * sizeof(float))) {
             return false;
         }
-        // MLS-MPM per-particle continuum seed (F=identity, vol0, material_id),
-        // gated to the MPM modes so a non-MPM world writes EXACTLY today's bytes (the
-        // new fields stay at their 0-byte segments). C is the arena zero default. For
-        // MpmVbd initial_F/vol0/material_id are sized to the MPM slice [0, n_mpm), so
-        // the loop's identity/0 fallback fills the VBD slice (unused by the transfer).
+        // Continuum streams cover the MPM slice; the unused VBD slice takes identity deformation and zero rate.
         if (mp.mode == Model::ParticleMode::Mpm ||
             mp.mode == Model::ParticleMode::MpmVbd) {
             std::vector<float> F(static_cast<size_t>(P) * E * 9u, 0.0f);
@@ -475,10 +471,26 @@ bool World::SeedInitialState() {
                                    mat.size() * sizeof(uint32_t))) {
                 return false;
             }
+            if (!mp.initial_C.empty()) {
+                std::vector<float> C(F.size(), 0.0f);
+                for (uint32_t e = 0; e < E; ++e)
+                    std::copy(mp.initial_C.begin(), mp.initial_C.end(), C.begin() + size_t{e}*P*9u);
+                if (!data_.UploadField(FieldId::ParticleC, C.data(), C.size()*sizeof(float))) return false;
+            }
+            if (!mp.initial_equivalent_plastic_strain.empty()) {
+                std::vector<float> strain(size_t{P}*E, 0.0f);
+                for (uint32_t e = 0; e < E; ++e)
+                    std::copy(mp.initial_equivalent_plastic_strain.begin(), mp.initial_equivalent_plastic_strain.end(),
+                              strain.begin() + size_t{e}*P);
+                if (!data_.UploadField(FieldId::ParticlePlastic, strain.data(), strain.size()*sizeof(float))) return false;
+            }
             if (cap.mpm_plastic_state) {
                 std::vector<float> plastic(F.size(), 0.0f);
                 for (size_t i = 0u; i < plastic.size(); i += 9u)
                     plastic[i] = plastic[i + 4u] = plastic[i + 8u] = 1.0f;
+                if (!mp.initial_plastic_F.empty())
+                    for (uint32_t e = 0; e < E; ++e)
+                        std::copy(mp.initial_plastic_F.begin(), mp.initial_plastic_F.end(), plastic.begin() + size_t{e}*P*9u);
                 if (!data_.UploadField(FieldId::ParticlePlasticF, plastic.data(),
                                       plastic.size() * sizeof(float))) return false;
             }

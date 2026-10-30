@@ -1984,11 +1984,21 @@ void CookVbdParticles(nk::Model& model, uint32_t env_count,
 
 void CookMpmParticles(nk::Model& model, uint32_t env_count,
                       const MpmCookInput& in) {
+    const size_t input_count = in.positions.size();
+    if (input_count > UINT32_MAX || (!in.velocities.empty() && in.velocities.size() != input_count) ||
+        (!in.inv_mass.empty() && in.inv_mass.size() != input_count) || (!in.vol0.empty() && in.vol0.size() != input_count) ||
+        (!in.material_id.empty() && in.material_id.size() != input_count) ||
+        (!in.elastic_deformation.empty() && in.elastic_deformation.size() != 9u*input_count) ||
+        (!in.affine_velocity.empty() && in.affine_velocity.size() != 9u*input_count) ||
+        (!in.plastic_deformation.empty() && in.plastic_deformation.size() != 9u*input_count) ||
+        (!in.equivalent_plastic_strain.empty() && in.equivalent_plastic_strain.size() != input_count))
+        throw std::invalid_argument("CookMpmParticles: inconsistent initial particle streams");
     const uint32_t envs = env_count > 0 ? env_count : 1u;
     nk::ModelCapacities& cap = model.capacities;
     if (cap.env_count == 1u || cap.env_count == 0u) cap.env_count = envs;
     const uint32_t rigid_base = RigidContactBase(model);
-    if (in.dx <= 0.0f || in.grid_dims[0] < nk::kMpmStencilWidth ||
+    if (!(std::isfinite(in.dx) && in.dx > 0.0f) || !std::isfinite(in.grid_origin.x) ||
+        !std::isfinite(in.grid_origin.y) || !std::isfinite(in.grid_origin.z) || in.grid_dims[0] < nk::kMpmStencilWidth ||
         in.grid_dims[1] < nk::kMpmStencilWidth || in.grid_dims[2] < nk::kMpmStencilWidth) {
         throw std::runtime_error(
             "CookMpmParticles: an MLS-MPM medium needs a positive cell size dx and "
@@ -2020,7 +2030,7 @@ void CookMpmParticles(nk::Model& model, uint32_t env_count,
     if (mp.inv_mass.size() != mp.initial_pos.size()) {
         mp.inv_mass.assign(mp.initial_pos.size(), 1.0f);
     }
-    // F seeded to identity per particle; C is the arena zero default.
+    // Missing deformation and affine streams retain the identity and zero defaults.
     const size_t n = mp.initial_pos.size();
     mp.initial_F.assign(n * 9u, 0.0f);
     for (size_t i = 0; i < n; ++i) {
@@ -2028,6 +2038,10 @@ void CookMpmParticles(nk::Model& model, uint32_t env_count,
         mp.initial_F[i * 9u + 4u] = 1.0f;
         mp.initial_F[i * 9u + 8u] = 1.0f;
     }
+    if (!in.elastic_deformation.empty()) mp.initial_F = in.elastic_deformation;
+    mp.initial_C = in.affine_velocity;
+    mp.initial_plastic_F = in.plastic_deformation;
+    mp.initial_equivalent_plastic_strain = in.equivalent_plastic_strain;
     mp.initial_vol0 = in.vol0;
     if (mp.initial_vol0.size() != n) mp.initial_vol0.assign(n, in.dx * in.dx * in.dx);
     // Grid-owned points meet bodies through grid rows, never particle contacts.
@@ -2049,6 +2063,8 @@ void CookMpmParticles(nk::Model& model, uint32_t env_count,
     };
     if (in.materials.empty()) {
         // Homogeneous cook: one material, id 0 for every particle.
+        for (uint32_t id : in.material_id) if (id != 0)
+            throw std::invalid_argument("CookMpmParticles: homogeneous material requires particle material ID zero");
         mp.initial_material_id.assign(n, 0u);
         model.mpm_materials = {to_material(in.material)};
         cap.mpm_material_count = 1u;
@@ -2070,11 +2086,11 @@ void CookMpmParticles(nk::Model& model, uint32_t env_count,
             throw std::invalid_argument("CookMpmParticles: particle material index is out of range");
 
     // Env-private dense grid sizing (the node product, loud u32 overflow guard).
-    const uint64_t nodes64 = static_cast<uint64_t>(in.grid_dims[0]) *
-                             in.grid_dims[1] * in.grid_dims[2];
-    if (nk::kMpmLattices * nodes64 > 0xFFFFFFFFull) {
-        throw std::runtime_error(
-            "CookMpmParticles: the MPM grid node count (dims product) overflows u32");
+    uint64_t nodes64 = 1;
+    for (uint32_t dim : in.grid_dims) {
+        if (dim > UINT32_MAX / (nk::kMpmLattices * nodes64))
+            throw std::invalid_argument("CookMpmParticles: MPM grid node product exceeds device indexing");
+        nodes64 *= dim;
     }
     cap.mpm_grid_nodes_per_env = static_cast<uint32_t>(nk::kMpmLattices * nodes64);
     cap.mpm_contact_capacity_per_env = in.contact_capacity != 0u ? in.contact_capacity :
@@ -2107,7 +2123,7 @@ void ValidateMedia(const std::vector<MediaRecord>& media) {
         bool legal = false;
         switch (m.kind) {
             case Kind::Cloth:   legal = m.method == Method::Vbd; break;
-            case Kind::SoftTet: legal = m.method == Method::MlsMpm; break;
+            case Kind::SoftTet: legal = m.method == Method::MlsMpm || m.method == Method::Vbd; break;
             case Kind::Fluid:   legal = m.method == Method::MlsMpm; break;
             case Kind::Granular: legal = m.method == Method::MlsMpm; break;
             case Kind::Cable:   legal = m.method == Method::Vbd; break;
@@ -2115,8 +2131,7 @@ void ValidateMedia(const std::vector<MediaRecord>& media) {
         if (!legal) {
             throw std::runtime_error(
                 "ValidateMedia: illegal medium (kind x method) -- cloth and cable solve "
-                "as vertex blocks (vbd), a tet-soft body, a fluid and a granular bed "
-                "with MLS-MPM");
+                "as vertex blocks (vbd), tetrahedra as VBD or MLS-MPM, fluids and granular beds as MLS-MPM");
         }
         // model_kind 4 (Drucker-Prager) and Kind::Granular imply each other: no
         // sand-tagged fluid/soft body and no granular bed cooking as another model.
@@ -2142,6 +2157,15 @@ void ValidateMedia(const std::vector<MediaRecord>& media) {
         }
         if (!m.cloth_regions.empty() && m.kind != Kind::Cloth)
             throw std::runtime_error("ValidateMedia: cloth_regions require a cloth medium");
+        if (!m.tet_materials.empty() && !(m.kind == Kind::SoftTet && m.method == Method::Vbd))
+            throw std::invalid_argument("tet_materials require a tetrahedral VBD medium");
+        if (!m.mpm_materials.empty() && (m.method != Method::MlsMpm || m.baked.Empty()))
+            throw std::invalid_argument("mpm_materials require a baked MLS-MPM particle medium");
+        if (m.kind == Kind::Granular)
+            for (const auto& material : m.mpm_materials) if (material.model_kind != 4.0f)
+                throw std::invalid_argument("Granular material table requires Drucker-Prager materials");
+        if (m.method == Method::MlsMpm && !m.baked.Empty() && !m.mpm_fills.empty())
+            throw std::invalid_argument("A baked particle medium cannot also sample box fills");
     }
 }
 
@@ -2433,6 +2457,123 @@ bool IsVertexBlockMedium(const MediaRecord& media) {
     return media.method == MediaRecord::Method::Vbd;
 }
 
+namespace {
+NkaTetMesh ReadTetGeometry(const MediaRecord& media) {
+    if (!media.baked.Empty()) {
+        if (media.baked.fourcc != NkaTagTets()) throw std::invalid_argument("Tetrahedra require a TETS asset");
+        return DecodeTetMesh(NkaFile::Open(media.baked.nka_path).LoadChunk(NkaTagTets(), media.baked.index));
+    }
+    const auto& s = media.tet_sphere;
+    if (!(s.radius > 0 && s.cell_len > 0 && s.cells >= 2))
+        throw std::invalid_argument("Tetrahedra require a baked mesh or a valid sphere lattice");
+    const auto lattice = runtime::soft::BuildSphereTetLattice(s.center, s.radius, s.cells, s.cell_len);
+    NkaTetMesh mesh;
+    for (const auto& p : lattice.rest) mesh.positions.insert(mesh.positions.end(), {p.x, p.y, p.z});
+    for (const auto& t : lattice.tets) mesh.indices.insert(mesh.indices.end(), t.v, t.v + 4);
+    return mesh;
+}
+
+void SetTetRest(nk::VbdElement& element, const NkaTetMesh& mesh, size_t tet, float mu, float lambda) {
+    double dm[3][3];
+    if (!mesh.rest_inverse.empty()) {
+        const float* a = mesh.rest_inverse.data() + 9u * tet;
+        const double c[3][3] = {{double(a[4])*a[8] - double(a[5])*a[7], double(a[2])*a[7] - double(a[1])*a[8],
+                                  double(a[1])*a[5] - double(a[2])*a[4]},
+            {double(a[5])*a[6] - double(a[3])*a[8], double(a[0])*a[8] - double(a[2])*a[6],
+             double(a[2])*a[3] - double(a[0])*a[5]},
+            {double(a[3])*a[7] - double(a[4])*a[6], double(a[1])*a[6] - double(a[0])*a[7],
+             double(a[0])*a[4] - double(a[1])*a[3]}};
+        const double det = double(a[0])*c[0][0] + double(a[1])*c[1][0] + double(a[2])*c[2][0];
+        if (!(std::isfinite(det) && det != 0)) throw std::invalid_argument("Singular tetrahedron rest inverse");
+        for (size_t i = 0; i < 3; ++i) for (size_t j = 0; j < 3; ++j) dm[i][j] = c[i][j] / det;
+    } else {
+        const auto& rest = mesh.rest_positions.empty() ? mesh.positions : mesh.rest_positions;
+        for (size_t i = 0; i < 3; ++i) for (size_t j = 0; j < 3; ++j)
+            dm[i][j] = double(rest[3u * element.vertex[j + 1u] + i]) - rest[3u * element.vertex[0] + i];
+    }
+    double q0[3], q1[3];
+    const double a = std::sqrt(dm[0][0]*dm[0][0] + dm[1][0]*dm[1][0] + dm[2][0]*dm[2][0]);
+    if (!(a > 0 && std::isfinite(a))) throw std::invalid_argument("Degenerate tetrahedron rest edge");
+    double b = 0, c = 0;
+    for (size_t i = 0; i < 3; ++i) { q0[i] = dm[i][0] / a; b += q0[i]*dm[i][1]; c += q0[i]*dm[i][2]; }
+    double norm = 0;
+    for (size_t i = 0; i < 3; ++i) { q1[i] = dm[i][1] - b*q0[i]; norm += q1[i]*q1[i]; }
+    const double d = std::sqrt(norm);
+    if (!(d > 0 && std::isfinite(d))) throw std::invalid_argument("Degenerate tetrahedron rest face");
+    double h = 0;
+    for (size_t i = 0; i < 3; ++i) { q1[i] /= d; h += q1[i]*dm[i][2]; }
+    const double n[3] = {q0[1]*q1[2] - q0[2]*q1[1], q0[2]*q1[0] - q0[0]*q1[2], q0[0]*q1[1] - q0[1]*q1[0]};
+    const double f = n[0]*dm[0][2] + n[1]*dm[1][2] + n[2]*dm[2][2];
+    if (!(f != 0 && std::isfinite(f))) throw std::invalid_argument("Degenerate tetrahedron rest volume");
+    nk::vbd::TetRest::Set(element, float(1/a), float(-b/(a*d)), float((b*h - c*d)/(a*d*f)),
+        float(1/d), float(-h/(d*f)), float(1/f), mu, lambda);
+    for (float v : element.rest) if (!std::isfinite(v))
+        throw std::invalid_argument("Tetrahedron rest metric exceeds float range");
+    if (!(nk::vbd::TetRest(element).Volume() > 0 && std::isfinite(nk::vbd::TetRest(element).Volume())))
+        throw std::invalid_argument("Tetrahedron rest volume exceeds float range");
+}
+}  // namespace
+
+VbdCookInput BuildTetVertexBlockInput(const MediaRecord& media) {
+    const auto mesh = ReadTetGeometry(media);
+    const size_t count = mesh.positions.size() / 3u, tet_count = mesh.indices.size() / 4u;
+    if (!count || !tet_count || count > UINT32_MAX || tet_count > UINT32_MAX / 4u)
+        throw std::invalid_argument("Tetrahedron mesh exceeds vertex-block index range");
+    const auto& contact = media.vbd;
+    if (!(std::isfinite(contact.half_thickness) && contact.half_thickness >= 0 &&
+          std::isfinite(contact.self_half_thickness) && contact.self_half_thickness >= 0 &&
+          std::isfinite(contact.friction) && contact.friction >= 0))
+        throw std::invalid_argument("Invalid tetrahedron contact material");
+    VbdCookInput in;
+    for (size_t i = 0; i < count; ++i) {
+        in.positions.push_back({mesh.positions[3*i], mesh.positions[3*i+1], mesh.positions[3*i+2]});
+        in.velocities.push_back(mesh.velocities.empty() ? math::Vec3{} :
+            math::Vec3{mesh.velocities[3*i], mesh.velocities[3*i+1], mesh.velocities[3*i+2]});
+    }
+    std::vector<double> mass(count, 0);
+    std::set<std::array<uint32_t, 4>> unique;
+    std::vector<runtime::soft::TetMeshTet> tets;
+    for (size_t i = 0; i < tet_count; ++i) {
+        const auto id = mesh.material_ids.empty() ? 0u : mesh.material_ids[i];
+        if (id >= std::max(size_t{1}, media.tet_materials.size()))
+            throw std::invalid_argument("Tetrahedron material ID exceeds its table");
+        const auto& m = media.tet_materials.empty() ? media.vbd : media.tet_materials[id];
+        if (!(std::isfinite(m.youngs) && m.youngs > 0 && std::isfinite(m.poisson) && m.poisson > -1 &&
+              m.poisson < 0.5f && std::isfinite(m.damping) && m.damping >= 0 &&
+              std::isfinite(m.density) && m.density >= 0 && (!mesh.inverse_masses.empty() || m.density > 0)))
+            throw std::invalid_argument("Tetrahedron requires finite E > 0, -1 < nu < 0.5 and a mass definition");
+        nk::VbdElement e;
+        e.kind = nk::kVbdTet; e.damping = m.damping;
+        std::array<uint32_t, 4> key;
+        for (size_t j = 0; j < 4; ++j) key[j] = e.vertex[j] = mesh.indices[4*i+j];
+        std::sort(key.begin(), key.end());
+        if (!unique.insert(key).second) throw std::invalid_argument("Duplicate tetrahedron");
+        const float mu = m.youngs / (2.0f * (1.0f + m.poisson));
+        const float lambda = m.youngs * m.poisson / ((1.0f + m.poisson) * (1.0f - 2.0f*m.poisson));
+        SetTetRest(e, mesh, i, mu, lambda);
+        in.vbd_elements.push_back(e);
+        runtime::soft::TetMeshTet t;
+        for (size_t j = 0; j < 4; ++j) { t.v[j] = e.vertex[j]; mass[e.vertex[j]] += nk::vbd::TetRest(e).Volume()*double(m.density)/4; }
+        tets.push_back(t);
+    }
+    in.inv_mass = mesh.inverse_masses;
+    if (in.inv_mass.empty()) for (double value : mass) {
+        const float inverse = float(1.0 / value);
+        if (!(inverse > 0 && std::isfinite(inverse))) throw std::invalid_argument("Tetrahedron vertex has invalid lumped mass");
+        in.inv_mass.push_back(inverse);
+    }
+    in.half_thickness.assign(count, contact.half_thickness);
+    in.self_half_thickness.assign(count, SelfHalfThickness(contact));
+    in.friction.assign(count, contact.friction);
+    CookParticleSurface surface;
+    surface.triangles = runtime::soft::ExtractBoundaryTriangles(in.positions, tets);
+    surface.self_contact = contact.self_contact;
+    surface.contact_pairs_per_vertex = contact.contact_pairs_per_vertex;
+    in.surfaces.push_back(std::move(surface));
+    in.vbd_count = uint32_t(count);
+    return in;
+}
+
 VbdCookInput BuildClothVertexBlockInput(const MediaRecord& media) {
     VbdCookInput in;
     const auto geometry = BuildClothGeometry(media);
@@ -2653,8 +2794,8 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
         } else {
             const uint32_t n_mpm =
                 static_cast<uint32_t>(BuildMpmInput(m).positions.size());
-            const float sp = m.kind == MediaRecord::Kind::SoftTet
-                                 ? m.tet_sphere.cell_len : m.fluid_box.spacing;
+            const float sp = !m.baked.Empty() ? 2.0f*(m.mpm.particle_radius > 0 ? m.mpm.particle_radius : 0.5f*m.mpm.dx)
+                : m.kind == MediaRecord::Kind::SoftTet ? m.tet_sphere.cell_len : m.fluid_box.spacing;
             if (sp > 0.0f && n_mpm > 0u) {
                 MediaRenderSurface s;
                 s.particle_radius = 0.5f * sp;
@@ -2673,6 +2814,19 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
     // The soft slice holds vertex-block media in media order; track the running particle
     // base exactly as CookSceneMedia appends them (fluid/MPM skipped).
     const auto append_soft = [&](const MediaRecord& m) {
+        if (m.kind == MediaRecord::Kind::SoftTet) {
+            const auto input = BuildTetVertexBlockInput(m);
+            MediaRenderSurface s;
+            s.triangles = input.surfaces.front().triangles;
+            for (auto& vertex : s.triangles) vertex += base;
+            s.particle_first = base; s.particle_count = uint32_t(input.positions.size());
+            s.render_material_id = m.render_material_id;
+            s.normal_offset = m.render_skin.normal_offset; s.smooth_iters = m.render_skin.smooth_iters;
+            s.smooth_lambda = m.render_skin.smooth_lambda;
+            surfaces.push_back(std::move(s));
+            base += uint32_t(input.positions.size());
+            return;
+        }
         // Cable: the rope renders as an instanced bead tube over its chain range; the
         // optional welded slab renders as a triangulated rigid box over its 8 corners.
         if (m.kind == MediaRecord::Kind::Cable) {
@@ -2882,7 +3036,85 @@ static MpmCookInput BuildMpmInputFills(const MediaRecord& media) {
     return in;
 }
 
+namespace {
+MpmMaterialInput MpmConstitutive(const MediaMpmMaterial& m) {
+    MpmMaterialInput r;
+    r.youngs = m.youngs; r.poisson = m.poisson; r.density = m.density;
+    r.dp_friction = m.dp_friction; r.dp_cohesion = m.dp_cohesion; r.model_kind = m.model_kind;
+    r.bulk_modulus = m.bulk_modulus; r.tait_gamma = m.tait_gamma; r.viscosity = m.viscosity;
+    r.yield_stress = m.yield_stress; r.hardening_modulus = m.hardening_modulus;
+    return r;
+}
+
+MpmCookInput BuildBakedMpmInput(const MediaRecord& media) {
+    if (media.baked.fourcc != NkaTagPset()) throw std::invalid_argument("Baked MLS-MPM requires a PSET asset");
+    const auto p = DecodeParticleSet(NkaFile::Open(media.baked.nka_path).LoadChunk(NkaTagPset(), media.baked.index));
+    const auto& m = media.mpm;
+    if (!(std::isfinite(m.dx) && m.dx > 0 && std::isfinite(m.loft_headroom) && m.loft_headroom >= 0 &&
+          std::isfinite(m.floor_d) && std::isfinite(m.floor_friction) && m.floor_friction >= 0 &&
+          std::isfinite(m.particle_radius) && m.particle_radius >= 0 && m.substeps > 0 &&
+          std::isfinite(m.floor_normal.x) && std::isfinite(m.floor_normal.y) &&
+          std::isfinite(m.floor_normal.z) && m.floor_normal.LengthSq() > 1e-12f &&
+          std::isfinite(m.floor_normal.LengthSq())))
+        throw std::invalid_argument("Baked MLS-MPM requires finite grid, floor and render parameters");
+    MpmCookInput in;
+    math::Vec3 lo{p.positions[0], p.positions[1], p.positions[2]}, hi = lo;
+    for (size_t i = 0; i < p.positions.size(); i += 3) {
+        const math::Vec3 x{p.positions[i], p.positions[i+1], p.positions[i+2]};
+        in.positions.push_back(x);
+        in.velocities.push_back(p.velocities.empty() ? math::Vec3{} :
+            math::Vec3{p.velocities[i], p.velocities[i+1], p.velocities[i+2]});
+        lo = {std::min(lo.x, x.x), std::min(lo.y, x.y), std::min(lo.z, x.z)};
+        hi = {std::max(hi.x, x.x), std::max(hi.y, x.y), std::max(hi.z, x.z)};
+    }
+    in.inv_mass = p.inverse_masses; in.vol0 = p.rest_volumes;
+    in.elastic_deformation = p.elastic_deformation; in.affine_velocity = p.affine_velocity;
+    in.plastic_deformation = p.plastic_deformation; in.equivalent_plastic_strain = p.equivalent_plastic_strain;
+    in.material = MpmConstitutive(m);
+    if (media.kind == MediaRecord::Kind::Granular && media.mpm_materials.empty()) in.material.model_kind = 4;
+    for (const auto& material : media.mpm_materials) in.materials.push_back(MpmConstitutive(material));
+    in.material_id = p.material_ids;
+    const size_t materials = std::max(size_t{1}, in.materials.size());
+    for (uint32_t id : in.material_id) if (id >= materials)
+        throw std::invalid_argument("PSET material ID exceeds the scene material table");
+    if (!in.materials.empty() && in.material_id.empty()) in.material_id.assign(in.positions.size(), 0u);
+    in.dx = m.dx; in.substeps = m.substeps; in.contact_capacity = m.contact_capacity;
+    in.implicit_stress = m.implicit_stress;
+    in.floor_normal = m.floor_normal; in.floor_d = m.floor_d; in.floor_friction = m.floor_friction;
+    const bool explicit_grid = m.grid_dims[0] || m.grid_dims[1] || m.grid_dims[2];
+    if (explicit_grid) {
+        in.grid_origin = m.grid_origin;
+        for (size_t i = 0; i < 3; ++i) in.grid_dims[i] = m.grid_dims[i];
+    } else {
+        const double margin = 4.0 * m.dx;
+        const auto normal = m.floor_normal / m.floor_normal.Length();
+        const double floor_z = normal.z > 0 ?
+            (double(m.floor_d) - double(normal.x)*(normal.x >= 0 ? hi.x : lo.x) -
+             double(normal.y)*(normal.y >= 0 ? hi.y : lo.y)) / normal.z : lo.z;
+        const double base = std::min(double(lo.z), floor_z) - margin;
+        const double top = double(hi.z) + (double(hi.z) - lo.z) + margin + m.loft_headroom;
+        in.grid_origin = {float(lo.x - margin), float(lo.y - margin), float(base)};
+        const double extents[3] = {double(hi.x) - lo.x + 2*margin, double(hi.y) - lo.y + 2*margin, top - base};
+        for (size_t i = 0; i < 3; ++i) {
+            const double nodes = std::ceil(extents[i]/m.dx) + 1;
+            if (!(nodes >= nk::kMpmStencilWidth && nodes <= UINT32_MAX))
+                throw std::invalid_argument("PSET grid extent exceeds index range");
+            in.grid_dims[i] = uint32_t(nodes);
+        }
+    }
+    const float origin[3] = {in.grid_origin.x, in.grid_origin.y, in.grid_origin.z};
+    const float lower[3] = {lo.x, lo.y, lo.z}, upper[3] = {hi.x, hi.y, hi.z};
+    for (size_t i = 0; i < 3; ++i)
+        if (!(std::isfinite(origin[i]) && in.grid_dims[i] >= nk::kMpmStencilWidth &&
+              double(lower[i]) >= double(origin[i]) + m.dx &&
+              double(upper[i]) <= double(origin[i]) + double(m.dx)*(in.grid_dims[i] - 2u)))
+            throw std::invalid_argument("PSET particles require one cell of grid padding on every side");
+    return in;
+}
+}  // namespace
+
 MpmCookInput BuildMpmInput(const MediaRecord& media) {
+    if (!media.baked.Empty()) return BuildBakedMpmInput(media);
     // A heterogeneous bed (>= one mpm_fill) samples each sub-box with its own material.
     if (!media.mpm_fills.empty()) return BuildMpmInputFills(media);
     MpmCookInput in;
@@ -3005,6 +3237,22 @@ MpmCookInput BuildMpmInput(const std::vector<MediaRecord>& media) {
         append(combined.velocities, next.velocities);
         append(combined.inv_mass, next.inv_mass);
         append(combined.vol0, next.vol0);
+        const auto append_state = [&](auto& destination, auto& source, size_t width, bool identity) {
+            if (destination.empty() && source.empty()) return;
+            const size_t previous = combined.positions.size() - next.positions.size();
+            const auto fill = [width, identity](auto& stream, size_t count) {
+                stream.assign(count*width, 0.0f);
+                if (identity) for (size_t i = 0; i < count; ++i)
+                    stream[i*width] = stream[i*width+4u] = stream[i*width+8u] = 1.0f;
+            };
+            if (destination.empty()) fill(destination, previous);
+            if (source.empty()) fill(source, next.positions.size());
+            append(destination, source);
+        };
+        append_state(combined.elastic_deformation, next.elastic_deformation, 9u, true);
+        append_state(combined.affine_velocity, next.affine_velocity, 9u, false);
+        append_state(combined.plastic_deformation, next.plastic_deformation, 9u, true);
+        append_state(combined.equivalent_plastic_strain, next.equivalent_plastic_strain, 1u, false);
         append(combined.materials, next.materials);
         append(combined.material_id, next.material_id);
         combined.substeps = std::max(combined.substeps, next.substeps);
@@ -3048,7 +3296,8 @@ float CrossContactDMin(const std::vector<MediaRecord>& media,
         float sp = 0.0f;
         if (m.kind == MediaRecord::Kind::Cloth)
             sp = m.vbd.half_thickness > 0.0f ? 2.0f * m.vbd.half_thickness : m.cloth_grid.spacing;
-        else if (m.kind == MediaRecord::Kind::SoftTet) sp = m.tet_sphere.cell_len;
+        else if (m.kind == MediaRecord::Kind::SoftTet)
+            sp = m.method == MediaRecord::Method::Vbd ? 2.0f*m.vbd.half_thickness : m.tet_sphere.cell_len;
         else if (m.kind == MediaRecord::Kind::Cable) sp = 2.0f * m.cable_line.radius;
         else sp = m.fluid_box.spacing;  // Fluid + Granular share the box lattice.
         if (sp > 0.0f) d_min = (d_min > 0.0f) ? std::min(d_min, sp) : sp;
@@ -3114,7 +3363,7 @@ void CookSceneMedia(nk::Model& model, uint32_t env_count,
     for (const MediaRecord& m : media) {
         if (!IsVertexBlockMedium(m)) continue;
         AppendSoftMedium(soft, m.kind == MediaRecord::Kind::Cloth ? BuildClothVertexBlockInput(m)
-                                                                  : BuildCableVertexBlockInput(m));
+            : m.kind == MediaRecord::Kind::SoftTet ? BuildTetVertexBlockInput(m) : BuildCableVertexBlockInput(m));
         have_soft = true;
     }
 

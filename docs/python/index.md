@@ -11,6 +11,7 @@ builds and installs the package.
 | --- | --- |
 | `nuka` | `Device`, `World`, `Field`, `Scene`, `SceneBuilder`, `Recorder`, `sync()`, `torch_stream_ptr()` |
 | `nuka.author` | The authoring layer: `morphs` (geometry), `materials`, `surfaces`, `SimOptions` and `Scene` |
+| `nuka.assets` | Writers for baked tetrahedral meshes and MPM particle sets |
 | `nuka.editor` | The editor from Python: launch it, script it, extend it ([Python: the editor](editor.md)) |
 | `nuka.mcp` | The editor as an MCP server for AI agents ([Agents](../editor/agents.md)) |
 | `nuka.train` | The training tasks the editor configures, and the run process (`python -m nuka.train job.json`) |
@@ -22,6 +23,52 @@ builds and installs the package.
 | `nuka.jax_state_pytree` | A JAX pytree over the state arrays, loaded on first use |
 
 `import nuka` never imports torch; `torch_stream_ptr()` loads it when called.
+
+## Baked continuum media
+
+Asset writers return absolute `.nka#TETS/0` or `.nka#PSET/0` references. Arrays keep their
+order and use metres, kilograms and seconds. A tetrahedral mesh can carry its initial and
+rest shapes separately:
+
+```python
+import numpy as np
+from nuka.assets import write_tet_mesh, write_particle_set
+from nuka.author import Scene, SimOptions, morphs, materials
+
+q = np.array([[0, 0, 1], [.1, 0, 1], [0, .1, 1], [0, 0, 1.1]], dtype=np.float32)
+asset = write_tet_mesh("solid.nka", q, [[0, 1, 2, 3]],
+                       rest_positions=q, inverse_masses=[0, 1, 1, 1])
+scene = Scene(SimOptions(dt=1/240, gravity=(0, 0, -9.81)))
+scene.add_entity(morphs.TetMesh(asset), materials.Soft.VBD(youngs=1e5, poisson=.3))
+```
+
+Use `velocities`, `rest_inverse` and `material_ids` for additional tetrahedral streams.
+`morphs.TetMesh(materials=(...))` supplies rows indexed by per-tet IDs; contact settings
+come from the entity's material. `morphs.TetSphere` also accepts `materials.Soft.VBD`.
+
+MPM particle sets require explicit inverse masses and rest volumes:
+
+```python
+asset = write_particle_set("points.nka", q, inverse_masses=np.full(4, 1000),
+                           rest_volumes=np.full(4, 1e-6), velocities=np.zeros((4, 3)))
+scene.add_entity(morphs.ParticleSet(asset, particle_radius=.005),
+                 materials.Soft.MPM(dx=.02, substeps=20))
+```
+
+Optional `elastic_deformation`, `affine_velocity`, `plastic_deformation` and
+`equivalent_plastic_strain` preserve continuum state through creation and reset. Matrices
+have shape `(N,3,3)` and row-major entries. Plastic histories require `Soft.ElastoPlastic`
+materials. `morphs.ParticleSet(materials=(...))` provides the per-particle material table;
+`grid_origin` and `grid_dimensions` optionally set the domain. Default zero dimensions choose
+a padded domain; moving media need enough domain headroom for their full trajectory.
+`Field.PARTICLE_AFFINE_VELOCITY`, `PARTICLE_REST_VOLUME` and `PARTICLE_MATERIAL_ID` expose
+these arrays alongside `PARTICLE_DEFORMATION_GRADIENT` for state inspection. The affine
+velocity has nine float32 entries per particle in s⁻¹, rest volume is float32 in m³, and
+material IDs are uint32 indices into the world's merged material table.
+
+For lower-level authoring, `SceneBuilder.set_media_asset`, `set_tet_materials`,
+`set_mpm_materials` and `set_mpm_grid` use the same cook path. A builder's `save(path)` packages
+the binary chunks beside its `.nks`. See the [stream layout](../reference/file-formats.md#scenes).
 
 ## A world
 
@@ -88,8 +135,9 @@ of a joint field is the root, the actuated joints follow.
 | `ENV_TERRAIN_TYPE`, `ENV_TERRAIN_DIFFICULTY` | per environment | yes | Procedural terrain kind and the scale of its features |
 | `ENV_STATUS` | per environment | | Failure flags, such as a control input that was not finite |
 
-Every field is float32 except `CONTACT_LINK` (uint32). `nuka.Field` lists them all, including the solver
-and contact diagnostics.
+Physical state and control fields use float32; indices, counts and status flags use integer types.
+`nuka.Field` lists them all, including the solver and contact diagnostics. Downloads and DLPack views
+retain each field's dtype.
 
 ## Control modes
 

@@ -905,11 +905,16 @@ typedef enum nuka_state_field_t {
     // vertex up to three parent nodes (UINT32_MAX unused) and their interpolation weights.
     NUKA_FIELD_VBD_COARSE_LEVEL_NODES = 122,
     NUKA_FIELD_VBD_COARSE_PARENTS = 123,
-    NUKA_FIELD_VBD_COARSE_WEIGHTS = 124
+    NUKA_FIELD_VBD_COARSE_WEIGHTS = 124,
+    // Per particle, environment-major: APIC velocity gradient C (row-major, s^-1), rest volume (m^3), material ID.
+    NUKA_FIELD_PARTICLE_AFFINE_VELOCITY = 125,
+    NUKA_FIELD_PARTICLE_REST_VOLUME = 126,
+    NUKA_FIELD_PARTICLE_MATERIAL_ID = 127
 } nuka_state_field_t;
 
 typedef enum nuka_vbd_element_kind_t {
-    NUKA_VBD_TRIANGLE = 0, NUKA_VBD_HINGE = 1, NUKA_VBD_SPRING = 2, NUKA_VBD_ROD_BEND = 3
+    NUKA_VBD_TRIANGLE = 0, NUKA_VBD_HINGE = 1, NUKA_VBD_SPRING = 2, NUKA_VBD_ROD_BEND = 3,
+    NUKA_VBD_TET = 4
 } nuka_vbd_element_kind_t;
 
 typedef enum nuka_vbd_membrane_t {

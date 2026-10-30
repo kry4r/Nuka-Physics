@@ -1936,6 +1936,43 @@ public:
               "nuka_scene_add_mpm_fill_ex");
     }
 
+    void set_media_asset(uint32_t media_id, const std::string& asset) {
+        check(nuka_scene_set_media_asset(h_, media_id, asset.c_str()), "nuka_scene_set_media_asset");
+    }
+
+    void set_tet_materials(uint32_t media_id, const std::vector<std::vector<float>>& materials) {
+        if (materials.size() > UINT32_MAX) throw std::invalid_argument("Too many tetrahedral materials");
+        std::vector<nuka_tet_material_t> values;
+        for (const auto& row : materials) {
+            if (row.size() != 4) throw std::invalid_argument("Tet material requires [E, nu, density, damping]");
+            values.push_back({row[0], row[1], row[2], row[3]});
+        }
+        check(nuka_scene_set_tet_materials(h_, media_id, values.data(), uint32_t(values.size())),
+              "nuka_scene_set_tet_materials");
+    }
+
+    void set_mpm_materials(uint32_t media_id, const std::vector<std::vector<float>>& materials) {
+        if (materials.size() > UINT32_MAX) throw std::invalid_argument("Too many MPM materials");
+        std::vector<nuka_mpm_material_t> values;
+        for (const auto& row : materials) {
+            if (row.size() != 11) throw std::invalid_argument("MPM material requires eleven constitutive values");
+            values.push_back({row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], row[10]});
+        }
+        check(nuka_scene_set_mpm_materials(h_, media_id, values.data(), uint32_t(values.size())),
+              "nuka_scene_set_mpm_materials");
+    }
+
+    void set_mpm_grid(uint32_t media_id, const std::vector<float>& origin,
+                      const std::vector<uint32_t>& dimensions, float particle_radius, bool implicit_stress) {
+        if (origin.size() != 3 || dimensions.size() != 3)
+            throw std::invalid_argument("MPM grid requires three origin coordinates and dimensions");
+        nuka_mpm_grid_desc_t d{};
+        std::copy(origin.begin(), origin.end(), d.origin);
+        std::copy(dimensions.begin(), dimensions.end(), d.dimensions);
+        d.particle_radius = particle_radius; d.implicit_stress = implicit_stress ? 1u : 0u;
+        check(nuka_scene_set_mpm_grid(h_, media_id, &d), "nuka_scene_set_mpm_grid");
+    }
+
     // Append a material region to the cloth medium `media_id` over the listed vertices.
     void add_cloth_region(uint32_t media_id, const std::vector<uint32_t>& vertices,
                           float particle_mass, float surface_density, float half_thickness,
@@ -2320,6 +2357,9 @@ NB_MODULE(_nuka_ext, m) {
         .value("BODY_GYRO_ITERATIONS", NUKA_FIELD_BODY_GYRO_ITERATIONS)
         .value("BODY_GYRO_STATUS", NUKA_FIELD_BODY_GYRO_STATUS)
         .value("PARTICLE_DEFORMATION_GRADIENT", NUKA_FIELD_PARTICLE_DEFORMATION_GRADIENT)
+        .value("PARTICLE_AFFINE_VELOCITY", NUKA_FIELD_PARTICLE_AFFINE_VELOCITY)
+        .value("PARTICLE_REST_VOLUME", NUKA_FIELD_PARTICLE_REST_VOLUME)
+        .value("PARTICLE_MATERIAL_ID", NUKA_FIELD_PARTICLE_MATERIAL_ID)
         .value("PARTICLE_PLASTIC_DEFORMATION_GRADIENT", NUKA_FIELD_PARTICLE_PLASTIC_DEFORMATION_GRADIENT)
         .value("PARTICLE_EQUIVALENT_PLASTIC_STRAIN", NUKA_FIELD_PARTICLE_EQUIVALENT_PLASTIC_STRAIN)
         .value("GRID_CONTACT_ATTEMPTED", NUKA_FIELD_GRID_CONTACT_ATTEMPTED)
@@ -3702,6 +3742,12 @@ NB_MODULE(_nuka_ext, m) {
              "`spacing`, position_jitter breaking the lattice, with its own "
              "constitutive) to the box MLS-MPM medium `media_id` (the add_media return). "
              "The base bed stays fill 0; the grid AABB grows to the union.")
+        .def("set_media_asset", &SceneBuilder::set_media_asset, nb::arg("media_id"), nb::arg("asset"))
+        .def("set_tet_materials", &SceneBuilder::set_tet_materials, nb::arg("media_id"), nb::arg("materials"))
+        .def("set_mpm_materials", &SceneBuilder::set_mpm_materials, nb::arg("media_id"), nb::arg("materials"))
+        .def("set_mpm_grid", &SceneBuilder::set_mpm_grid, nb::arg("media_id"),
+             nb::arg("origin") = std::vector<float>{0, 0, 0}, nb::arg("dimensions") = std::vector<uint32_t>{0, 0, 0},
+             nb::arg("particle_radius") = 0.0f, nb::arg("implicit_stress") = false)
         .def("add_cloth_region", &SceneBuilder::add_cloth_region, nb::arg("media_id"),
              nb::arg("vertices"), nb::arg("particle_mass"), nb::arg("surface_density"),
              nb::arg("half_thickness"), nb::arg("friction"), nb::arg("stretch_stiffness"),

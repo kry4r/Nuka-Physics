@@ -371,6 +371,8 @@ struct MediaVbdMaterial {
     float    friction          = 0.6f;   // body<->soft contact mu
     float    stretch_stiffness = 0.0f;   // cloth Young's modulus times thickness (N/m); cable EA (N)
     float    poisson           = 0.0f;   // cloth membrane Poisson ratio
+    float    youngs            = 0.0f;   // volumetric Young's modulus (Pa)
+    float    density           = 0.0f;   // volumetric density (kg/m^3)
     float    bend_stiffness    = 0.0f;   // cloth hinge (N m); cable EI (N m^2)
     float    damping           = 0.0f;   // Rayleigh coefficient on the elastic stiffness (s)
     float    compression_ratio = 1.0f;   // cloth compressive over tensile membrane stiffness, (0, 1]
@@ -408,6 +410,9 @@ struct MediaMpmMaterial {
     float      yield_stress = 0.0f, hardening_modulus = 0.0f;
     // Solve the stress with the contact rows instead of transferring it explicitly.
     bool       implicit_stress = false;
+    math::Vec3 grid_origin{};
+    uint32_t   grid_dims[3]{};  // all zero derives a padded grid from geometry
+    float      particle_radius = 0.0f;  // baked-particle render radius; zero uses dx/2
 };
 
 // Render-skin metadata for surface baking. The cloth fields mirror the particle
@@ -522,10 +527,12 @@ struct MediaRecord {
     ClothGrid cloth_grid{};
     ClothMesh cloth_mesh{};
     std::vector<ClothRegion> cloth_regions{};
+    std::vector<MediaVbdMaterial> tet_materials{};
     TetSphere tet_sphere{};
     FluidBox  fluid_box{};
     CableLine cable_line{};
     std::vector<MpmFill> mpm_fills{};
+    std::vector<MediaMpmMaterial> mpm_materials{};
     AssetRef  baked;            // .nka tet/cloth chunk; empty => procedural.
 
     MediaVbdMaterial vbd{};

@@ -86,6 +86,42 @@ class Grid:
 
 
 @_dc.dataclass(frozen=True)
+class TetMesh:
+    """A baked ``.nka#TETS/index`` paired with ``materials.Soft.VBD``.
+    ``materials`` optionally supplies the table indexed by per-tet material IDs."""
+
+    MEDIA_KIND = "soft_tet"
+    asset: str
+    materials: Tuple[object, ...] = ()
+
+    def media_geometry_kwargs(self) -> dict:
+        return {}
+
+
+@_dc.dataclass(frozen=True)
+class ParticleSet:
+    """A baked ``.nka#PSET/index`` paired with an MPM material of ``kind``.
+    ``materials`` optionally supplies its per-particle material table."""
+
+    asset: str
+    kind: str = "soft_tet"
+    materials: Tuple[object, ...] = ()
+    grid_origin: Tuple[float, float, float] = (0, 0, 0)
+    grid_dimensions: Tuple[int, int, int] = (0, 0, 0)
+    particle_radius: float = 0.0
+    implicit_stress: bool = False
+
+    @property
+    def MEDIA_KIND(self):
+        if self.kind not in ("soft_tet", "fluid", "granular"):
+            raise ValueError("ParticleSet kind must be soft_tet, fluid or granular")
+        return self.kind
+
+    def media_geometry_kwargs(self) -> dict:
+        return {}
+
+
+@_dc.dataclass(frozen=True)
 class TetSphere:
     """A solid sphere soft body: a tet rest-lattice of ``cells`` per axis spanning
     ``radius`` at ``center``, each grid cell ``cell_len`` m (``0`` => a snug
@@ -327,6 +363,6 @@ class Ground:
 
 
 __all__ = [
-    "NKS", "ClothRegion", "Grid", "TetSphere", "FluidBox", "GranularBed", "MpmFill", "Cable",
+    "NKS", "ClothRegion", "Grid", "TetMesh", "TetSphere", "ParticleSet", "FluidBox", "GranularBed", "MpmFill", "Cable",
     "CableSlab", "Box", "Sphere", "Capsule", "Cylinder", "Plane", "Ground",
 ]

@@ -6,6 +6,8 @@
 #include "sha256.h"
 
 #include <cstring>
+#include <cmath>
+#include <limits>
 #include <fstream>
 #include <iterator>
 #include <stdexcept>
@@ -119,6 +121,138 @@ NkaMesh DecodeMesh(const std::vector<uint8_t>& bytes) {
     mesh.indices.resize(index_count);
     ReadArray(bytes, cursor, mesh.indices.data(), mesh.indices.size() * sizeof(uint32_t));
     return mesh;
+}
+
+namespace {
+void ValidateTetMesh(const NkaTetMesh& m) {
+    const size_t n = m.positions.size() / 3u, t = m.indices.size() / 4u;
+    if (n == 0 || t == 0 || n > UINT32_MAX || t > UINT32_MAX / 4u ||
+        m.positions.size() != 3u * n || m.indices.size() != 4u * t ||
+        (!m.rest_positions.empty() && m.rest_positions.size() != 3u * n) ||
+        (!m.velocities.empty() && m.velocities.size() != 3u * n) ||
+        (!m.inverse_masses.empty() && m.inverse_masses.size() != n) ||
+        (!m.rest_inverse.empty() && m.rest_inverse.size() != 9u * t) ||
+        (!m.material_ids.empty() && m.material_ids.size() != t))
+        throw std::invalid_argument("TETS requires matching vertex and tetrahedron streams");
+    for (const auto* stream : {&m.positions, &m.rest_positions, &m.velocities, &m.inverse_masses, &m.rest_inverse})
+        for (float v : *stream) if (!std::isfinite(v))
+            throw std::invalid_argument("TETS streams must be finite");
+    for (float v : m.inverse_masses) if (v < 0.0f)
+        throw std::invalid_argument("TETS inverse masses must be nonnegative");
+    for (size_t i = 0; i < m.indices.size(); i += 4)
+        for (size_t j = 0; j < 4; ++j) {
+            if (m.indices[i + j] >= n) throw std::invalid_argument("TETS index exceeds its vertex stream");
+            for (size_t k = 0; k < j; ++k) if (m.indices[i + j] == m.indices[i + k])
+                throw std::invalid_argument("TETS indices must name four distinct vertices");
+        }
+}
+
+template <typename T>
+void AppendVector(std::vector<uint8_t>& out, const std::vector<T>& v) {
+    AppendBytes(out, v.data(), v.size() * sizeof(T));
+}
+
+template <typename T>
+void ReadVector(const std::vector<uint8_t>& bytes, size_t& cursor, uint64_t count, std::vector<T>& v) {
+    if (cursor > bytes.size() || count > (bytes.size() - cursor) / sizeof(T))
+        throw std::invalid_argument("nka: truncated numeric stream");
+    v.resize(static_cast<size_t>(count));
+    ReadArray(bytes, cursor, v.data(), v.size() * sizeof(T));
+}
+}  // namespace
+
+std::vector<uint8_t> EncodeTetMesh(const NkaTetMesh& m) {
+    ValidateTetMesh(m);
+    const uint32_t flags = (!m.rest_positions.empty() ? 1u : 0u) | (!m.velocities.empty() ? 2u : 0u) |
+        (!m.inverse_masses.empty() ? 4u : 0u) | (!m.rest_inverse.empty() ? 8u : 0u) |
+        (!m.material_ids.empty() ? 16u : 0u);
+    std::vector<uint8_t> out;
+    AppendPod(out, 1u); AppendPod(out, uint32_t(m.positions.size() / 3u));
+    AppendPod(out, uint32_t(m.indices.size() / 4u)); AppendPod(out, flags);
+    AppendVector(out, m.positions); AppendVector(out, m.rest_positions); AppendVector(out, m.velocities);
+    AppendVector(out, m.inverse_masses); AppendVector(out, m.indices);
+    AppendVector(out, m.rest_inverse); AppendVector(out, m.material_ids);
+    return out;
+}
+
+NkaTetMesh DecodeTetMesh(const std::vector<uint8_t>& bytes) {
+    size_t cursor = 0;
+    const auto version = ReadPod<uint32_t>(bytes, cursor), n = ReadPod<uint32_t>(bytes, cursor);
+    const auto t = ReadPod<uint32_t>(bytes, cursor), flags = ReadPod<uint32_t>(bytes, cursor);
+    if (version != 1u || (flags & ~31u) != 0u) throw std::invalid_argument("Unsupported TETS version or streams");
+    NkaTetMesh m;
+    ReadVector(bytes, cursor, uint64_t(n) * 3u, m.positions);
+    if (flags & 1u) ReadVector(bytes, cursor, uint64_t(n) * 3u, m.rest_positions);
+    if (flags & 2u) ReadVector(bytes, cursor, uint64_t(n) * 3u, m.velocities);
+    if (flags & 4u) ReadVector(bytes, cursor, n, m.inverse_masses);
+    ReadVector(bytes, cursor, uint64_t(t) * 4u, m.indices);
+    if (flags & 8u) ReadVector(bytes, cursor, uint64_t(t) * 9u, m.rest_inverse);
+    if (flags & 16u) ReadVector(bytes, cursor, t, m.material_ids);
+    if (cursor != bytes.size()) throw std::invalid_argument("TETS has trailing bytes");
+    ValidateTetMesh(m);
+    return m;
+}
+
+namespace {
+void ValidateParticleSet(const NkaParticleSet& p) {
+    const size_t n = p.positions.size() / 3u;
+    if (n == 0 || n > UINT32_MAX || p.positions.size() != 3u*n || p.inverse_masses.size() != n ||
+        p.rest_volumes.size() != n || (!p.velocities.empty() && p.velocities.size() != 3u*n) ||
+        (!p.material_ids.empty() && p.material_ids.size() != n) ||
+        (!p.elastic_deformation.empty() && p.elastic_deformation.size() != 9u*n) ||
+        (!p.affine_velocity.empty() && p.affine_velocity.size() != 9u*n) ||
+        (!p.plastic_deformation.empty() && p.plastic_deformation.size() != 9u*n) ||
+        (!p.equivalent_plastic_strain.empty() && p.equivalent_plastic_strain.size() != n))
+        throw std::invalid_argument("PSET requires matching particle streams and explicit inverse masses and rest volumes");
+    for (const auto* stream : {&p.positions, &p.inverse_masses, &p.rest_volumes, &p.velocities,
+        &p.elastic_deformation, &p.affine_velocity, &p.plastic_deformation, &p.equivalent_plastic_strain})
+        for (float v : *stream) if (!std::isfinite(v)) throw std::invalid_argument("PSET streams must be finite");
+    for (float v : p.inverse_masses) if (v < 0) throw std::invalid_argument("PSET inverse masses must be nonnegative");
+    for (float v : p.rest_volumes) if (!(v > 0)) throw std::invalid_argument("PSET rest volumes must be positive");
+    for (float v : p.equivalent_plastic_strain) if (v < 0)
+        throw std::invalid_argument("PSET equivalent plastic strains must be nonnegative");
+    for (const auto* stream : {&p.elastic_deformation, &p.plastic_deformation})
+        for (size_t i = 0; i < stream->size(); i += 9) {
+            const float* a = stream->data() + i;
+            const double det = double(a[0])*(double(a[4])*a[8] - double(a[5])*a[7]) +
+                double(a[1])*(double(a[5])*a[6] - double(a[3])*a[8]) +
+                double(a[2])*(double(a[3])*a[7] - double(a[4])*a[6]);
+            if (!(det > 0 && std::isfinite(det)))
+                throw std::invalid_argument("PSET deformation gradients require positive determinants");
+        }
+}
+}  // namespace
+
+std::vector<uint8_t> EncodeParticleSet(const NkaParticleSet& p) {
+    ValidateParticleSet(p);
+    const uint32_t flags = (!p.velocities.empty() ? 1u : 0u) | (!p.material_ids.empty() ? 2u : 0u) |
+        (!p.elastic_deformation.empty() ? 4u : 0u) | (!p.affine_velocity.empty() ? 8u : 0u) |
+        (!p.plastic_deformation.empty() ? 16u : 0u) | (!p.equivalent_plastic_strain.empty() ? 32u : 0u);
+    std::vector<uint8_t> out;
+    AppendPod(out, 1u); AppendPod(out, uint32_t(p.positions.size()/3u)); AppendPod(out, flags); AppendPod(out, 0u);
+    AppendVector(out, p.positions); AppendVector(out, p.inverse_masses); AppendVector(out, p.rest_volumes);
+    AppendVector(out, p.velocities); AppendVector(out, p.material_ids); AppendVector(out, p.elastic_deformation);
+    AppendVector(out, p.affine_velocity); AppendVector(out, p.plastic_deformation); AppendVector(out, p.equivalent_plastic_strain);
+    return out;
+}
+
+NkaParticleSet DecodeParticleSet(const std::vector<uint8_t>& bytes) {
+    size_t cursor = 0;
+    const auto version = ReadPod<uint32_t>(bytes, cursor), n = ReadPod<uint32_t>(bytes, cursor);
+    const auto flags = ReadPod<uint32_t>(bytes, cursor), reserved = ReadPod<uint32_t>(bytes, cursor);
+    if (version != 1 || (flags & ~63u) != 0 || reserved != 0) throw std::invalid_argument("Unsupported PSET version or streams");
+    NkaParticleSet p;
+    ReadVector(bytes, cursor, uint64_t(n)*3u, p.positions);
+    ReadVector(bytes, cursor, n, p.inverse_masses); ReadVector(bytes, cursor, n, p.rest_volumes);
+    if (flags & 1u) ReadVector(bytes, cursor, uint64_t(n)*3u, p.velocities);
+    if (flags & 2u) ReadVector(bytes, cursor, n, p.material_ids);
+    if (flags & 4u) ReadVector(bytes, cursor, uint64_t(n)*9u, p.elastic_deformation);
+    if (flags & 8u) ReadVector(bytes, cursor, uint64_t(n)*9u, p.affine_velocity);
+    if (flags & 16u) ReadVector(bytes, cursor, uint64_t(n)*9u, p.plastic_deformation);
+    if (flags & 32u) ReadVector(bytes, cursor, n, p.equivalent_plastic_strain);
+    if (cursor != bytes.size()) throw std::invalid_argument("PSET has trailing bytes");
+    ValidateParticleSet(p);
+    return p;
 }
 
 // ---------------------------------------------------------------------------

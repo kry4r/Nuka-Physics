@@ -46,6 +46,7 @@ struct RestMesh {
     std::vector<double> edge_length;
     std::vector<std::array<uint32_t, 3>> triangles;
     std::vector<uint32_t> triangle_offsets, vertex_triangles;
+    std::vector<uint8_t> solid;
 
     bool Active(uint32_t v) const { return edge_offsets[v + 1u] > edge_offsets[v]; }
     double Length(uint32_t a, uint32_t b) const {
@@ -62,6 +63,7 @@ RestMesh BuildRestMesh(const Model& model) {
     const uint32_t begin = model.capacities.vbd_particle_begin;
     RestMesh mesh;
     mesh.vertices = n;
+    mesh.solid.assign(n, 0u);
     // (a, b, length) with a < b; the first element defining an edge sets its length.
     std::vector<std::tuple<uint32_t, uint32_t, double>> defined;
     auto define = [&](uint32_t a, uint32_t b, double length) {
@@ -80,6 +82,16 @@ RestMesh BuildRestMesh(const Model& model) {
             mesh.triangles.push_back({e.vertex[0], e.vertex[1], e.vertex[2]});
         } else if (e.kind == kVbdSpring) {
             define(e.vertex[0], e.vertex[1], e.rest[0]);
+        } else if (e.kind == kVbdTet) {
+            for (uint32_t v : e.vertex) mesh.solid[v] = 1u;
+            const vbd::TetRest r(e);
+            const double a = 1.0 / r.xx, d = 1.0 / r.yy, f = 1.0 / r.zz;
+            const double b = -r.xy * a * d, h = -r.yz * d * f;
+            const double c = -(r.xy * h + r.xz * f) * a;
+            const double x[4][3] = {{0, 0, 0}, {a, 0, 0}, {b, d, 0}, {c, h, f}};
+            for (uint32_t i = 0; i < 3; ++i) for (uint32_t j = i + 1; j < 4; ++j)
+                define(e.vertex[i], e.vertex[j], std::sqrt((x[i][0] - x[j][0]) * (x[i][0] - x[j][0]) +
+                    (x[i][1] - x[j][1]) * (x[i][1] - x[j][1]) + (x[i][2] - x[j][2]) * (x[i][2] - x[j][2])));
         }
     }
     // Rod segments that no spring defines take their cooked length.
@@ -243,7 +255,8 @@ Boundary BuildBoundary(const RestMesh& mesh) {
     }
     for (uint32_t v = 0u; v < n; ++v)
         for (uint32_t i = mesh.edge_offsets[v]; i < mesh.edge_offsets[v + 1u]; ++i)
-            if (mesh.edge_to[i] > v && (surface[v] == 0u || surface[mesh.edge_to[i]] == 0u))
+            if (mesh.edge_to[i] > v && mesh.solid[v] == 0u && mesh.solid[mesh.edge_to[i]] == 0u &&
+                (surface[v] == 0u || surface[mesh.edge_to[i]] == 0u))
                 open.emplace_back(v, mesh.edge_to[i]);
     std::sort(open.begin(), open.end());
     Boundary result;

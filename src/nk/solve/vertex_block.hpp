@@ -29,6 +29,8 @@ inline constexpr uint32_t kVbdHinge = 1u;
 inline constexpr uint32_t kVbdSpring = 2u;
 // Segment bend of three consecutive vertices: rest = stiffness over mean length.
 inline constexpr uint32_t kVbdRodBend = 3u;
+// Isotropic tetrahedron: upper-triangular inverse rest edges, then the Lame pair (Pa).
+inline constexpr uint32_t kVbdTet = 4u;
 inline constexpr uint32_t kVbdNoColor = ~0u;
 
 struct VbdElement {
@@ -42,7 +44,7 @@ struct VbdElement {
 static_assert(sizeof(VbdElement) == 16u * sizeof(uint32_t), "VbdElement packs to 64 bytes");
 
 NUKA_VBD_HD constexpr uint32_t VbdElementVertexCount(uint32_t kind) {
-    return kind == kVbdTriangle ? 3u : kind == kVbdHinge ? 4u : kind == kVbdSpring ? 2u : 3u;
+    return kind == kVbdTriangle ? 3u : kind == kVbdHinge || kind == kVbdTet ? 4u : kind == kVbdSpring ? 2u : 3u;
 }
 NUKA_VBD_HD constexpr uint32_t PackVbdIncidence(uint32_t element, uint32_t local) {
     return (element << 2u) | local;
@@ -203,6 +205,114 @@ struct ElementGeometry {
                 double(start[j].z) - start[0].z + (double(delta[j].z) - delta[0].z)};
     }
 };
+
+// Isotropy removes the material frame's rotation, leaving six inverse-edge coefficients in a QR frame.
+struct TetRest {
+    float xx, xy, xz, yy, yz, zz, mu, lambda;
+    NUKA_VBD_HD explicit TetRest(const VbdElement& e)
+        : xx(e.rest[0]), xy(e.rest[1]), xz(e.rest[2]), yy(e.rest[3]), yz(e.rest[4]),
+          zz(e.rest[5]), mu(e.rest[6]), lambda(e.rest[7]) {}
+    static void Set(VbdElement& e, float xx, float xy, float xz, float yy, float yz, float zz,
+                    float mu, float lambda) {
+        const float data[8] = {xx, xy, xz, yy, yz, zz, mu, lambda};
+        for (uint32_t i = 0; i < 8; ++i) e.rest[i] = data[i];
+    }
+    NUKA_VBD_HD float Volume() const { return float(fabs(1.0 / (6.0 * double(xx) * yy * zz))); }
+    NUKA_VBD_HD Vec3 Weight(uint32_t local) const {
+        return local == 1u ? Vec3{xx, xy, xz} : local == 2u ? Vec3{0, yy, yz}
+            : local == 3u ? Vec3{0, 0, zz} : Vec3{-xx, -xy - yy, -xz - yz - zz};
+    }
+    NUKA_VBD_HD void Columns(const Vec3* x, Vec3* f) const {
+        const Vec3 a = x[1] - x[0], b = x[2] - x[0], c = x[3] - x[0];
+        f[0] = a * xx; f[1] = a * xy + b * yy; f[2] = a * xz + b * yz + c * zz;
+    }
+};
+
+struct TetStrain {
+    Vec3 f[3], cof[3];
+    float volume_change, half_norm_change;
+};
+
+NUKA_VBD_HD inline TetStrain TetrahedronStrain(const VbdElement& e, const ElementGeometry& g) {
+    const TetRest r(e);
+    const Point a = g.Precise(1), b = g.Precise(2), c = g.Precise(3);
+    const double f[3][3] = {{a.x * r.xx, a.y * r.xx, a.z * r.xx},
+        {a.x * r.xy + b.x * r.yy, a.y * r.xy + b.y * r.yy, a.z * r.xy + b.z * r.yy},
+        {a.x * r.xz + b.x * r.yz + c.x * r.zz, a.y * r.xz + b.y * r.yz + c.y * r.zz,
+         a.z * r.xz + b.z * r.yz + c.z * r.zz}};
+    TetStrain t;
+    double norm = -3.0;
+    for (uint32_t i = 0; i < 3; ++i) {
+        t.f[i] = {float(f[i][0]), float(f[i][1]), float(f[i][2])};
+        for (uint32_t j = 0; j < 3; ++j) norm += f[i][j] * f[i][j];
+    }
+    t.cof[0] = t.f[1].Cross(t.f[2]); t.cof[1] = t.f[2].Cross(t.f[0]); t.cof[2] = t.f[0].Cross(t.f[1]);
+    const double J = f[0][0] * (f[1][1] * f[2][2] - f[1][2] * f[2][1]) +
+        f[0][1] * (f[1][2] * f[2][0] - f[1][0] * f[2][2]) +
+        f[0][2] * (f[1][0] * f[2][1] - f[1][1] * f[2][0]);
+    t.volume_change = float(J - 1.0); t.half_norm_change = float(0.5 * norm);
+    return t;
+}
+
+NUKA_VBD_HD inline float TetEnergy(const VbdElement& e, const TetStrain& t) {
+    const TetRest r(e);
+    const float d = t.volume_change;
+    return r.Volume() * (r.mu * (t.half_norm_change - d) + 0.5f * (r.lambda + r.mu) * d * d);
+}
+
+// Exact energy Hessian; the determinant's second derivative can be indefinite away from rest.
+NUKA_VBD_HD inline float TetHessianForm(const VbdElement& e, const TetStrain& t,
+                                       const Vec3* x, const Vec3* y) {
+    const TetRest r(e);
+    float norm = 0.0f, jx = 0.0f, jy = 0.0f;
+    for (uint32_t i = 0; i < 3; ++i) { norm += x[i].Dot(y[i]); jx += t.cof[i].Dot(x[i]); jy += t.cof[i].Dot(y[i]); }
+    const float second = x[0].Dot(y[1].Cross(t.f[2]) + t.f[1].Cross(y[2])) +
+        y[0].Dot(x[1].Cross(t.f[2]) + t.f[1].Cross(x[2])) +
+        t.f[0].Dot(x[1].Cross(y[2]) + y[1].Cross(x[2]));
+    return r.Volume() * (r.mu * norm + (r.lambda + r.mu) * jx * jy +
+        ((r.lambda + r.mu) * t.volume_change - r.mu) * second);
+}
+
+// The determinant's second variation vanishes for one vertex, so its exact diagonal block is PSD.
+NUKA_VBD_HD inline void TetBlock(const VbdElement& e, uint32_t local, const TetStrain& t,
+                                 Vec3* gradient, SymmetricMat3* hessian) {
+    const TetRest r(e);
+    const Vec3 b = r.Weight(local), fb = t.f[0] * b.x + t.f[1] * b.y + t.f[2] * b.z;
+    const Vec3 cb = t.cof[0] * b.x + t.cof[1] * b.y + t.cof[2] * b.z;
+    const float volume = r.Volume(), l = r.lambda + r.mu;
+    *gradient = ((fb - cb) * r.mu + cb * (l * t.volume_change)) * volume;
+    *hessian = Outer(cb, volume * l);
+    AddIdentity(*hessian, volume * r.mu * b.LengthSq());
+}
+
+NUKA_VBD_HD inline float TetEnergyChange(const VbdElement& e, const TetStrain& t, const Vec3* df,
+                                         float determinant_change) {
+    const TetRest r(e);
+    float norm_change = 0.0f;
+    for (uint32_t i = 0; i < 3; ++i) norm_change += df[i].Dot(t.f[i] * 2.0f + df[i]);
+    return r.Volume() * (0.5f * r.mu * norm_change +
+        ((r.lambda + r.mu) * t.volume_change - r.mu) * determinant_change +
+        0.5f * (r.lambda + r.mu) * determinant_change * determinant_change);
+}
+
+// Objective viscous metric mu/2 |F^T dF + dF^T F|^2, evaluated at the interval start.
+NUKA_VBD_HD inline void TetRayleighBlock(const VbdElement& e, uint32_t local,
+    const ElementGeometry& start, const Vec3* rate, Vec3* applied, SymmetricMat3* diagonal) {
+    const TetRest r(e);
+    const TetStrain t = TetrahedronStrain(e, start);
+    Vec3 df[3]; r.Columns(rate, df);
+    const Vec3 b = r.Weight(local);
+    const float weights[3] = {b.x, b.y, b.z}, scale = r.Volume() * r.mu;
+    *applied = {}; *diagonal = {};
+    for (uint32_t i = 0; i < 3; ++i) {
+        float action = 0.0f;
+        for (uint32_t j = 0; j < 3; ++j)
+            action += weights[j] * (t.f[i].Dot(df[j]) + df[i].Dot(t.f[j]));
+        *applied = *applied + t.f[i] * (scale * action);
+        AddTo(*diagonal, Outer(t.f[i], scale * b.LengthSq()));
+    }
+    AddTo(*diagonal, Outer(t.f[0] * b.x + t.f[1] * b.y + t.f[2] * b.z, scale));
+}
 
 // StVK membrane: F = sum_j x_j b_j^T with b_j the rows of the inverse material edges.
 // The strain keeps the two columns of F, the Green strain G = (F^T F - I) / 2 and J - 1.
@@ -677,6 +787,7 @@ NUKA_VBD_HD inline void ElementRayleighBlock(const VbdElement& e, uint32_t local
                                              const ElementGeometry& start, const Vec3* rate,
                                              Vec3* applied, SymmetricMat3* diagonal,
                                              const MembraneStartState* cached = nullptr) {
+    if (e.kind == kVbdTet) { TetRayleighBlock(e, local, start, rate, applied, diagonal); return; }
     *applied = {};
     *diagonal = {};
     const Vec3 v1 = rate[1] - rate[0];
@@ -791,6 +902,11 @@ NUKA_VBD_HD inline float BendCosine(const Vec3* x) {
 NUKA_VBD_HD inline float ElementEnergyChange(const VbdElement& e, uint32_t local,
                                              const ElementGeometry& g, Vec3 move,
                                              const MembraneStartState* start = nullptr) {
+    if (e.kind == kVbdTet) {
+        const TetRest r(e); const TetStrain t = TetrahedronStrain(e, g);
+        const Vec3 b = r.Weight(local), df[3] = {move * b.x, move * b.y, move * b.z};
+        return TetEnergyChange(e, t, df, move.Dot(t.cof[0] * b.x + t.cof[1] * b.y + t.cof[2] * b.z));
+    }
     if (e.kind == kVbdTriangle) {
         const TriangleStrain t = start != nullptr ? MembraneStrain(e, g, *start) : MembraneStrain(e, g);
         float bx, by;
@@ -841,6 +957,7 @@ NUKA_VBD_HD inline float ElementEnergyChange(const VbdElement& e, uint32_t local
 
 // Stored elastic energy uses the same constitutive functions as the vertex update.
 NUKA_VBD_HD inline float ElementEnergy(const VbdElement& e, const ElementGeometry& g) {
+    if (e.kind == kVbdTet) return TetEnergy(e, TetrahedronStrain(e, g));
     if (e.kind == kVbdTriangle) {
         const TriangleStrain t = MembraneStrain(e, g);
         const float trace = t.g00 + t.g11;
@@ -875,6 +992,7 @@ NUKA_VBD_HD inline float ElementEnergy(const VbdElement& e, const ElementGeometr
 NUKA_VBD_HD inline void ElementBlock(const VbdElement& e, uint32_t local, const ElementGeometry& g,
                                      Vec3* gradient, SymmetricMat3* hessian,
                                      const MembraneStartState* start = nullptr) {
+    if (e.kind == kVbdTet) { TetBlock(e, local, TetrahedronStrain(e, g), gradient, hessian); return; }
     if (e.kind == kVbdTriangle) {
         const TriangleStrain t = start != nullptr ? MembraneStrain(e, g, *start) : MembraneStrain(e, g);
         TriangleBlock(e, local, t, gradient, hessian);

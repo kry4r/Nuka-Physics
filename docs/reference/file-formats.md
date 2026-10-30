@@ -19,6 +19,40 @@ interior edge and its signed rest dihedral in radians under the mesh's face wind
 once. These angles override the rest angles derived from the mesh, including the flat angles otherwise used
 with `cloth_mesh.material_mesh`. Omitted edges keep their derived angles.
 
+Baked volumetric VBD media use `kind: "soft_tet"`, `method: "vbd"` and a
+`baked: "solid.nka#TETS/0"` reference. `tet_materials` contains volumetric `youngs` (Pa),
+`poisson`, `density` (kg/m³) and Rayleigh `damping` (s). Contact properties remain in `vbd`.
+The isotropic energy is stable Neo-Hookean; its full Hessian and the positive semidefinite
+curvature used by the solver are distinct. Damping measures the Green strain rate at the interval start.
+
+Baked MLS-MPM media use `method: "mlsmpm"` and `baked: "particles.nka#PSET/0"`.
+The `mpm` block holds grid and stepping settings; optional `mpm_materials` rows hold constitutive
+parameters indexed by each particle's material ID. Multiple media share a grid with the same `dx`,
+floor and implicit-stress setting. `grid_origin` and `grid_dims` specify an explicit domain;
+three zero dimensions derive a padded domain from positions, floor and `loft_headroom`.
+`particle_radius` controls rendering only. Rest volume is always supplied by the asset.
+
+Both chunks use little-endian integers and float32 arrays, preserve authored order, and reject
+unknown flags, trailing/truncated streams, invalid indices and nonfinite values. Matrix streams
+are row-major. Save packages the chunks into the scene's sidecar without changing their payloads.
+
+| Chunk version 1 | Required streams after its four uint32 header words | Optional streams, in flag-bit order |
+| --- | --- | --- |
+| `TETS`: version, vertex count, tet count, flags | Positions `(N,3)`; tet indices `(T,4)` follow optional vertex streams | Bits 0–2: rest positions `(N,3)`, velocities `(N,3)`, inverse masses `(N)` before indices. Bits 3–4: rest inverse `(T,3,3)`, material IDs `(T)` after indices |
+| `PSET`: version, particle count, flags, reserved zero | Positions `(N,3)`, inverse masses `(N)`, rest volumes `(N)` | Bits 0–5: velocities `(N,3)`, material IDs `(N)`, elastic F `(N,3,3)`, affine velocity C `(N,3,3)`, plastic Fp `(N,3,3)`, equivalent plastic strain `(N)` |
+
+For `TETS`, rest inverse takes precedence over rest positions; absent both, initial positions
+define the rest shape. Absent inverse masses, density and rest volume determine lumped vertex
+masses; zero inverse masses pin vertices. `PSET` requires nonnegative inverse mass and positive
+rest volume and determinants of F/Fp. Missing F/Fp are identity, velocities/C and plastic strain
+are zero. Nontrivial Fp and equivalent plastic strain require Hencky J2 material rows. Zero-mass
+MPM points do not impose a Dirichlet condition on neighboring grid nodes.
+
+Use [`nuka.assets`](../python/index.md#baked-continuum-media) to write these assets. Importing a
+particle set preserves geometry and state; comparing another engine also requires matching its
+constitutive law, transfer, boundary conditions and control schedule. A scalar plastic volume
+alone does not specify a full plastic deformation gradient or equivalent strain.
+
 The editor and the engine also read:
 
 | Format | Read | Written |

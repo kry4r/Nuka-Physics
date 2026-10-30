@@ -344,6 +344,8 @@ __device__ inline float StoreElementHessian(const VertexBlockView& b, const Data
         return StoreKindHessian<nk::kVbdHinge>(element, gn, rayleigh, damped, damping, out, stride);
     case nk::kVbdSpring:
         return StoreKindHessian<nk::kVbdSpring>(element, gn, rayleigh, damped, damping, out, stride);
+    case nk::kVbdTet:
+        return StoreKindHessian<nk::kVbdTet>(element, gn, rayleigh, damped, damping, out, stride);
     default:
         return StoreKindHessian<nk::kVbdRodBend>(element, gn, rayleigh, damped, damping, out, stride);
     }

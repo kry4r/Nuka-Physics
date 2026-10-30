@@ -166,6 +166,8 @@ struct MpmCookInput {
     std::vector<math::Vec3> velocities;    // per-particle initial velocity
     std::vector<float>      inv_mass;      // 1/mass (0 == pinned)
     std::vector<float>      vol0;           // per-particle sampling-lattice volume
+    std::vector<float>      elastic_deformation, affine_velocity;
+    std::vector<float>      plastic_deformation, equivalent_plastic_strain;
     MpmMaterialInput        material;       // single-material cook: appended as id 0
     // Heterogeneous cook: N material rows + a per-particle material index into them.
     // Empty (default) => the single `material` above, all particles id 0 (byte-identical).
@@ -215,6 +217,9 @@ bool IsVertexBlockMedium(const MediaRecord& media);
 // lattice, lumped area masses, and StVK membrane plus hinge vertex blocks from
 // soft::BuildClothVertexBlocks. Empty when the geometry is absent.
 VbdCookInput BuildClothVertexBlockInput(const MediaRecord& media);
+
+// Tetrahedral stable Neo-Hookean elements, preserving separate rest and initial states.
+VbdCookInput BuildTetVertexBlockInput(const MediaRecord& media);
 
 // Build the soft-slice input of a cable MediaRecord: segments+1 vertex blocks from
 // start to end joined by axial springs and segment bends, the pinned endpoint(s)

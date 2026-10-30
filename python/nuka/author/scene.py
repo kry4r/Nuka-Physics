@@ -123,7 +123,7 @@ class Environment:
 
 
 _MEDIA_MORPHS = (_morphs.Grid, _morphs.TetSphere, _morphs.FluidBox,
-                 _morphs.GranularBed, _morphs.Cable)
+                 _morphs.GranularBed, _morphs.Cable, _morphs.TetMesh, _morphs.ParticleSet)
 _RIGID_MORPHS = (_morphs.Box, _morphs.Sphere, _morphs.Capsule, _morphs.Cylinder,
                  _morphs.Plane, _morphs.Ground)
 
@@ -213,7 +213,8 @@ class Scene:
         """
         scenes = [e for e in self._entities if isinstance(e.morph, _morphs.NKS)]
         grids = [e for e in self._entities if isinstance(e.morph, _morphs.Grid)]
-        tets = [e for e in self._entities if isinstance(e.morph, _morphs.TetSphere)]
+        tets = [e for e in self._entities
+                if isinstance(e.morph, (_morphs.TetSphere, _morphs.TetMesh, _morphs.ParticleSet))]
         fluids = [e for e in self._entities if isinstance(e.morph, _morphs.FluidBox)]
         grans = [e for e in self._entities
                  if isinstance(e.morph, _morphs.GranularBed)]
@@ -227,7 +228,7 @@ class Scene:
             raise TypeError(
                 "Scene.build: unsupported morph "
                 f"{type(unknown[0].morph).__name__} (use morphs.NKS / Grid / "
-                "TetSphere / FluidBox / GranularBed / Cable / Box / Sphere / "
+                "TetSphere / TetMesh / ParticleSet / FluidBox / GranularBed / Cable / Box / Sphere / "
                 "Capsule / Plane / Ground)")
         # Authored gravity, appearance or environment routes to the general builder path
         # (the SceneBuilder carries the gravity and the material + environment records).
@@ -384,8 +385,12 @@ class Scene:
     def _add_media(self, builder, e, material_ids=None) -> None:
         morph = e.morph
         kind = morph.MEDIA_KIND
-        mat = (e.material if e.material is not None
-               else _DEFAULT_MEDIA_MATERIAL[kind]())
+        mat = (e.material if e.material is not None else _materials.Soft.VBD()
+               if isinstance(morph, _morphs.TetMesh) else _DEFAULT_MEDIA_MATERIAL[kind]())
+        if isinstance(morph, _morphs.TetMesh) and not isinstance(mat, _materials.TetMaterial):
+            raise TypeError("TetMesh requires a Soft.VBD material")
+        if isinstance(morph, _morphs.ParticleSet) and not isinstance(mat, _materials.MpmMaterial):
+            raise TypeError("ParticleSet requires an MPM material")
         mat_kind = getattr(mat, "MEDIA_KIND", None)
         if mat_kind != kind:
             raise TypeError(
@@ -417,6 +422,22 @@ class Scene:
             kw["cable_slab_render_material_id"] = material_ids[e.slab_render.name]
         media_id = builder.add_media(kind=_MEDIA_KIND[kind],
                                      method=_MEDIA_METHOD[mat.MEDIA_METHOD], **kw)
+        if getattr(morph, "asset", None):
+            builder.set_media_asset(media_id, str(morph.asset))
+        if isinstance(mat, _materials.TetMaterial):
+            table = getattr(morph, "materials", ()) or (mat,)
+            if not all(isinstance(m, _materials.TetMaterial) for m in table):
+                raise TypeError("TetMesh materials must be Soft.VBD materials")
+            builder.set_tet_materials(media_id, [m.tet_parameters() for m in table])
+        if isinstance(morph, _morphs.ParticleSet):
+            if not isinstance(mat, _materials.MpmMaterial):
+                raise TypeError("ParticleSet requires an MPM material")
+            table = morph.materials or (mat,)
+            if not all(isinstance(m, _materials.MpmMaterial) for m in table):
+                raise TypeError("ParticleSet materials must be MPM materials")
+            builder.set_mpm_materials(media_id, [m.particle_parameters() for m in table])
+            builder.set_mpm_grid(media_id, origin=list(morph.grid_origin), dimensions=list(morph.grid_dimensions),
+                                 particle_radius=morph.particle_radius, implicit_stress=morph.implicit_stress)
         # Heterogeneous MLS-MPM sub-fills (each its own material) onto the base bed.
         for fl in getattr(morph, "fills", ()):
             if not isinstance(fl.material, _materials.MpmMaterial):

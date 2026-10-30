@@ -395,6 +395,8 @@ public:
         // F seeded identity, vol0 from the sampling lattice, material_id indexes
         // mpm_materials. Empty for a non-MPM cook (C is the arena zero default).
         std::vector<float>      initial_F;           // 9 floats/particle (identity)
+        std::vector<float>      initial_C;
+        std::vector<float>      initial_plastic_F, initial_equivalent_plastic_strain;
         std::vector<float>      initial_vol0;         // 1/particle
         std::vector<uint32_t>   initial_material_id;  // 1/particle
         // Cloth AERODYNAMIC-DRAG element templates (single-env; one per surface

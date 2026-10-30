@@ -223,9 +223,44 @@ class MpmMaterial:
             viscosity=float(self.viscosity), yield_stress=float(self.yield_stress),
             hardening_modulus=float(self.hardening_modulus))
 
+    def particle_parameters(self):
+        return [float(v) for v in (self.youngs, self.poisson, self.density, self.model_kind, self.dp_friction,
+            self.dp_cohesion, self.bulk_modulus, self.tait_gamma, self.viscosity, self.yield_stress, self.hardening_modulus)]
+
+
+@_dc.dataclass(frozen=True)
+class TetMaterial:
+    """Volumetric stable Neo-Hookean elasticity and objective Green-strain viscosity."""
+
+    MEDIA_KIND = "soft_tet"
+    MEDIA_METHOD = "vbd"
+    youngs: float = 1.0e5
+    poisson: float = 0.3
+    density: float = 1000.0
+    damping: float = 0.0
+    thickness: float = 0.0
+    friction: float = 0.6
+    self_contact: bool = True
+
+    def __post_init__(self):
+        if (not all(_math.isfinite(v) for v in (self.youngs, self.poisson, self.density,
+                                               self.damping, self.thickness, self.friction)) or
+                self.youngs <= 0 or not -1 < self.poisson < .5 or self.density < 0 or
+                min(self.damping, self.thickness, self.friction) < 0):
+            raise ValueError("Soft.VBD requires E > 0, -1 < nu < .5 and nonnegative density, viscosity and contact values")
+
+    def media_material_kwargs(self) -> dict:
+        return dict(vbd_half_thickness=.5 * self.thickness, vbd_friction=self.friction,
+                    vbd_self_contact=self.self_contact)
+
+    def tet_parameters(self):
+        return [float(v) for v in (self.youngs, self.poisson, self.density, self.damping)]
+
 
 class Soft:
-    """Tet-soft constitutive models: ``Soft.MPM`` (a continuum solid)."""
+    """Continuum solids: tetrahedral ``Soft.VBD`` or particle-based ``Soft.MPM``."""
+
+    VBD = TetMaterial
 
     @staticmethod
     def MPM(youngs: float = 1.0e5, poisson: float = 0.3, density: float = 1000.0,
@@ -389,7 +424,7 @@ def Render(name: str, base_color: Tuple[float, float, float] = (1.0, 1.0, 1.0),
 
 
 __all__ = [
-    "Cloth", "ClothMaterial", "Cable", "CableMaterial", "Soft",
+    "Cloth", "ClothMaterial", "Cable", "CableMaterial", "Soft", "TetMaterial",
     "MpmMaterial", "Fluid", "Granular",
     "Rigid", "RigidMaterial", "Render", "RenderAppearance",
 ]

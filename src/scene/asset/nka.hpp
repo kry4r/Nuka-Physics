@@ -49,6 +49,8 @@ inline uint32_t NkaTagHull() { return MakeFourCC('H', 'U', 'L', 'L'); }  // V-HA
 inline uint32_t NkaTagSdf0() { return MakeFourCC('S', 'D', 'F', '0'); }  // sparse SDF
 inline uint32_t NkaTagSamp() { return MakeFourCC('S', 'A', 'M', 'P'); }  // sampling point set
 inline uint32_t NkaTagTexb() { return MakeFourCC('T', 'E', 'X', 'B'); }  // raw texture bytes
+inline uint32_t NkaTagTets() { return MakeFourCC('T', 'E', 'T', 'S'); }
+inline uint32_t NkaTagPset() { return MakeFourCC('P', 'S', 'E', 'T'); }
 
 // One table-of-contents entry: fourcc family tag + file offset/size of the
 // payload + low-64 of the SHA-256 content hash.
@@ -70,6 +72,26 @@ struct NkaMesh {
     std::vector<float>    uvs;        // u,v per vertex (empty => none)
     std::vector<uint32_t> indices;    // triangle indices
 };
+
+// TETS v1: u32 version, vertices, tetrahedra, stream flags; float streams precede tet indices and material IDs.
+struct NkaTetMesh {
+    std::vector<float> positions, rest_positions, velocities, inverse_masses;
+    std::vector<uint32_t> indices, material_ids;
+    std::vector<float> rest_inverse;  // optional row-major 3x3 per tetrahedron
+};
+
+std::vector<uint8_t> EncodeTetMesh(const NkaTetMesh& mesh);
+NkaTetMesh DecodeTetMesh(const std::vector<uint8_t>& bytes);
+
+// PSET v1: version, count, optional-stream flags, zero; positions, inverse masses and rest volumes are required.
+struct NkaParticleSet {
+    std::vector<float> positions, inverse_masses, rest_volumes, velocities;
+    std::vector<uint32_t> material_ids;
+    std::vector<float> elastic_deformation, affine_velocity, plastic_deformation, equivalent_plastic_strain;
+};
+
+std::vector<uint8_t> EncodeParticleSet(const NkaParticleSet& particles);
+NkaParticleSet DecodeParticleSet(const std::vector<uint8_t>& bytes);
 
 // -- payload encode/decode (free functions; pure) ---------------------------
 // MESH: u32 vert_count, u32 index_count, then pos(3f)*v, normal(3f)*v, uv(2f)*v,

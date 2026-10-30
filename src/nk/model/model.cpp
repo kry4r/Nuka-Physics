@@ -1460,6 +1460,49 @@ phi::Status Model::ValidateTopology(std::string* reason) const {
     for (uint32_t id : particles.initial_material_id)
         if (id >= cap.mpm_material_count)
             return reject(Status::InvalidArgument, "MPM particle material index is out of range");
+    const size_t mpm_count = MpmParticlesPerEnv();
+    if (mpm_count > 0) {
+        if (particles.initial_pos.size() < mpm_count || particles.inv_mass.size() < mpm_count ||
+            particles.initial_vel.size() < mpm_count || particles.initial_vol0.size() != mpm_count ||
+            (!particles.initial_material_id.empty() && particles.initial_material_id.size() != mpm_count))
+            return reject(Status::InvalidArgument, "incomplete MPM initial particle state");
+        for (const auto* stream : {&particles.initial_F, &particles.initial_C, &particles.initial_plastic_F}) {
+            if (!stream->empty() && stream->size() != 9u*mpm_count)
+                return reject(Status::InvalidArgument, "MPM initial matrix stream length differs from its particle range");
+            for (float value : *stream) if (!std::isfinite(value))
+                return reject(Status::InvalidArgument, "MPM initial matrices must be finite");
+        }
+        if (!particles.initial_equivalent_plastic_strain.empty() &&
+            particles.initial_equivalent_plastic_strain.size() != mpm_count)
+            return reject(Status::InvalidArgument, "MPM initial plastic strain length differs from its particle range");
+        for (size_t i = 0; i < mpm_count; ++i) {
+            const auto p = particles.initial_pos[i], v = particles.initial_vel[i];
+            const float inverse = particles.inv_mass[i], volume = particles.initial_vol0[i];
+            if (!(std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z) && std::isfinite(v.x) &&
+                  std::isfinite(v.y) && std::isfinite(v.z) && std::isfinite(inverse) && inverse >= 0 &&
+                  std::isfinite(volume) && volume > 0))
+                return reject(Status::InvalidArgument, "invalid MPM initial position, velocity, mass or rest volume");
+            for (const auto* stream : {&particles.initial_F, &particles.initial_plastic_F}) if (!stream->empty()) {
+                const float* matrix = stream->data() + 9u*i;
+                const double determinant = double(matrix[0])*(double(matrix[4])*matrix[8] - double(matrix[5])*matrix[7]) +
+                    double(matrix[1])*(double(matrix[5])*matrix[6] - double(matrix[3])*matrix[8]) +
+                    double(matrix[2])*(double(matrix[3])*matrix[7] - double(matrix[4])*matrix[6]);
+                if (!(determinant > 0 && std::isfinite(determinant)))
+                    return reject(Status::InvalidArgument, "MPM initial deformation gradients require positive determinants");
+            }
+            const uint32_t id = particles.initial_material_id.empty() ? 0u : particles.initial_material_id[i];
+            const bool plastic = id < mpm_materials.size() && mpm_materials[id].model_kind == MpmMaterial::kHenckyJ2;
+            if (!particles.initial_equivalent_plastic_strain.empty()) {
+                const float strain = particles.initial_equivalent_plastic_strain[i];
+                if (!(std::isfinite(strain) && strain >= 0 && (plastic || strain == 0)))
+                    return reject(Status::InvalidArgument, "initial equivalent plastic strain requires Hencky J2");
+            }
+            if (!plastic && !particles.initial_plastic_F.empty())
+                for (size_t component = 0; component < 9; ++component)
+                    if (particles.initial_plastic_F[9u*i+component] != (component % 4 == 0 ? 1.0f : 0.0f))
+                        return reject(Status::InvalidArgument, "initial plastic deformation requires Hencky J2");
+        }
+    }
     for (uint64_t count : {uint64_t(n), uint64_t(k), uint64_t(cap.bodies_per_env),
                            uint64_t(cap.particles_per_env), uint64_t(cap.aero_tris_per_env) * 3u,
                            uint64_t(cap.particle_surface_nodes_per_env), uint64_t(cap.point_endpoints_per_env),
@@ -1609,7 +1652,7 @@ phi::Status Model::ValidateVertexBlocks(std::string* reason) const {
     if (uint64_t{p.vbd_elements.size()} * 4u > std::numeric_limits<uint32_t>::max())
         return reject(Status::InvalidArgument, "vertex-block elements exceed incidence packing");
     for (const VbdElement& element : p.vbd_elements) {
-        if (element.kind > kVbdRodBend || !std::isfinite(element.damping) || element.damping < 0.0f)
+        if (element.kind > kVbdTet || !std::isfinite(element.damping) || element.damping < 0.0f)
             return reject(Status::InvalidArgument, "invalid vertex-block element");
         for (uint32_t j = 0u; j < VbdElementVertexCount(element.kind); ++j)
             if (element.vertex[j] >= vertices)
@@ -1617,6 +1660,12 @@ phi::Status Model::ValidateVertexBlocks(std::string* reason) const {
         for (float value : element.rest)
             if (!std::isfinite(value))
                 return reject(Status::InvalidArgument, "vertex-block rest data must be finite");
+        if (element.kind == kVbdTet) {
+            const vbd::TetRest r(element);
+            if (!(r.xx > 0.0f && r.yy > 0.0f && r.zz != 0.0f && r.mu > 0.0f &&
+                  r.lambda + r.mu > 0.0f && std::isfinite(r.Volume()) && r.Volume() > 0.0f))
+                return reject(Status::InvalidArgument, "invalid tetrahedron rest metric or elastic moduli");
+        }
     }
     for (uint32_t v = 0u; v < vertices; ++v) {
         if (p.vbd_incidence_offsets[v] > p.vbd_incidence_offsets[v + 1u])

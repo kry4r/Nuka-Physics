@@ -42,6 +42,7 @@ using nuka::c_abi::DeviceRecord;
 using nuka::c_abi::SceneRecord;
 using nuka::c_abi::SceneTable;  // the shared table (defined in scene.cpp).
 namespace cook = nuka::scene::cook;
+namespace nk = nuka::nk;
 namespace articulation = nuka::runtime::articulation;
 namespace nscene = nuka::scene;
 namespace nmath = nuka::math;
@@ -452,6 +453,95 @@ nuka_result_t nuka_scene_set_mpm_contact_capacity(nuka_scene_handle scene,
     if (media.method != nscene::MediaRecord::Method::MlsMpm) return NUKA_RESULT_INVALID_ARG;
     media.mpm.contact_capacity = capacity;
     return NUKA_RESULT_OK;
+}
+
+nuka_result_t nuka_scene_set_media_asset(nuka_scene_handle scene, uint32_t media_id, const char* asset_ref) {
+    auto* sr = SceneTable().Get(scene);
+    if (!sr || !sr->scene) return NUKA_RESULT_NULL_HANDLE;
+    if (media_id >= sr->scene->MediaCount() || !asset_ref) return NUKA_RESULT_INVALID_ARG;
+    try {
+        auto ref = nscene::ParseAssetRef(asset_ref);
+        if (ref.Empty()) return NUKA_RESULT_INVALID_ARG;
+        sr->scene->GetMediaMut(media_id).baked = std::move(ref);
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) { return NUKA_RESULT_OUT_OF_MEMORY; }
+      catch (...) { return NUKA_RESULT_INVALID_ARG; }
+}
+
+nuka_result_t nuka_scene_set_tet_materials(nuka_scene_handle scene, uint32_t media_id,
+                                         const nuka_tet_material_t* materials, uint32_t count) {
+    auto* sr = SceneTable().Get(scene);
+    if (!sr || !sr->scene) return NUKA_RESULT_NULL_HANDLE;
+    if (media_id >= sr->scene->MediaCount() || !materials || !count) return NUKA_RESULT_INVALID_ARG;
+    auto& medium = sr->scene->GetMediaMut(media_id);
+    if (medium.kind != nscene::MediaRecord::Kind::SoftTet || medium.method != nscene::MediaRecord::Method::Vbd)
+        return NUKA_RESULT_INVALID_ARG;
+    try {
+        std::vector<nscene::MediaVbdMaterial> values;
+        values.reserve(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto& p = materials[i];
+            if (!(std::isfinite(p.youngs) && p.youngs > 0 && std::isfinite(p.poisson) && p.poisson > -1 &&
+                  p.poisson < .5f && std::isfinite(p.density) && p.density >= 0 &&
+                  std::isfinite(p.damping) && p.damping >= 0)) return NUKA_RESULT_INVALID_ARG;
+            auto m = medium.vbd;
+            m.youngs = p.youngs; m.poisson = p.poisson; m.density = p.density; m.damping = p.damping;
+            values.push_back(m);
+        }
+        medium.tet_materials = std::move(values);
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) { return NUKA_RESULT_OUT_OF_MEMORY; }
+      catch (...) { return NUKA_RESULT_INVALID_ARG; }
+}
+
+nuka_result_t nuka_scene_set_mpm_grid(nuka_scene_handle scene, uint32_t media_id,
+                                    const nuka_mpm_grid_desc_t* grid) {
+    auto* sr = SceneTable().Get(scene);
+    if (!sr || !sr->scene) return NUKA_RESULT_NULL_HANDLE;
+    if (media_id >= sr->scene->MediaCount() || !grid || grid->implicit_stress > 1 ||
+        !std::isfinite(grid->particle_radius) || grid->particle_radius < 0) return NUKA_RESULT_INVALID_ARG;
+    auto& medium = sr->scene->GetMediaMut(media_id);
+    if (medium.method != nscene::MediaRecord::Method::MlsMpm) return NUKA_RESULT_INVALID_ARG;
+    const bool explicit_grid = grid->dimensions[0] || grid->dimensions[1] || grid->dimensions[2];
+    for (size_t i = 0; i < 3; ++i)
+        if (!std::isfinite(grid->origin[i]) || (explicit_grid && grid->dimensions[i] < nk::kMpmStencilWidth))
+            return NUKA_RESULT_INVALID_ARG;
+    medium.mpm.grid_origin = {grid->origin[0], grid->origin[1], grid->origin[2]};
+    for (size_t i = 0; i < 3; ++i) medium.mpm.grid_dims[i] = grid->dimensions[i];
+    medium.mpm.particle_radius = grid->particle_radius;
+    medium.mpm.implicit_stress = grid->implicit_stress != 0;
+    return NUKA_RESULT_OK;
+}
+
+nuka_result_t nuka_scene_set_mpm_materials(nuka_scene_handle scene, uint32_t media_id,
+                                         const nuka_mpm_material_t* materials, uint32_t count) {
+    auto* sr = SceneTable().Get(scene);
+    if (!sr || !sr->scene) return NUKA_RESULT_NULL_HANDLE;
+    if (media_id >= sr->scene->MediaCount() || !materials || !count) return NUKA_RESULT_INVALID_ARG;
+    auto& medium = sr->scene->GetMediaMut(media_id);
+    if (medium.method != nscene::MediaRecord::Method::MlsMpm) return NUKA_RESULT_INVALID_ARG;
+    try {
+        std::vector<nscene::MediaMpmMaterial> values;
+        values.reserve(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto& p = materials[i];
+            nk::MpmMaterial m;
+            m.youngs = p.youngs; m.poisson = p.poisson; m.density = p.density; m.model_kind = p.model_kind;
+            m.dp_friction = p.dp_friction; m.dp_cohesion = p.dp_cohesion;
+            m.bulk_modulus = p.bulk_modulus; m.tait_gamma = p.tait_gamma; m.viscosity = p.viscosity;
+            m.yield_stress = p.yield_stress; m.hardening_modulus = p.hardening_modulus;
+            if (!nk::material::ValidMpmMaterial(m)) return NUKA_RESULT_INVALID_ARG;
+            auto v = medium.mpm;
+            v.youngs = p.youngs; v.poisson = p.poisson; v.density = p.density; v.model_kind = p.model_kind;
+            v.dp_friction = p.dp_friction; v.dp_cohesion = p.dp_cohesion; v.bulk_modulus = p.bulk_modulus;
+            v.tait_gamma = p.tait_gamma; v.viscosity = p.viscosity;
+            v.yield_stress = p.yield_stress; v.hardening_modulus = p.hardening_modulus;
+            values.push_back(v);
+        }
+        medium.mpm_materials = std::move(values);
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) { return NUKA_RESULT_OUT_OF_MEMORY; }
+      catch (...) { return NUKA_RESULT_INVALID_ARG; }
 }
 
 nuka_result_t nuka_scene_add_mpm_fill(nuka_scene_handle scene, uint32_t media_id,

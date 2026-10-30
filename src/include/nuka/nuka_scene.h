@@ -254,7 +254,7 @@ typedef enum nuka_media_kind_t {
 
 typedef enum nuka_media_method_t {
     NUKA_MEDIA_METHOD_MLSMPM = 2,
-    NUKA_MEDIA_METHOD_VBD    = 3   /* Vertex blocks: cloth and cable. */
+    NUKA_MEDIA_METHOD_VBD    = 3   /* Vertex blocks: membranes, rods and tetrahedral solids. */
 } nuka_media_method_t;
 
 // A TAGGED media record: `kind` + `method` select which geometry block and which
@@ -416,6 +416,38 @@ nuka_result_t nuka_scene_add_collision_shape(nuka_scene_handle scene,
 nuka_result_t nuka_scene_add_media(nuka_scene_handle scene,
                                    const nuka_media_desc_t* desc,
                                    uint32_t* out_media_id);
+
+// A baked asset reference such as "solid.nka#TETS/0"; geometry and stream validation run at cook.
+nuka_result_t nuka_scene_set_media_asset(nuka_scene_handle scene, uint32_t media_id, const char* asset_ref);
+
+typedef struct nuka_tet_material_t {
+    float youngs, poisson, density, damping;
+} nuka_tet_material_t;
+
+// Tetrahedral material IDs index this table; density supplies mass when the asset omits inverse masses.
+nuka_result_t nuka_scene_set_tet_materials(nuka_scene_handle scene, uint32_t media_id,
+                                         const nuka_tet_material_t* materials, uint32_t count);
+
+typedef struct nuka_mpm_material_t {
+    float youngs, poisson, density, model_kind;
+    float dp_friction, dp_cohesion, bulk_modulus, tait_gamma, viscosity;
+    float yield_stress, hardening_modulus;
+} nuka_mpm_material_t;
+
+typedef struct nuka_mpm_grid_desc_t {
+    float origin[3];
+    uint32_t dimensions[3];
+    float particle_radius;
+    uint32_t implicit_stress;
+} nuka_mpm_grid_desc_t;
+
+// PSET material IDs index this table; every row uses the same grid and boundary conditions.
+nuka_result_t nuka_scene_set_mpm_materials(nuka_scene_handle scene, uint32_t media_id,
+                                         const nuka_mpm_material_t* materials, uint32_t count);
+
+// Zero dimensions derive a padded domain from the particles; the radius controls rendering only.
+nuka_result_t nuka_scene_set_mpm_grid(nuka_scene_handle scene, uint32_t media_id,
+                                    const nuka_mpm_grid_desc_t* grid);
 
 // One heterogeneous MLS-MPM sub-fill: a sub-box region [min,max] sampled at spacing
 // (position_jitter breaks the lattice) with its OWN constitutive material. Appended to

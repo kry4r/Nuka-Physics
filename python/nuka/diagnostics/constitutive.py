@@ -28,7 +28,7 @@ def elastic_quantities(words, positions, *, rates=None, dt=None, precision=np.fl
     parameters = parameters.astype(precision)
     if x.ndim != 2 or x.shape[1] != 3 or not np.isfinite(x).all():
         raise ValueError("elastic evaluation requires finite vertex positions")
-    if not np.isin(kinds, [0, 1, 2, 3]).all():
+    if not np.isin(kinds, [0, 1, 2, 3, 4]).all():
         raise ValueError("unknown cooked VBD material family")
     if rates is not None:
         rates = np.asarray(rates, dtype=precision)
@@ -36,11 +36,11 @@ def elastic_quantities(words, positions, *, rates=None, dt=None, precision=np.fl
             raise ValueError("relative elastic rates require matching finite vectors and a positive step")
     gradient = np.zeros_like(x)
     energy_by_kind = {}
-    for kind in range(4):
+    for kind in range(5):
         selected = kinds == kind
         if not selected.any():
             continue
-        count = 4 if kind == 1 else 2 if kind == 2 else 3
+        count = 4 if kind in (1, 4) else 2 if kind == 2 else 3
         ids = vertices[selected, :count]
         if (ids >= len(x)).any():
             raise ValueError("cooked VBD vertex index is outside the captured range")
@@ -130,6 +130,20 @@ def elastic_quantities(words, positions, *, rates=None, dt=None, precision=np.fl
             energy = .5 * p[:, 1] * delta**2
             g = edge * (p[:, 1] * delta / length)[:, None]
             gradients = np.stack([-g, g], axis=1)
+        elif kind == 4:
+            inverse = np.zeros((len(p), 3, 3), dtype=precision)
+            inverse[:, 0, 0], inverse[:, 0, 1], inverse[:, 0, 2] = p[:, 0], p[:, 1], p[:, 2]
+            inverse[:, 1, 1], inverse[:, 1, 2], inverse[:, 2, 2] = p[:, 3], p[:, 4], p[:, 5]
+            f = np.transpose(local[:, 1:], (0, 2, 1)) @ inverse
+            cofactor = np.stack([np.cross(f[:, :, 1], f[:, :, 2]), np.cross(f[:, :, 2], f[:, :, 0]),
+                                 np.cross(f[:, :, 0], f[:, :, 1])], axis=2)
+            volume = np.abs(1 / (6 * p[:, 0] * p[:, 3] * p[:, 5]))
+            delta = np.linalg.det(f) - 1
+            mu, lam = p[:, 6], p[:, 7] + p[:, 6]
+            energy = volume * (mu * (.5 * ((f * f).sum(axis=(1, 2)) - 3) - delta) + .5 * lam * delta**2)
+            stress = mu[:, None, None] * f + (lam * delta - mu)[:, None, None] * cofactor
+            corner = volume[:, None, None] * (stress @ np.transpose(inverse, (0, 2, 1)))
+            gradients = np.concatenate([-corner.sum(axis=2)[:, None], np.transpose(corner, (0, 2, 1))], axis=1)
         else:
             first, second = local[:, 1], local[:, 2] - local[:, 1]
             a, b = np.linalg.norm(first, axis=1), np.linalg.norm(second, axis=1)
