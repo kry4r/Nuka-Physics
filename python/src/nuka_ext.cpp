@@ -2902,6 +2902,19 @@ NB_MODULE(_nuka_ext, m) {
             return result;
         }, nb::arg("name"), nb::arg("env_index") = 0u,
             "Read an authored camera's cooked mount, optics and live world-space view.")
+        .def("body_binding", [](World& w, uint32_t body_index, uint32_t env_index) {
+            nuka_body_binding_t binding{};
+            check(nuka_world_get_body_binding(w.raw(), env_index, body_index, &binding),
+                  "nuka_world_get_body_binding");
+            nb::dict result;
+            result["link_index"] = binding.link_index;
+            result["owner_body_index"] = binding.owner_body_index;
+            result["inverse_mass"] = binding.inverse_mass;
+            result["center_of_mass"] = std::vector<float>(binding.center_of_mass,
+                                                         binding.center_of_mass + 3);
+            return result;
+        }, nb::arg("body_index"), nb::arg("env_index") = 0u,
+            "Read a rigid row's live inverse mass, articulation binding and local COM.")
         .def("kinematic_tree", [](World& w) {
             nb::list links;
             for (uint32_t index = 0u; index < w.base_link_count(); ++index) {

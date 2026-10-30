@@ -135,12 +135,10 @@ ResolvedPose ResolvePoseSource(const scene::Registry& registry,
             return out;
         }
         if (!have_body && ref->body_row != scene::SceneMap::kNoRow) {
-            // Only the body node itself (which carries the RigidBodyComponent) drives
-            // the pose: a child shape/visual node has no rb and must not short-circuit
-            // here with its own (possibly cross-wired) body_row. A STATIC (kinematic)
-            // body keeps its bind pose -- its BodyPose row is not integrated.
+            // A body's live row also carries prescribed motion for kinematic colliders.
+            // Child visual and shape nodes do not own rigid pose rows.
             const auto* rb = registry.Get<scene::RigidBodyComponent>(n->entity);
-            if (rb != nullptr && !rb->kinematic) {
+            if (rb != nullptr) {
                 body.kind = PoseSource::Kind::Body;
                 body.row  = ref->body_row;
                 body_node = n;
@@ -520,8 +518,7 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
             build_common(e, mesh_id, resolve_material(vis.render_material_id));
         });
 
-    // Collision-proxy fallback, per body: box/sphere/capsule/cylinder tessellate from params
-    // for a body with no visual of its own; hull/SDF carry no host geometry.
+    // Bodies without authored visuals render their collision geometry.
     using CK = scene::CollisionShapeComponent::Kind;
     registry.ForEach<scene::CollisionShapeComponent>(
         [&](scene::EntityId e, const scene::CollisionShapeComponent& cs) {
@@ -546,6 +543,23 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
                 }
             }
             uint32_t mesh_id;
+            const auto& surface = cs.surface;
+            if (!surface.inline_positions.empty() && !surface.inline_indices.empty()) {
+                mesh_id = world.meshes.InternPrimitive(InlineMeshKey(surface),
+                    [&]() { return FromInlineTriangles(surface); });
+                build_common(e, mesh_id, resolve_material(cs.render_material_id));
+                return;
+            }
+            if (!surface.mesh.Empty() && surface.mesh.fourcc == scene::NkaTagMesh()) {
+                auto file = open_nka(surface.mesh.nka_path);
+                if (file && file->CountChunks(scene::NkaTagMesh()) > surface.mesh.index) {
+                    mesh_id = world.meshes.InternNkaMesh(surface.mesh, [&]() {
+                        return FromNkaMesh(scene::DecodeMesh(file->LoadChunk(scene::NkaTagMesh(), surface.mesh.index)));
+                    });
+                    build_common(e, mesh_id, resolve_material(cs.render_material_id));
+                    return;
+                }
+            }
             switch (cs.kind) {
                 case CK::Box: {
                     const float hx = cs.params[0], hy = cs.params[1], hz = cs.params[2];

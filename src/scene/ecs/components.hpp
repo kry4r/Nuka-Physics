@@ -134,6 +134,8 @@ struct CollisionShapeComponent {
     // Authored render material for a collision-only body's proxy visual (a body
     // that ships no VisualMeshComponent). kNoSlot => the shared default appearance.
     uint32_t render_material_id  = ~uint32_t(0);
+    // Source triangles supply the visual fallback when a body has no authored visual.
+    VisualMeshComponent surface;
     uint32_t group = 0;                       // replaces magic handles 7000/8500/9000+
     uint32_t mask  = 0;
 };

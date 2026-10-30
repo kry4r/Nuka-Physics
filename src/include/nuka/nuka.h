@@ -1190,6 +1190,17 @@ typedef struct nuka_link_binding_t {
 nuka_result_t nuka_world_get_link_binding(nuka_world_handle world, uint32_t link_index,
                                           nuka_link_binding_t* out);
 
+// Live rigid-row mass and COM; owner indices are UINT32_MAX for independent bodies.
+typedef struct nuka_body_binding_t {
+    uint32_t link_index;
+    uint32_t owner_body_index;
+    float inverse_mass;
+    float center_of_mass[3];
+} nuka_body_binding_t;
+
+nuka_result_t nuka_world_get_body_binding(nuka_world_handle world, uint32_t env_index,
+                                          uint32_t body_index, nuka_body_binding_t* out);
+
 // One cooked collision shape with its live world pose (xyz, wxyz) in an environment.
 // params hold the sphere radius, capsule or cylinder radius and half height, or box half extents.
 typedef struct nuka_collider_t {

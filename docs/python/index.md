@@ -170,6 +170,9 @@ Control inputs persist across resets. The full rules, units and the actuator env
 
 ## Authoring a scene
 
+[Prescribed motion](prescribed-motion.md) provides named joint FK and COM twists
+for independent kinematic boundaries, plus bounded cone mesh conversion.
+
 `nuka.author` builds a world from parts instead of a file: geometry from `morphs`, physics from
 `materials`, looks from `materials.Render` and `surfaces`, put together in a `Scene` whose
 `build(device)` cooks one GPU world. [Getting started](../getting-started.md#author-a-demo-scene) has a

@@ -37,6 +37,34 @@
 namespace fs = std::filesystem;
 using namespace nuka;
 
+TEST(VisualMeshCook, KinematicCollisionMeshUsesLiveBodyPose) {
+    scene::SceneIR source;
+    scene::RigidBodyRecord body;
+    body.is_static = true;
+    body.local_transform.position = {0.1f, 0.2f, 0.3f};
+    const auto body_id = source.AddRigidBody(std::move(body));
+    scene::CollisionShapeRecord shape;
+    shape.body_id = body_id;
+    shape.type = scene::ShapeType::TriMesh;
+    shape.local_transform.position = {0.01f, 0.02f, 0.03f};
+    shape.mesh_vertices = {0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1};
+    shape.mesh_indices = {0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3};
+    shape.contype = shape.conaffinity = 1u;
+    source.AddCollisionShape(std::move(shape));
+    scene::SceneMap map;
+    scene::CookedRef binding;
+    binding.body_row = 0u;
+    map.Bind(source.EntityOfBody(body_id), binding);
+    const auto world = render::BuildRenderWorld(source.Ecs(), map);
+    ASSERT_EQ(world.instances.size(), 1u);
+    const auto& instance = world.instances[0];
+    EXPECT_EQ(world.meshes.Geometry(instance.mesh_id).TriangleCount(), 4u);
+    EXPECT_EQ(instance.pose_source.kind, render::PoseSource::Kind::Body);
+    EXPECT_FLOAT_EQ(instance.cached_visual_local.position.x, 0.01f);
+    EXPECT_FLOAT_EQ(instance.cached_visual_local.position.y, 0.02f);
+    EXPECT_FLOAT_EQ(instance.cached_visual_local.position.z, 0.03f);
+}
+
 namespace {
 
 const std::string kGo2Mjcf = ".nuka-assets/mujoco_menagerie/unitree_go2/go2.xml";

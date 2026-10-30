@@ -1279,6 +1279,44 @@ nuka_result_t nuka_world_get_link_binding(nuka_world_handle world, uint32_t link
     return NUKA_RESULT_OK;
 }
 
+nuka_result_t nuka_world_get_body_binding(nuka_world_handle world, uint32_t env_index,
+                                          uint32_t body_index, nuka_body_binding_t* out) {
+    if (out == nullptr) return NUKA_RESULT_INVALID_ARG;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->world) return NUKA_RESULT_NOT_SUPPORTED;
+    try {
+        const auto& model = record->world->GetModel();
+        if (env_index >= model.capacities.env_count ||
+            body_index >= model.capacities.bodies_per_env)
+            return NUKA_RESULT_INVALID_ARG;
+        const uint64_t row = uint64_t(env_index) * model.capacities.bodies_per_env + body_index;
+        nuka_body_binding_t result{};
+        nuka::math::Transform inertial;
+        auto& data = record->world->GetData();
+        if (!data.DownloadField(nuka::nk::FieldId::BodyInvMass, &result.inverse_mass,
+                                sizeof(float), row * sizeof(float)) ||
+            !data.DownloadField(nuka::nk::FieldId::BodyInertialFrame, &inertial,
+                                sizeof(inertial), row * sizeof(inertial)))
+            return NUKA_RESULT_INTERNAL;
+        result.link_index = body_index < model.body_to_link.size()
+            ? model.body_to_link[body_index] : ~uint32_t(0);
+        if (result.link_index == ~uint32_t(0) && body_index < model.body_collidable_link.size())
+            result.link_index = model.body_collidable_link[body_index];
+        result.owner_body_index = body_index < model.body_collidable_body.size()
+            ? model.body_collidable_body[body_index] : ~uint32_t(0);
+        result.center_of_mass[0] = inertial.position.x;
+        result.center_of_mass[1] = inertial.position.y;
+        result.center_of_mass[2] = inertial.position.z;
+        *out = result;
+        return NUKA_RESULT_OK;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
 nuka_result_t nuka_world_get_colliders(nuka_world_handle world, uint32_t env_index,
                                        nuka_collider_t* out, uint32_t capacity,
                                        uint32_t* out_count) {
