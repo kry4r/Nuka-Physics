@@ -7,7 +7,9 @@
 #include "math/quat.hpp"
 #include "math/transform.hpp"
 #include "math/spatial.hpp"
+#include "nk/solve/point_endpoint.hpp"
 
+#include <array>
 #include <cmath>
 
 namespace {
@@ -315,6 +317,67 @@ TEST(SpatialTransform, IdentityForce) {
     const auto result = X.TransformForce(f);
     EXPECT_NEAR(result.angular.x, 1.0f, kEps);
     EXPECT_NEAR(result.linear.x, 4.0f, kEps);
+}
+
+TEST(PointEndpoint, OffsetTrianglePreservesRigidMotionAndMomentumUnderWorldTranslation) {
+    namespace nk = nuka::nk;
+    using D = std::array<double, 3>;
+    const auto cross = [](const D& a, const D& b) {
+        return D{a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]};
+    };
+    const uint32_t indices[3] = {0u, 1u, 2u};
+    const Vec3 local[3] = {{0, 0, 0}, {.0014f, -.0001f, .0003f}, {.0005f, .0014f, .0005f}};
+    const Vec3 bary{.2f, .3f, .5f}, offset{.0015f, -.002f, .0035f};
+    const D omega{.7, .2, -.4}, translation{.12, -.03, .04};
+    for (const Vec3 origin : {Vec3{.0423f, -.0197f, .3001f}, Vec3{.3f, -.2f, .6f}, Vec3{30, -20, 60}}) {
+        Vec3 positions[3];
+        for (uint32_t i = 0u; i < 3u; ++i) positions[i] = origin + local[i];
+        const Vec3 point = positions[0]*bary.x + positions[1]*bary.y + positions[2]*bary.z + offset;
+        nk::PointEndpointTerm terms[3];
+        ASSERT_TRUE(nk::BuildTrianglePointEndpoint(indices, positions, bary, point, terms));
+        for (uint32_t axis = 0u; axis < 3u; ++axis) {
+            D sum{};
+            for (const auto& term : terms) {
+                sum[0] += term.column[axis].x; sum[1] += term.column[axis].y; sum[2] += term.column[axis].z;
+            }
+            for (uint32_t c = 0u; c < 3u; ++c) EXPECT_NEAR(sum[c], double(c == axis), 3e-8);
+        }
+        const D contact{double(point.x)-origin.x, double(point.y)-origin.y, double(point.z)-origin.z};
+        D endpoint_velocity{};
+        for (uint32_t i = 0u; i < 3u; ++i) {
+            const D radius{double(positions[i].x)-origin.x, double(positions[i].y)-origin.y, double(positions[i].z)-origin.z};
+            D velocity = cross(omega, radius);
+            for (uint32_t c = 0u; c < 3u; ++c) velocity[c] += translation[c];
+            for (uint32_t axis = 0u; axis < 3u; ++axis) {
+                const Vec3 column = terms[i].column[axis];
+                endpoint_velocity[0] += double(column.x) * velocity[axis];
+                endpoint_velocity[1] += double(column.y) * velocity[axis];
+                endpoint_velocity[2] += double(column.z) * velocity[axis];
+            }
+        }
+        const D spin = cross(omega, contact);
+        for (uint32_t c = 0u; c < 3u; ++c)
+            EXPECT_NEAR(endpoint_velocity[c], translation[c] + spin[c], 2e-6);
+        for (const D impulse : {D{1, 0, 0}, D{.3, -.4, .866}, D{.7, .2, -.3}}) {
+            D linear{}, angular{};
+            for (uint32_t i = 0u; i < 3u; ++i) {
+                const D radius{double(positions[i].x)-origin.x, double(positions[i].y)-origin.y, double(positions[i].z)-origin.z};
+                const Vec3 mapped = terms[i].TransposeMultiply({static_cast<float>(impulse[0]),
+                    static_cast<float>(impulse[1]), static_cast<float>(impulse[2])});
+                const D force{mapped.x, mapped.y, mapped.z};
+                for (uint32_t axis = 0u; axis < 3u; ++axis) {
+                    linear[axis] += force[axis];
+                }
+                const D torque = cross(radius, force);
+                for (uint32_t c = 0u; c < 3u; ++c) angular[c] += torque[c];
+            }
+            const D torque = cross(contact, impulse);
+            for (uint32_t c = 0u; c < 3u; ++c) {
+                EXPECT_NEAR(linear[c], impulse[c], 2e-6);
+                EXPECT_NEAR(angular[c], torque[c], 2e-8);
+            }
+        }
+    }
 }
 
 } // anonymous namespace

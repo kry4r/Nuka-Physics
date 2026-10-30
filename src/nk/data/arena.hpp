@@ -75,6 +75,12 @@ public:
 
     phi::Buffer* PersistentBuffer() const { return persistent_; }
     phi::Buffer* ScratchBuffer() const { return scratch_; }
+    uint64_t AllocatedBytes(FieldArena arena) const {
+        const bool persistent = arena == FieldArena::Persistent;
+        if ((persistent ? persistent_ : scratch_) == nullptr) return 0u;
+        const uint64_t bytes = arena_bytes_[persistent ? 0 : 1];
+        return bytes == 0u ? 256u : bytes;
+    }
 
 private:
     void FreeAll();

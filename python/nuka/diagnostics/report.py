@@ -316,7 +316,8 @@ def contact_analysis(counts, metrics, limits, tolerance, readout_complete=True):
                 totals[A.UNMEASURED_GAPS] == 0 and totals[A.INVALID_ROWS] == 0)
     passed = all(totals[c] == 0 for c in (A.INVALID_ROWS, A.LINEAR_CLOSURE_VIOLATIONS,
         A.CONE_VIOLATIONS, A.NEGATIVE_NORMAL_IMPULSES, A.GAP_VIOLATIONS)) and bool((rates <= tolerance).all())
-    return decision(bool(complete), bool(passed), contacts=int(checked),
+    result = decision(bool(complete), bool(passed), contacts=int(checked),
+        coverage_complete=bool(complete),
         observed_contact_intervals=int(np.count_nonzero(counts[:, A.CONTACTS])),
         readout_valid=readout_complete,
         totals={c.name: int(totals[c]) for c in A}, worst=worst,
@@ -329,6 +330,14 @@ def contact_analysis(counts, metrics, limits, tolerance, readout_complete=True):
                     "nonpositive, so each row may exceed zero only by the solver velocity tolerance.",
         gap_scope="Final OGC VF/EE features and particle-body surfaces; unavailable feature kinds block acceptance.",
         frozen_gap="Auxiliary frozen-Jacobian estimate; excluded from the closest-feature gap gate.")
+    known = {c.name: int(totals[c]) for c in (A.INVALID_ROWS, A.LINEAR_CLOSURE_VIOLATIONS,
+             A.CONE_VIOLATIONS, A.NEGATIVE_NORMAL_IMPULSES, A.GAP_VIOLATIONS) if totals[c] != 0}
+    if (rates > tolerance).any():
+        known["DISPLACEMENT_RATE_INTERVALS"] = int((rates > tolerance).any(axis=1).sum())
+    result["known_violations"] = known if readout_complete else {}
+    if readout_complete and known:
+        result["status"] = "failed"
+    return result
 
 
 SIDE_FIELDS = ("CONTACT_SIDE_A_KIND", "CONTACT_SIDE_A_INDEX", "CONTACT_SIDE_B_KIND", "CONTACT_SIDE_B_INDEX")

@@ -270,10 +270,12 @@ TEST(RigidOnMpmRest, FiniteMassMultipleOwnersConserveMomentum) {
                 config.dt = dt;
                 config.gravity[2] = 0.0f;
                 config.vel_iters = 4096u;
+                config.velocity_iterations_override = true;
                 config.pos_iters = 3u;
                 nk::World world(FiniteMassImpact(ratio, owners, 2u * nk::kMpmStencilNodes),
                                 1u, backend.dev, backend.backend, config);
                 ASSERT_TRUE(world.Ready()) << world.CreationError();
+                ASSERT_EQ(world.VelocityIterations(), config.vel_iters);
                 ASSERT_TRUE(world.Step().AllOk());
                 const auto& cap = world.GetModel().capacities;
                 const auto mass = ReadValues<float>(world, nk::FieldId::GridMass);
@@ -319,7 +321,7 @@ TEST(RigidOnMpmRest, FiniteMassMultipleOwnersConserveMomentum) {
                 }
                 EXPECT_EQ(contacts, retained[0]);
                 std::printf("[finite-mass] mass=%g owners=%u dt=%g iterations=%u residual=%.9e contacts=%u\n",
-                            ratio, owners, dt, config.vel_iters, residual, contacts);
+                            ratio, owners, dt, world.VelocityIterations(), residual, contacts);
                 EXPECT_LT(residual, 2.0e-5);
                 double coupled_mass = 0.0, grid_px = 0.0, grid_energy = 0.0;
                 Vec3 momentum{}, moment{};
@@ -387,39 +389,41 @@ TEST(RigidOnMpmRest, MaterialPointGapAndThinColliderUseFinalVelocity) {
             for (float gap : {-0.001f, 0.0f, 0.004f, 0.03f}) {
                 SCOPED_TRACE(::testing::Message() << "mass=" << mass << " dt=" << dt << " gap=" << gap);
                 auto model = FiniteMassImpact(mass, 1u, nk::kMpmStencilNodes);
-                const float half = 0.002f, band = 0.002f, incoming = -10.0f;
+                const float half = 0.002f, band = 0.002f, incoming = -10.0f, recovery_speed = 1.0f;
                 model.body_init[0].pose.position.x = 0.013f;
                 model.shape_table_rows[0].params[0] = half;
                 model.particles.mpm_body_band = band;
+                model.overlap_recovery_velocity = recovery_speed;
                 const float initial = model.body_init[0].pose.position.x + half + gap;
                 model.particles.initial_pos[0].x = initial;
                 model.particles.initial_vel[0].x = incoming;
                 auto config = Cfg();
                 config.dt = dt;
                 config.gravity[2] = 0.0f;
-                config.pos_iters = 4u;
-                config.pos_beta = 1.0f;
                 config.pos_slop = 0.0f;
+                config.velocity_iterations_override = true;
                 nk::World world(std::move(model), 1u, backend.dev, backend.backend, config);
                 ASSERT_TRUE(world.Ready()) << world.CreationError();
+                ASSERT_EQ(world.VelocityIterations(), config.vel_iters);
                 ASSERT_TRUE(world.Step().AllOk());
                 EXPECT_EQ(ReadValues<uint32_t>(world, nk::FieldId::EnvStatus)[0], 0u);
                 const auto point = ReadValues<Vec3>(world, nk::FieldId::ParticlePos)[0];
                 const auto particle_velocity = ReadValues<Vec3>(world, nk::FieldId::ParticleVel)[0];
                 const auto body = ReadValues<Transform>(world, nk::FieldId::BodyPose)[0];
                 const auto body_velocity = ReadValues<Vec3>(world, nk::FieldId::BodyLinearVelocity)[0];
-                const double impulse = std::max(0.0, (-double(std::max(gap, 0.0f)) / dt - incoming)
+                const double target = std::min(std::max(-double(gap), 0.0) / dt, double(recovery_speed)) -
+                    std::max(double(gap), 0.0) / dt;
+                const double impulse = std::max(0.0, (target - incoming)
                     / (1.0 + 1.0 / mass));
-                const double recovery = std::max(-double(gap), 0.0) / (1.0 + 1.0 / mass);
                 EXPECT_NEAR(particle_velocity.x, incoming + impulse, 3.0e-5);
                 EXPECT_NEAR(body_velocity.x, -impulse / mass, 3.0e-5);
                 EXPECT_NEAR(particle_velocity.x + mass * body_velocity.x, incoming, 3.0e-5);
-                EXPECT_NEAR(point.x, initial + particle_velocity.x * dt + recovery, 3.0e-7f);
-                EXPECT_NEAR(body.position.x, 0.013f + body_velocity.x * dt - recovery / mass, 3.0e-7f);
+                EXPECT_NEAR(point.x, initial + particle_velocity.x * dt, 3.0e-7f);
+                EXPECT_NEAR(body.position.x, 0.013f + body_velocity.x * dt, 3.0e-7f);
                 EXPECT_LE(particle_velocity.LengthSq() + mass * body_velocity.LengthSq(), incoming * incoming + 1.0e-4f);
                 EXPECT_GE(point.x - body.position.x - half, -2.0e-7f);
                 EXPECT_NEAR(point.x - body.position.x - half,
-                            std::max(0.0f, gap + incoming * dt), 3.0e-7f);
+                            gap + std::max(double(incoming), target) * dt, 3.0e-7f);
             }
         }
     }

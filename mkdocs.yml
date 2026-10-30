@@ -118,6 +118,7 @@ nav:
       - Keyboard and mouse: reference/shortcuts.md
       - Command line: reference/command-line.md
       - File formats: reference/file-formats.md
+      - Physics acceptance: reference/physics-acceptance.md
       - Actions:
           - reference/actions/index.md
           - Documents: reference/actions/documents.md

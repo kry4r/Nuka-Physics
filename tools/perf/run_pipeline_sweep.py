@@ -262,6 +262,8 @@ def main():
     parser.add_argument("--input-file", type=Path, action="append", default=[])
     parser.add_argument("--allow-unaccepted-baseline", action="store_true",
                         help="allow an unaccepted baseline to finish successfully; acceptance remains unmeasured")
+    parser.add_argument("--complete-failing-observations", action="store_true",
+                        help="collect all requested processes after measured physics failures; final acceptance and exit remain failed")
     parser.add_argument("--cuda-launch-queues", choices=["default", "0.25x", "0.5x", "2x", "4x"])
     parser.add_argument("--save-state", action="store_true")
     parser.add_argument("--save-wrench", action="store_true")
@@ -385,7 +387,9 @@ def main():
         print(json.dumps(receipt), flush=True)
         results.append({"envs": envs, "execution": execution, "process": process, "result": result,
                         "receipt": receipt})
-        if not receipt["acceptance"]["valid"] or receipt["acceptance"]["physical_acceptance_status"] == "failed":
+        if not receipt["acceptance"]["valid"] or (
+                receipt["acceptance"]["physical_acceptance_status"] == "failed" and
+                not args.complete_failing_observations):
             break
     summary = []
     for envs in args.envs:
@@ -434,6 +438,7 @@ def main():
                             "input_configuration_digests": identities,
                             "cross_process_d1": cross_process})
     report = {"schema_version": 2, "source_id": args.source_id, "binary_sha256": binary_hash,
+              "complete_failing_observations": args.complete_failing_observations,
               "summary": summary, "process_results": results,
               "accepted_performance": all(entry["accepted_performance"] for entry in summary),
               "acceptance_scope": "full physics acceptance, bound inputs and binaries, and five independent processes",

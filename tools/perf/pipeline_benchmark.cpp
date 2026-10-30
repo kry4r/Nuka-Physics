@@ -1,6 +1,7 @@
 
 #include "robot_cloth_fluid_scene.hpp"
 #include "measurement_clock.hpp"
+#include "pipeline_physics_acceptance.hpp"
 
 #include <algorithm>
 #include <array>
@@ -421,9 +422,14 @@ Json Memory(nk::World& world) {
     world.GetModel().ComputeModelSegments(&model_bytes);
     nk::Arena::ComputeSegments(world.GetModel().capacities, arena_bytes);
     memory.Set("model_bytes", Json::Int(model_bytes));
-    memory.Set("persistent_bytes", Json::Int(arena_bytes[0]));
-    memory.Set("workspace_bytes", Json::Int(arena_bytes[1]));
-    memory.Set("data_bytes", Json::Int(arena_bytes[0] + arena_bytes[1]));
+    const uint64_t persistent = world.GetData().AllocatedBytes(nk::FieldArena::Persistent);
+    const uint64_t workspace = world.GetData().AllocatedBytes(nk::FieldArena::Scratch);
+    memory.Set("persistent_bytes", Json::Int(persistent));
+    memory.Set("workspace_bytes", Json::Int(workspace));
+    memory.Set("data_bytes", Json::Int(persistent + workspace));
+    memory.Set("compact_layout_persistent_bytes", Json::Int(arena_bytes[0]));
+    memory.Set("compact_layout_workspace_bytes", Json::Int(arena_bytes[1]));
+    memory.Set("allocation_scope", Json::Str("retained arenas plus dedicated replacement buffers; excludes backend plans and renderer storage"));
     memory.Set("state_sensor_bytes", Json::Int(world.StateSensors().StorageBytes()));
     for (const auto& segment : world.GetData().Segments()) {
         Json item = Json::Object();
@@ -1648,8 +1654,16 @@ Json Run(const Options& options) {
     }
     const auto timed_state = State(world);
     const auto timed_sensors = StateSensorBytes(world);
+    const auto timed_memory = Memory(world);
+    Json render_measurements = Json::Null();
+    bool render_valid = true;
+    if (options.render_sensors != 0u) {
+        render_measurements = RenderMeasurements(world, visuals, options, timed_state);
+        render_valid = render_measurements.At("valid").AsBool();
+    }
 
     const auto quality_start = Clock::now();
+    nuka::perf::PipelinePhysicsAcceptance physics_acceptance(world);
     fixture::Require(world.Reset() == phi::Status::Ok, "quality replay reset failed");
     const bool reset_equal = State(world, false) == initial;
     std::vector<uint32_t> status(options.envs);
@@ -1675,6 +1689,7 @@ Json Run(const Options& options) {
     VbdAcceptance vbd_acceptance;
     for (uint32_t i = 0; i < options.warmup + options.steps; ++i) {
         Step(world, options);
+        physics_acceptance.Observe(world, i + 1u);
         fixture::Require(world.GetData().DownloadField(nk::FieldId::EnvStatus, status.data(),
                          status.size() * sizeof(uint32_t)), "status download failed");
         bool first_failure_step = false;
@@ -1701,6 +1716,7 @@ Json Run(const Options& options) {
                          rows_host.size() * sizeof(nk::NkRow)), "row download failed");
         fixture::Require(world.GetData().DownloadField(nk::FieldId::Lambda, impulses.data(),
                          impulses.size() * sizeof(float)), "impulse download failed");
+        physics_acceptance.ObserveRows(world, rows_host, impulses, i + 1u);
         coupling_acceptance.Observe(world, rows_host, impulses, i + 1u, i >= options.warmup);
         const bool periodic_sample =
             i >= options.warmup && (i % 25u == 0u || i + 1u == options.warmup + options.steps);
@@ -1783,6 +1799,8 @@ Json Run(const Options& options) {
             solve.Set("iterations", Json::Int(params.iterations));
             solve.Set("substep", Json::Int(params.substep_index));
             solve.Set("dt", Json::Float(params.dt));
+            solve.Set("velocity_tolerance_m_s", Json::Float(params.velocity_tolerance));
+            solve.Set("measures_contact_residual", Json::Bool(params.measure_contact_residual != 0u));
         } else continue;
         solve_calls.PushBack(std::move(solve));
         ++solve_call_count;
@@ -1793,7 +1811,7 @@ Json Run(const Options& options) {
         config.velocity_iterations_override ? "explicit world override" :
         std::getenv("NUKA_BLOCK_DESCENT_ITERATIONS") != nullptr ? "solver environment" : "solver default"));
     solver.Set("solve_calls", std::move(solve_calls));
-    for (const char* key : {"NUKA_BLOCK_DESCENT_ITERATIONS"}) {
+    for (const char* key : {"NUKA_BLOCK_DESCENT_ITERATIONS", "NUKA_SOLVER_VEL_TOLERANCE"}) {
         const char* value = std::getenv(key);
         solver_environment.Set(key, value != nullptr ? Json::Str(value) : Json::Null());
     }
@@ -1841,6 +1859,7 @@ Json Run(const Options& options) {
     per_tag.Set("host_step_submission", Distribution(std::move(host_us)));
     result.Set("per_tag", std::move(per_tag));
     result.Set("memory", Memory(world));
+    result.Set("timed_memory", timed_memory);
     Json sensors = Json::Object();
     sensors.Set("count", Json::Int(world.StateSensors().Count()));
     sensors.Set("timed_replay_bit_equal", Json::Bool(timed_sensors == replay_sensors));
@@ -1910,12 +1929,11 @@ Json Run(const Options& options) {
     quality.Set("coupling_acceptance", coupling_acceptance.Report());
     quality.Set("vbd_samples", std::move(vbd_samples));
     quality.Set("vbd_acceptance", vbd_acceptance.Report());
+    const auto physical_acceptance = physics_acceptance.Report(timed_state == replay_state);
+    quality.Set("physical_acceptance", physical_acceptance);
     result.Set("quality", std::move(quality));
-    bool render_valid = true;
     if (options.render_sensors != 0u) {
-        auto render = RenderMeasurements(world, visuals, options, timed_state);
-        render_valid = render.At("valid").AsBool();
-        result.Set("render", std::move(render));
+        result.Set("render", std::move(render_measurements));
     }
     Json hardware = Json::Object();
     cudaDeviceProp properties{};
@@ -1935,9 +1953,9 @@ Json Run(const Options& options) {
                        timed_sensors == replay_sensors;
     validity.Set("valid", Json::Bool(valid));
     validity.Set("valid_scope", Json::Str("lifecycle/state/render/deformation/coupling workload contracts"));
-    validity.Set("passes_full_physics_acceptance", Json::Bool(false));
-    validity.Set("physical_acceptance_status", Json::Str("unmeasured"));
-    validity.Set("physical_acceptance_reason", Json::Str("full-system energy ledger, analytic checks, reference comparisons and independent CCD are not integrated into this program"));
+    validity.Set("passes_full_physics_acceptance", physical_acceptance.At("passes_full_physics_acceptance"));
+    validity.Set("physical_acceptance_status", physical_acceptance.At("status"));
+    validity.Set("physical_acceptance_reason", Json::Str("quality.physical_acceptance separates observed violations from incomplete energy, analytic, external reference, convergence and independent CCD coverage"));
     Json failures = Json::Array();
     if (status_union != 0u) failures.PushBack(Json::Str("nonzero environment failure flags"));
     if (!solver_workload_valid) failures.PushBack(Json::Str("grid block coloring conflicts or lacks owner coverage"));
@@ -1951,7 +1969,7 @@ Json Run(const Options& options) {
     if (timed_sensors != replay_sensors) failures.PushBack(Json::Str("mounted sensor replay mismatch"));
     validity.Set("failures", std::move(failures));
     unavailable.PushBack(Json::Str("GPU clocks, source/binary SHA256 and process identity are collected by the sweep runner"));
-    unavailable.PushBack(Json::Str("residual, complementarity and detailed penetration observability remain incomplete"));
+    unavailable.PushBack(Json::Str("full energy balance, independent CCD, matched external references and convergence remain unmeasured; committed gap and multi-substep residual coverage may be incomplete"));
     validity.Set("unavailable", std::move(unavailable));
     result.Set("status", std::move(validity));
     return result;
@@ -1974,7 +1992,7 @@ int main(int argc, char** argv) {
         status.Set("valid_scope", Json::Str("lifecycle/state/render/deformation/coupling workload contracts"));
         status.Set("passes_full_physics_acceptance", Json::Bool(false));
         status.Set("physical_acceptance_status", Json::Str("unmeasured"));
-        status.Set("physical_acceptance_reason", Json::Str("full-system energy ledger, analytic checks, reference comparisons and independent CCD are not integrated into this program"));
+        status.Set("physical_acceptance_reason", Json::Str("benchmark aborted before a complete physical acceptance report; see error"));
         status.Set("error", Json::Str(error.what()));
         result.Set("status", std::move(status));
         std::cerr << error.what() << '\n';

@@ -725,10 +725,13 @@ __global__ void PhysicsStageMetricsKernel(ModelView m, DataView d, ReadoutEnergy
     }
 }
 
-__device__ Vec3 AuditLinearJacobian(const NkRowSide& side, PointMassView points) {
-    if (!PointMassView::IsPointSide(side.kind)) return side.jlin;
-    Vec3 total{};
-    for (uint32_t i = 0u; i < points.Count(side); ++i) total += points.At(side, i).jacobian;
+__device__ double3 AuditLinearJacobian(const NkRowSide& side, PointMassView points) {
+    if (!PointMassView::IsPointSide(side.kind)) return make_double3(side.jlin.x, side.jlin.y, side.jlin.z);
+    double3 total{};
+    for (uint32_t i = 0u; i < points.Count(side); ++i) {
+        const Vec3 term = points.At(side, i).jacobian;
+        total.x += term.x; total.y += term.y; total.z += term.z;
+    }
     return total;
 }
 
@@ -892,13 +895,15 @@ __global__ void ContactAuditKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
             if (row >= (env + 1u) * p.rows_per_env) { count(C::InvalidRows); continue; }
             const auto r = rows[row];
             count(C::Rows);
-            const Vec3 a = AuditLinearJacobian(r.a, points);
-            const Vec3 b = AuditLinearJacobian(r.b, points);
+            const double3 a = AuditLinearJacobian(r.a, points);
+            const double3 b = AuditLinearJacobian(r.b, points);
             const double impulse = d.lambda[row];
-            const double numerator = sqrt(Dot(a + b, a + b)) * fabs(impulse);
-            const double denominator = sqrt(Dot(a, a)) * fabs(impulse);
+            const double x = a.x + b.x, y = a.y + b.y, z = a.z + b.z;
+            const double numerator = sqrt(x*x + y*y + z*z) * fabs(impulse);
+            const double denominator = sqrt(a.x*a.x + a.y*a.y + a.z*a.z) * fabs(impulse);
             const double relative = denominator > 0.0 ? numerator / denominator : numerator == 0.0 ? 0.0 : FLT_MAX;
-            if (!Finite(a) || !Finite(b) || !isfinite(impulse)) count(C::InvalidRows);
+            if (!isfinite(a.x) || !isfinite(a.y) || !isfinite(a.z) ||
+                !isfinite(b.x) || !isfinite(b.y) || !isfinite(b.z) || !isfinite(impulse)) count(C::InvalidRows);
             if (relative > 1.0e-6) count(C::LinearClosureViolations);
             maximum(M::RelativeLinearClosure, float(relative), row);
             if (impulse != 0.0)

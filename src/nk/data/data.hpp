@@ -73,6 +73,8 @@ public:
     }
 
     const Arena& GetArena() const { return arena_; }
+    // Includes retained arena storage and separately allocated replacement fields.
+    uint64_t AllocatedBytes(FieldArena arena) const;
     phi::Status UploadFieldStatus(FieldId id, const void* src, uint64_t bytes,
                                    uint64_t byte_offset = 0) const;
     phi::Status DownloadFieldStatus(FieldId id, void* dst, uint64_t bytes,

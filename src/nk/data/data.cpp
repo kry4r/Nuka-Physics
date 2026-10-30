@@ -399,6 +399,13 @@ const Data::FieldBuffer* Data::OwnBuffer(FieldId id) const {
     return nullptr;
 }
 
+uint64_t Data::AllocatedBytes(FieldArena arena) const {
+    uint64_t bytes = arena_.AllocatedBytes(arena);
+    for (const auto& own : own_)
+        if (LayoutOf(own.field).arena == arena) bytes += own.bytes;
+    return bytes;
+}
+
 void* Data::Ptr(FieldId id) const {
     const FieldBuffer* own = OwnBuffer(id);
     return own != nullptr ? phi::BufferBase(own->buffer.get()) : arena_.Ptr(id);
