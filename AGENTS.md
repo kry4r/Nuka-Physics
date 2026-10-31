@@ -17,6 +17,9 @@ These rules OVERRIDE default behavior. Follow them in every file you write or ed
   A comment describes the code as it stands, not the project timeline that made it.
 
 ## Architecture
+- Preserve the unified UABD solver and one general solving path. Implementation
+  and numerical detail fixes are allowed within that scheme. Pause and obtain
+  explicit user approval before replacing or substantially restructuring it.
 - **ONE general physics solving path. No case-by-case paths, no per-scene hacks.**
   Robot+ground and robot+grasped-object are the same contact problem and run the
   same general code. Reject special-cased solvers, fused fast-paths, scene-specific
