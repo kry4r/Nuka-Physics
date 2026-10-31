@@ -50,6 +50,54 @@ struct PointEndpointTerm {
 static_assert(sizeof(PointEndpointRange) == 2u * sizeof(uint32_t));
 static_assert(sizeof(PointEndpointTerm) == 2u * sizeof(uint32_t) + 9u * sizeof(float));
 
+// Projected terms retain their stored linear map's sum after rounding to floats.
+// The smallest component absorbs the residual with the finest available spacing.
+struct PointEndpointProjection {
+    uint32_t pivot[3] = {~0u, ~0u, ~0u};
+    float value[3]{};
+
+    NUKA_ENDPOINT_HD math::Vec3 At(const PointEndpointTerm* terms, uint32_t index,
+                                   math::Vec3 direction) const {
+        auto result = terms[index].TransposeMultiply(direction);
+        if (index == pivot[0]) result.x = value[0];
+        if (index == pivot[1]) result.y = value[1];
+        if (index == pivot[2]) result.z = value[2];
+        return result;
+    }
+};
+
+NUKA_ENDPOINT_HD inline PointEndpointProjection ProjectPointEndpoint(
+    const PointEndpointTerm* terms, uint32_t count, math::Vec3 direction) {
+    PointEndpointProjection result;
+    if (count <= 1u) return result;
+    double exact_sum[3]{}, rounded_sum[3]{};
+    float smallest[3] = {FLT_MAX, FLT_MAX, FLT_MAX};
+    float pivot_value[3]{};
+    for (uint32_t i = 0u; i < count; ++i) {
+        for (uint32_t axis = 0u; axis < 3u; ++axis) {
+            const auto column = terms[i].column[axis];
+            const double exact = double(column.x)*direction.x + double(column.y)*direction.y +
+                double(column.z)*direction.z;
+            const float rounded = static_cast<float>(exact);
+            exact_sum[axis] += exact;
+            rounded_sum[axis] += rounded;
+            if (fabsf(rounded) < smallest[axis]) {
+                smallest[axis] = fabsf(rounded);
+                result.pivot[axis] = i;
+                pivot_value[axis] = rounded;
+            }
+        }
+    }
+    for (uint32_t axis = 0u; axis < 3u; ++axis) {
+        const double residual = exact_sum[axis] - (rounded_sum[axis] - pivot_value[axis]);
+        if (residual >= -FLT_MAX && residual <= FLT_MAX)
+            result.value[axis] = static_cast<float>(residual);
+        else
+            result.pivot[axis] = ~0u;
+    }
+    return result;
+}
+
 NUKA_ENDPOINT_HD inline PointEndpointTerm WeightedPointEndpointTerm(
     uint32_t kind, uint32_t index, float weight) {
     return {kind, index, {{weight, 0, 0}, {0, weight, 0}, {0, 0, weight}}};

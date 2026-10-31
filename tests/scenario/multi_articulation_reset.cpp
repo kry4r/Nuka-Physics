@@ -74,6 +74,7 @@ nk::Model ParticleModel() {
     particles.initial_vol0.assign(count, 0.001f);
     particles.initial_material_id.assign(count, 0u);
     particles.half_thickness.assign(count, 0.0f);
+    particles.self_half_thickness.assign(count, 0.0f);
     particles.friction.assign(count, 0.0f);
     particles.mpm_grid_dims[0] = particles.mpm_grid_dims[1] = particles.mpm_grid_dims[2] = 6u;
     particles.mpm_cell_size = 0.1f;
@@ -354,7 +355,7 @@ TEST(MultiArticulationReset, ParticleStateRoundTripsWithoutArticulations) {
     auto& device = Device();
     if (!device.backend) GTEST_SKIP() << "no CUDA backend";
     nk::World world(ParticleModel(), 3u, device.device, device.backend, Config());
-    ASSERT_TRUE(world.Ready());
+    ASSERT_TRUE(world.Ready()) << world.CreationError();
     ASSERT_EQ(world.GetModel().capacities.articulations_per_env, 0u);
     ASSERT_EQ(ReadState(world, kParticleStateFields), ReadState(world, kParticleSnapshotFields));
 
@@ -393,7 +394,7 @@ TEST(MultiArticulationReset, ParticleStepAfterResetMatchesANewWorld) {
         nk::World world(ParticleModel(), 3u, device.device, device.backend, Config());
         nk::World fresh(ParticleModel(), 3u, device.device, device.backend, Config());
         nk::World uninterrupted(ParticleModel(), 3u, device.device, device.backend, Config());
-        ASSERT_TRUE(world.Ready());
+        ASSERT_TRUE(world.Ready()) << world.CreationError();
         ASSERT_TRUE(fresh.Ready());
         ASSERT_TRUE(uninterrupted.Ready());
         const auto initial = ReadState(world, kParticleStateFields);

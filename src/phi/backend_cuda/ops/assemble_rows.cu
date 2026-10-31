@@ -1066,14 +1066,20 @@ __device__ void SharedPointCouplings(const PointMassView& points, const NkRowSid
                                      const math::Vec3 (&jlin)[3], float (&coupling)[5]) {
     for (uint32_t c = 0u; c < 5u; ++c) coupling[c] = 0.0f;
     const uint32_t count = points.Count(side);
+    const bool endpoint = side.kind == nk::kNkSidePointEndpoint;
+    const auto* entries = endpoint ? points.terms + points.ranges[side.index].first : nullptr;
+    nk::PointEndpointProjection projections[3];
+    if (endpoint)
+        for (uint32_t r = 0u; r < 3u; ++r)
+            projections[r] = nk::ProjectPointEndpoint(entries, count, jlin[r]);
     for (uint32_t term = 0u; term < count; ++term) {
         uint32_t kind = side.kind, index = side.index;
         math::Vec3 u[3] = {jlin[0], jlin[1], jlin[2]};
-        if (side.kind == nk::kNkSidePointEndpoint) {
-            const auto& entry = points.terms[points.ranges[side.index].first + term];
+        if (endpoint) {
+            const auto& entry = entries[term];
             kind = entry.kind;
             index = entry.index;
-            for (uint32_t r = 0u; r < 3u; ++r) u[r] = entry.TransposeMultiply(jlin[r]);
+            for (uint32_t r = 0u; r < 3u; ++r) u[r] = projections[r].At(entries, term, jlin[r]);
         }
         if (points.InverseMass(kind) == nullptr) continue;
         coupling[0] += points.Quad(kind, index, u[1], u[1]);

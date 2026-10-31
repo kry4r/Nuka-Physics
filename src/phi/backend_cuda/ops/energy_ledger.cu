@@ -187,6 +187,7 @@ __device__ double SideDisplacementRate(const NkRowSide& side, bool second, uint3
         for (uint32_t k = 0u; k < points.Count(side); ++k) {
             const auto term = points.At(side, k);
             if (term.kind == nk::kNkSideParticle) rate += Dot(term.jacobian, d.particle_vel[term.index]);
+            else if (term.kind == nk::kNkSideGrid) rate += Dot(term.jacobian, d.grid_velocity[term.index]);
         }
     }
     return rate;

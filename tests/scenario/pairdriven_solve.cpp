@@ -1,25 +1,4 @@
-// ---------------------------------------------------------------------------
-// General contact pipeline — Phase 1B SOLVER + INTEGRATION gate.
-//
-// Proves the GENERAL mixed-island solver: a detected PairDriven manifold
-// (broadphase LBVH -> cvx narrowphase -> the unified contact buffer) becomes a
-// COUPLED two-sided NkRow assembled by OpAssembleRowsPairDriven (S1/S2/S5) and
-// solved by the generalized BlockDescentSolve (S3 per-articulation qdot tiles
-// + S4 two-key schedule), scattering reaction into BOTH sides. NO special-casing:
-// a free rigid body, an articulation link, and a static collidable are all just
-// physics bodies fed into the EXISTING coupling engine (SolveUnionRowWarp).
-//
-// Cases (the Phase 1 exit gate, §9):
-//   (b1) TWO free rigid boxes collide head-on -> push apart + SYMMETRIC momentum
-//        exchange (free x free, no articulation).
-//   (b2) a free box resting on a STATIC ground plane stays (free x static; the
-//        static side scatters no reaction, the box is held up).
-//   (e)  TWO-RUN byte-identity for the PairDriven solve path (it does NOT inherit
-//        single-dog D1 -- proven here directly on q/qdot/body velocity/lambda).
-//
-// The dog cases (artic x rigid box-on-dog mixed island; artic x artic two dogs)
-// live in pairdriven_dog_solve.cpp (they need the go2 USD asset).
-// ---------------------------------------------------------------------------
+// Complete contact steps check separation, momentum, resting geometry and repeatability.
 
 #include <gtest/gtest.h>
 
@@ -74,6 +53,7 @@ nk::Pipeline::SolverConfig Cfg(float gz) {
     cfg.gravity[2] = gz;
     cfg.contact_margin = 0.0f;
     cfg.vel_iters = 32u;
+    cfg.velocity_iterations_override = true;
     cfg.max_pairs = 32u;
     return cfg;
 }
@@ -191,15 +171,12 @@ Snapshot Download(nk::World& w, uint32_t bodies, uint32_t rows) {
 
 }  // namespace
 
-// --- (b1) two free boxes collide + symmetric momentum exchange ---------------
 TEST(PairDrivenSolve, TwoFreeBoxesCollideExchangeMomentum) {
     if (GetBackend().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
     Backend b = GetBackend();
 
-    // Box A at x=-0.09 moving +X (toward B); box B at x=+0.09 moving -X. Half 0.10
-    // each -> centers 0.18 apart, faces touch at 0.20 reach -> 0.02 overlap. Equal
-    // mass, head-on, no gravity: a symmetric elastic-ish exchange (PGS) MUST push
-    // them apart and reverse the sign of each box's x-velocity contribution.
+    // Equal masses approach with zero total momentum and 0.02 m of initial overlap.
+    // Zero restitution dissipates the approach velocity while split impulses separate them.
     nk::Model m;
     AddBox(m, Vec3{-0.09f, 0, 0}, Vec3{+0.5f, 0, 0}, 0.10f, 1.0f, 0);
     AddBox(m, Vec3{+0.09f, 0, 0}, Vec3{-0.5f, 0, 0}, 0.10f, 1.0f, 1);
@@ -219,18 +196,13 @@ TEST(PairDrivenSolve, TwoFreeBoxesCollideExchangeMomentum) {
                  "[pd free-boxes] xA=%.4f xB=%.4f sep=%.4f vA.x=%.4f vB.x=%.4f\n",
                  xa, xb, sep, snap.lin[0].x, snap.lin[1].x);
 
-    // (1) PUSH-APART: separation grew past the 0.18 spawn gap toward ~0.20 (2*half).
     EXPECT_GT(sep, 0.18f + 1.0e-3f) << "overlapping boxes must push apart";
-    // (2) TWO-WAY: box A (was +X) ends moving -X, box B (was -X) ends moving +X
-    // (the contact reversed BOTH, the symmetric momentum exchange).
-    EXPECT_LT(snap.lin[0].x, 0.0f) << "box A reaction must reverse its +X motion";
-    EXPECT_GT(snap.lin[1].x, 0.0f) << "box B reaction must reverse its -X motion";
-    // (3) SYMMETRY: equal mass, head-on -> the two post-contact x-speeds match.
-    EXPECT_NEAR(std::abs(snap.lin[0].x), std::abs(snap.lin[1].x), 0.05f)
-        << "equal-mass head-on collision must exchange momentum symmetrically";
-    // (4) momentum: total x-momentum ~0 (started +0.5 + -0.5 == 0, no external X).
-    EXPECT_NEAR(snap.lin[0].x + snap.lin[1].x, 0.0f, 0.05f)
+    EXPECT_NEAR(snap.lin[0].x, 0.0f, 1.0e-3f);
+    EXPECT_NEAR(snap.lin[1].x, 0.0f, 1.0e-3f);
+    EXPECT_NEAR(snap.lin[0].x + snap.lin[1].x, 0.0f, 2.0e-4f)
         << "x-momentum must be conserved (sum ~ 0)";
+    const float energy = 0.5f * (snap.lin[0].LengthSq() + snap.lin[1].LengthSq());
+    EXPECT_LT(energy, 1.0e-6f);
 }
 
 // --- (b2) a free box rests on a static ground plane (free x static) ----------
@@ -247,18 +219,33 @@ TEST(PairDrivenSolve, FreeBoxRestsOnStaticGround) {
         AddBox(m, Vec3{0, 0, 0.105f}, Vec3{0, 0, 0}, 0.10f, 1.0f, box);
         if (ground == 1u) AddGroundPlane(m, 1);
         if (representation != 0u) {
-            auto& shape = m.shape_table_rows[box];
-            shape.kind = nuka::collision::kShapeSdfMesh;
-            // A conservative bound must not become the collision surface.
-            shape.params[0] = 0.70f;
-            shape.params[1] = shape.params[2] = shape.params[3] = 0.40f;
-            for (float x : {-0.10f, 0.10f})
-                for (float y : {-0.10f, 0.10f})
-                    for (float z : {-0.10f, 0.10f})
-                        m.samp_points.insert(m.samp_points.end(), {x, y, z});
-            m.samp_ranges.assign(4u, 0u);
-            m.samp_ranges[box * 2u + 1u] = 8u;
-            m.capacities.max_samp_points = 8u;
+            namespace scene = nuka::scene;
+            scene::SceneIR source;
+            for (uint32_t body = 0u; body < 2u; ++body) {
+                scene::RigidBodyRecord record;
+                record.is_static = body == ground;
+                record.local_transform.position = {0, 0, body == box ? 0.105f : 0.0f};
+                record.mass = 1.0f;
+                record.inertia = {0.006666667f, 0.006666667f, 0.006666667f};
+                scene::CollisionShapeRecord shape;
+                shape.body_id = source.AddRigidBody(record);
+                shape.type = body == ground ? scene::ShapeType::Plane : scene::ShapeType::TriMesh;
+                if (body == box) {
+                    shape.decompose_mode = scene::DecomposeMode::Skip;
+                    shape.mesh_vertices = {-.1f,-.1f,-.1f, .1f,-.1f,-.1f, .1f,.1f,-.1f, -.1f,.1f,-.1f,
+                        -.1f,-.1f,.1f, .1f,-.1f,.1f, .1f,.1f,.1f, -.1f,.1f,.1f};
+                    shape.mesh_indices = {0,2,1,0,3,2,4,5,6,4,6,7,0,1,5,0,5,4,
+                        1,2,6,1,6,5,2,3,7,2,7,6,3,0,4,3,4,7};
+                }
+                source.AddCollisionShape(shape);
+            }
+            m = std::move(scene::cook::CookSceneToModel(source, 1u, {}).model);
+            ASSERT_EQ(m.shape_table_rows[box].kind, nuka::collision::kShapeSdfMesh);
+            ASSERT_EQ(m.mesh_surface_info[box].triangle_count, 12u);
+            // Conservative bounds do not become the collision surface.
+            m.shape_table_rows[box].params[0] = 0.70f;
+            m.shape_table_rows[box].params[1] = m.shape_table_rows[box].params[2] =
+                m.shape_table_rows[box].params[3] = 0.40f;
         }
         FinishBodyModel(m);
         const uint32_t rows = m.capacities.max_rows_per_env;
@@ -385,8 +372,9 @@ TEST(PairDrivenSolve, CookedConcaveAndOpenSurfacesSupportBodiesAndParticles) {
         particle.positions = {{0.1f, 0.08f, initial_height}};
         particle.velocities = {{0, 0, 0}};
         particle.inv_mass = {100.0f};
-        particle.half_thickness = {0.0f};
+        particle.half_thickness = {radius};
         particle.friction = {0.6f};
+        particle.vbd_count = 1u;
         cook::CookVbdParticles(model, envs, particle);
         model.particles.pp_contact_d_min = 2.0f * radius;
         const uint32_t bodies = model.capacities.bodies_per_env;

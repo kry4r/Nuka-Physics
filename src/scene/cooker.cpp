@@ -168,7 +168,6 @@ uint32_t AppendConvexGeometry(CookedConvexGeometry& geom,
     auto surface = import::cooker::CookMeshSurfaceCached(vertices.data(),
         static_cast<uint32_t>(vertices.size() / 3u), oriented_indices.data(),
         static_cast<uint32_t>(oriented_indices.size() / 3u), convex, options);
-    surface.info.flags |= collision::kMeshSurfaceOriented;
     const auto found = std::find(geom.surface_cache_keys.begin(), geom.surface_cache_keys.end(),
                                  surface.cache_key);
     if (found != geom.surface_cache_keys.end())

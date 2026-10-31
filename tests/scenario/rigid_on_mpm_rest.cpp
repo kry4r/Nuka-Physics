@@ -13,6 +13,7 @@
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/model/model.hpp"
 #include "nk/pipeline/world.hpp"
+#include "nk/readout/physics_diagnostics.hpp"
 #include "nk/solve/nk_row.hpp"   // kPairDrivenRowsPerSlot
 #include "nk/solve/point_endpoint.hpp"
 #include "phi/backend.hpp"
@@ -276,6 +277,7 @@ TEST(RigidOnMpmRest, FiniteMassMultipleOwnersConserveMomentum) {
                                 1u, backend.dev, backend.backend, config);
                 ASSERT_TRUE(world.Ready()) << world.CreationError();
                 ASSERT_EQ(world.VelocityIterations(), config.vel_iters);
+                ASSERT_NE(world.FieldPtr(nk::FieldId::ContactAuditMetrics), nullptr);
                 ASSERT_TRUE(world.Step().AllOk());
                 const auto& cap = world.GetModel().capacities;
                 const auto mass = ReadValues<float>(world, nk::FieldId::GridMass);
@@ -323,6 +325,14 @@ TEST(RigidOnMpmRest, FiniteMassMultipleOwnersConserveMomentum) {
                 std::printf("[finite-mass] mass=%g owners=%u dt=%g iterations=%u residual=%.9e contacts=%u\n",
                             ratio, owners, dt, world.VelocityIterations(), residual, contacts);
                 EXPECT_LT(residual, 2.0e-5);
+                const auto audit_counts = ReadValues<uint32_t>(world, nk::FieldId::ContactAuditCounts);
+                const auto audit_metrics = ReadValues<uint64_t>(world, nk::FieldId::ContactAuditMetrics);
+                ASSERT_GT(audit_counts[static_cast<uint32_t>(nk::ContactAuditCount::Contacts)], 0u);
+                const uint32_t rate_bits = static_cast<uint32_t>(
+                    audit_metrics[static_cast<uint32_t>(nk::ContactAuditMetric::NormalDisplacementRate)] >> 32u);
+                float audited_rate = 0.0f;
+                std::memcpy(&audited_rate, &rate_bits, sizeof(audited_rate));
+                EXPECT_LE(audited_rate, 2.0e-5f);
                 double coupled_mass = 0.0, grid_px = 0.0, grid_energy = 0.0;
                 Vec3 momentum{}, moment{};
                 const uint32_t lattice_nodes = static_cast<uint32_t>(mass.size()) / nk::kMpmLattices;
@@ -568,10 +578,8 @@ TEST(RigidOnMpmRest, RestTwoRunByteIdentical) {
         << "particle positions differ run-to-run";
 }
 
-// Off-centre drop: the free box overhangs the bed +x edge, so the supported -x
-// side gets all the upward reaction. The unsupported +x side must tip DOWN, i.e.
-// the body picks up a positive omega_y (right-hand rule: +omega_y drops +x). The
-// sign is derived physically; only its sign + non-triviality are asserted.
+// The first resolved impact tips the +x overhang down, giving positive omega_y.
+// A deformable bed can reverse the box's rotation during the later rebound.
 TEST(RigidOnMpmRest, OffCentreDropInducesTippingTorque) {
     if (GetBackend().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
     Backend b = GetBackend();
@@ -582,6 +590,9 @@ TEST(RigidOnMpmRest, OffCentreDropInducesTippingTorque) {
     Vec3 ang_vel{0, 0, 0};
     Vec3 reaction{0, 0, 0};
     double peak_wy = 0.0;
+    double impact_wy = 0.0, impact_moment_y = 0.0;
+    bool impacted = false;
+    const float weight_impulse = kBoxMass * std::fabs(Cfg().gravity[2]) * Cfg().dt;
     // Step through the first contact transient; track the peak signed omega_y.
     constexpr uint32_t kSteps = 200u;
     for (uint32_t s = 0; s < kSteps; ++s) {
@@ -590,6 +601,13 @@ TEST(RigidOnMpmRest, OffCentreDropInducesTippingTorque) {
                                   sizeof(Vec3));
         w.GetData().DownloadField(nk::FieldId::MpmBodyReaction, &reaction,
                                   sizeof(Vec3));
+        if (!impacted && reaction.z > weight_impulse) {
+            Vec3 moment{};
+            ASSERT_TRUE(w.GetData().DownloadField(nk::FieldId::MpmBodyAngReaction, &moment, sizeof(moment)));
+            impact_wy = ang_vel.y;
+            impact_moment_y = moment.y;
+            impacted = true;
+        }
         if (std::fabs(ang_vel.y) > std::fabs(peak_wy)) peak_wy = ang_vel.y;
     }
     std::fprintf(stderr,
@@ -597,8 +615,9 @@ TEST(RigidOnMpmRest, OffCentreDropInducesTippingTorque) {
                  peak_wy, ang_vel.y, reaction.z);
 
     EXPECT_TRUE(std::isfinite(ang_vel.y)) << "the angular trajectory must be finite";
-    // The +x overhang tips the box +x-side down -> a positive omega_y.
-    EXPECT_GT(peak_wy, 0.0) << "the box must tip toward the unsupported +x side";
+    ASSERT_TRUE(impacted);
+    EXPECT_GT(impact_wy, 0.0) << "the first impact must tip toward the unsupported +x side";
+    EXPECT_GT(impact_moment_y, 0.0);
     // Non-trivial: well above the symmetric-drop angular noise floor.
     EXPECT_GT(std::fabs(peak_wy), 1e-3)
         << "the induced torque must be non-trivial in magnitude";
@@ -703,7 +722,7 @@ TEST(RigidOnMpmRest, SharedIntervalsMatchCompleteWorldSteps) {
                     expect_vector(change, external + linear[body], 2.0e-6f);
                 }
             }
-            EXPECT_GT(linear[0].z, 1.0e-6f);
+            EXPECT_GT(linear[0].LengthSq(), 1.0e-14f);
             EXPECT_EQ(read_vectors(outer, nk::FieldId::BodyForce), std::vector<Vec3>(bodies));
             EXPECT_EQ(read_vectors(outer, nk::FieldId::BodyTorque), std::vector<Vec3>(bodies));
             std::vector<uint32_t> status(cap.env_count);

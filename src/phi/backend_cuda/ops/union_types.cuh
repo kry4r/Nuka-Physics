@@ -56,8 +56,11 @@ struct PointMassView {
     }
     __device__ Contribution At(const NkRowSide& side, uint32_t term) const {
         if (side.kind != nk::kNkSidePointEndpoint) return {side.kind, side.index, side.jlin};
-        const auto& entry = terms[ranges[side.index].first + term];
-        return {entry.kind, entry.index, entry.TransposeMultiply(side.jlin)};
+        const auto range = ranges[side.index];
+        const auto* entries = terms + range.first;
+        const auto projection = nk::ProjectPointEndpoint(entries, range.count, side.jlin);
+        const auto& entry = entries[term];
+        return {entry.kind, entry.index, projection.At(entries, term, side.jlin)};
     }
 
     __device__ const float* InverseMass(uint32_t kind) const {
@@ -110,12 +113,14 @@ struct PointMassView {
             return result;
         }
         const nk::PointEndpointRange range = ranges[side.index];
+        const auto* entries = terms + range.first;
+        const auto projection = nk::ProjectPointEndpoint(entries, range.count, side.jlin);
 #pragma unroll 4
         for (uint32_t i = 0u; i < range.count; ++i) {
-            const auto& entry = terms[range.first + i];
+            const auto& entry = entries[i];
             const auto* velocity = Velocity(entry.kind);
             if (velocity != nullptr)
-                result += entry.TransposeMultiply(side.jlin).Dot(velocity[entry.index]);
+                result += projection.At(entries, i, side.jlin).Dot(velocity[entry.index]);
         }
         return result;
     }

@@ -327,8 +327,9 @@ TEST(PointEndpoint, OffsetTrianglePreservesRigidMotionAndMomentumUnderWorldTrans
     };
     const uint32_t indices[3] = {0u, 1u, 2u};
     const Vec3 local[3] = {{0, 0, 0}, {.0014f, -.0001f, .0003f}, {.0005f, .0014f, .0005f}};
-    const Vec3 bary{.2f, .3f, .5f}, offset{.0015f, -.002f, .0035f};
+    const Vec3 bary{.2f, .3f, .5f};
     const D omega{.7, .2, -.4}, translation{.12, -.03, .04};
+    for (const Vec3 offset : {Vec3{.0015f, -.002f, .0035f}, Vec3{.012f, -.016f, .028f}})
     for (const Vec3 origin : {Vec3{.0423f, -.0197f, .3001f}, Vec3{.3f, -.2f, .6f}, Vec3{30, -20, 60}}) {
         Vec3 positions[3];
         for (uint32_t i = 0u; i < 3u; ++i) positions[i] = origin + local[i];
@@ -360,10 +361,12 @@ TEST(PointEndpoint, OffsetTrianglePreservesRigidMotionAndMomentumUnderWorldTrans
             EXPECT_NEAR(endpoint_velocity[c], translation[c] + spin[c], 2e-6);
         for (const D impulse : {D{1, 0, 0}, D{.3, -.4, .866}, D{.7, .2, -.3}}) {
             D linear{}, angular{};
+            const Vec3 direction{static_cast<float>(impulse[0]), static_cast<float>(impulse[1]),
+                static_cast<float>(impulse[2])};
+            const auto projection = nk::ProjectPointEndpoint(terms, 3u, direction);
             for (uint32_t i = 0u; i < 3u; ++i) {
                 const D radius{double(positions[i].x)-origin.x, double(positions[i].y)-origin.y, double(positions[i].z)-origin.z};
-                const Vec3 mapped = terms[i].TransposeMultiply({static_cast<float>(impulse[0]),
-                    static_cast<float>(impulse[1]), static_cast<float>(impulse[2])});
+                const Vec3 mapped = projection.At(terms, i, direction);
                 const D force{mapped.x, mapped.y, mapped.z};
                 for (uint32_t axis = 0u; axis < 3u; ++axis) {
                     linear[axis] += force[axis];
@@ -373,7 +376,7 @@ TEST(PointEndpoint, OffsetTrianglePreservesRigidMotionAndMomentumUnderWorldTrans
             }
             const D torque = cross(contact, impulse);
             for (uint32_t c = 0u; c < 3u; ++c) {
-                EXPECT_NEAR(linear[c], impulse[c], 2e-6);
+                EXPECT_NEAR(linear[c], impulse[c], 2e-7);
                 EXPECT_NEAR(angular[c], torque[c], 2e-8);
             }
         }
