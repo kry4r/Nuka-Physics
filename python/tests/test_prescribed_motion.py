@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from nuka.geometry import cone_mesh
+from nuka.geometry import cone_mesh, ellipsoid_mesh
 from nuka.motion import JointMotion
 
 
@@ -54,3 +54,23 @@ def test_cone_support_bound_and_closed_outward_surface():
     edges = np.concatenate([mesh.triangles[:, [0, 1]], mesh.triangles[:, [1, 2]], mesh.triangles[:, [2, 0]]])
     _, counts = np.unique(np.sort(edges, axis=1), axis=0, return_counts=True)
     assert np.all(counts == 2)
+
+
+def test_ellipsoid_support_bound_and_closed_outward_surface():
+    axes, tolerance = np.array([.2, .08, .05]), 1e-4
+    mesh = ellipsoid_mesh(axes, max_error=tolerance)
+    assert mesh.error_bound <= tolerance
+    direction = np.random.default_rng(2).normal(size=(300, 3))
+    direction /= np.linalg.norm(direction, axis=1, keepdims=True)
+    exact = np.linalg.norm(direction * axes, axis=1)
+    polygon = (direction @ mesh.vertices.T).max(axis=1)
+    assert np.min(exact - polygon) >= -1e-15
+    assert np.max(exact - polygon) <= mesh.error_bound + 1e-15
+    np.testing.assert_allclose(np.linalg.norm(mesh.vertices / axes, axis=1), 1, atol=1e-15)
+    faces = mesh.vertices[mesh.triangles]
+    normal = np.cross(faces[:, 1] - faces[:, 0], faces[:, 2] - faces[:, 0])
+    assert np.all(np.einsum('ij,ij->i', normal, faces[:, 0]) > 0)
+    edges = np.concatenate([mesh.triangles[:, [0, 1]], mesh.triangles[:, [1, 2]], mesh.triangles[:, [2, 0]]])
+    unique, counts = np.unique(np.sort(edges, axis=1), axis=0, return_counts=True)
+    assert np.all(counts == 2)
+    assert len(mesh.vertices) - len(unique) + len(mesh.triangles) == 2

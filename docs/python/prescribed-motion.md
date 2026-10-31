@@ -51,3 +51,11 @@ cone. The cone points along +Z, with base at `-half_height` and tip at
 Hausdorff/support error bound `radius * (1 - cos(pi / sides))`. Preserve the
 original solid's mass, COM and inertia when exporting a dynamic cone. This
 geometric bound does not establish equal contact forces between different laws.
+
+`nuka.geometry.ellipsoid_mesh(semiaxes, max_error=...)` provides the same closed
+mesh contract for a centered ellipsoid with three positive semiaxes. It refines
+an inscribed unit octahedron until the largest semiaxis times its radial error
+bound meets the requested tolerance. The bound covers solid Hausdorff distance
+and support function error. Preserve the original mass, COM and inertia, and
+reserve part of the error budget for any later vertex quantization or export
+rounding. Triangle count can grow substantially at small tolerances.
