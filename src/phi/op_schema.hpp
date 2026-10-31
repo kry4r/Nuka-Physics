@@ -514,8 +514,6 @@ struct NarrowphaseBodyParticleParams {
     // [0, particle_row_base) couples via the grid, NOT rows; it owns no reserved
     // slots (the cook exempts it from the budget). 0 for every other mode.
     uint32_t particle_row_base;
-    uint32_t excluded_particle_begin;
-    uint32_t excluded_particle_count;
     // Vertex-block particles take their surface thickness and a motion-bounded query, and skip meshed bodies.
     uint32_t vbd_particle_begin;
     uint32_t vbd_particle_count;
@@ -672,7 +670,7 @@ struct RecordTelemetryParams {
 };
 
 // Environments of rigid bodies and articulations without particles or grid nodes solve as one warp tile each,
-// a lane holding up to two coordinates; only the tiles run position iterations.
+// a lane holding up to two coordinates.
 inline bool BlockDescentTileRoute(uint32_t particles, uint32_t grid_nodes, uint32_t blocks, uint32_t max_dof) {
     return particles == 0u && grid_nodes == 0u && blocks > 0u && max_dof <= kMaxArticulationDof;
 }
@@ -722,6 +720,15 @@ struct ClothStepParams {
     VertexBlockLayout layout;
     uint32_t integrator;
     uint32_t truncation;  // nonzero when displacement truncation precedes the finalize
+    uint32_t position_pass = 0u;
+};
+
+struct ClothContactRestartParams {
+    ClothStepParams step{};
+    uint32_t contacts_per_env = 0u;
+    uint32_t bodies_per_env = 0u;
+    uint32_t links_per_env = 0u;
+    uint32_t artics_per_env = 0u;
 };
 
 // Non-MPM particles share one projected position buffer and one step-start position.
@@ -772,6 +779,10 @@ struct ReadoutEnergyLedgerParams {
     uint32_t substeps = 1u;
     uint32_t slot = 0u;
     uint32_t particles_per_env = 0u;
+    uint32_t mpm_particles_per_env = 0u;
+    uint32_t point_endpoints_per_env = 0u;
+    float floor_normal[3]{};
+    float floor_d = 0.0f;
     uint32_t surfaces_per_env = 0u;
     uint32_t vbd_begin = 0u;
     uint32_t vbd_vertices = 0u;

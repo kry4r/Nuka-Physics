@@ -397,8 +397,12 @@ TEST(RigidOnMpmRest, MaterialPointGapAndThinColliderUseFinalVelocity) {
     if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
     for (float mass : {0.1f, 1.0f, 1000.0f}) {
         for (float dt : {0.001f, 0.002f}) {
-            for (float gap : {-0.001f, 0.0f, 0.004f, 0.03f}) {
-                SCOPED_TRACE(::testing::Message() << "mass=" << mass << " dt=" << dt << " gap=" << gap);
+            for (uint32_t variant = 0u; variant < 8u; ++variant) {
+                const float gaps[] = {-0.001f, 0.0f, 0.004f, 0.03f};
+                const float gap = gaps[variant % 4u];
+                const bool split = variant >= 4u;
+                SCOPED_TRACE(::testing::Message() << "mass=" << mass << " dt=" << dt << " gap=" << gap
+                                                << " split=" << split);
                 auto model = FiniteMassImpact(mass, 1u, nk::kMpmStencilNodes);
                 const float half = 0.002f, band = 0.002f, incoming = -10.0f, recovery_speed = 1.0f;
                 model.body_init[0].pose.position.x = 0.013f;
@@ -412,9 +416,13 @@ TEST(RigidOnMpmRest, MaterialPointGapAndThinColliderUseFinalVelocity) {
                 config.dt = dt;
                 config.gravity[2] = 0.0f;
                 config.pos_slop = 0.0f;
+                config.pos_iters = split ? 32u : 0u;
                 config.velocity_iterations_override = true;
+                const double correction = split ? std::min(config.pos_beta * std::max(-gap, 0.0f),
+                    model.baumgarte_max_velocity * dt) : 0.0;
                 nk::World world(std::move(model), 1u, backend.dev, backend.backend, config);
                 ASSERT_TRUE(world.Ready()) << world.CreationError();
+                ASSERT_NE(world.FieldPtr(nk::FieldId::ContactAuditMetrics), nullptr);
                 ASSERT_EQ(world.VelocityIterations(), config.vel_iters);
                 ASSERT_TRUE(world.Step().AllOk());
                 EXPECT_EQ(ReadValues<uint32_t>(world, nk::FieldId::EnvStatus)[0], 0u);
@@ -422,19 +430,27 @@ TEST(RigidOnMpmRest, MaterialPointGapAndThinColliderUseFinalVelocity) {
                 const auto particle_velocity = ReadValues<Vec3>(world, nk::FieldId::ParticleVel)[0];
                 const auto body = ReadValues<Transform>(world, nk::FieldId::BodyPose)[0];
                 const auto body_velocity = ReadValues<Vec3>(world, nk::FieldId::BodyLinearVelocity)[0];
-                const double target = std::min(std::max(-double(gap), 0.0) / dt, double(recovery_speed)) -
+                const double target = (split ? 0.0 : std::min(std::max(-double(gap), 0.0) / dt, double(recovery_speed))) -
                     std::max(double(gap), 0.0) / dt;
                 const double impulse = std::max(0.0, (target - incoming)
                     / (1.0 + 1.0 / mass));
                 EXPECT_NEAR(particle_velocity.x, incoming + impulse, 3.0e-5);
                 EXPECT_NEAR(body_velocity.x, -impulse / mass, 3.0e-5);
                 EXPECT_NEAR(particle_velocity.x + mass * body_velocity.x, incoming, 3.0e-5);
-                EXPECT_NEAR(point.x, initial + particle_velocity.x * dt, 3.0e-7f);
-                EXPECT_NEAR(body.position.x, 0.013f + body_velocity.x * dt, 3.0e-7f);
+                EXPECT_NEAR(point.x, initial + particle_velocity.x * dt + correction / (1.0 + 1.0 / mass), 3.0e-7f);
+                EXPECT_NEAR(body.position.x, 0.013f + body_velocity.x * dt - correction / (1.0 + mass), 3.0e-7f);
                 EXPECT_LE(particle_velocity.LengthSq() + mass * body_velocity.LengthSq(), incoming * incoming + 1.0e-4f);
-                EXPECT_GE(point.x - body.position.x - half, -2.0e-7f);
+                EXPECT_GE(point.x - body.position.x - half, (split ? std::min(gap, 0.0f) : 0.0f) - 2.0e-7f);
                 EXPECT_NEAR(point.x - body.position.x - half,
-                            gap + std::max(double(incoming), target) * dt, 3.0e-7f);
+                            gap + std::max(double(incoming), target) * dt + correction, 3.0e-7f);
+                const auto audit_counts = ReadValues<uint32_t>(world, nk::FieldId::ContactAuditCounts);
+                const auto audit_metrics = ReadValues<uint64_t>(world, nk::FieldId::ContactAuditMetrics);
+                EXPECT_EQ(audit_counts[static_cast<uint32_t>(nk::ContactAuditCount::UnmeasuredGaps)], 0u);
+                const uint32_t bits = static_cast<uint32_t>(
+                    audit_metrics[static_cast<uint32_t>(nk::ContactAuditMetric::GapPenetration)] >> 32u);
+                float penetration = 0.0f;
+                std::memcpy(&penetration, &bits, sizeof(penetration));
+                EXPECT_NEAR(penetration, std::max(half + body.position.x - point.x, 0.0f), 3.0e-7f);
             }
         }
     }

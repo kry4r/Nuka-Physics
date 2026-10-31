@@ -43,9 +43,6 @@ void RowCouplingProvider::PreCouple(const CouplingBuildCtx& ctx) const {
     p_np_body_particle.contact_margin = ctx.contact_margin;
     // Grid-owned particles do not emit body-particle manifolds.
     p_np_body_particle.particle_row_base = ctx.n_mpm;
-    const bool vbd_rows = model.capacities.analytic_collidable_bodies > 0u;
-    p_np_body_particle.excluded_particle_begin = model.capacities.vbd_particle_begin;
-    p_np_body_particle.excluded_particle_count = vbd_rows ? 0u : model.capacities.vbd_vertices_per_env;
     p_np_body_particle.vbd_particle_begin = model.capacities.vbd_particle_begin;
     p_np_body_particle.vbd_particle_count = model.capacities.vbd_vertices_per_env;
     p_np_body_particle.particle_surfaces = model.capacities.particle_surfaces_per_env;
@@ -83,9 +80,7 @@ void RowCouplingProvider::PreCouple(const CouplingBuildCtx& ctx) const {
     } else {
         p_np_body_particle.has_heightfield = 0u;
     }
-    if (model.capacities.vbd_vertices_per_env == 0u || vbd_rows ||
-        ctx.particles_per_env - ctx.n_mpm > model.capacities.vbd_vertices_per_env)
-        ctx.Emit(phi::NkOp::NarrowphaseBodyParticle, &p_np_body_particle);
+    ctx.Emit(phi::NkOp::NarrowphaseBodyParticle, &p_np_body_particle);
 }
 
 void RowCouplingProvider::Couple(const CouplingBuildCtx&) const {

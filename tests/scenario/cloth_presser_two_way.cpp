@@ -1,31 +1,11 @@
-// ---------------------------------------------------------------------------
-// Cloth <-> presser TWO-WAY coupling on the ONE general row solver.
-//
-// A real VBD cloth grid (24x24 = 576 particles) drapes over a low static ridge
-// above a ground plane, then a simple rigid body presses it. The cloth particles
-// are SPHERE collidables flowing through the SAME body<->particle row solver a
-// foot uses on the ground: detection -> body<->particle narrowphase -> emit ->
-// BlockDescentSolve -> particle finalize. No bespoke coupler: the
-// presser is a general rigid body, the cloth is particles, both on one path.
-//
-// The two directions of the two-way effect, proven numerically:
-//   (a) CLOTH DIPS: the min particle z under a kinematically lowered presser
-//       drops measurably below the settled drape rest, then RECOVERS toward rest
-//       when the presser lifts (the cloth springs back).
-//   (b) PRESSER IS RESISTED: a DYNAMIC presser released onto the drape is arrested
-//       (its z stays well above a no-cloth control that keeps falling to the ridge)
-//       AND a body<->particle row carries a body-side normal lambda > 0 -- the
-//       reaction the cloth pushes back into the body. The control proves the arrest
-//       is the cloth, not gravity alone.
-//   Every coupling row asserted has exactly one side kind == kNkSideParticle, so the
-//   contact is the general body<->particle path, not a special-cased coupler.
-// ---------------------------------------------------------------------------
+// Cloth deformation, recovery, and rigid reaction share the general row solver.
+// A free drape spans two ridges; a presser supplies kinematic and dynamic loads.
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -86,6 +66,7 @@ nk::Pipeline::SolverConfig Cfg() {
     cfg.gravity[0] = 0.0f; cfg.gravity[1] = 0.0f; cfg.gravity[2] = -9.81f;
     cfg.contact_margin = 0.0f;
     cfg.vel_iters = 32u;
+    cfg.velocity_iterations_override = true;
     cfg.pos_iters = 0u;
     cfg.max_pairs = 64u;
     return cfg;
@@ -179,14 +160,13 @@ cook::VbdCookInput BuildCloth() {
     soft::BuildClothVertexBlocks(rest, tris, {}, {}, std::vector<soft::ShellMaterial>(tris.size(), shell),
                                  in.vbd_elements);
     in.vbd_count = static_cast<uint32_t>(rest.size());
-    in.half_thickness.assign(rest.size(), 0.0f);
+    in.half_thickness.assign(rest.size(), 0.5f * kContactDMin);
     in.friction.assign(rest.size(), 0.6f);
     return in;
 }
 
-// Cook ground + two ridges + a presser sphere + the cloth into ONE model;
-// CookVbdParticles grows the rigid budget additively for the body<->particle reserve.
-// presser_inv_mass picks kinematic(0)/dynamic(>0); the resist test passes a gap radius.
+// The rigid and cloth geometry use one model and a shared contact row budget.
+// Zero inverse mass drives the presser kinematically; positive mass permits reaction.
 nk::Model BuildScene(const Vec3& presser_pos, float presser_inv_mass,
                      float presser_radius = kPresserRadius) {
     nk::Model m;
@@ -212,18 +192,36 @@ nk::Model BuildScene(const Vec3& presser_pos, float presser_inv_mass,
     return m;
 }
 
-// NkRow packs to 26 f32: [0]=flags [7]=upper, a.kind [10] a.index [11],
-// b.kind [18] b.index [19].
-struct RowSides { uint32_t a_kind, b_kind; bool active; float upper; uint32_t flags; };
-RowSides DecodeRow(const std::vector<float>& urows, uint32_t row) {
-    const float* r = urows.data() + static_cast<size_t>(row) * 26u;
-    auto u = [&](int i) { uint32_t v; std::memcpy(&v, &r[i], 4); return v; };
-    RowSides s;
-    s.active = (u(0) & 1u) != 0u;
-    s.flags = u(0);
-    s.upper = r[7];
-    s.a_kind = u(10); s.b_kind = u(18);
-    return s;
+struct PresserReaction {
+    float maximum_normal_impulse = 0.0f;
+    uint32_t particle_rows = 0u;
+};
+
+PresserReaction ReadPresserReaction(nk::World& w, std::vector<nk::NkRow>& rows,
+                                    std::vector<float>& lambda) {
+    const uint32_t count = w.GetModel().capacities.max_rows_per_env;
+    rows.resize(count);
+    lambda.resize(count);
+    EXPECT_TRUE(w.GetData().DownloadField(nk::FieldId::Urows, rows.data(),
+                                          rows.size() * sizeof(nk::NkRow)));
+    EXPECT_TRUE(w.GetData().DownloadField(nk::FieldId::Lambda, lambda.data(),
+                                          lambda.size() * sizeof(float)));
+    PresserReaction reaction;
+    for (uint32_t i = 0u; i < count; ++i) {
+        const nk::NkRow& row = rows[i];
+        if (!(row.flags & nk::nk_row_flags::kActive)) continue;
+        const bool a_particle = row.a.kind == nk::kNkSideParticle;
+        const bool b_particle = row.b.kind == nk::kNkSideParticle;
+        if (!(a_particle || b_particle)) continue;
+        EXPECT_FALSE(a_particle && b_particle) << "row has two particle sides";
+        const nk::NkRowSide& body = a_particle ? row.b : row.a;
+        if (body.kind != nk::kNkSideRigid || body.index != kPresserBody) continue;
+        ++reaction.particle_rows;
+        if (row.flags & nk::nk_row_flags::kBlockNormal)
+            reaction.maximum_normal_impulse =
+                std::max(reaction.maximum_normal_impulse, lambda[i]);
+    }
+    return reaction;
 }
 
 // Min particle z over the cloth whose xy lies within reach of the presser sphere
@@ -267,9 +265,7 @@ void DrivePresser(nk::World& w, const Vec3& target) {
 
 }  // namespace
 
-// (a) the cloth dips under a lowered presser then recovers when it lifts. The
-// presser is kinematic (its motion is scripted); the cloth's two-way response (dip
-// + spring-back) flows entirely through the body<->particle rows.
+// A kinematic presser indents the settled drape, then lifts to permit recovery.
 TEST(ClothPresserTwoWay, ClothDipsUnderPresserThenRecovers) {
     if (GetBackend().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
     Backend b = GetBackend();
@@ -281,19 +277,28 @@ TEST(ClothPresserTwoWay, ClothDipsUnderPresserThenRecovers) {
     ASSERT_TRUE(w.Ready());
 
     // SETTLE: presser parked high, cloth drapes over the ridge.
-    for (uint32_t s = 0; s < kSettleSteps; ++s) { DrivePresser(w, Vec3{0, 0, top}); w.Step(); }
+    for (uint32_t s = 0; s < kSettleSteps; ++s) { DrivePresser(w, Vec3{0, 0, top}); EXPECT_TRUE(w.Step().AllOk()); }
     std::vector<Vec3> settled;
     DownloadParticles(w, &settled);
     const float rest_min_z = MinZUnderPresser(settled, presser_xy);
 
-    // The gap accommodates the sphere and the cloth's collision thickness.
-    const float bottom = kRidgeTopZ - 0.02f + kPresserRadius;  // sphere center ~0.14.
+    const float indentation = 0.025f;
+    const float bottom = rest_min_z + 0.5f * kContactDMin + kPresserRadius - indentation;
     for (uint32_t s = 0; s < 200u; ++s) {
         const float t = static_cast<float>(s) / 199.0f;
         DrivePresser(w, Vec3{0, 0, top + (bottom - top) * t});
-        w.Step();
+        EXPECT_TRUE(w.Step().AllOk());
     }
-    for (uint32_t s = 0; s < 150u; ++s) { DrivePresser(w, Vec3{0, 0, bottom}); w.Step(); }
+    std::vector<nk::NkRow> rows;
+    std::vector<float> lambda;
+    float maximum_impulse = 0.0f;
+    for (uint32_t s = 0; s < 150u; ++s) {
+        DrivePresser(w, Vec3{0, 0, bottom});
+        EXPECT_TRUE(w.Step().AllOk());
+        maximum_impulse = std::max(maximum_impulse,
+            ReadPresserReaction(w, rows, lambda).maximum_normal_impulse);
+    }
+    EXPECT_GT(maximum_impulse, 0.0f) << "the prescribed motion applied no contact load";
     std::vector<Vec3> pressed;
     DownloadParticles(w, &pressed);
     const float pressed_min_z = MinZUnderPresser(pressed, presser_xy);
@@ -302,18 +307,19 @@ TEST(ClothPresserTwoWay, ClothDipsUnderPresserThenRecovers) {
     for (uint32_t s = 0; s < 200u; ++s) {
         const float t = static_cast<float>(s) / 199.0f;
         DrivePresser(w, Vec3{0, 0, bottom + (top - bottom) * t});
-        w.Step();
+        EXPECT_TRUE(w.Step().AllOk());
     }
-    for (uint32_t s = 0; s < 250u; ++s) { DrivePresser(w, Vec3{0, 0, top}); w.Step(); }
+    for (uint32_t s = 0; s < 250u; ++s) { DrivePresser(w, Vec3{0, 0, top}); EXPECT_TRUE(w.Step().AllOk()); }
     std::vector<Vec3> recovered;
     DownloadParticles(w, &recovered);
     const float recovered_min_z = MinZUnderPresser(recovered, presser_xy);
 
     std::fprintf(stderr,
                  "[cloth-presser] rest_min_z=%.4f pressed_min_z=%.4f "
-                 "recovered_min_z=%.4f (dip=%.4f recovery=%.4f)\n",
+                 "recovered_min_z=%.4f (dip=%.4f recovery=%.4f) impulse=%.8g\n",
                  rest_min_z, pressed_min_z, recovered_min_z,
-                 rest_min_z - pressed_min_z, recovered_min_z - pressed_min_z);
+                 rest_min_z - pressed_min_z, recovered_min_z - pressed_min_z,
+                 maximum_impulse);
 
     ASSERT_TRUE(std::isfinite(rest_min_z) && std::isfinite(pressed_min_z) &&
                 std::isfinite(recovered_min_z));
@@ -325,38 +331,30 @@ TEST(ClothPresserTwoWay, ClothDipsUnderPresserThenRecovers) {
         << "the cloth did not recover after the presser lifted";
 }
 
-// (b) a DYNAMIC presser released onto the drape is ARRESTED by the cloth (vs a
-// no-cloth control that falls through the gap to the ground) AND a body<->particle
-// row carries a body-side normal lambda > 0 -- the reaction direction of the two-way.
+// A dynamic presser transfers contact impulse to the cloth and rests above a control.
 TEST(ClothPresserTwoWay, DynamicPresserIsResistedByCloth) {
     if (GetBackend().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
     Backend b = GetBackend();
 
     const Vec3 center{0.0f, 0.0f, 0.0f};
-    // A lighter, wider probe: the condim=3 elliptic cone carries less peak
-    // tangential grip than the legacy pyramid, so capture must come from the
-    // drape's tension arc (ball wider than a mesh cell) rather than edge
-    // friction; the reduced mass keeps the impact inside that regime.
+    // A probe wider than a mesh cell is supported by the drape's tension arc.
     const float inv_mass = 1.0f / 0.35f;
     // A gap-fitting presser (radius < half the ridge gap): WITHOUT the cloth it falls
     // clean through the gap to the ground; WITH the cloth it is caught by the drape.
     const float resist_radius = 0.038f;
 
-    // Drops a DYNAMIC presser (built dynamic from the start, parked far in xy during
-    // settle so it lands away from the cloth) onto the center from `release_z`, runs
-    // it, and returns its final z + the deepest body<->particle normal reaction. With
-    // `cloth_present` false the cloth is sunk far below so only the ground stops it.
+    // Settle the presser away from the cloth, then drop it onto the drape.
+    // The control moves the cloth below reach and measures the unopposed fall.
     auto drop_presser = [&](bool cloth_present, float* out_lambda,
                             uint32_t* out_particle_rows) -> float {
         nk::Model m = BuildScene(Vec3{2.0f, 2.0f, resist_radius}, inv_mass,
                                  resist_radius);
         if (!cloth_present)
             for (Vec3& p : m.particles.initial_pos) p.z -= 10.0f;  // cloth out of reach.
-        const uint32_t rows = m.capacities.max_rows_per_env;
         nk::World w(std::move(m), 1u, b.dev, b.backend, Cfg());
         if (!w.Ready()) return 1e9f;
         // Settle the cloth while the presser falls to rest far away (x=2).
-        for (uint32_t s = 0; s < kSettleSteps; ++s) w.Step();
+        for (uint32_t s = 0; s < kSettleSteps; ++s) EXPECT_TRUE(w.Step().AllOk());
         const float drape_top = [&] {
             std::vector<Vec3> s; DownloadParticles(w, &s);
             return MinZUnderPresser(s, center);
@@ -372,25 +370,15 @@ TEST(ClothPresserTwoWay, DynamicPresserIsResistedByCloth) {
         d.UploadField(nk::FieldId::BodyLinearVelocity, &zero, sizeof(Vec3), kVec3Off);
         d.UploadField(nk::FieldId::BodyAngularVelocity, &zero, sizeof(Vec3), kVec3Off);
 
-        std::vector<float> urows(static_cast<size_t>(rows) * 26u, 0.0f);
-        std::vector<float> lambda(rows, 0.0f);
+        std::vector<nk::NkRow> urows;
+        std::vector<float> lambda;
         float max_lambda = 0.0f;
         uint32_t particle_rows = 0u;
         for (uint32_t s = 0; s < 300u; ++s) {
-            w.Step();
-            d.DownloadField(nk::FieldId::Urows, urows.data(), urows.size() * sizeof(float));
-            d.DownloadField(nk::FieldId::Lambda, lambda.data(), lambda.size() * sizeof(float));
-            for (uint32_t row = 0u; row < rows; ++row) {
-                const RowSides rs = DecodeRow(urows, row);
-                if (!rs.active) continue;
-                const bool a_part = rs.a_kind == nk::kNkSideParticle;
-                const bool b_part = rs.b_kind == nk::kNkSideParticle;
-                if (!(a_part || b_part)) continue;
-                EXPECT_FALSE(a_part && b_part) << "row has two particle sides";
-                ++particle_rows;
-                if (!(rs.flags & nk::nk_row_flags::kBlockNormal)) continue;
-                max_lambda = std::max(max_lambda, lambda[row]);
-            }
+            EXPECT_TRUE(w.Step().AllOk());
+            const PresserReaction reaction = ReadPresserReaction(w, urows, lambda);
+            max_lambda = std::max(max_lambda, reaction.maximum_normal_impulse);
+            particle_rows += reaction.particle_rows;
         }
         Transform got = Transform::Identity();
         d.DownloadField(nk::FieldId::BodyPose, &got, sizeof(Transform), kPoseOff);
@@ -429,8 +417,7 @@ TEST(ClothPresserTwoWay, DynamicPresserIsResistedByCloth) {
     EXPECT_GT(particle_rows_seen, 0u) << "no body<->particle coupling rows emitted";
     EXPECT_GT(body_particle_lambda, 0.0f)
         << "the cloth produced no body-side reaction impulse on the presser";
-    // The presser was ARRESTED by the cloth: it came to rest well above the no-cloth
-    // control, which falls through the gap to the ground (rest near the radius).
+    // Cloth support holds the presser above the control resting on the ground.
     EXPECT_GT(presser_z_with_cloth, presser_z_no_cloth + 0.02f)
         << "the cloth did not resist the presser (it fell as far as the no-cloth "
            "control)";

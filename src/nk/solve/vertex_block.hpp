@@ -32,6 +32,8 @@ inline constexpr uint32_t kVbdRodBend = 3u;
 // Isotropic tetrahedron: upper-triangular inverse rest edges, then the Lame pair (Pa).
 inline constexpr uint32_t kVbdTet = 4u;
 inline constexpr uint32_t kVbdNoColor = ~0u;
+inline constexpr uint32_t kVbdHistoryValid = 1u << 0;
+inline constexpr uint32_t kVbdHistoryRestart = 1u << 1;
 
 struct VbdElement {
     uint32_t kind = kVbdSpring;

@@ -354,6 +354,15 @@ struct BlockScratch {
     uint32_t* tile_incidence;
     float* articulation_pseudo;
     float* rigid_pseudo;
+    uint32_t* position_workspace;
+    uint64_t position_workspace_words;
+    NkRow* position_rows;
+    uint32_t* position_active;
+    Vec3* position_joint_angular;
+    uint32_t* position_sweeps;
+    float* position_residual;
+    uint32_t* position_colors;
+    uint64_t* position_phase_time;
     uint32_t tile_head_capacity;
     uint32_t tile_row_capacity;
     uint32_t tile_incidence_stride;
@@ -387,6 +396,24 @@ struct LargeIncidenceBound {
 };
 using LargeIncidenceBounds =
     thrust::transform_iterator<LargeIncidenceBound, thrust::counting_iterator<uint32_t>>;
+
+BlockDescentSolveParams PositionSolveParams(const BlockDescentSolveParams& physical) {
+    auto p = physical;
+    p.iterations = physical.position_iterations;
+    p.position_iterations = 0u;
+    p.vertex_blocks = {};
+    p.vertex_blocks.env_count = p.env_count;
+    p.vertex_blocks.particles_per_env = p.total_particle_count / p.env_count;
+    p.material_cells_per_env = 0u;
+    p.measure_contact_residual = 0u;
+    p.measure_vertex_audit = 0u;
+    p.clear_failure_diagnostics = 1u;
+    p.joint_limit_rows_per_env = 0u;
+    p.velocity_tolerance = 0.0f;
+    p.trace_sweeps = 0u;
+    p.telemetry = 0u;
+    return p;
+}
 
 uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScratch* result) {
     const uint64_t blocks = uint64_t{p.total_particle_count} + p.total_body_count +
@@ -622,6 +649,22 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     s.blocks = static_cast<uint32_t>(blocks);
     s.rows = static_cast<uint32_t>(rows);
     s.incidence_capacity = incidence;
+    if (!tile && p.position_iterations > 0u) {
+        s.position_workspace_words = BindScratch(PositionSolveParams(p), nullptr, nullptr);
+        if (s.position_workspace_words == 0u) return 0u;
+        at = (at + 63u) & ~uint64_t{63u};
+        s.position_workspace = take(s.position_workspace_words);
+        s.position_rows = reinterpret_cast<NkRow*>(take(rows * sizeof(NkRow) / sizeof(uint32_t)));
+        s.position_active = take(1u);
+        s.position_joint_angular = reinterpret_cast<Vec3*>(take(
+            3u * uint64_t{p.base_link_count} * p.env_count));
+        s.position_sweeps = take(p.env_count);
+        s.position_residual = reinterpret_cast<float*>(take(uint64_t{p.env_count} * kResidualClasses));
+        s.position_colors = take(uint64_t{p.env_count} * kSolverCountWords);
+        at = (at + 1u) & ~uint64_t{1u};
+        s.position_phase_time = reinterpret_cast<uint64_t*>(take(
+            2u * uint64_t{p.env_count} * kSolverPhaseWords));
+    }
     if (!fits || at > word_limit) return 0u;
     if (result != nullptr) *result = s;
     return at;
@@ -2777,7 +2820,7 @@ Status OpRecordTelemetry(const ModelView&, const DataView& data, const void* par
     return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
 }
 
-Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
+Status SolveBlockDescent(const ModelView& model, const DataView& data,
                            const void* params, cudaStream_t stream) {
     const auto* p = static_cast<const BlockDescentSolveParams*>(params);
     if (p == nullptr || !(p->dt > 0.0f) || p->iterations == 0u || p->env_count == 0u)
@@ -3149,6 +3192,145 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
         LaunchWork(WriteBlockJointLimitImpulsesKernel, p->base_link_count * p->env_count,
             kThreads, stream, data, *p) != cudaSuccess) return Status::Failed;
     return MeasureAndRecord(model, data, *p, s, true, stream);
+}
+
+__global__ void InitializePositionRowsKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
+    const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
+    for (uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x; slot < s.rows;
+         slot += gridDim.x * blockDim.x) {
+        const NkRow row = rows[slot];
+        NkRow position{};
+        const uint32_t excluded = nk::nk_row_flags::kFriction | nk::nk_row_flags::kBlockTangent |
+            nk::nk_row_flags::kVelocityOnly | nk::nk_row_flags::kMuJoCo | nk::nk_row_flags::kMaterialBlock;
+        const uint32_t kinds = nk::nk_row_flags::kContactNormal | nk::nk_row_flags::kJointLimit;
+        if ((row.flags & nk::nk_row_flags::kActive) != 0u && (row.flags & excluded) == 0u &&
+            (row.flags & kinds) != 0u) {
+            const float slop = (row.flags & nk::nk_row_flags::kSpeculative) != 0u ? 0.0f : p.position_slop;
+            const float penetration = data.row_penetration[slot];
+            if (penetration > slop || data.lambda[slot] != 0.0f) {
+                position = row;
+                position.flags = nk::nk_row_flags::kActive | (row.flags & kinds);
+                position.group_first = slot;
+                position.group_normal_count = 1u;
+                const float bias = fminf(p.position_beta * fmaxf(penetration - slop, 0.0f) / p.dt,
+                                         p.position_max_velocity);
+                position.rhs = bias / p.dt;
+                position.compliance_alpha = 0.0f;
+                position.lower = 0.0f;
+                position.upper = FLT_MAX;
+                position.mu = position.friction_secondary = 0.0f;
+                if (bias > 0.0f) atomicExch(s.position_active, 1u);
+            }
+        }
+        s.position_rows[slot] = position;
+        data.row_pseudo_lambda[slot] = 0.0f;
+    }
+}
+
+__global__ void FinishPositionArticulationsKernel(ModelView model, DataView data,
+                                                  BlockDescentSolveParams p, BlockScratch s) {
+    const uint32_t links = p.base_link_count * p.env_count;
+    auto* pseudo = reinterpret_cast<LinkSpatialVel*>(data.link_velocity_pseudo);
+    for (uint32_t link = blockIdx.x * blockDim.x + threadIdx.x; link < links;
+         link += gridDim.x * blockDim.x) {
+        if (model.joint_type[link] != static_cast<uint32_t>(ArticulationJointType::Spherical)) continue;
+        const Vec3 spin = s.position_joint_angular[link];
+        pseudo[link].v[0] = spin.x;
+        pseudo[link].v[1] = spin.y;
+        pseudo[link].v[2] = spin.z;
+    }
+}
+
+Status SolvePositionSystem(const ModelView& model, const DataView& data,
+                            BlockDescentSolveParams p, BlockScratch s, cudaStream_t stream) {
+    auto position = PositionSolveParams(p);
+    position.workspace_words = s.position_workspace_words;
+    DataView view = data;
+    view.block_descent_scratch = s.position_workspace;
+    view.urows = reinterpret_cast<float*>(s.position_rows);
+    view.lambda = data.row_pseudo_lambda;
+    view.particle_vel = data.particle_pseudo_vel;
+    view.particle_response = nullptr;
+    view.particle_row_impulse = nullptr;
+    view.grid_velocity = data.grid_pseudo_vel;
+    view.body_linear_velocity = data.body_pseudo_linear_velocity;
+    view.body_angular_velocity = data.body_pseudo_angular_velocity;
+    view.qdot = data.qdot_pseudo;
+    view.qdot_flat = data.qdot_pseudo_flat;
+    view.link_velocity = data.link_velocity_pseudo;
+    view.joint_angular_velocity = s.position_joint_angular;
+    view.vbd_velocity_sweep_count = s.position_sweeps;
+    view.solver_residual = s.position_residual;
+    view.solver_color_counts = s.position_colors;
+    view.solver_phase_time = s.position_phase_time;
+    const Status result = SolveBlockDescent(model, view, &position, stream);
+    if (result != Status::Ok) return result;
+    return LaunchWork(FinishPositionArticulationsKernel, p.base_link_count * p.env_count, kThreads,
+        stream, model, data, p, s) == cudaSuccess ? Status::Ok : Status::Failed;
+}
+
+__global__ void SetPositionConditionKernel(BlockScratch s, cudaGraphConditionalHandle condition) {
+    if (threadIdx.x == 0u) cudaGraphSetConditional(condition, *s.position_active != 0u);
+}
+
+Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
+                           const void* params, cudaStream_t stream) {
+    const Status physical = SolveBlockDescent(model, data, params, stream);
+    if (physical != Status::Ok) return physical;
+    const auto p = *static_cast<const BlockDescentSolveParams*>(params);
+    if (p.position_iterations == 0u || DenseTileRoute(p)) return Status::Ok;
+    BlockScratch s{};
+    if (BindScratch(p, data.block_descent_scratch, &s) == 0u) return Status::InvalidArgument;
+    const size_t links = size_t{p.base_link_count} * p.env_count;
+    WordSpans cleared;
+    cleared.Fill(data.particle_pseudo_vel, size_t{p.total_particle_count} * sizeof(Vec3));
+    cleared.Fill(data.grid_pseudo_vel, size_t{p.total_grid_count} * sizeof(Vec3));
+    cleared.Fill(data.body_pseudo_linear_velocity, size_t{p.total_body_count} * sizeof(Vec3));
+    cleared.Fill(data.body_pseudo_angular_velocity, size_t{p.total_body_count} * sizeof(Vec3));
+    cleared.Fill(data.qdot_pseudo, links * sizeof(float));
+    cleared.Fill(data.link_velocity_pseudo, links * sizeof(LinkSpatialVel));
+    cleared.Fill(data.qdot_pseudo_flat, size_t{p.articulation_count} * p.max_dof * sizeof(float));
+    cleared.Fill(s.position_joint_angular, links * sizeof(Vec3));
+    cleared.Fill(s.position_active, sizeof(uint32_t));
+    if (LaunchWordSpans(cleared, stream) != cudaSuccess ||
+        LaunchWork(InitializePositionRowsKernel, s.rows, kThreads, stream, data, p, s) != cudaSuccess)
+        return Status::Failed;
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess) return Status::Failed;
+    if (capture != cudaStreamCaptureStatusActive) {
+        uint32_t active = 0u;
+        if (cudaMemcpyAsync(&active, s.position_active, sizeof(active), cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+            cudaStreamSynchronize(stream) != cudaSuccess) return Status::Failed;
+        return active != 0u ? SolvePositionSystem(model, data, p, s, stream) : Status::Ok;
+    }
+    cudaGraph_t graph = nullptr;
+    cudaGraphConditionalHandle condition{};
+    if (cudaStreamGetCaptureInfo(stream, &capture, nullptr, &graph) != cudaSuccess ||
+        cudaGraphConditionalHandleCreate(&condition, graph, 0u, 0u) != cudaSuccess)
+        return Status::Failed;
+    LaunchCuda(SetPositionConditionKernel, dim3(1u), dim3(1u), 0u, stream, s, condition);
+    if (cudaGetLastError() != cudaSuccess) return Status::Failed;
+    const cudaGraphNode_t* dependencies = nullptr;
+    const cudaGraphEdgeData* edges = nullptr;
+    size_t dependency_count = 0u;
+    if (cudaStreamGetCaptureInfo(stream, &capture, nullptr, &graph, &dependencies, &edges,
+            &dependency_count) != cudaSuccess) return Status::Failed;
+    cudaGraphNodeParams conditional{};
+    conditional.type = cudaGraphNodeTypeConditional;
+    conditional.conditional.handle = condition;
+    conditional.conditional.type = cudaGraphCondTypeIf;
+    conditional.conditional.size = 1u;
+    cudaGraphNode_t node = nullptr;
+    cudaStream_t body = nullptr;
+    if (cudaGraphAddNode(&node, graph, dependencies, edges, dependency_count, &conditional) != cudaSuccess ||
+        cudaStreamUpdateCaptureDependencies(stream, &node, nullptr, 1u, cudaStreamSetCaptureDependencies) != cudaSuccess ||
+        cudaStreamCreateWithFlags(&body, cudaStreamNonBlocking) != cudaSuccess) return Status::Failed;
+    cudaGraph_t captured = nullptr;
+    const bool recorded = cudaStreamBeginCaptureToGraph(body, conditional.conditional.phGraph_out[0],
+            nullptr, nullptr, 0u, cudaStreamCaptureModeThreadLocal) == cudaSuccess &&
+        SolvePositionSystem(model, data, p, s, body) == Status::Ok;
+    const bool ended = cudaStreamEndCapture(body, &captured) == cudaSuccess;
+    return cudaStreamDestroy(body) == cudaSuccess && recorded && ended ? Status::Ok : Status::Failed;
 }
 
 }  // namespace

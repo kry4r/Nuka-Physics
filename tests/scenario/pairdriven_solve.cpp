@@ -206,6 +206,71 @@ TEST(PairDrivenSolve, TwoFreeBoxesCollideExchangeMomentum) {
 }
 
 // --- (b2) a free box rests on a static ground plane (free x static) ----------
+TEST(PairDrivenSolve, ParticleImpactPreservesPhysicalMomentumAcrossIntegrators) {
+    const auto backend = GetBackend();
+    if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    namespace scene = nuka::scene;
+    namespace cook = nuka::scene::cook;
+    for (uint32_t variant = 0u; variant < 3u; ++variant) {
+        for (float body_mass : {0.1f, 1.0f, 100.0f}) {
+            SCOPED_TRACE(::testing::Message() << "variant=" << variant << " mass=" << body_mass);
+            scene::SceneIR source;
+            scene::RigidBodyRecord body;
+            body.mass = body_mass;
+            body.inertia = Vec3{1, 1, 1} * (0.4f * body_mass * 0.05f * 0.05f);
+            const uint32_t owner = source.AddRigidBody(body);
+            scene::CollisionShapeRecord sphere;
+            sphere.body_id = owner;
+            sphere.type = scene::ShapeType::Sphere;
+            sphere.radius = 0.05f;
+            source.AddCollisionShape(sphere);
+            auto model = std::move(cook::CookSceneToModel(source, 1u, {}).model);
+            cook::VbdCookInput particle;
+            particle.positions = {{0.075f, 0, 0}};
+            particle.velocities = {{-1, 0, 0}};
+            particle.inv_mass = {1.0f};
+            particle.half_thickness = {0.02f};
+            particle.friction = {0.0f};
+            particle.vbd_count = variant == 0u ? 0u : 1u;
+            cook::CookVbdParticles(model, 1u, particle);
+            model.particles.pp_contact_d_min = 0.04f;
+            auto cfg = Cfg(0.0f);
+            cfg.dt = 0.001f;
+            cfg.vel_iters = 128u;
+            cfg.velocity_iterations_override = true;
+            cfg.cloth_integrator = variant == 2u ? 1u : 0u;
+            nk::World world(std::move(model), 1u, backend.dev, backend.backend, cfg);
+            ASSERT_TRUE(world.Ready()) << world.CreationError();
+            ASSERT_EQ(world.SetExecutionMode(nk::World::ExecutionMode::Graph), nphi::Status::Ok);
+            const size_t bodies = world.GetModel().capacities.bodies_per_env;
+            std::vector<Vec3> rigid_velocity(bodies), angular(bodies);
+            std::vector<Transform> poses(bodies);
+            Vec3 position{}, velocity{};
+            for (uint32_t step = 0u; step < 40u; ++step) {
+                ASSERT_TRUE(world.Step().AllOk());
+                ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::ParticleVel, &velocity, sizeof(velocity)));
+                ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::ParticlePos, &position, sizeof(position)));
+                ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::BodyLinearVelocity,
+                    rigid_velocity.data(), bodies * sizeof(Vec3)));
+                ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::BodyAngularVelocity,
+                    angular.data(), bodies * sizeof(Vec3)));
+                ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::BodyPose,
+                    poses.data(), bodies * sizeof(Transform)));
+                const auto momentum = velocity + rigid_velocity[owner] * body_mass;
+                EXPECT_LT((momentum - Vec3{-1, 0, 0}).Length(), 2e-5f);
+                const double kinetic = 0.5 * velocity.LengthSq() +
+                    0.5 * body_mass * rigid_velocity[owner].LengthSq() +
+                    0.2 * body_mass * 0.05 * 0.05 * angular[owner].LengthSq();
+                EXPECT_LE(kinetic, 0.5 + 2e-5);
+                EXPECT_GE((position - poses[owner].position).Length(), 0.07f - 2e-4f);
+            }
+            const float expected = -1.0f / (1.0f + body_mass);
+            EXPECT_NEAR(velocity.x, expected, 2e-4f);
+            EXPECT_NEAR(rigid_velocity[owner].x, expected, 2e-4f);
+        }
+    }
+}
+
 TEST(PairDrivenSolve, FreeBoxRestsOnStaticGround) {
     if (GetBackend().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
     Backend b = GetBackend();
@@ -296,8 +361,10 @@ TEST(PairDrivenSolve, CookedConcaveAndOpenSurfacesSupportBodiesAndParticles) {
             std::filesystem::remove(nka_path, error);
         }
     };
-    for (uint32_t surface_case = 0u; surface_case < 4u; ++surface_case) {
-        SCOPED_TRACE(surface_case);
+    for (uint32_t variant = 0u; variant < 8u; ++variant) {
+        SCOPED_TRACE(variant);
+        const uint32_t surface_case = variant % 4u;
+        const bool vertex_block = variant >= 4u;
         const float side = surface_case == 2u ? -1.0f : 1.0f;
         const float initial_height = surface_case == 3u ? -0.003f : side * 0.15f;
         const Vec3 offset{0.07f, -0.03f, 0.02f};
@@ -374,7 +441,7 @@ TEST(PairDrivenSolve, CookedConcaveAndOpenSurfacesSupportBodiesAndParticles) {
         particle.inv_mass = {100.0f};
         particle.half_thickness = {radius};
         particle.friction = {0.6f};
-        particle.vbd_count = 1u;
+        particle.vbd_count = vertex_block ? 1u : 0u;
         cook::CookVbdParticles(model, envs, particle);
         model.particles.pp_contact_d_min = 2.0f * radius;
         const uint32_t bodies = model.capacities.bodies_per_env;
@@ -384,12 +451,14 @@ TEST(PairDrivenSolve, CookedConcaveAndOpenSurfacesSupportBodiesAndParticles) {
         ASSERT_TRUE(world.Ready()) << world.CreationError();
         ASSERT_EQ(world.SetExecutionMode(nk::World::ExecutionMode::Graph), nphi::Status::Ok);
         std::vector<Transform> poses(envs * bodies);
-        std::vector<Vec3> positions(envs), velocities(envs * bodies);
+        std::vector<Vec3> positions(envs), particle_velocities(envs), velocities(envs * bodies);
         std::vector<uint32_t> status(envs);
         float max_penetration = 0.0f;
+        float max_contact_rebound = 0.0f;
         const auto read = [&]() {
             return world.GetData().DownloadField(nk::FieldId::BodyPose, poses.data(), poses.size() * sizeof(Transform)) &&
-                world.GetData().DownloadField(nk::FieldId::ParticlePos, positions.data(), positions.size() * sizeof(Vec3));
+                world.GetData().DownloadField(nk::FieldId::ParticlePos, positions.data(), positions.size() * sizeof(Vec3)) &&
+                world.GetData().DownloadField(nk::FieldId::ParticleVel, particle_velocities.data(), particle_velocities.size() * sizeof(Vec3));
         };
         for (uint32_t step = 0u; step < steps; ++step) {
             ASSERT_TRUE(world.Step().AllOk());
@@ -398,6 +467,8 @@ TEST(PairDrivenSolve, CookedConcaveAndOpenSurfacesSupportBodiesAndParticles) {
                 for (uint32_t env = 0u; env < envs; ++env)
                     EXPECT_NEAR(positions[env].z, initial_height + cfg.gravity[2] * cfg.dt * cfg.dt, 5e-8f);
             for (uint32_t env = 0u; env < envs; ++env) {
+                if (side * positions[env].z <= radius + 0.002f)
+                    max_contact_rebound = std::max(max_contact_rebound, side * particle_velocities[env].z);
                 max_penetration = std::max(max_penetration,
                     radius - std::min(side * poses[env * bodies + sphere_id].position.z,
                                       side * positions[env].z));
@@ -413,8 +484,9 @@ TEST(PairDrivenSolve, CookedConcaveAndOpenSurfacesSupportBodiesAndParticles) {
             EXPECT_LT(std::fabs(velocities[env * bodies + sphere_id].z), 0.1f);
         }
         EXPECT_LT(max_penetration, surface_case == 3u ? radius - initial_height : 0.006f);
-        std::fprintf(stderr, "[triangle surface] case=%u rigid_z=%.7f particle_z=%.7f penetration=%.7f\n",
-            surface_case, poses[sphere_id].position.z, positions[0].z, max_penetration);
+        EXPECT_LE(max_contact_rebound, 1e-3f);
+        std::fprintf(stderr, "[triangle surface] case=%u vertex_block=%u rigid_z=%.7f particle_z=%.7f penetration=%.7f\n",
+            surface_case, vertex_block ? 1u : 0u, poses[sphere_id].position.z, positions[0].z, max_penetration);
         const auto before = poses;
         const auto particle_before = positions;
         ASSERT_EQ(world.Reset({0u}), nphi::Status::Ok);

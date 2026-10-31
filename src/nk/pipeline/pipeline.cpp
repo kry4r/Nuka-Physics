@@ -224,8 +224,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
             ++independent_dof;
         max_independent_dof = std::max(max_independent_dof, independent_dof);
     }
-    // Split-impulse position passes run in block descent's warp tiles.
-    const bool split_positions = phi::BlockDescentTileRoute(
+    const bool dense_tiles = phi::BlockDescentTileRoute(
         cap.particles_per_env * env_count, cap.mpm_grid_nodes_per_env * env_count,
         articulation_cnt + cap.bodies_per_env * env_count, max_dof);
     const bool use_inverse_dynamics =
@@ -293,6 +292,12 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p.env_count = env_count;
         p.substeps = cap.integration_substeps;
         p.particles_per_env = cap.particles_per_env;
+        p.mpm_particles_per_env = grid_particles_per_env;
+        p.point_endpoints_per_env = cap.point_endpoints_per_env;
+        p.floor_normal[0] = model.particles.mpm_floor_normal.x;
+        p.floor_normal[1] = model.particles.mpm_floor_normal.y;
+        p.floor_normal[2] = model.particles.mpm_floor_normal.z;
+        p.floor_d = model.particles.mpm_floor_d;
         p.surfaces_per_env = cap.particle_surfaces_per_env;
         p.vbd_begin = cap.vbd_particle_begin;
         p.vbd_vertices = cap.vbd_vertices_per_env;
@@ -309,7 +314,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p.has_dat = cap.ogc_contacts_per_env > 0u;
         p.has_aero = cap.aero_tris_per_env > 0u &&
             (model.particles.aero_drag_normal != 0.0f || model.particles.aero_drag_tangent != 0.0f);
-        p.pos_pass = split_positions && has_contacts && cfg.pos_iters > 0u;
+        p.pos_pass = has_contacts && cfg.pos_iters > 0u;
         if (has_mpm) p.coverage_status |= energy_status::kGridMaterial;
         if (cap.particles_per_env != cap.vbd_vertices_per_env)
             p.coverage_status |= energy_status::kOtherParticleMaterial;
@@ -393,6 +398,12 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         add(phi::NkOp::IntegrateVelocity, &p_int_vel_);
     }
 
+    if (has_articulation && has_particles) {
+        p_fk_velocity_.articulation_count = articulation_cnt;
+        p_fk_velocity_.total_link_count = total_link_count;
+        add(phi::NkOp::FkLinkVelocities, &p_fk_velocity_);
+    }
+
     // particle launch geometry + mode (resolved once from the Model).
     const uint32_t particle_count = cap.particles_per_env * env_count;
     const Model::ModelParticles& mp = model.particles;
@@ -433,11 +444,11 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     p_block_descent_.joint_limit_rows_per_env = cap.joint_limit_rows_per_env;
     p_block_descent_.workspace_words = cap.block_descent_scratch_words;
     p_block_descent_.vertex_blocks = vertex_blocks;
-    p_block_descent_.position_iterations = split_positions && has_contacts ? cfg.pos_iters : 0u;
+    p_block_descent_.position_iterations = has_contacts ? cfg.pos_iters : 0u;
     p_block_descent_.position_beta = cfg.pos_beta;
     p_block_descent_.position_slop = cfg.pos_slop;
     p_block_descent_.position_max_velocity = model.baumgarte_max_velocity;
-    p_block_descent_.velocity_tolerance = split_positions ? phi::kTileVelocityTolerance : 0.0f;
+    p_block_descent_.velocity_tolerance = dense_tiles ? phi::kTileVelocityTolerance : 0.0f;
     const char* velocity_tolerance = std::getenv("NUKA_SOLVER_VEL_TOLERANCE");
     if (velocity_tolerance != nullptr) {
         char* end = nullptr;
@@ -463,7 +474,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         ? cap.solver_trace_sweeps : 0u;
     p_block_descent_.measure_contact_residual = cfg.measure_contact_residual ||
         p_block_descent_.measure_vertex_audit != 0u ||
-        (!split_positions && p_block_descent_.velocity_tolerance > 0.0f) ||
+        (!dense_tiles && p_block_descent_.velocity_tolerance > 0.0f) ||
         telemetry ||
         (readout_demand & kReadoutPhysicsDiagnostics) != 0u ||
         (diagnostics != nullptr && diagnostics[0] == '1');
@@ -494,7 +505,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     coupling_ctx.gravity[2] = cfg.gravity[2];
     coupling_ctx.contact_margin = contact_margin;
     coupling_ctx.pos_pass =
-        (split_positions && has_contacts && family == phi::kContactFamilyPairDriven &&
+        (has_contacts && family == phi::kContactFamilyPairDriven &&
          cfg.pos_iters > 0u) ? 1u : 0u;
     coupling_ctx.p_np_body_particle = &p_np_body_particle_;
     p_np_body_particle_.query_reach = query_reach;
@@ -534,6 +545,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
             p_cloth_step_.layout = vertex_blocks;
             p_cloth_step_.integrator = cfg.cloth_integrator;
             p_cloth_step_.truncation = 0u;
+            p_cloth_step_.position_pass = has_contacts && cfg.pos_iters > 0u;
             add(phi::NkOp::ClothPredict, &p_cloth_step_);
         }
     }
@@ -763,6 +775,15 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         add(phi::NkOp::OgcDetect, &p_ogc_detect_);
     }
 
+    if (has_contacts && vertex_blocks.vertices > 0u && cfg.cloth_integrator == 0u) {
+        p_cloth_contact_restart_.step = p_cloth_step_;
+        p_cloth_contact_restart_.contacts_per_env = cap.max_contacts_per_env;
+        p_cloth_contact_restart_.bodies_per_env = cap.bodies_per_env;
+        p_cloth_contact_restart_.links_per_env = cap.links_per_env;
+        p_cloth_contact_restart_.artics_per_env = cap.articulations_per_env;
+        add(phi::NkOp::ClothContactRestart, &p_cloth_contact_restart_);
+    }
+
     // Coupled coordinates use the same mass factor and unconstrained step velocity.
     if (mimic_couplings > 0u) {
         p_mimic_reduce_.max_dof = max_dof;
@@ -814,7 +835,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_assemble_.overlap_recovery_velocity = model.overlap_recovery_velocity;
         p_assemble_.contact_margin = cfg.contact_margin;
         p_assemble_.position_pass =
-            (split_positions && family == phi::kContactFamilyPairDriven && cfg.pos_iters > 0u) ? 1u : 0u;
+            (family == phi::kContactFamilyPairDriven && cfg.pos_iters > 0u) ? 1u : 0u;
         p_assemble_.vertex_blocks = vertex_blocks;
         if constexpr (family == phi::kContactFamilyPairDriven) {
             p_warm_start_prepare_.phase = 0u;
@@ -916,7 +937,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         // Read the split-impulse pseudo velocity additively when the position pass
         // is active (the general PairDriven path); else velocity-only (identical).
         p_int_pos_.pos_pass =
-            (split_positions && has_contacts && family == phi::kContactFamilyPairDriven &&
+            (has_contacts && family == phi::kContactFamilyPairDriven &&
              cfg.pos_iters > 0u) ? 1u : 0u;
         p_int_pos_.mimic_couplings = mimic_couplings;
         add(phi::NkOp::IntegratePosition, &p_int_pos_);

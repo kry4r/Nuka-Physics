@@ -382,16 +382,12 @@ __global__ void NarrowphaseBodyParticleKernel(
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t lane = kWarp ? (threadIdx.x & 31u) : 0u;
     const uint32_t gid = kWarp ? (tid >> 5u) : tid;
-    const uint32_t row_particles = pp.particles_per_env - pp.particle_row_base -
-                                   pp.excluded_particle_count;
+    const uint32_t row_particles = pp.particles_per_env - pp.particle_row_base;
     const uint32_t total = pp.env_count * row_particles;
     if (gid >= total) return;  // uniform per-warp: the whole warp exits together.
     const uint32_t env = gid / row_particles;
     const uint32_t rank = gid - env * row_particles;
-    const uint32_t pi = pp.particle_row_base + rank +
-        (pp.excluded_particle_count != 0u &&
-         rank >= pp.excluded_particle_begin - pp.particle_row_base
-            ? pp.excluded_particle_count : 0u);
+    const uint32_t pi = pp.particle_row_base + rank;
     const uint32_t N = pp.bodies_per_env;
 
     // Reserved contact-slot sub-range for THIS row-making particle: a fixed
@@ -414,22 +410,22 @@ __global__ void NarrowphaseBodyParticleKernel(
     const uint32_t global_particle = env * pp.particles_per_env + pi;
     // Vertex-block particles detect like OGC: their own thickness at the step-start position.
     const bool vertex_block = pi - pp.vbd_particle_begin < pp.vbd_particle_count;
+    uint32_t surface = ~0u;
+    for (uint32_t s = 0u; s < pp.particle_surfaces && surface == ~0u; ++s)
+        if (pi >= surface_info[s].vertex_offset &&
+            pi - surface_info[s].vertex_offset < surface_info[s].vertex_count) surface = s;
+    const bool surface_vertex = surface != ~0u;
     float radius = pp.particle_radius, surface_rate = 0.0f;
     if (vertex_block) {
-        uint32_t surface = ~0u;
-        for (uint32_t s = 0u; s < pp.particle_surfaces && surface == ~0u; ++s)
-            if (pi >= surface_info[s].vertex_offset &&
-                pi - surface_info[s].vertex_offset < surface_info[s].vertex_count) surface = s;
-        if (surface == ~0u) return;  // uniform per-warp.
         radius = particle_half_thickness[pi];
-        surface_rate = surface_speed[size_t{env} * pp.particle_surfaces + surface];
-    } else if (!(radius > 0.0f)) {
-        return;  // uniform per-warp.
     }
+    if (!vertex_block && !(radius > 0.0f)) return;
+    if (surface_vertex)
+        surface_rate = surface_speed[size_t{env} * pp.particle_surfaces + surface];
     // Row-coupled particles detect at the shared projected position.
     const Vec3 center = !vertex_block && pbf_predicted_pos != nullptr
         ? pbf_predicted_pos[global_particle] : particle_pos[global_particle];
-    const collision::AABB query = ParticleAabb(center, vertex_block
+    const collision::AABB query = ParticleAabb(center, surface_vertex
         ? pp.query_reach : radius + pp.contact_margin);
 
     // LANE 0 gathers the candidate list (the cand[] + traversal stack are local
@@ -460,14 +456,14 @@ __global__ void NarrowphaseBodyParticleKernel(
         if (kWarp) body = __shfl_sync(0xffffffffu, body, 0);
         const PrimShapeDev sb = LoadPrimShape(shape_table, body);
         if ((sb.contype | sb.conaffinity) == 0u) continue;
-        // OGC owns vertex-block contacts with meshed bodies.
-        if (vertex_block && surfaces.mesh_info != nullptr && body < surfaces.shape_count &&
+        // Authored particle surfaces own their contacts with meshed bodies.
+        if (surface_vertex && surfaces.mesh_info != nullptr && body < surfaces.shape_count &&
             surfaces.mesh_info[body].vertex_count > 0u) continue;
         const math::Transform xb = body_pose[env * N + body];
         const amf::PrimParams pb = MakePrim(sb, xb);
         // A vertex-block sphere spans OGC's motion-bounded query; depth is taken back to its thickness.
         float sphere = radius;
-        if (vertex_block) {
+        if (surface_vertex) {
             const size_t at = size_t{env} * N + body;
             const Vec3 lo = body_aabb_lo[at], hi = body_aabb_hi[at];
             const Vec3 extent{fmaxf(fabsf(lo.x - xb.position.x), fabsf(hi.x - xb.position.x)),
@@ -629,12 +625,7 @@ Status OpNarrowphaseBodyParticle(const ModelView& model, const DataView& data,
     if (p == nullptr) return Status::Failed;
     if (p->family != kContactFamilyPairDriven) return Status::Ok;  // early-exit.
     if (p->particle_row_base > p->particles_per_env) return Status::InvalidArgument;
-    if (p->excluded_particle_count != 0u &&
-        (p->excluded_particle_begin < p->particle_row_base ||
-         uint64_t{p->excluded_particle_begin} + p->excluded_particle_count >
-             p->particles_per_env)) return Status::InvalidArgument;
-    const uint32_t row_particles = p->particles_per_env - p->particle_row_base -
-                                   p->excluded_particle_count;
+    const uint32_t row_particles = p->particles_per_env - p->particle_row_base;
     if (p->env_count == 0u || row_particles == 0u ||
         p->slot_stride == 0u || p->cands_per_particle == 0u) {
         return Status::Ok;  // no particles or no reserved slots -> nothing to do.

@@ -422,6 +422,7 @@ __global__ void EmitPairDrivenRowsKernel(
     float solref0, float solref1,
     float solimp0, float solimp1, float solimp2, float solimp3, float solimp4,
     float dt, float impratio, bool refsafe, uint32_t cone, float overlap_recovery_velocity,
+    bool position_pass,
     uint32_t env_count, uint32_t slot_count, uint32_t rows_per_env,
     uint32_t full_row_slot_count, uint32_t ogc_slot_count,
     uint32_t bodies_per_env, uint32_t base_link_count, uint32_t artics_per_env,
@@ -693,9 +694,10 @@ __global__ void EmitPairDrivenRowsKernel(
                 row.group_normal_count = points_per_slot;
                 row.env = env;
                 row.rhs = compliant.aref_bias;
-                // Gap closure belongs to physical velocity; overlap recovers at most overlap_recovery_velocity.
+                // Split impulses recover overlap without adding physical kinetic energy.
                 if (speculative) row.rhs = (fminf(ucontact_depth[mp], 0.0f) +
-                    fminf(fmaxf(ucontact_depth[mp], 0.0f), overlap_recovery_velocity * dt)) / (dt * dt);
+                    (position_pass ? 0.0f : fminf(fmaxf(ucontact_depth[mp], 0.0f),
+                                                overlap_recovery_velocity * dt))) / (dt * dt);
                 row_reference_velocity_gain[rs] = 1.0f / dt - compliant.damping;
                 row_invweight[rs] = invweight;
                 row.compliance_alpha = compliant.R;
@@ -1574,6 +1576,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    p->solref[0], p->solref[1],
                    p->solimp[0], p->solimp[1], p->solimp[2], p->solimp[3], p->solimp[4],
                    p->dt, p->impratio, p->refsafe, p->cone, p->overlap_recovery_velocity,
+                   p->position_pass != 0u,
                    p->env_count, p->union_slot_count, p->rows_per_env,
                    p->full_row_slot_count, p->ogc_slot_count,
                    p->bodies_per_env, p->base_link_count, artics_per_env,

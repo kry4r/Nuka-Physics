@@ -560,8 +560,21 @@ __global__ void PhysicsStageMetricsKernel(ModelView m, DataView d, ReadoutEnergy
     constexpr uint32_t columns = nk::kPhysicsStageColumnCount;
     const uint32_t env = blockIdx.x;
     const size_t record = size_t{env} * p.substeps + p.slot;
+    __shared__ uint32_t history_restart;
+    if (threadIdx.x == 0u)
+        history_restart = p.vbd_vertices > 0u ? d.vbd_history_ready[env] & nk::kVbdHistoryRestart : 0u;
+    __syncthreads();
+    if (p.stage == EnergyStage::Begin && p.vbd_vertices > 0u &&
+        (d.vbd_history_ready[env] & nk::kVbdHistoryValid) != 0u)
+        for (uint32_t vertex = threadIdx.x; vertex < p.vbd_vertices; vertex += blockDim.x)
+            if (d.vbd_restart[env * p.vbd_vertices + vertex] != 0u &&
+                d.particle_inv_mass[env * p.particles_per_env + p.vbd_begin + vertex] > 0.0f)
+                atomicOr(&history_restart, nk::kVbdHistoryRestart);
+    __syncthreads();
     double values[columns]{};
     values[static_cast<uint32_t>(C::MinVbdEffectiveDt)] = DBL_MAX;
+    const bool restarted_history = p.stage == EnergyStage::Free && history_restart != 0u;
+    double begin_discrete[3]{};
     const auto add = [&](C c, double value) { values[static_cast<uint32_t>(c)] += value; };
     const auto maximum = [&](C c, double value) {
         auto& held = values[static_cast<uint32_t>(c)];
@@ -594,10 +607,17 @@ __global__ void PhysicsStageMetricsKernel(ModelView m, DataView d, ReadoutEnergy
         }
         momentum(1.0 / inverse_mass, position, velocity, {});
         if (!IsVertex(p, particle)) continue;
+        if (restarted_history) {
+            const Vec3 before = d.step_particle_velocity[particle];
+            begin_discrete[0] += double(before.x) / inverse_mass;
+            begin_discrete[1] += double(before.y) / inverse_mass;
+            begin_discrete[2] += double(before.z) / inverse_mass;
+        }
         const uint32_t vertex = local - p.vbd_begin;
         const uint32_t slot = env * p.vbd_vertices + vertex;
         const bool second_order = p.stage == EnergyStage::Begin
-            ? p.cloth_integrator == 0u && d.vbd_history_ready[env] != 0u && d.vbd_restart[slot] == 0u
+            ? p.cloth_integrator == 0u && (d.vbd_history_ready[env] & nk::kVbdHistoryValid) != 0u &&
+                history_restart == 0u
             : ParticleStep(d, p, particle) < p.dt;
         const Vec3 discrete = second_order ? velocity * 1.5f - d.vbd_history_vel[slot] * 0.5f : velocity;
         vector(C::VbdDiscreteMomentumX, discrete / inverse_mass);
@@ -729,6 +749,23 @@ __global__ void PhysicsStageMetricsKernel(ModelView m, DataView d, ReadoutEnergy
         }
         __syncthreads();
     }
+    // Contact detection resolves the integration rule after the entry sample.
+    // A restarted interval uses physical entry momentum in its discrete balance.
+    if (restarted_history) {
+        float* begin = d.physics_stage_metrics + record * nk::kEnergyStageCount * columns;
+        for (uint32_t axis = 0u; axis < 3u; ++axis) {
+            reduction[threadIdx.x] = begin_discrete[axis];
+            __syncthreads();
+            for (uint32_t stride = blockDim.x / 2u; stride > 0u; stride /= 2u) {
+                if (threadIdx.x < stride) reduction[threadIdx.x] += reduction[threadIdx.x + stride];
+                __syncthreads();
+            }
+            if (threadIdx.x == 0u)
+                begin[static_cast<uint32_t>(C::VbdDiscreteMomentumX) + axis] = float(reduction[0]);
+            __syncthreads();
+        }
+        if (threadIdx.x == 0u) begin[static_cast<uint32_t>(C::VbdBdfParticles)] = 0.0f;
+    }
 }
 
 __device__ double3 AuditLinearJacobian(const NkRowSide& side, PointMassView points) {
@@ -830,6 +867,82 @@ __device__ bool AuditBodyParticleGap(const ModelView& m, const DataView& d, cons
     return surface.valid && isfinite(*gap);
 }
 
+// MPM point endpoints retain their physical sample index; grid nodes carry its impulse response.
+__device__ bool AuditMpmGap(const NkRow& row, PointMassView points, const ModelView& m, const DataView& d,
+    const ReadoutEnergyLedgerParams& p, const SurfaceQueryView& surfaces, uint32_t env, size_t at, double* gap) {
+    if (d.ucontact_a_kind[at] != nk::kUContactSidePointEndpoint) return false;
+    const uint32_t sample = d.ucontact_a[at] - env * p.point_endpoints_per_env;
+    if (sample >= p.mpm_particles_per_env) return false;
+    const Vec3 point = d.particle_pos[env * p.particles_per_env + sample];
+    const uint32_t kind = d.ucontact_b_kind[at], other = d.ucontact_b[at];
+    if (kind == nk::kUContactSideBody) {
+        if (other >= p.bodies_per_env) return false;
+        const auto pose = d.body_pose[size_t{env} * p.bodies_per_env + other];
+        const auto surface = QueryCollidableSurface(surfaces, other, LoadPrimShape(m.shape_table, other),
+            PrimInverseTransformPoint(pose, point), FLT_MAX);
+        *gap = surface.distance;
+        return surface.valid && isfinite(*gap);
+    }
+    if (kind == nk::kUContactSideBoundary && other == 0u) {
+        const Vec3 normal{p.floor_normal[0], p.floor_normal[1], p.floor_normal[2]};
+        const double length = sqrt(Dot(normal, normal));
+        *gap = (Dot(point, normal) - p.floor_d) / length;
+        return length > 0.0 && isfinite(*gap);
+    }
+    if (kind != nk::kUContactSidePointEndpoint || points.Count(row.b) != 3u) return false;
+    Vec3 vertices[3];
+    uint32_t indices[3];
+    for (uint32_t i = 0u; i < 3u; ++i) {
+        const auto term = points.At(row.b, i);
+        if (term.kind != nk::kNkSideParticle) return false;
+        indices[i] = term.index - env * p.particles_per_env;
+        if (indices[i] >= p.particles_per_env) return false;
+        vertices[i] = d.particle_pos[term.index];
+    }
+    uint32_t found = ~0u;
+    for (uint32_t surface = 0u; surface < p.surfaces_per_env; ++surface) {
+        const auto info = m.particle_surface_info[surface];
+        bool contains = true;
+        for (uint32_t i = 0u; i < 3u; ++i)
+            contains &= indices[i] >= info.vertex_offset && indices[i] - info.vertex_offset < info.vertex_count;
+        if (!contains) continue;
+        if (found != ~0u) return false;
+        found = surface;
+    }
+    if (found == ~0u) return false;
+    const auto info = m.particle_surface_info[found];
+    if ((info.flags & collision::kMeshSurfaceClosed) != 0u) return false;
+    const auto closest = collision::ClosestTrianglePoint(point, vertices[0], vertices[1], vertices[2]);
+    double distance = sqrt(Dot(point - closest.point, point - closest.point));
+    if ((info.flags & collision::kMeshSurfaceOriented) != 0u) {
+        if (closest.feature < 6u) return false;
+        Vec3 normal{};
+        bool matched = false;
+        for (uint32_t triangle = 0u; triangle < info.triangle_count; ++triangle) {
+            const size_t first = size_t{info.triangle_offset + triangle} * 3u;
+            uint32_t authored[3];
+            bool same = true;
+            for (uint32_t i = 0u; i < 3u; ++i) {
+                authored[i] = info.vertex_offset + m.particle_surface_triangles[first + i];
+                same &= authored[i] == indices[0] || authored[i] == indices[1] || authored[i] == indices[2];
+            }
+            if (!same) continue;
+            if (matched) return false;
+            matched = true;
+            const size_t base = size_t{env} * p.particles_per_env;
+            normal = (d.particle_pos[base + authored[1]] - d.particle_pos[base + authored[0]]).Cross(
+                d.particle_pos[base + authored[2]] - d.particle_pos[base + authored[0]]);
+        }
+        if (!matched || !(normal.LengthSq() > 0.0f)) return false;
+        if (Dot(point - closest.point, normal) < 0.0) distance = -distance;
+    }
+    const double thickness = double(closest.barycentric.x) * m.particle_half_thickness[indices[0]] +
+        double(closest.barycentric.y) * m.particle_half_thickness[indices[1]] +
+        double(closest.barycentric.z) * m.particle_half_thickness[indices[2]];
+    *gap = distance - thickness;
+    return isfinite(*gap);
+}
+
 // Impulse laws use the solved state; closest-feature gaps use the committed state.
 __global__ void ContactAuditKernel(ModelView m, DataView d, ReadoutEnergyLedgerParams p, SurfaceQueryView surfaces) {
     using C = nk::ContactAuditCount;
@@ -870,7 +983,8 @@ __global__ void ContactAuditKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
                 local_contact - p.rigid_contact_slots < p.ogc_contact_slots;
             if (ogc ? AuditOgcParticleGap(normal, points, d, at, &gap) ||
                       AuditMixedGap(m, d, p, env, global_contact, at, &gap)
-                    : AuditBodyParticleGap(m, d, p, surfaces, env, at, &gap)) {
+                    : AuditBodyParticleGap(m, d, p, surfaces, env, at, &gap) ||
+                      AuditMpmGap(normal, points, m, d, p, surfaces, env, at, &gap)) {
                 if (gap < -p.pos_slop) count(C::GapViolations);
                 maximum(M::GapPenetration, float(-gap), slot);
             } else count(C::UnmeasuredGaps);

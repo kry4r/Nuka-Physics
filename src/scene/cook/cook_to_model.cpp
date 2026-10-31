@@ -1937,7 +1937,7 @@ void CookVbdParticles(nk::Model& model, uint32_t env_count,
                 positions, count, local.data(), static_cast<uint32_t>(local.size() / 3u), false);
             cooked = import::cooker::CookMeshSurface(
                 positions, count, oriented.data(), static_cast<uint32_t>(oriented.size() / 3u));
-            cooked.info.flags |= collision::kMeshSurfaceOriented;
+            if (surface.oriented) cooked.info.flags |= collision::kMeshSurfaceOriented;
             cooked_edges = import::cooker::CookMeshEdges(
                 positions, count, oriented.data(), static_cast<uint32_t>(oriented.size() / 3u), false);
         }

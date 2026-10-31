@@ -133,6 +133,7 @@ private:
     phi::ParticleContactDeltaParams   p_part_contact_delta_{};
     phi::ParticleFinalizeParams       p_part_finalize_{};
     phi::ClothStepParams              p_cloth_step_{};
+    phi::ClothContactRestartParams    p_cloth_contact_restart_{};
     phi::MpmParams                    p_mpm_{};
     phi::ReadoutContactWrenchParams   p_readout_{};
     phi::RecordTelemetryParams        p_telemetry_{};
