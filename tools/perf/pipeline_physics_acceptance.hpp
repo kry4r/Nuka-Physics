@@ -74,7 +74,6 @@ public:
         stages_.resize(records * nk::kEnergyStageCount * nk::kPhysicsStageColumnCount);
         counts_.resize(records * nk::kContactAuditCountSize);
         metrics_.resize(records * nk::kContactAuditMetricCount);
-        residual_.resize(size_t{envs_} * kResidualClasses);
         dat_.resize(envs_);
         for (const auto& call : world.GetPipeline().Calls()) {
             if (call.op != phi::NkOp::BlockDescentSolve) continue;
@@ -91,7 +90,6 @@ public:
         Read(world, nk::FieldId::PhysicsStageMetrics, stages_);
         Read(world, nk::FieldId::ContactAuditCounts, counts_);
         Read(world, nk::FieldId::ContactAuditMetrics, metrics_);
-        Read(world, nk::FieldId::SolverResidual, residual_);
         Read(world, nk::FieldId::DatTruncationCount, dat_);
         for (uint32_t env = 0u; env < envs_; ++env) {
             dat_visits_ += dat_[env];
@@ -149,13 +147,16 @@ public:
                 if (std::isfinite(error)) vbd_error_.Observe(error, step, env, substep);
                 const float gain = solved[static_cast<uint32_t>(S::MaxPassiveRowEnergyGain)];
                 if (std::isfinite(gain)) passive_gain_.Observe(gain, step, env, substep);
-            }
-            if (!residual_measured_) continue;
-            for (uint32_t c = 0u; c < kResidualClasses; ++c) {
-                const float value = residual_[size_t{env} * kResidualClasses + c];
-                if (!std::isfinite(value)) { nonfinite_ = true; continue; }
-                residual_max_[c].Observe(value, step, env, substeps_ - 1u);
-                if (value > acceptance_velocity_tolerance_) ++residual_violations_;
+                if (!residual_measured_ || solved[static_cast<uint32_t>(S::SolverResidualMeasured)] != 1.0f) {
+                    ++unwritten_residuals_;
+                    continue;
+                }
+                for (uint32_t c = 0u; c < kResidualClasses; ++c) {
+                    const float value = solved[static_cast<uint32_t>(S::SolverContactNormalResidual) + c];
+                    if (!std::isfinite(value)) { nonfinite_ = true; continue; }
+                    residual_max_[c].Observe(value, step, env, substep);
+                    if (value > acceptance_velocity_tolerance_) ++residual_violations_;
+                }
             }
         }
     }
@@ -200,7 +201,7 @@ public:
         checks.Set("committed_contact_gaps", Decision(count_totals_[static_cast<uint32_t>(C::GapViolations)] != 0u,
             contacts && count_totals_[static_cast<uint32_t>(C::UnmeasuredGaps)] == 0u));
         checks.Set("solver_residual_budget", Decision(residual_violations_ != 0u,
-            residual_measured_ && records_ != 0u && substeps_ == 1u));
+            residual_measured_ && records_ != 0u && unwritten_residuals_ == 0u));
         checks.Set("full_system_energy", Decision(nonfinite_ || physics_failure_, false));
         checks.Set("analytic_balance", Decision(false, false));
         checks.Set("matched_external_reference", Decision(false, false));
@@ -252,7 +253,8 @@ public:
         const char* names[] = {"contact_normal", "contact_tangent", "joint", "primal_coupling"};
         for (uint32_t c = 0u; c < kResidualClasses; ++c) residual.Set(names[c], residual_max_[c].Report());
         residual.Set("units", Json::Str("m/s"));
-        residual.Set("scope", Json::Str("last solve per policy step/environment; earlier substep residuals are not retained"));
+        residual.Set("scope", Json::Str("solved residuals of every physical interval, environment and policy step"));
+        residual.Set("unwritten_interval_records", Json::Int(unwritten_residuals_));
         residual.Set("configured_velocity_tolerance_m_s", Json::Float(velocity_tolerance_));
         residual.Set("acceptance_velocity_tolerance_m_s", Json::Float(acceptance_velocity_tolerance_));
         residual.Set("acceptance_budget_source", Json::Str(velocity_tolerance_ > 0.0f ?
@@ -322,7 +324,7 @@ private:
     float acceptance_velocity_tolerance_ = phi::kTileVelocityTolerance;
     bool residual_measured_ = false, nonfinite_ = false, physics_failure_ = false;
     uint64_t records_ = 0u, covered_energy_ = 0u, unwritten_energy_ = 0u, residual_violations_ = 0u, dat_visits_ = 0u;
-    uint64_t unwritten_stages_ = 0u, work_rate_violations_ = 0u;
+    uint64_t unwritten_stages_ = 0u, unwritten_residuals_ = 0u, work_rate_violations_ = 0u;
     std::array<uint64_t, 9> coverage_counts_{};
     std::array<uint64_t, nk::kContactAuditCountSize> count_totals_{};
     std::array<double, nk::kEnergyColumnCount> energy_sums_{};
@@ -333,7 +335,7 @@ private:
     Json first_contact_failure_;
     Json closure_witness_;
     float closure_witness_value_ = 0.0f;
-    std::vector<float> energy_, stages_, residual_;
+    std::vector<float> energy_, stages_;
     std::vector<uint32_t> coverage_, counts_, dat_;
     std::vector<uint64_t> metrics_;
 };

@@ -34,6 +34,24 @@ def quantiles(values):
 RESIDUAL_LEVELS = (1e-2, 3e-3, 1e-3, 3e-4, 1e-4, 3e-5, 1e-5)
 
 
+def interval_solver_analysis(stages, tolerance):
+    """Check retained physical intervals without substituting the latest solve for earlier ones."""
+    solved = np.asarray(stages)[..., S.SOLVED, :]
+    measured = solved[..., C.SOLVER_RESIDUAL_MEASURED] == 1
+    residual = solved[..., C.SOLVER_CONTACT_NORMAL_RESIDUAL:C.SOLVER_PRIMAL_RESIDUAL + 1]
+    valid = np.isfinite(residual) & (residual >= 0)
+    tolerance_valid = bool(np.isfinite(tolerance) and tolerance > 0)
+    bad = measured[..., None] & (~valid | (residual > tolerance))
+    complete = bool(measured.size and measured.all() and valid.all() and tolerance_valid)
+    names = ("contact_normal", "contact_tangent", "joint", "primal_coupling")
+    return {"status": "failed" if tolerance_valid and bad.any() else "passed" if complete else "unmeasured",
+            "coverage_complete": complete, "interval_records": int(measured.size),
+            "measured_interval_records": int(measured.sum()), "budget_violations": int(bad.sum()),
+            "tolerance_mps": tolerance,
+            "maxima_mps": {name: float(residual[..., k][measured].max()) if measured.any() else None
+                           for k, name in enumerate(names)}}
+
+
 def convergence_analysis(values, manifest):
     """Final solver residuals and sweeps of every recorded solve; with a sweep trace, the residual after each
     sweep and the solve time and sweeps needed to reach fixed residual levels."""
@@ -45,6 +63,9 @@ def convergence_analysis(values, manifest):
               "final_largest": quantiles(final.max(axis=-1)),
               "sweeps": {"mean": float(sweeps.mean()), **quantiles(sweeps),
                          "at_budget_fraction": float((sweeps >= manifest["sweep_budget"]).mean())}}
+    tolerance = manifest["metadata"].get("solver_velocity_tolerance_mps")
+    if tolerance is not None:
+        result["physical_intervals"] = interval_solver_analysis(values["stages"], float(tolerance))
     if not manifest["trace_sweeps"]:
         return result
     trace = values["sweep_trace"].astype(np.float64)
@@ -460,15 +481,12 @@ def stream_analysis(values, env, manifest, limits, initial_velocity=None, initia
     dynamic_vertices = stages[:, S.SOLVED, C.VBD_DYNAMIC_PARTICLES] > 0
     dynamic_policies = dynamic_vertices.reshape(-1, manifest["substeps"]).any(axis=1)
     solver_measurements = bool((measured[:, 0] | ~dynamic_policies).all())
-    solver_complete = (readout_complete and manifest["substeps"] == 1 and dynamic_vertices.any() and
-                       metadata.get("solver_velocity_tolerance_mps") is not None and
-                       np.isfinite(tolerance) and tolerance > 0 and solver_measurements and
-                       (values["sweeps"][:, env] > 0).all())
-    solver_pass = bool((equation_error <= tolerance).all() and (newton[:, 0] <= tolerance).all())
+    interval_solver = interval_solver_analysis(stages, tolerance)
+    solver_complete = (readout_complete and interval_solver["coverage_complete"] and
+                       metadata.get("solver_velocity_tolerance_mps") is not None)
+    solver_pass = bool((equation_error <= tolerance).all() and interval_solver["status"] == "passed")
     contact_residual, contact_row, contact_measured = decode_maxima(values["contact_metrics"][:, env])
     has_contacts = (counts[:, A.CONTACTS] > 0).reshape(-1, manifest["substeps"]).any(axis=1)
-    solver_complete &= bool((contact_measured[:, :2] | ~has_contacts[:, None]).all())
-    solver_pass &= bool((contact_residual[:, :2] <= tolerance).all())
     truncations = values["dat_truncations"][:, env]
     dat_ratio = float(np.count_nonzero(truncations) / len(truncations))
     dt = records[:, E.DT]
@@ -528,8 +546,11 @@ def stream_analysis(values, env, manifest, limits, initial_velocity=None, initia
             max_contact_normal_residual_mps=float(contact_residual[:, 0].max()),
             max_contact_tangent_residual_mps=float(contact_residual[:, 1].max()),
             tolerance_mps=tolerance, mean_sweeps=float(values["sweeps"][:, env].mean()),
+            physical_intervals=interval_solver,
             vertex_measurements_complete=solver_measurements,
             contact_measurements_complete=bool((contact_measured[:, :2] | ~has_contacts[:, None]).all()))}
+    if readout_complete and interval_solver["status"] == "failed":
+        layers["solver"]["status"] = "failed"
     return {"environment": env, "intervals": len(records), "elapsed_s": float(elapsed[-1]),
             "layers": layers, "events": events, "timeline": timeline,
             "contact_owners": contact_owners(values, env, manifest),

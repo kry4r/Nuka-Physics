@@ -52,6 +52,11 @@ class StageColumn(IntEnum):
     VBD_ROW_IMPULSE_Y = 36
     VBD_ROW_IMPULSE_Z = 37
     VBD_BDF_PARTICLES = 38
+    SOLVER_CONTACT_NORMAL_RESIDUAL = 39
+    SOLVER_CONTACT_TANGENT_RESIDUAL = 40
+    SOLVER_JOINT_RESIDUAL = 41
+    SOLVER_PRIMAL_RESIDUAL = 42
+    SOLVER_RESIDUAL_MEASURED = 43
 
 
 class AuditCount(IntEnum):
@@ -169,7 +174,7 @@ def stage_units(column):
         return "kg m/s"
     if 4 <= c <= 6 or 10 <= c <= 12:
         return "kg m^2/s"
-    if c == StageColumn.VBD_MOMENTUM_VELOCITY_ERROR:
+    if c == StageColumn.VBD_MOMENTUM_VELOCITY_ERROR or 39 <= c <= 42:
         return "m/s"
     if c == StageColumn.VBD_FORCE:
         return "N"

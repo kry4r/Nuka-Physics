@@ -34,7 +34,7 @@ diagnostic decisions remain unmeasured until a complete interval is recorded.
 | Field | Per environment and substep | Meaning |
 |---|---|---|
 | `ENERGY_LEDGER` | 32 float32 values | State energies, actual work, signed losses, original residual, validity |
-| `PHYSICS_STAGE_METRICS` | 5 × 39 float32 values | Physical state momentum, finite counts, VBD force defect and discrete momentum |
+| `PHYSICS_STAGE_METRICS` | 5 × 44 float32 values | Physical momentum, finite counts, VBD force defect, discrete momentum and substep solver residuals |
 | `CONTACT_AUDIT_COUNTS` | 8 uint32 values | Contact and violation counts over active contact rows |
 | `CONTACT_AUDIT_METRICS` | 7 uint64 values | Maximum audit values and their global row witnesses |
 | `VBD_EFFECTIVE_DT` | One float32 per VBD vertex, latest substep | Actual BE/BDF2 step, including per-vertex restarts |
@@ -47,6 +47,12 @@ Stages are `BEGIN`, `FREE`, `SOLVED`, `PROJECTED`, `END`.
 Python enums in `nuka.diagnostics.schema` define column order and stage units.
 `decode_maxima` in `nuka.diagnostics.report` decodes packed values and row IDs.
 A row ID belongs to its recorded interval; slots can be reused in later steps.
+
+`SOLVED` retains all four solver residual classes in m/s for every physical
+interval. `SOLVER_RESIDUAL_MEASURED` is one when those residuals were written.
+The separate `SOLVER_RESIDUAL` field and sweep traces describe the latest solve.
+Capture schema 2 includes the retained interval residuals; schema 1 records
+remain readable and keep their missing residual coverage unmeasured.
 
 Request `VBD_SOLVE_AUDIT` in `state_fields` before stepping to record individual
 vertex descents. Its scope is the last solve call of the latest substep, including

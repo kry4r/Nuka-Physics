@@ -805,7 +805,7 @@ fields:
   # The ledger record in double; residuals difference stage energies far larger than their change.
   - {name: energy_ledger_sum, dtype: f64, per: scalar, count: "integration_substeps*env_count", elem: 31, arena: scratch, owner: data}
   - {name: energy_ledger_status, dtype: u32, per: scalar, count: "integration_substeps*env_count", arena: scratch, owner: data, flags: [readout]}
-  - {name: physics_stage_metrics, dtype: f32, per: scalar, count: "integration_substeps*env_count", elem: 195, arena: scratch, owner: data, flags: [readout]}
+  - {name: physics_stage_metrics, dtype: f32, per: scalar, count: "integration_substeps*env_count", elem: 220, arena: scratch, owner: data, flags: [readout]}
   - {name: contact_audit_counts, dtype: u32, per: scalar, count: "integration_substeps*env_count", elem: 8, arena: scratch, owner: data, flags: [readout]}
   - {name: contact_audit_metrics, dtype: u64, per: scalar, count: "integration_substeps*env_count", elem: 7, arena: scratch, owner: data, flags: [readout]}
   - {name: energy_particle_start, dtype: vec3, per: particle, arena: scratch, owner: data}

@@ -678,6 +678,11 @@ __global__ void PhysicsStageMetricsKernel(ModelView m, DataView d, ReadoutEnergy
         vector(C::AngularMomentumX, spin + pose.position.Cross(force));
     }
     if (p.stage == EnergyStage::Solved) {
+        if (threadIdx.x == 0u && p.rows_per_env > 0u && d.solver_residual != nullptr) {
+            for (uint32_t c = 0u; c < 4u; ++c)
+                values[static_cast<uint32_t>(C::SolverContactNormalResidual) + c] = d.solver_residual[env * 4u + c];
+            add(C::SolverResidualMeasured, 1.0);
+        }
         const auto* rows = reinterpret_cast<const NkRow*>(d.urows);
         const uint32_t first_drive = p.contact_rows + p.limit_rows + p.friction_rows;
         const uint32_t bound = ContactRowBound(d.contact_row_extent, env, p.contact_rows);

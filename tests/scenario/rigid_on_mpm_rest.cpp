@@ -13,6 +13,7 @@
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/model/model.hpp"
 #include "nk/pipeline/world.hpp"
+#include "nk/readout/energy_ledger.hpp"
 #include "nk/readout/physics_diagnostics.hpp"
 #include "nk/solve/nk_row.hpp"   // kPairDrivenRowsPerSlot
 #include "nk/solve/point_endpoint.hpp"
@@ -643,6 +644,8 @@ TEST(RigidOnMpmRest, SharedIntervalsMatchCompleteWorldSteps) {
         nk::World intervals(std::move(interval_model), 2u, backend.dev, backend.backend, interval_config);
         ASSERT_TRUE(outer.Ready()) << outer.CreationError();
         ASSERT_TRUE(intervals.Ready()) << intervals.CreationError();
+        ASSERT_NE(outer.FieldPtr(nk::FieldId::PhysicsStageMetrics), nullptr);
+        ASSERT_NE(intervals.FieldPtr(nk::FieldId::PhysicsStageMetrics), nullptr);
         const auto& cap = outer.GetModel().capacities;
         const uint32_t bodies = cap.bodies_per_env * cap.env_count;
         const uint32_t particles = cap.particles_per_env * cap.env_count;
@@ -678,12 +681,22 @@ TEST(RigidOnMpmRest, SharedIntervalsMatchCompleteWorldSteps) {
             ASSERT_TRUE(outer.GetData().UploadField(nk::FieldId::BodyForce, forces.data(), bodies * sizeof(Vec3)));
             ASSERT_TRUE(outer.GetData().UploadField(nk::FieldId::BodyTorque, torques.data(), bodies * sizeof(Vec3)));
             ASSERT_EQ(advance(outer), nphi::Status::Ok);
+            const auto stage_metrics = ReadValues<float>(outer, nk::FieldId::PhysicsStageMetrics);
             std::vector<Vec3> impulse(bodies), world_moment(bodies);
             std::vector<uint32_t> combined_status(cap.env_count, 0u);
             for (uint32_t interval = 0u; interval < substeps; ++interval) {
                 ASSERT_TRUE(intervals.GetData().UploadField(nk::FieldId::BodyForce, forces.data(), bodies * sizeof(Vec3)));
                 ASSERT_TRUE(intervals.GetData().UploadField(nk::FieldId::BodyTorque, torques.data(), bodies * sizeof(Vec3)));
                 ASSERT_EQ(advance(intervals), nphi::Status::Ok);
+                const auto residuals = ReadValues<float>(intervals, nk::FieldId::SolverResidual);
+                for (uint32_t env = 0u; env < cap.env_count; ++env) {
+                    const size_t first = ((size_t{env} * substeps + interval) * nk::kEnergyStageCount +
+                        static_cast<uint32_t>(nk::EnergyStage::Solved)) * nk::kPhysicsStageColumnCount;
+                    EXPECT_EQ(stage_metrics[first + static_cast<uint32_t>(nk::PhysicsStageColumn::SolverResidualMeasured)], 1.0f);
+                    for (uint32_t c = 0u; c < 4u; ++c)
+                        EXPECT_EQ(stage_metrics[first + static_cast<uint32_t>(nk::PhysicsStageColumn::SolverContactNormalResidual) + c],
+                                  residuals[env * 4u + c]);
+                }
                 const auto linear = read_vectors(intervals, nk::FieldId::MpmBodyReaction);
                 const auto angular = read_vectors(intervals, nk::FieldId::MpmBodyAngReaction);
                 std::vector<Transform> poses(bodies);

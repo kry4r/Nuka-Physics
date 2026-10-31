@@ -17,7 +17,9 @@ enum class PhysicsStageColumn : uint32_t {
     VbdDiscreteMomentumX, VbdDiscreteMomentumY, VbdDiscreteMomentumZ,
     VbdGravityImpulseX, VbdGravityImpulseY, VbdGravityImpulseZ,
     VbdElasticBoundaryImpulseX, VbdElasticBoundaryImpulseY, VbdElasticBoundaryImpulseZ,
-    VbdRowImpulseX, VbdRowImpulseY, VbdRowImpulseZ, VbdBdfParticles, Count
+    VbdRowImpulseX, VbdRowImpulseY, VbdRowImpulseZ, VbdBdfParticles,
+    SolverContactNormalResidual, SolverContactTangentResidual, SolverJointResidual,
+    SolverPrimalResidual, SolverResidualMeasured, Count
 };
 
 inline constexpr uint32_t kPhysicsStageColumnCount =

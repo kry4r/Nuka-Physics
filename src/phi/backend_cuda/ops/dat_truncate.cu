@@ -2060,8 +2060,9 @@ Status OpDatTruncate(const ModelView& model, const DataView& data,
           (p->edges_per_env > 0u && (!model.particle_surface_edges ||
                                     !data.particle_surface_edge_nodes)) ||
           !model.particle_surface_thickness || !data.particle_surface_max_speed ||
-          !data.dat_surface_motion ||
-          !data.dat_particle_beta || !data.dat_particle_parent || !data.particle_inv_mass ||
+          !data.dat_surface_motion)) ||
+        (p->particles_per_env > 0u &&
+         (!data.dat_particle_beta || !data.dat_particle_parent || !data.particle_inv_mass ||
           !data.particle_prev_pos || !data.particle_pos || !data.particle_vel)) ||
         (p->bodies_per_env > 0u &&
          (!model.mesh_surface_info || !model.mesh_edge_info || !model.mesh_triangles ||
@@ -2128,7 +2129,7 @@ Status OpDatTruncate(const ModelView& model, const DataView& data,
         std::max(p->bodies_per_env, std::max(p->articulations_per_env, 1u));
     LaunchCuda(ClearDatOwnersKernel, dim3((owners + kBlockSize - 1u) / kBlockSize),
                dim3(kBlockSize), 0u, stream, *p, data);
-    if (particles > 0u && p->surfaces_per_env > 0u)
+    if (particles > 0u)
         LaunchCuda(ClearDatKernel, particle_grid, dim3(kBlockSize), 0u, stream, *p, model, data);
     if (triangles > 0u)
         LaunchCuda(DatTriangleValidityKernel,

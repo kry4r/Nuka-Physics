@@ -394,6 +394,9 @@ TEST(PairDrivenSolve, CookedConcaveAndOpenSurfacesSupportBodiesAndParticles) {
         for (uint32_t step = 0u; step < steps; ++step) {
             ASSERT_TRUE(world.Step().AllOk());
             ASSERT_TRUE(read());
+            if (step == 0u && surface_case != 3u)
+                for (uint32_t env = 0u; env < envs; ++env)
+                    EXPECT_NEAR(positions[env].z, initial_height + cfg.gravity[2] * cfg.dt * cfg.dt, 5e-8f);
             for (uint32_t env = 0u; env < envs; ++env) {
                 max_penetration = std::max(max_penetration,
                     radius - std::min(side * poses[env * bodies + sphere_id].position.z,

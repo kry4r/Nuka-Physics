@@ -69,7 +69,7 @@ class DiagnosticSession:
         self.energy = EnergyLedgerSampler(world, self.env_count)
         self.substeps = self.energy.substeps
         self.manifest = {
-            "schema_version": 1, "status": "recording", "metadata": metadata,
+            "schema_version": 2, "status": "recording", "metadata": metadata,
             "env_count": self.env_count, "substeps": self.substeps,
             "axes": ["policy_step", "environment", "substep"],
             "thresholds": self.thresholds.to_dict(), "chunks": [], "steps": 0,
@@ -241,9 +241,10 @@ def iter_record_blocks(root, *, states=False):
         raise ValueError("diagnostic manifest must be an object")
     if not isinstance(manifest.get("metadata"), dict):
         raise ValueError("diagnostic metadata must be an object")
-    if type(manifest.get("schema_version")) is not int or manifest["schema_version"] != 1:
+    if type(manifest.get("schema_version")) is not int or manifest["schema_version"] not in (1, 2):
         raise ValueError("unsupported diagnostic schema")
-    columns = {"stages": Stage, "stage_columns": StageColumn,
+    stage_columns = list(StageColumn) if manifest["schema_version"] == 2 else list(StageColumn)[:39]
+    columns = {"stages": Stage, "stage_columns": stage_columns,
                "audit_counts": AuditCount, "audit_metrics": AuditMetric}
     for name, enum in columns.items():
         if manifest.get(name) != [column.name for column in enum]:
@@ -263,7 +264,7 @@ def iter_record_blocks(root, *, states=False):
     extent = (manifest["env_count"], manifest["substeps"])
     environments = (manifest["env_count"],)
     shapes = {"energy": extent + (len(EnergyColumn),), "energy_status": extent,
-              "stages": extent + (len(Stage), len(StageColumn)),
+              "stages": extent + (len(Stage), len(stage_columns)),
               "audit_counts": extent + (len(AuditCount),),
               "audit_metrics": extent + (len(AuditMetric),), "force_residual_work": extent,
               "env_status": environments, "ogc_contacts": environments,
@@ -340,6 +341,9 @@ def iter_record_blocks(root, *, states=False):
         next_step += entry["steps"]
         if next_step - 1 > manifest["steps"]:
             raise ValueError("diagnostic chunks exceed the declared total steps")
+        if len(stage_columns) < len(StageColumn):
+            block["stages"] = np.pad(block["stages"],
+                [(0, 0)] * (block["stages"].ndim - 1) + [(0, len(StageColumn) - len(stage_columns))])
         yield block, manifest
     if next_step - 1 != manifest["steps"]:
         raise ValueError("diagnostic chunks do not cover the declared total steps")
