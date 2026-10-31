@@ -48,6 +48,10 @@ These rules OVERRIDE default behavior. Follow them in every file you write or ed
 - Use Newton, MuJoCo, and Genesis simulation results as physical references where
   their models apply. Match inputs and document parameter/solver differences;
   resolve disagreements with analytic cases and invariants, not majority voting.
+- Judge results that differ from Newton using independent physical invariants
+  and timestep/solver convergence. Matching its trajectory is not required when
+  the solver formulation is physically justified; document the evidence and
+  model, contact-law, and parameter differences behind acceptance.
 - Preserve failing baselines. Fix shared physical errors before freezing a new
   performance denominator; do not count changed physics as a speedup.
 
