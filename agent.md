@@ -30,6 +30,9 @@ This repository is being built as a CUDA-first, full-GPU physics simulation plat
 
 ## Physics Architecture Principle
 
+- Preserve the unified UABD solver and one general solving path. Implementation
+  and numerical detail fixes are allowed within that scheme. Obtain explicit
+  owner approval before replacing or substantially restructuring the scheme.
 - The highest Nuka-Physics requirement is one general physics solving path. No
   case-by-case paths, per-scene hacks, magic-numbered layouts, silent
   truncation, or faked results are allowed.
@@ -38,6 +41,12 @@ This repository is being built as a CUDA-first, full-GPU physics simulation plat
   shortcuts, scene-specific cooks, or golden-only behavior.
 - Robot-ground, robot-robot, robot-object, terrain, and grasp contacts are all
   the same contact problem and must run through the same general solver path.
+- Newton trajectories are physical references, not acceptance oracles. Match
+  inputs and document model and solver differences; judge physical correctness
+  using constraint error, contact response, conservation, and timestep and solver
+  convergence. A justified difference does not require copying Newton's scheme.
+- Preserve failing physical baselines. Freeze performance comparisons only after
+  independent physical acceptance at the declared quality budget.
 
 ## Robot Simulation Focus
 
