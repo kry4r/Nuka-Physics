@@ -288,23 +288,31 @@ __global__ void PairDrivenNarrowphaseKernel(
         b = candidate_pairs[static_cast<size_t>(gid) * 2u + 1u];
         sa = LoadPrimShape(shape_table, a);
         sb = LoadPrimShape(shape_table, b);
-        const float* profiles = mat_buckets + size_t{env} * num_material_buckets * nk::kContactProfileWordCount;
         // An authored pair's single profile replaces both shape profiles.
         const uint32_t authored = AuthoredPairProfile(authored_keys, authored_profiles, authored_count, a, b);
-        const float* profile_a = profiles +
-            size_t{authored != ~0u ? authored : sa.contact_profile_index} * nk::kContactProfileWordCount;
-        const float* profile_b = profiles +
-            size_t{authored != ~0u ? authored : sb.contact_profile_index} * nk::kContactProfileWordCount;
-        const uint32_t source_a = __float_as_uint(profile_a[nk::kContactProfileLawSource]);
-        const uint32_t source_b = __float_as_uint(profile_b[nk::kContactProfileLawSource]);
+        const auto profile = [&](uint32_t index) -> const float* {
+            if (mat_buckets == nullptr || index >= num_material_buckets) return nullptr;
+            const float* row = mat_buckets + (size_t{env} * num_material_buckets + index) *
+                nk::kContactProfileWordCount;
+            if (__float_as_uint(row[nk::kContactProfileSchema]) != nk::kContactProfileSchemaVersion ||
+                (__float_as_uint(row[nk::kContactProfileFlags]) & ~nk::kContactProfileSupportedFlags) != 0u)
+                return nullptr;
+            return row;
+        };
+        const float* profile_a = profile(authored != ~0u ? authored : sa.contact_profile_index);
+        const float* profile_b = profile(authored != ~0u ? authored : sb.contact_profile_index);
+        const uint32_t source_a = profile_a ? __float_as_uint(profile_a[nk::kContactProfileLawSource]) :
+            static_cast<uint32_t>(constraint::LawSource::None);
+        const uint32_t source_b = profile_b ? __float_as_uint(profile_b[nk::kContactProfileLawSource]) :
+            static_cast<uint32_t>(constraint::LawSource::None);
         if (source_a == static_cast<uint32_t>(constraint::LawSource::MuJoCo) ||
             source_b == static_cast<uint32_t>(constraint::LawSource::MuJoCo))
             law = nk::kContactLawCompliant;
-        if (law == nk::kContactLawCompliant && authored != ~0u)
-            query_margin = profile_a[nk::kContactProfileMargin] + profile_a[nk::kContactProfileGap];
-        else if (law == nk::kContactLawCompliant)
-            query_margin = profile_a[nk::kContactProfileMargin] + profile_b[nk::kContactProfileMargin] +
-                           profile_a[nk::kContactProfileGap] + profile_b[nk::kContactProfileGap];
+        if (law == nk::kContactLawCompliant) {
+            const float margin_a = profile_a ? profile_a[nk::kContactProfileMargin] + profile_a[nk::kContactProfileGap] : 0.0f;
+            const float margin_b = profile_b ? profile_b[nk::kContactProfileMargin] + profile_b[nk::kContactProfileGap] : 0.0f;
+            query_margin = authored != ~0u ? margin_a : margin_a + margin_b;
+        }
         const auto route = RouteMeshContact(sa.kind, sb.kind, mesh_contact_mode[a],
                                             mesh_contact_mode[b]);
         if (!kConvex && route == MeshContactRoute::Ogc) atomicAdd(&mesh_ogc_pair_count[env], 1u);
