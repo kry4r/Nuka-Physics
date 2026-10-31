@@ -35,6 +35,17 @@ NUKA_CONTACT_HD inline math::Vec3 ContactPointNormal(
     return n;
 }
 
+NUKA_CONTACT_HD inline math::Vec3 ContactPointWorldImpulse(
+    const NkRow* rows, const float* lambda, uint32_t first, uint32_t stride) {
+    if ((rows[first].flags & nk_row_flags::kActive) == 0u) return {};
+    math::Vec3 impulse{};
+    for (uint32_t axis = 0u; axis < ContactPointAxes(rows[first]); ++axis) {
+        const uint32_t index = first + axis * stride;
+        impulse += rows[index].a.jlin * lambda[index];
+    }
+    return impulse;
+}
+
 } // namespace nuka::nk
 
 #undef NUKA_CONTACT_HD

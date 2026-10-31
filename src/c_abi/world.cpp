@@ -1317,6 +1317,17 @@ nuka_result_t nuka_world_get_body_binding(nuka_world_handle world, uint32_t env_
     }
 }
 
+nuka_result_t nuka_world_get_collider_name(nuka_world_handle world, uint32_t collider_index, const char** out) {
+    if (out == nullptr) return NUKA_RESULT_INVALID_ARG;
+    const auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->world) return NUKA_RESULT_NOT_SUPPORTED;
+    const auto& model = record->world->GetModel();
+    if (collider_index >= model.shape_table_rows.size()) return NUKA_RESULT_INVALID_ARG;
+    *out = collider_index < model.collidable_names.size() ? model.collidable_names[collider_index].c_str() : "";
+    return NUKA_RESULT_OK;
+}
+
 nuka_result_t nuka_world_get_colliders(nuka_world_handle world, uint32_t env_index,
                                        nuka_collider_t* out, uint32_t capacity,
                                        uint32_t* out_count) {

@@ -857,3 +857,5 @@ fields:
   # Each environment particle's sorted surface neighbours (ModelParticles::surface_neighbours), by particle.
   - {name: particle_surface_neighbour_offsets, dtype: u32, per: scalar, count: "particles_per_env+1", arena: persistent, owner: model}
   - {name: particle_surface_neighbours, dtype: u32, per: scalar, count: "particle_surface_neighbours_per_env", arena: persistent, owner: model}
+  # World-space impulse toward side A at each manifold point; unused points are zero.
+  - {name: ucontact_impulse, dtype: vec3, per: contact_slot, elem: 4, arena: scratch, owner: data, flags: [readout]}

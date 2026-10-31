@@ -892,7 +892,7 @@ phi::Status World::DemandReadout(FieldId id) {
     // Every field OpReadoutContactWrench produces (geometry + {Fn,Ft1,Ft2} +
     // owning link + per-link wrench) shares the one readout bit.
     if (id == FieldId::LinkContactWrench || id == FieldId::ContactForce ||
-        id == FieldId::ContactPoint || id == FieldId::ContactNormal ||
+        id == FieldId::ContactPoint || id == FieldId::ContactNormal || id == FieldId::UcontactImpulse ||
         id == FieldId::ContactLink || id == FieldId::ContactSideAKind ||
         id == FieldId::ContactSideBKind || id == FieldId::ContactSideAIndex ||
         id == FieldId::ContactSideBIndex || id == FieldId::ActiveRowIds ||
@@ -908,13 +908,13 @@ phi::Status World::DemandReadout(FieldId id) {
     if (last_status_ != phi::Status::Ok) return last_status_;
     phi::BufferType* bt = phi::BackendDeviceBufferType(backend_);
     auto& cap = model_.capacities;
-    if ((bit & Pipeline::kReadoutContactWrench) != 0u && !cap.contact_readout &&
-        cap.contact_index_scratch_bytes != 0u) {
+    if ((bit & Pipeline::kReadoutContactWrench) != 0u && !cap.contact_readout) {
         ModelCapacities demanded = cap;
         demanded.contact_readout = true;
         for (FieldId field : {FieldId::ActiveRowIds, FieldId::ActiveRowCount, FieldId::ContactEndpointKeys,
                               FieldId::ContactEndpointCount, FieldId::LinkContactBegin,
-                              FieldId::LinkContactEnd, FieldId::ContactIndexScratch}) {
+                              FieldId::LinkContactEnd, FieldId::ContactIndexScratch, FieldId::UcontactImpulse}) {
+            if (demanded.ElementCount(field) == 0u) continue;
             last_status_ = data_.AllocateField(bt, field,
                 CheckedProduct({demanded.ElementCount(field), uint64_t{LayoutOf(field).elem_size}}));
             if (last_status_ != phi::Status::Ok) return last_status_;

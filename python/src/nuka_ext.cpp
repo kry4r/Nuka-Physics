@@ -784,6 +784,18 @@ public:
         return result;
     }
 
+    nb::list collider_names() const {
+        uint32_t count = 0u;
+        check(nuka_world_get_colliders(h_, 0u, nullptr, 0u, &count), "nuka_world_get_colliders");
+        nb::list result;
+        for (uint32_t index = 0u; index < count; ++index) {
+            const char* name = nullptr;
+            check(nuka_world_get_collider_name(h_, index, &name), "nuka_world_get_collider_name");
+            result.append(name);
+        }
+        return result;
+    }
+
     void set_telemetry_mask(uint32_t mask, float alert_velocity) {
         check(nuka_world_set_telemetry_mask(h_, mask, alert_velocity), "nuka_world_set_telemetry_mask");
     }
@@ -2355,6 +2367,11 @@ NB_MODULE(_nuka_ext, m) {
         .value("UCONTACT_WITNESS_B", NUKA_FIELD_UCONTACT_WITNESS_B)
         .value("UCONTACT_LAW", NUKA_FIELD_UCONTACT_LAW)
         .value("UCONTACT_FRICTION", NUKA_FIELD_UCONTACT_FRICTION)
+        .value("UCONTACT_SIDE_A", NUKA_FIELD_UCONTACT_SIDE_A)
+        .value("UCONTACT_SIDE_B", NUKA_FIELD_UCONTACT_SIDE_B)
+        .value("UCONTACT_SIDE_A_KIND", NUKA_FIELD_UCONTACT_SIDE_A_KIND)
+        .value("UCONTACT_SIDE_B_KIND", NUKA_FIELD_UCONTACT_SIDE_B_KIND)
+        .value("UCONTACT_IMPULSE", NUKA_FIELD_UCONTACT_IMPULSE)
         .value("BODY_FORCE", NUKA_FIELD_BODY_FORCE)
         .value("BODY_TORQUE", NUKA_FIELD_BODY_TORQUE)
         .value("LINK_WRENCH", NUKA_FIELD_LINK_WRENCH)
@@ -2397,6 +2414,13 @@ NB_MODULE(_nuka_ext, m) {
         .value("COMPLIANT", NUKA_CONTACT_LAW_COMPLIANT)
         .value("VELOCITY", NUKA_CONTACT_LAW_VELOCITY)
         .value("SPECULATIVE", NUKA_CONTACT_LAW_SPECULATIVE);
+
+    nb::enum_<nuka_contact_endpoint_kind_t>(m, "ContactEndpointKind")
+        .value("COLLIDER", NUKA_CONTACT_ENDPOINT_COLLIDER)
+        .value("PARTICLE", NUKA_CONTACT_ENDPOINT_PARTICLE)
+        .value("GRID", NUKA_CONTACT_ENDPOINT_GRID)
+        .value("BOUNDARY", NUKA_CONTACT_ENDPOINT_BOUNDARY)
+        .value("POINT", NUKA_CONTACT_ENDPOINT_POINT);
 
     nb::enum_<nuka_contact_side_kind_t>(m, "ContactSideKind")
         .value("RIGID", NUKA_CONTACT_SIDE_RIGID)
@@ -3372,6 +3396,7 @@ NB_MODULE(_nuka_ext, m) {
              "timestep and invalidates the execution graph when the value changes.")
         .def("solver_options", &World::solver_options)
         .def("contact_profile_shapes", &World::contact_profile_shapes)
+        .def("collider_names", &World::collider_names)
         .def("velocity_iterations", &World::velocity_iterations,
              "Block-descent iteration budget of the contact solve.")
         .def("set_telemetry_mask", &World::set_telemetry_mask, nb::arg("mask"), nb::arg("alert_velocity") = 1.0e-3f,

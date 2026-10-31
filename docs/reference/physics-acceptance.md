@@ -114,3 +114,30 @@ acceptance and the runner still exits unsuccessfully after writing its summary.
 it does not waive a measured failure. A source/input hash, five processes or a
 successful render cannot replace complete physical acceptance. Freeze a
 performance denominator only after equal physical quality has been established.
+
+## Contact point identities and impulses
+
+`Field.UCONTACT_IMPULSE` contains four world-space impulse vectors per contact
+slot, directed toward side A, in N·s. Read it after stepping; divide by that
+physical interval's duration to obtain its average force. For worlds with
+internal integration substeps it describes the last interval, not the sum over
+the outer step. Requesting its buffer enables the existing contact readout.
+Unused point impulses are zero; use `UCONTACT_COUNT` to select valid points.
+These values come from the solved contact rows. Complete momentum accounting
+also needs external forces, integration and geometric truncation diagnostics.
+Contact readout reserves another 48 bytes per slot for these vectors; worlds
+that do not request contact readout do not allocate this buffer.
+
+`UCONTACT_SIDE_A`, `UCONTACT_SIDE_B` and their `_KIND` fields retain each
+point's geometric endpoint independently of its reaction owner. A
+`ContactEndpointKind.COLLIDER` ID indexes `world.collider_names()`, including
+static shapes and multiple shapes owned by the same body. Collider and boundary
+IDs are local to the environment; particle, grid and point-endpoint IDs are
+global. Other endpoint kinds must not be used as collider indices. Names can
+repeat when one authored shape produces multiple colliders, and are empty for
+unnamed programmatic shapes. Re-query names after rebuilding a world.
+
+`CONTACT_SIDE_*` continues to identify reaction owners. A static reaction has
+no dynamic owner, while its `UCONTACT_SIDE_*` collider ID remains available.
+The existing `CONTACT_FORCE` field sums the manifold's normal and tangent
+components; it does not identify the force at an individual point.

@@ -543,6 +543,7 @@ public:
         uint8_t    mesh_contact_mode = 0u;
     };
     std::vector<PairDrivenShape> shape_table_rows;
+    std::vector<std::string> collidable_names;
     std::vector<float>           samp_points;     // xyz packed.
     std::vector<uint32_t>        samp_ranges;     // {offset,count} per body row.
     // Cooked sparse-SDF grids (host staging; uploaded by UploadTo into the

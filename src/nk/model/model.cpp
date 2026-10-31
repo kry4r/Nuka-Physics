@@ -148,6 +148,7 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
     if (!mpm_reaction &&
         (id == FieldId::StepMpmBodyImpulse || id == FieldId::StepMpmBodyMoment)) return 0u;
     if (joint_limit_rows_per_env == 0u && id == FieldId::StepJointLimitImpulse) return 0u;
+    if (!contact_readout && id == FieldId::UcontactImpulse) return 0u;
     if ((contact_index_scratch_bytes == 0u || !contact_readout) &&
         (id == FieldId::ActiveRowIds || id == FieldId::ActiveRowCount ||
          id == FieldId::ContactEndpointKeys || id == FieldId::ContactEndpointCount ||
@@ -2024,6 +2025,7 @@ void MoveModelMembers(Model& dst, Model&& src) {
     dst.contact_pair_keys = std::move(src.contact_pair_keys);
     dst.contact_pair_profiles = std::move(src.contact_pair_profiles);
     dst.shape_table_rows = std::move(src.shape_table_rows);
+    dst.collidable_names = std::move(src.collidable_names);
     dst.samp_points = std::move(src.samp_points);
     dst.samp_ranges = std::move(src.samp_ranges);
     dst.sdf_grids = std::move(src.sdf_grids);

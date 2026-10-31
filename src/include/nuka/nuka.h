@@ -919,8 +919,24 @@ typedef enum nuka_state_field_t {
     NUKA_FIELD_UCONTACT_WITNESS_B = 131,
     // READ: per contact slot, nuka_contact_law_t and the detector's friction override (OGC and MPM contacts).
     NUKA_FIELD_UCONTACT_LAW = 132,
-    NUKA_FIELD_UCONTACT_FRICTION = 133
+    NUKA_FIELD_UCONTACT_FRICTION = 133,
+    // READ: four endpoint IDs and kinds per slot. Collider IDs retain static geometry identity.
+    NUKA_FIELD_UCONTACT_SIDE_A = 134,
+    NUKA_FIELD_UCONTACT_SIDE_B = 135,
+    NUKA_FIELD_UCONTACT_SIDE_A_KIND = 136,
+    NUKA_FIELD_UCONTACT_SIDE_B_KIND = 137,
+    // READ: four world impulses (N*s) toward side A from the last physical interval; unused points are zero.
+    NUKA_FIELD_UCONTACT_IMPULSE = 138
 } nuka_state_field_t;
+
+// Collider and boundary IDs are environment-local; particle, grid and point-endpoint IDs are global.
+typedef enum nuka_contact_endpoint_kind_t {
+    NUKA_CONTACT_ENDPOINT_COLLIDER = 0,
+    NUKA_CONTACT_ENDPOINT_PARTICLE = 1,
+    NUKA_CONTACT_ENDPOINT_GRID = 2,
+    NUKA_CONTACT_ENDPOINT_BOUNDARY = 3,
+    NUKA_CONTACT_ENDPOINT_POINT = 4
+} nuka_contact_endpoint_kind_t;
 
 typedef enum nuka_contact_law_t {
     NUKA_CONTACT_LAW_COMPLIANT = 0,
@@ -1214,6 +1230,9 @@ typedef struct nuka_collider_t {
 nuka_result_t nuka_world_get_colliders(nuka_world_handle world, uint32_t env_index,
                                        nuka_collider_t* out, uint32_t capacity,
                                        uint32_t* out_count);
+// Name of the authored shape for an environment-local collider ID; empty for unnamed programmatic shapes.
+// The returned string remains valid until the world is rebuilt or destroyed.
+nuka_result_t nuka_world_get_collider_name(nuka_world_handle world, uint32_t collider_index, const char** out);
 
 // ---------------------------------------------------------------------------
 // Offline beauty render of the LIVE world: a one-off HOST RGB image of the world's

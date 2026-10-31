@@ -88,7 +88,8 @@ __global__ void ContactForceKernel(const float* __restrict__ lambda,
                                     uint32_t* __restrict__ out_a_kind,
                                     uint32_t* __restrict__ out_b_kind,
                                     uint32_t* __restrict__ out_a_index,
-                                    uint32_t* __restrict__ out_b_index) {
+                                    uint32_t* __restrict__ out_b_index,
+                                    Vec3* __restrict__ out_point_impulse) {
     const uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
     if (slot >= slot_count) {
         return;
@@ -104,6 +105,9 @@ __global__ void ContactForceKernel(const float* __restrict__ lambda,
         ft1 += impulse.y;
         ft2 += impulse.z;
     }
+    for (uint32_t i = 0u; i < kPdPtsPerSlot; ++i)
+        out_point_impulse[slot * kPdPtsPerSlot + i] = i < pts
+            ? nk::ContactPointWorldImpulse(urows, lambda, row_base + i, t1) : Vec3{};
     const uint32_t base = slot * kContactForceComponents;
     out_contact_force[base + 0u] = fn * inv_dt;
     out_contact_force[base + 1u] = ft1 * inv_dt;
@@ -442,6 +446,8 @@ __global__ void ResetEnvsKernel(DataView data, ResetEnvsParams p) {
         for (uint32_t component = 0u; component < kContactForceComponents; ++component)
             data.contact_force[contact * kContactForceComponents + component] = 0.0f;
         for (uint32_t point = 0u; point < kPdPtsPerSlot; ++point) {
+            if (data.ucontact_impulse != nullptr)
+                data.ucontact_impulse[contact * kPdPtsPerSlot + point] = {};
             ClearWarmStartPoint(contact * kPdPtsPerSlot + point, data.contact_cache_pair,
                 data.contact_cache_feature, data.contact_cache_lambda, data.contact_cache_normal,
                 data.contact_cache_material, data.contact_cache_age);
@@ -596,7 +602,7 @@ Status OpReadoutContactWrench(const ModelView& /*model*/, const DataView& data,
                inv_dt, data.contact_force, reinterpret_cast<const NkRow*>(data.urows),
                data.row_cj_link, data.row_cj_link_b,
                data.contact_side_a_kind, data.contact_side_b_kind,
-               data.contact_side_a_index, data.contact_side_b_index);
+               data.contact_side_a_index, data.contact_side_b_index, data.ucontact_impulse);
     if (cudaGetLastError() != cudaSuccess) return Status::Failed;
     LaunchCuda(ContactLinkKernel, dim3(force_grid), dim3(kBlock), 0u, stream,
                static_cast<const uint32_t*>(data.row_cj_link),

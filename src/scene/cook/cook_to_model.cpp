@@ -1500,6 +1500,10 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
 
     // An authored pair binds each collidable row cooked from one named shape to each row of the other.
     collidable_shape.resize(model.shape_table_rows.size(), ~0u);
+    model.collidable_names.resize(collidable_shape.size());
+    for (size_t row = 0; row < collidable_shape.size(); ++row)
+        if (collidable_shape[row] != ~0u)
+            model.collidable_names[row] = blob.contact_params.names[collidable_shape[row]];
     {
         std::vector<std::pair<uint64_t, uint32_t>> pairs;
         const auto source_of = [&](uint32_t row) {

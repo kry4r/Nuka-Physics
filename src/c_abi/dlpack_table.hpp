@@ -26,6 +26,11 @@ static_assert(NUKA_CONTACT_SIDE_POINT_ENDPOINT == nk::kNkSidePointEndpoint);
 static_assert(NUKA_CONTACT_LAW_COMPLIANT == nk::kContactLawCompliant);
 static_assert(NUKA_CONTACT_LAW_VELOCITY == nk::kContactLawVelocity);
 static_assert(NUKA_CONTACT_LAW_SPECULATIVE == nk::kContactLawSpeculative);
+static_assert(NUKA_CONTACT_ENDPOINT_COLLIDER == nk::kUContactSideBody);
+static_assert(NUKA_CONTACT_ENDPOINT_PARTICLE == nk::kUContactSideParticle);
+static_assert(NUKA_CONTACT_ENDPOINT_GRID == nk::kUContactSideGrid);
+static_assert(NUKA_CONTACT_ENDPOINT_BOUNDARY == nk::kUContactSideBoundary);
+static_assert(NUKA_CONTACT_ENDPOINT_POINT == nk::kUContactSidePointEndpoint);
 static_assert(sizeof(nuka_point_endpoint_range_t) == sizeof(nk::PointEndpointRange));
 static_assert(sizeof(nuka_point_endpoint_term_t) == sizeof(nk::PointEndpointTerm));
 static_assert(offsetof(nuka_point_endpoint_term_t, column) == offsetof(nk::PointEndpointTerm, column));
@@ -302,6 +307,16 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
         kWireDtypeF32, nk::FieldId::UcontactWitnessB},
     {NUKA_FIELD_UCONTACT_LAW, kStrideU32, kWireDtypeU32, nk::FieldId::UcontactLaw},
     {NUKA_FIELD_UCONTACT_FRICTION, kStrideF32, kWireDtypeF32, nk::FieldId::UcontactFriction},
+    {NUKA_FIELD_UCONTACT_SIDE_A, nk::LayoutOf(nk::FieldId::UcontactA).elem_size,
+        kWireDtypeU32, nk::FieldId::UcontactA},
+    {NUKA_FIELD_UCONTACT_SIDE_B, nk::LayoutOf(nk::FieldId::UcontactB).elem_size,
+        kWireDtypeU32, nk::FieldId::UcontactB},
+    {NUKA_FIELD_UCONTACT_SIDE_A_KIND, nk::LayoutOf(nk::FieldId::UcontactAKind).elem_size,
+        kWireDtypeU32, nk::FieldId::UcontactAKind},
+    {NUKA_FIELD_UCONTACT_SIDE_B_KIND, nk::LayoutOf(nk::FieldId::UcontactBKind).elem_size,
+        kWireDtypeU32, nk::FieldId::UcontactBKind},
+    {NUKA_FIELD_UCONTACT_IMPULSE, nk::LayoutOf(nk::FieldId::UcontactImpulse).elem_size,
+        kWireDtypeF32, nk::FieldId::UcontactImpulse},
 };
 
 inline constexpr size_t kDlpackFieldCount =
