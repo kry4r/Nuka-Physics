@@ -27,7 +27,7 @@ struct WorldStepOptions {
     bool clear_forces_after_step = true;
     bool enable_contacts = true;
     uint32_t solver_velocity_iterations = 10;
-    uint32_t solver_position_iterations = 4;
+    uint32_t solver_position_iterations = 32;
     float solver_slop = 0.005f;
     float solver_baumgarte = 0.2f;
 };

@@ -38,11 +38,9 @@ public:
         uint16_t vel_iters = 32;
         bool velocity_iterations_override = false;
         bool measure_contact_residual = false;
-        // Split-impulse position-correction sweeps (the general PairDriven path).
-        // 0 keeps the velocity-only solve; the production default runs a small pass
-        // that geometrically expels accumulated penetration without energy
-        // injection (a SEPARATE pseudo velocity integrated into position only).
-        uint16_t pos_iters = 4;
+        // Split-impulse position sweeps converge coupled contacts from rest.
+        // Zero disables geometric correction; pseudo velocity enters position only.
+        uint16_t pos_iters = 32;
         float    pos_beta = 0.3f;      // penetration-closing fraction per step.
         float    pos_slop = 0.001f;    // allowed residual penetration (m).
         float    contact_margin = 0.0f;

@@ -115,6 +115,13 @@ it does not waive a measured failure. A source/input hash, five processes or a
 successful render cannot replace complete physical acceptance. Freeze a
 performance denominator only after equal physical quality has been established.
 
+The default split-impulse position budget is 32 sweeps. Coupled contacts need
+enough sweeps to converge mass-weighted separation: a finite block sweep can
+leave a center-of-mass error even when physical velocity impulses balance.
+Explicit position budgets remain part of the physical-quality configuration.
+Validate their convergence before comparing performance or accepting a new
+denominator; a higher-quality configuration is a new physical baseline.
+
 ## Contact point identities and impulses
 
 `Field.UCONTACT_IMPULSE` contains four world-space impulse vectors per contact

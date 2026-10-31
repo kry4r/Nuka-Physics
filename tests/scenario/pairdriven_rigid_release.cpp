@@ -61,7 +61,6 @@ nk::Pipeline::SolverConfig Config() {
     config.dt = 0.005f;
     config.gravity[0] = config.gravity[1] = config.gravity[2] = 0.0f;
     config.max_pairs = 32u;
-    config.pos_iters = 4u;
     return config;
 }
 
@@ -105,32 +104,44 @@ TEST(PairDrivenRigidRelease, ManifoldPointsStayOnTheContactingGeometry) {
     }
 }
 
-// Physical impulses and geometric push-out preserve the center of mass without
-// external forces, for either body order.
+// Position sweeps converge to mass-weighted separation without external forces,
+// independently of body order; the production default must meet the final bound.
 TEST(PairDrivenRigidRelease, SeparationPreservesCenterOfMass) {
     auto& backend = Device();
     if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
     for (bool reverse : {false, true}) {
         SCOPED_TRACE(::testing::Message() << "reverse=" << reverse);
-        nk::Model model;
-        AddBody(model, nuka::collision::kShapeSphere,
-                {reverse ? 0.09f : -0.09f, 0, 0}, 0.1f, reverse ? 0.3f : 0.2f);
-        AddBody(model, nuka::collision::kShapeSphere,
-                {reverse ? -0.09f : 0.09f, 0, 0}, 0.1f, reverse ? 0.2f : 0.3f);
-        Finish(model);
-        nk::World world(std::move(model), 2u, backend.device, backend.backend, Config());
-        ASSERT_TRUE(world.Ready());
-        for (uint32_t step = 0; step < 20u; ++step) ASSERT_TRUE(world.Step().AllOk());
-        const auto poses = Read<Transform>(world, nk::FieldId::BodyPose, 4u);
-        const auto velocities = Read<Vec3>(world, nk::FieldId::BodyLinearVelocity, 4u);
-        for (uint32_t env = 0; env < 2u; ++env) {
-            const uint32_t left = env * 2u + (reverse ? 1u : 0u);
-            const uint32_t right = env * 2u + (reverse ? 0u : 1u);
-            const float center = (0.2f * poses[left].position.x + 0.3f * poses[right].position.x) / 0.5f;
-            EXPECT_NEAR(center, 0.018f, 2.0e-6f) << "env=" << env;
-            EXPECT_NEAR(0.2f * velocities[left].x + 0.3f * velocities[right].x,
-                        0.0f, 2.0e-6f);
-            EXPECT_GT(poses[right].position.x - poses[left].position.x, 0.199f);
+        double previous_error = 1.0;
+        const uint16_t final_iterations = Config().pos_iters;
+        for (uint16_t iterations : std::vector<uint16_t>{4u, 8u, 16u, final_iterations}) {
+            SCOPED_TRACE(::testing::Message() << "position iterations=" << iterations);
+            nk::Model model;
+            AddBody(model, nuka::collision::kShapeSphere,
+                    {reverse ? 0.09f : -0.09f, 0, 0}, 0.1f, reverse ? 0.3f : 0.2f);
+            AddBody(model, nuka::collision::kShapeSphere,
+                    {reverse ? -0.09f : 0.09f, 0, 0}, 0.1f, reverse ? 0.2f : 0.3f);
+            Finish(model);
+            auto config = Config();
+            config.pos_iters = iterations;
+            nk::World world(std::move(model), 2u, backend.device, backend.backend, config);
+            ASSERT_TRUE(world.Ready());
+            for (uint32_t step = 0; step < 20u; ++step) ASSERT_TRUE(world.Step().AllOk());
+            const auto poses = Read<Transform>(world, nk::FieldId::BodyPose, 4u);
+            const auto velocities = Read<Vec3>(world, nk::FieldId::BodyLinearVelocity, 4u);
+            double error = 0.0;
+            for (uint32_t env = 0; env < 2u; ++env) {
+                const uint32_t left = env * 2u + (reverse ? 1u : 0u);
+                const uint32_t right = env * 2u + (reverse ? 0u : 1u);
+                const float center = (0.2f * poses[left].position.x + 0.3f * poses[right].position.x) / 0.5f;
+                error = std::fmax(error, std::abs(double(center) - 0.018));
+                if (iterations == final_iterations) EXPECT_NEAR(center, 0.018f, 2.0e-6f) << "env=" << env;
+                EXPECT_NEAR(0.2f * velocities[left].x + 0.3f * velocities[right].x, 0.0f, 2.0e-6f);
+                EXPECT_GT(poses[right].position.x - poses[left].position.x, 0.199f);
+            }
+            RecordProperty("center_error_pm_" + std::to_string(reverse) + "_" + std::to_string(iterations),
+                           std::to_string(std::llround(error * 1.0e12)));
+            EXPECT_LE(error, std::fmax(0.65 * previous_error, 2.0e-7));
+            previous_error = error;
         }
     }
 }
