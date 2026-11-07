@@ -18,6 +18,7 @@ inline constexpr uint32_t kContactFeatureUnavailable = 0xffffffffu;
 inline constexpr uint32_t kContactKindGeneric = 0u;
 inline constexpr uint32_t kContactKindOgcVertexFace = 1u;
 inline constexpr uint32_t kContactKindOgcEdgeEdge = 2u;
+inline constexpr uint32_t kContactKindSphereFace = 3u;
 inline constexpr uint32_t kContactHandleBits = 28u;
 inline constexpr uint32_t kContactHandleMask = (1u << kContactHandleBits) - 1u;
 inline constexpr float kContactPointQuantization = 4096.0f;

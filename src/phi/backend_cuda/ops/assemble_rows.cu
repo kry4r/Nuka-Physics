@@ -6,6 +6,7 @@
 
 #include <algorithm>
 
+#include "collision/contact_query.hpp"
 #include "phi/backend_cuda/ops/contact_row_layout.cuh"
 #include "constraint/solref_solimp.hpp"  // ComputeCompliantRow (HD)
 #include "nk/contact/contact_profile.hpp"
@@ -58,6 +59,8 @@ __device__ scene::ContactParamsIn ReadContactProfile(
         return fallback;
     scene::ContactParamsIn out;
     out.mu1 = w[nk::kContactProfileMu1];
+    out.geometric_friction = (__float_as_uint(w[nk::kContactProfileFlags]) &
+                              nk::kContactProfileFlagGeometricFriction) != 0u;
     out.mu2 = w[nk::kContactProfileMu2];
     out.friction_spin = w[nk::kContactProfileSpin];
     out.friction_roll = w[nk::kContactProfileRoll];
@@ -550,6 +553,8 @@ __global__ void EmitPairDrivenRowsKernel(
               mat_buckets + size_t{env} * num_material_buckets * nk::kContactProfileWordCount,
               num_material_buckets, authored, default_profile))
         : scene::MergeContactParams(side_a, side_b);
+    if (authored == ~0u && (side_a.geometric_friction || side_b.geometric_friction) &&
+        merged.mu1 == 0.0f && merged.mu2 == 0.0f) merged.condim = 1u;
     if (mujoco) {
         merged.mu1 = fmaxf(1.0e-5f, merged.mu1);
         merged.mu2 = fmaxf(1.0e-5f, merged.mu2);
@@ -617,13 +622,13 @@ __global__ void EmitPairDrivenRowsKernel(
         math::Vec3 point{0, 0, 0};
         math::Vec3 point_a{0, 0, 0}, point_b{0, 0, 0};
         math::Vec3 t0{1, 0, 0}, t1v{0, 1, 0};
+        const bool ogc_slot = slot >= full_row_slot_count &&
+            slot - full_row_slot_count < ogc_slot_count;
         if (live) {
             n = NormalizedHostExpr(ucontact_normal[mp]);
             point = ucontact_point[mp];
-            const bool ogc_slot = slot >= full_row_slot_count &&
-                slot - full_row_slot_count < ogc_slot_count;
-            point_a = ogc_slot ? ucontact_witness_a[mp] : point;
-            point_b = ogc_slot ? ucontact_witness_b[mp] : point;
+            // Endpoint Jacobians share the force point; witnesses only describe the contact geometry.
+            point_a = point_b = point;
             if (pyramidal) mg::MuJoCoContactFrame(ucontact_normal[mp], frame_axis, &t0, &t1v);
             else mg::ContactTangentBasis(ucontact_normal[mp], &t0, &t1v);
         }
@@ -678,9 +683,18 @@ __global__ void EmitPairDrivenRowsKernel(
             row_cj_link_b[rs] = kInvalidLink;
             if (live) {
                 const float pos = -ucontact_depth[mp] - merged.margin;
-                // Geometric penetration (positive when overlapping) for the
-                // split-impulse position pass; the velocity solve uses aref.
-                row_penetration[rs] = speculative ? ucontact_depth[mp] : fmaxf(ucontact_depth[mp], 0.0f);
+                // Every speculative contact reserves the rounding of its projected endpoint positions.
+                const math::Vec3 extent{fabsf(point.x) + fabsf(n.x * ucontact_depth[mp]),
+                    fabsf(point.y) + fabsf(n.y * ucontact_depth[mp]),
+                    fabsf(point.z) + fabsf(n.z * ucontact_depth[mp])};
+                const math::Vec3 witness_a = ogc_slot ? ucontact_witness_a[mp] : extent;
+                const math::Vec3 witness_b = ogc_slot ? ucontact_witness_b[mp] : extent;
+                const double projection_roundoff = speculative
+                    ? collision::ContactProjectionRoundoff(witness_a, witness_b, n) : 0.0;
+                const float numerical_clearance = projection_roundoff > 0.0
+                    ? nextafterf(float(projection_roundoff), FLT_MAX) : 0.0f;
+                const float depth = ucontact_depth[mp] + numerical_clearance;
+                row_penetration[rs] = speculative ? depth : fmaxf(ucontact_depth[mp], 0.0f);
                 constraint::CompliantContactRow compliant{};
                 if (!velocity_only)
                     compliant = constraint::ComputeCompliantRow(solref, solimp, pos, pos,
@@ -695,7 +709,7 @@ __global__ void EmitPairDrivenRowsKernel(
                 row.env = env;
                 row.rhs = compliant.aref_bias;
                 // Split impulses recover overlap without adding physical kinetic energy.
-                if (speculative) row.rhs = (fminf(ucontact_depth[mp], 0.0f) +
+                if (speculative) row.rhs = (fminf(depth, 0.0f) +
                     (position_pass ? 0.0f : fminf(fmaxf(ucontact_depth[mp], 0.0f),
                                                 overlap_recovery_velocity * dt))) / (dt * dt);
                 row_reference_velocity_gain[rs] = 1.0f / dt - compliant.damping;
@@ -1172,7 +1186,8 @@ __global__ void PrepareContactRowsKernel(
             step_qdot, step_body_linear, step_body_angular, step_particle, point_masses);
         row.rhs += row_reference_velocity_gain[rs] * initial_velocity;
     }
-    const bool respond = measure != 0u && (row.flags & nk::nk_row_flags::kBlockNormal);
+    const bool respond = measure != 0u &&
+        (row.flags & (nk::nk_row_flags::kBlockNormal | nk::nk_row_flags::kContactNormal));
     if (!respond) return;
     uint32_t tangent_rows[2] = {0u, 0u};
     const bool block = respond && BlockTangentRows(urows, rs, row, tangent_rows);
@@ -1206,7 +1221,7 @@ __global__ void PrepareContactRowsKernel(
         dof_stride);
     diagonal += row.compliance_alpha;
     if (!block) {
-        contact_response[rs] = {};
+        contact_response[rs] = {diagonal, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
         return;
     }
     const NkRow& tangent1 = urows[tangent1_row];

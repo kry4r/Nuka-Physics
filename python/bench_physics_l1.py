@@ -28,7 +28,7 @@ from bench_cloth_twist import topology
 
 PARTICLE_FIELDS = (nuka.Field.PARTICLE_POSITION, nuka.Field.PARTICLE_VELOCITY,
                    nuka.Field.PARTICLE_INV_MASS, nuka.Field.VBD_EFFECTIVE_DT)
-CONTACT_FIELDS = (nuka.Field.DAT_FAILURE_WITNESS, nuka.Field.CONTACT_SIDE_A_KIND, nuka.Field.CONTACT_SIDE_A_INDEX,
+CONTACT_FIELDS = (nuka.Field.CONTACT_SIDE_A_KIND, nuka.Field.CONTACT_SIDE_A_INDEX,
                   nuka.Field.CONTACT_SIDE_B_KIND, nuka.Field.CONTACT_SIDE_B_INDEX)
 LINK_FIELDS = (nuka.Field.ARTICULATION_LINK_POSE, nuka.Field.JOINT_POSITION, nuka.Field.JOINT_VELOCITY,
                nuka.Field.JOINT_LIMIT_IMPULSE, nuka.Field.LINK_CONTACT_WRENCH)

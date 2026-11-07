@@ -38,7 +38,7 @@
 #include "collision/analytical_manifold.hpp"   // amf:: sphere handlers (HD)
 #include "collision/convex_narrowphase.hpp"    // cvx::SphereHull (EPA-bypass)
 #include "collision/cross_system_query.hpp"    // kCrossSystemMaxCandidates (the cap)
-#include "collision/dat_geometry.hpp"
+#include "collision/contact_query.hpp"
 #include "collision/lbvh_node.cuh"             // LbvhNode (arena tree traversal)
 #include "collision/shape_kind.hpp"            // nuka::collision::ShapeKind
 #include "math/transform.hpp"
@@ -456,9 +456,9 @@ __global__ void NarrowphaseBodyParticleKernel(
         if (kWarp) body = __shfl_sync(0xffffffffu, body, 0);
         const PrimShapeDev sb = LoadPrimShape(shape_table, body);
         if ((sb.contype | sb.conaffinity) == 0u) continue;
-        // Authored particle surfaces own their contacts with meshed bodies.
-        if (surface_vertex && surfaces.mesh_info != nullptr && body < surfaces.shape_count &&
-            surfaces.mesh_info[body].vertex_count > 0u) continue;
+        // Surface features own sphere contacts and contacts with meshed bodies.
+        if (surface_vertex && (sb.kind == kKindSphere || (surfaces.mesh_info != nullptr &&
+            body < surfaces.shape_count && surfaces.mesh_info[body].vertex_count > 0u))) continue;
         const math::Transform xb = body_pose[env * N + body];
         const amf::PrimParams pb = MakePrim(sb, xb);
         // A vertex-block sphere spans OGC's motion-bounded query; depth is taken back to its thickness.
@@ -471,8 +471,8 @@ __global__ void NarrowphaseBodyParticleKernel(
                               fmaxf(fabsf(lo.z - xb.position.z), fabsf(hi.z - xb.position.z))};
             const float body_rate = sqrtf(body_linear_velocity[at].LengthSq()) +
                 sqrtf(body_angular_velocity[at].LengthSq()) * sqrtf(extent.LengthSq());
-            sphere = ::nuka::collision::DatQueryRadius(::nuka::collision::DatMotionRadius(
-                radius + pp.contact_margin, pp.dt, surface_rate, body_rate, kDatRelaxation), pp.query_reach);
+            sphere = ::nuka::collision::ContactQueryRadius(::nuka::collision::ContactMotionRadius(
+                radius + pp.contact_margin, pp.dt, surface_rate, body_rate, kContactQueryRelaxation), pp.query_reach);
         }
         const amf::PrimParams ps = MakeParticleSphere(center, sphere);
 

@@ -745,8 +745,7 @@ fields:
   - {name: dat_particle_beta, dtype: f32, per: particle, arena: scratch, owner: data, flags: [readout]}
   - {name: dat_body_beta, dtype: u32, per: body, arena: scratch, owner: data}
   - {name: dat_artic_beta, dtype: u32, per: articulation, arena: scratch, owner: data}
-  # Per DAT bound kind (vertex motion, particle pair, body pair, chain travel): smallest fraction
-  # bits in high32, then limiting body << 16 | counterpart; all ones when the bound never applied.
+  # Reserved DAT witness field; no storage in the discrete contact pipeline.
   - {name: dat_artic_witness, dtype: u64, per: articulation, elem: 4, arena: scratch, owner: data}
   - {name: dat_prev_q, dtype: f32, per: link, arena: scratch, owner: data}
   - {name: dat_prev_joint_rotation, dtype: quat, per: link, arena: scratch, owner: data}
@@ -754,10 +753,9 @@ fields:
   - {name: dat_prev_body_pose, dtype: transform, per: body, arena: scratch, owner: data}
   - {name: dat_body_speed, dtype: f32, per: body, arena: scratch, owner: data}
   - {name: dat_body_query_radius, dtype: f32, per: body, arena: scratch, owner: data}
-  # Largest untruncated vertex displacement rate of each body in the last DAT pass.
+  # Reserved DAT motion field; no storage in the discrete contact pipeline.
   - {name: dat_body_motion, dtype: f32, per: body, arena: persistent, owner: data}
-  # Untruncated joint speed of each link in the last DAT pass, and the joint speed bound
-  # predicted at contact detection.
+  # Reserved DAT joint motion and the current joint speed bound used by contact queries.
   - {name: dat_joint_motion, dtype: f32, per: link, arena: persistent, owner: data}
   - {name: dat_joint_rate, dtype: f32, per: link, arena: scratch, owner: data}
   - {name: dat_pair_kind, dtype: u32, per: contact_slot, arena: scratch, owner: data}
@@ -781,7 +779,7 @@ fields:
   - {name: vbd_restart, dtype: u32, per: scalar, count: "vbd_vertices_per_env*env_count", arena: persistent, owner: data}
   - {name: dat_failure_count, dtype: u32, per: env, arena: scratch, owner: data}
   - {name: dat_query_limit_count, dtype: u32, per: env, arena: scratch, owner: data}
-  # Last DAT pass per env: failures by reason, unrecorded events, then (key, count, depth) per owner pair.
+  # Reserved DAT failure witnesses; no storage in the discrete contact pipeline.
   - {name: dat_failure_witness, dtype: u64, per: env, elem: 389, arena: scratch, owner: data}
   - {name: contact_warm_start_counts, dtype: u32, per: env, elem: 2, arena: scratch, owner: data}
   - {name: mesh_ogc_pair_count, dtype: u32, per: env, arena: scratch, owner: data}
@@ -842,7 +840,7 @@ fields:
   # World-frame force through each articulation link COM, followed by torque.
   # The outer step consumes and clears this input with the free-body forces.
   - {name: link_wrench, dtype: spatial6, per: link, arena: scratch, owner: data}
-  # Union-find parents of DAT owners whose pairs hold only under one shared step fraction.
+  # Reserved DAT owner fields; no storage in the discrete contact pipeline.
   - {name: dat_particle_parent, dtype: u32, per: particle, arena: scratch, owner: data}
   - {name: dat_body_parent, dtype: u32, per: body, arena: scratch, owner: data}
   - {name: dat_artic_parent, dtype: u32, per: articulation, arena: scratch, owner: data}

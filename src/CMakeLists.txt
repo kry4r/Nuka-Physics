@@ -791,7 +791,6 @@ if(CMAKE_CUDA_COMPILER)
         phi/backend_cuda/ops/particles.cu
         phi/backend_cuda/ops/vertex_blocks.cu
         phi/backend_cuda/ops/ogc_detect.cu
-        phi/backend_cuda/ops/dat_truncate.cu
         # MLS-MPM transfer ops (P2G deterministic gather + G2P + grid clear) — the
         # inert round-trip scaffold; reachable through RegisterNkMpmOps, not yet in
         # Pipeline::Build's op list.

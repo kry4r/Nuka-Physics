@@ -4,7 +4,7 @@
 
 #include <cstdint>
 #include "phi/articulation_contract.hpp"
-#include "collision/dat_geometry.hpp"
+#include "collision/contact_query.hpp"
 #include "collision/mesh_surface_types.hpp"
 #include "sensor/observation_types.hpp"
 #include "sensor/state_types.hpp"
@@ -214,7 +214,7 @@ struct MimicReduceParams {
 // views are pure pointer aggregates).
 struct BuildAabbsParams {
     float dt = 0.0f;
-    float query_reach = collision::kDatQueryRadiusMax;
+    float query_reach = collision::kContactQueryReachMin;
     float    margin;            // AABB inflation margin
     uint32_t family;            // kContactFamily* (PairDriven => build)
     uint32_t env_count;
@@ -266,19 +266,18 @@ struct ParticleSurfacesParams {
     uint32_t triangles_per_env;
     uint32_t nodes_per_env;
     uint32_t edge_nodes_per_env;
-    uint32_t position_source = 0u;
 };
 
-// Share of a DAT query radius that two sides of an undetected pair may jointly travel.
-inline constexpr float kDatRelaxation = 0.9f;
+// Relative-motion padding for speculative discrete contact queries.
+inline constexpr float kContactQueryRelaxation = 0.9f;
 
 struct OgcDetectParams {
     uint32_t num_material_buckets;
     uint32_t ogc_body_pairs = 1u;
     float dt = 0.0f;
     float margin = 0.0f;
-    float relaxation = kDatRelaxation;
-    float query_reach = collision::kDatQueryRadiusMax;
+    float relaxation = kContactQueryRelaxation;
+    float query_reach = collision::kContactQueryReachMin;
     uint32_t env_count = 0u;
     uint32_t particles_per_env = 0u;
     uint32_t surfaces_per_env = 0u;
@@ -308,42 +307,6 @@ struct OgcDetectParams {
     uint32_t point_endpoint_term_first = 0u;
     uint64_t workspace_bytes = 0u;
 };
-
-struct DatTruncateParams {
-    uint32_t ogc_body_pairs = 1u;
-    float dt = 0.0f;
-    float relaxation = kDatRelaxation;
-    float margin = 0.0f;
-    float query_reach = collision::kDatQueryRadiusMax;
-    uint64_t workspace_bytes = 0u;
-    uint32_t env_count = 0u;
-    uint32_t particles_per_env = 0u;
-    uint32_t vbd_particle_begin = 0u;
-    uint32_t vbd_vertices_per_env = 0u;
-    uint32_t surfaces_per_env = 0u;
-    uint32_t triangles_per_env = 0u;
-    uint32_t nodes_per_env = 0u;
-    uint32_t edges_per_env = 0u;
-    uint32_t edge_nodes_per_env = 0u;
-    uint32_t bodies_per_env = 0u;
-    uint32_t links_per_env = 0u;
-    uint32_t articulations_per_env = 0u;
-    uint32_t max_dof = 0u;
-    uint32_t mesh_vertices = 0u;
-    uint32_t mesh_triangles = 0u;
-    uint32_t mesh_nodes = 0u;
-    uint32_t mesh_edges = 0u;
-    uint32_t mesh_edge_nodes = 0u;
-    uint32_t mesh_vertex_sources = 0u;
-    uint32_t mesh_edge_sources = 0u;
-    uint32_t excluded_pairs = 0u;
-    uint32_t contact_pairs = 0u;
-    uint32_t slot_stride = 0u;
-    uint32_t slot_base = 0u;
-    uint32_t slot_capacity = 0u;
-};
-
-uint64_t DatReachScratchBytes(const DatTruncateParams& params);
 
 struct MpmParams {
     uint32_t contact_slot_base;
@@ -422,7 +385,7 @@ struct NarrowphasePrimitivesParams {
     uint32_t num_material_buckets;
     uint32_t contact_pairs = 0u;  // authored pair key count (contact_pair_keys)
     float dt = 0.0f;
-    float query_reach = collision::kDatQueryRadiusMax;
+    float query_reach = collision::kContactQueryReachMin;
     uint8_t max_contacts_per_pair;
     // first batch (foot sphere x ground plane, the production Go2/H1 path):
     float    ground_height;
@@ -519,7 +482,7 @@ struct NarrowphaseBodyParticleParams {
     uint32_t vbd_particle_count;
     uint32_t particle_surfaces;
     float    dt;
-    float    query_reach = collision::kDatQueryRadiusMax;
+    float    query_reach = collision::kContactQueryReachMin;
     // 1 == launch ONE WARP per particle (the giant-hull SupportHull scan runs warp-
     // cooperatively); 0 == one thread per particle (analytic-only collider worlds,
     // no wide hull to split). BOTH paths are byte-identical; set by the cook-time max
@@ -719,7 +682,6 @@ struct ClothStepParams {
     float gravity[3];
     VertexBlockLayout layout;
     uint32_t integrator;
-    uint32_t truncation;  // nonzero when displacement truncation precedes the finalize
     uint32_t position_pass = 0u;
 };
 

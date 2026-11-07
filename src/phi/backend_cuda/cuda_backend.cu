@@ -29,7 +29,6 @@ const char* NkOpName(int op) {
         case NkOp::IntegrateVelocity: return "IntegrateVelocity";
         case NkOp::FkWorldPoses: return "FkWorldPoses";
         case NkOp::IntegratePosition: return "IntegratePosition";
-        case NkOp::DatSnapshot: return "DatSnapshot";
         case NkOp::BuildAabbs: return "BuildAabbs";
         case NkOp::LbvhBuild: return "LbvhBuild";
         case NkOp::LbvhQueryPairs: return "LbvhQueryPairs";
@@ -69,7 +68,6 @@ const char* NkOpName(int op) {
         case NkOp::ClothPredict: return "ClothPredict";
         case NkOp::ClothFinalize: return "ClothFinalize";
         case NkOp::OgcDetect: return "OgcDetect";
-        case NkOp::DatTruncate: return "DatTruncate";
         case NkOp::ReadoutEnergyLedger: return "ReadoutEnergyLedger";
         case NkOp::ReadoutContactAudit: return "ReadoutContactAudit";
         case NkOp::MimicReduce: return "MimicReduce";

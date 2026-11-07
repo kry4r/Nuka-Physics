@@ -931,4 +931,38 @@ NUKA_AMF_HD inline void CapsuleCapsule(const PrimParams& a, const PrimParams& b,
     out->AddPoint(pt);
 }
 
+NUKA_AMF_HD inline bool PrimitivePair(uint32_t ka, const amf::PrimParams& a,
+                             uint32_t kb, const amf::PrimParams& b,
+                             float query, ContactManifold* out) {
+    out->Clear();
+
+    if (ka == kShapeSphere && kb == kShapeSphere) { amf::SphereSphere(a, b, out, query); return true; }
+    if (ka == kShapeSphere && kb == kShapeBox)    { amf::SphereBox(a, b, out, query); return true; }
+    if (ka == kShapeSphere && kb == kShapePlane)  { amf::SpherePlane(a, b, out, query); return true; }
+    if (ka == kShapeBox && kb == kShapePlane)     { amf::BoxPlane(a, b, out, query); return true; }
+    if (ka == kShapeBox && kb == kShapeBox)       { amf::BoxBox(a, b, out, query); return true; }
+    if (ka == kShapeCapsule && kb == kShapePlane) { amf::CapsulePlane(a, b, out, query); return true; }
+    if (ka == kShapeCapsule && kb == kShapeSphere){ amf::CapsuleSphere(a, b, out, query); return true; }
+
+    if (ka == kShapeCapsule && kb == kShapeCapsule){ amf::CapsuleCapsule(a, b, out, query); return true; }
+    if (ka == kShapeCylinder && kb == kShapePlane) { amf::CylinderPlane(a, b, out, query); return true; }
+    if (ka == kShapeCylinder && kb == kShapeSphere) { amf::CylinderSphere(a, b, out, query); return true; }
+    auto flip = [&]() {
+        for (uint32_t i = 0; i < out->point_count; ++i) {
+            out->points[i].normal = math::Vec3{-out->points[i].normal.x,
+                                               -out->points[i].normal.y,
+                                               -out->points[i].normal.z};
+        }
+    };
+    if (ka == kShapeBox && kb == kShapeSphere)    { amf::SphereBox(b, a, out, query); flip(); return true; }
+    if (ka == kShapePlane && kb == kShapeSphere)  { amf::SpherePlane(b, a, out, query); flip(); return true; }
+    if (ka == kShapePlane && kb == kShapeBox)     { amf::BoxPlane(b, a, out, query); flip(); return true; }
+    if (ka == kShapePlane && kb == kShapeCapsule) { amf::CapsulePlane(b, a, out, query); flip(); return true; }
+    if (ka == kShapeSphere && kb == kShapeCapsule){ amf::CapsuleSphere(b, a, out, query); flip(); return true; }
+    if (ka == kShapePlane && kb == kShapeCylinder) { amf::CylinderPlane(b, a, out, query); flip(); return true; }
+    if (ka == kShapeSphere && kb == kShapeCylinder) { amf::CylinderSphere(b, a, out, query); flip(); return true; }
+
+    return false;
+}
+
 } // namespace nuka::collision::amf

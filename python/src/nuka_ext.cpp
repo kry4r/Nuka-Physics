@@ -2422,6 +2422,10 @@ NB_MODULE(_nuka_ext, m) {
         .value("BOUNDARY", NUKA_CONTACT_ENDPOINT_BOUNDARY)
         .value("POINT", NUKA_CONTACT_ENDPOINT_POINT);
 
+    nb::enum_<nuka_contact_profile_flag_t>(m, "ContactProfileFlag")
+        .value("REFSAFE", NUKA_CONTACT_PROFILE_REFSAFE)
+        .value("GEOMETRIC_FRICTION", NUKA_CONTACT_PROFILE_GEOMETRIC_FRICTION);
+
     nb::enum_<nuka_contact_side_kind_t>(m, "ContactSideKind")
         .value("RIGID", NUKA_CONTACT_SIDE_RIGID)
         .value("LINK", NUKA_CONTACT_SIDE_LINK)

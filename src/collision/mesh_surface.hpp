@@ -357,6 +357,32 @@ NUKA_MESH_HD inline MeshSurfacePoint QueryMeshSurface(
         return {};
     if (result.triangle == ~0u) return result;
     result.valid = true;
+    if (result.feature == 6u) {
+        Vec3 a, b, c;
+        if (!MeshSurfaceTriangle(view, info, result.triangle, a, b, c)) return {};
+        const double ab[3] = {double(b.x) - a.x, double(b.y) - a.y, double(b.z) - a.z};
+        const double ac[3] = {double(c.x) - a.x, double(c.y) - a.y, double(c.z) - a.z};
+        double normal[3] = {ab[1] * ac[2] - ab[2] * ac[1],
+            ab[2] * ac[0] - ab[0] * ac[2], ab[0] * ac[1] - ab[1] * ac[0]};
+        const double length = sqrt(normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]);
+        if (!(length > 0.0 && length <= DBL_MAX)) return {};
+        for (double& component : normal) component /= length;
+        const double signed_distance = (double(p.x) - a.x) * normal[0] +
+            (double(p.y) - a.y) * normal[1] + (double(p.z) - a.z) * normal[2];
+        face_normal = {float(normal[0]), float(normal[1]), float(normal[2])};
+        // An interior witness uses the plane derivative, not a cancellation-prone point difference.
+        result.point = {float(double(p.x) - signed_distance * normal[0]),
+            float(double(p.y) - signed_distance * normal[1]), float(double(p.z) - signed_distance * normal[2])};
+        if (signed_distance != 0.0) {
+            const bool inside = closed ? MeshSurfaceContains(view, info, p, result.valid)
+                                       : oriented && signed_distance < 0.0;
+            const double sign = (signed_distance < 0.0 ? -1.0 : 1.0) * (inside ? -1.0 : 1.0);
+            result.distance = float((inside ? -1.0 : 1.0) * fabs(signed_distance));
+            result.normal = {float(sign * normal[0]), float(sign * normal[1]), float(sign * normal[2])};
+            return result;
+        }
+        best_sq = 0.0f;
+    }
     const float distance = sqrtf(best_sq);
     if (oriented && !closed && result.feature < 6u) {
         const Vec3 feature_normal = MeshFeatureNormal(view, info, result.point);

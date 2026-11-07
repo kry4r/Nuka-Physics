@@ -177,6 +177,23 @@ NUKA_OGC_HD inline OgcTriangleFeature OgcFacetFeature(
     result.distance = sqrtf(separation.LengthSq());
     result.normal = result.distance > 0.0f
         ? separation / result.distance : face_normal / sqrtf(face_normal.LengthSq());
+    if (closest.feature == 6u) {
+        const double ab[3] = {double(p[1].x) - p[0].x, double(p[1].y) - p[0].y, double(p[1].z) - p[0].z};
+        const double ac[3] = {double(p[2].x) - p[0].x, double(p[2].y) - p[0].y, double(p[2].z) - p[0].z};
+        double normal[3] = {ab[1] * ac[2] - ab[2] * ac[1],
+            ab[2] * ac[0] - ab[0] * ac[2], ab[0] * ac[1] - ab[1] * ac[0]};
+        const double length = sqrt(normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]);
+        if (!(length > 0.0 && length <= DBL_MAX)) return {};
+        for (double& component : normal) component /= length;
+        const double distance = (double(query.x) - p[0].x) * normal[0] +
+            (double(query.y) - p[0].y) * normal[1] + (double(query.z) - p[0].z) * normal[2];
+        const double sign = distance < 0.0 ? -1.0 : 1.0;
+        result.distance = float(fabs(distance));
+        result.normal = {float(sign * normal[0]), float(sign * normal[1]), float(sign * normal[2])};
+        // Interior contact normals follow the plane derivative, without subtracting rounded witness points.
+        result.point = {float(double(query.x) - distance * normal[0]),
+            float(double(query.y) - distance * normal[1]), float(double(query.z) - distance * normal[2])};
+    }
     if (!(result.distance <= reach)) return result;
     if (closest.feature < 3u) {
         result.kind = 0u;

@@ -65,8 +65,7 @@ __global__ void RefitParticleSurfacesKernel(ParticleSurfacesParams p, ModelView 
         float speed_squared = 0.0f;
         for (uint32_t i = lane; i < info.vertex_count; i += blockDim.x) {
             const uint32_t particle = env * p.particles_per_env + info.vertex_offset + i;
-            const math::Vec3 motion = p.position_source == 0u ? data.particle_vel[particle]
-                : data.particle_pos[particle] - data.particle_prev_pos[particle];
+            const math::Vec3 motion = data.particle_vel[particle];
             speed_squared = fmaxf(speed_squared, motion.LengthSq());
             if (!isfinite(motion.x) || !isfinite(motion.y) || !isfinite(motion.z))
                 speed_squared = INFINITY;
@@ -78,10 +77,7 @@ __global__ void RefitParticleSurfacesKernel(ParticleSurfacesParams p, ModelView 
         if (lane == 0u) {
             for (uint32_t i = 0u; i < kBlockSize / 32u; ++i)
                 speed_squared = fmaxf(speed_squared, warp_speed[i]);
-            if (p.position_source == 0u)
-                data.particle_surface_max_speed[task] = sqrtf(speed_squared);
-            else
-                data.dat_surface_motion[task] = sqrtf(speed_squared);
+            data.particle_surface_max_speed[task] = sqrtf(speed_squared);
         }
         __syncthreads();
     }
@@ -98,8 +94,7 @@ __global__ void RefitParticleSurfacesKernel(ParticleSurfacesParams p, ModelView 
         if (node.triangle == ~0u) {
             node.triangle = kRefitPending;
         } else {
-            const math::Vec3* positions = p.position_source == 0u
-                ? data.particle_pos : data.particle_prev_pos;
+            const math::Vec3* positions = data.particle_pos;
             const collision::MeshSurfaceView view{
                 reinterpret_cast<const float*>(positions + size_t{env} * p.particles_per_env),
                 model.particle_surface_triangles, model.particle_surface_tree,
@@ -158,8 +153,7 @@ __global__ void RefitParticleSurfacesKernel(ParticleSurfacesParams p, ModelView 
             node.triangle = kRefitPending;
         } else {
             const auto edge = model.particle_surface_edges[info.edge_offset + node.triangle];
-            const math::Vec3* positions = p.position_source == 0u
-                ? data.particle_pos : data.particle_prev_pos;
+            const math::Vec3* positions = data.particle_pos;
             const math::Vec3 a = positions[size_t{env} * p.particles_per_env +
                                                    info.vertex_offset + edge.vertex0];
             const math::Vec3 b = positions[size_t{env} * p.particles_per_env +
@@ -229,9 +223,8 @@ Status OpRefitParticleSurfaces(const ModelView& model, const DataView& data,
         (p->nodes_per_env > 0u && (!model.particle_surface_tree ||
                                    !model.particle_surface_triangles ||
                                    !data.particle_surface_nodes)) ||
-        !(p->position_source == 0u ? data.particle_pos : data.particle_prev_pos) ||
+        !data.particle_pos ||
         !data.particle_vel || !data.particle_surface_max_speed ||
-        (p->position_source != 0u && (!data.particle_pos || !data.dat_surface_motion)) ||
         !model.particle_surface_edge_info ||
         (p->edge_nodes_per_env > 0u && (!model.particle_surface_edges ||
             !model.particle_surface_edge_tree || !data.particle_surface_edge_nodes)))

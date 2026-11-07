@@ -5,7 +5,7 @@
 
 #include "collision/analytical_manifold.hpp"   
 #include "collision/convex_narrowphase.hpp"    
-#include "collision/dat_geometry.hpp"
+#include "collision/contact_query.hpp"
 #include "collision/shape_kind.hpp"            
 #include "math/transform.hpp"
 #include "nk/contact/contact_identity.hpp"
@@ -69,40 +69,6 @@ __device__ bool MakeSupportProxy(uint32_t kind, const amf::PrimParams& prim,
     }
 }
 
-__device__ bool DispatchAnalyticPair(uint32_t ka, const amf::PrimParams& a,
-                             uint32_t kb, const amf::PrimParams& b,
-                             float query, ContactManifold* out) {
-    out->Clear();
-
-    if (ka == kKindSphere && kb == kKindSphere) { amf::SphereSphere(a, b, out, query); return true; }
-    if (ka == kKindSphere && kb == kKindBox)    { amf::SphereBox(a, b, out, query); return true; }
-    if (ka == kKindSphere && kb == kKindPlane)  { amf::SpherePlane(a, b, out, query); return true; }
-    if (ka == kKindBox && kb == kKindPlane)     { amf::BoxPlane(a, b, out, query); return true; }
-    if (ka == kKindBox && kb == kKindBox)       { amf::BoxBox(a, b, out, query); return true; }
-    if (ka == kKindCapsule && kb == kKindPlane) { amf::CapsulePlane(a, b, out, query); return true; }
-    if (ka == kKindCapsule && kb == kKindSphere){ amf::CapsuleSphere(a, b, out, query); return true; }
-
-    if (ka == kKindCapsule && kb == kKindCapsule){ amf::CapsuleCapsule(a, b, out, query); return true; }
-    if (ka == kKindCylinder && kb == kKindPlane) { amf::CylinderPlane(a, b, out, query); return true; }
-    if (ka == kKindCylinder && kb == kKindSphere) { amf::CylinderSphere(a, b, out, query); return true; }
-    
-    auto flip = [&]() {
-        for (uint32_t i = 0; i < out->point_count; ++i) {
-            out->points[i].normal = math::Vec3{-out->points[i].normal.x,
-                                               -out->points[i].normal.y,
-                                               -out->points[i].normal.z};
-        }
-    };
-    if (ka == kKindBox && kb == kKindSphere)    { amf::SphereBox(b, a, out, query); flip(); return true; }
-    if (ka == kKindPlane && kb == kKindSphere)  { amf::SpherePlane(b, a, out, query); flip(); return true; }
-    if (ka == kKindPlane && kb == kKindBox)     { amf::BoxPlane(b, a, out, query); flip(); return true; }
-    if (ka == kKindPlane && kb == kKindCapsule) { amf::CapsulePlane(b, a, out, query); flip(); return true; }
-    if (ka == kKindSphere && kb == kKindCapsule){ amf::CapsuleSphere(b, a, out, query); flip(); return true; }
-    if (ka == kKindPlane && kb == kKindCylinder) { amf::CylinderPlane(b, a, out, query); flip(); return true; }
-    if (ka == kKindSphere && kb == kKindCylinder) { amf::CylinderSphere(b, a, out, query); flip(); return true; }
-
-    return false;
-}
 
 // Mesh vertices inside the query band meet the plane; the deepest one and the band's tangent
 // extremes span the manifold. Features are vertex index + 1.
@@ -278,8 +244,8 @@ __global__ void PairDrivenNarrowphaseKernel(
     // A pair is queried over its profile band or the gap both bodies can close within the step; a
     // second shell width keeps contacts resting on the separation shell detected.
     const auto query_radius = [&]() {
-        return fmaxf(query_margin, collision::DatQueryRadius(
-            collision::DatMotionRadius(2.0f * separation, dt, speed(a), speed(b), kDatRelaxation),
+        return fmaxf(query_margin, collision::ContactQueryRadius(
+            collision::ContactMotionRadius(2.0f * separation, dt, speed(a), speed(b), kContactQueryRelaxation),
             query_reach));
     };
 
@@ -325,7 +291,7 @@ __global__ void PairDrivenNarrowphaseKernel(
             const math::Transform xb = body_pose[env * bodies_per_env + b];
             const amf::PrimParams pa = MakePrim(sa, xa);
             const amf::PrimParams pb = MakePrim(sb, xb);
-            DispatchAnalyticPair(sa.kind, pa, sb.kind, pb, query_radius(), &m);
+            amf::PrimitivePair(sa.kind, pa, sb.kind, pb, query_radius(), &m);
             if (law != nk::kContactLawCompliant)
                 for (uint32_t i = 0u; i < m.point_count; ++i) m.points[i].penetration += separation;
         }
@@ -456,7 +422,7 @@ Status LaunchPairDrivenNarrowphase(const ModelView& model, const DataView& data,
                    data.body_linear_velocity, data.body_angular_velocity,
                    data.body_aabb_lo, data.body_aabb_hi, data.dat_body_motion,
                    static_cast<const float*>(model.hull_verts), p.hull_vert_count, kGen,
-                   fmaxf(p.contact_margin, ::nuka::collision::kRigidContactSeparation),
+                   fmaxf(p.contact_margin, ::nuka::collision::kRigidContactQueryMargin),
                    p.dt, p.query_reach,
                    p.env_count, p.union_slot_count, rigid_slots, p.bodies_per_env,
                    data.ucontact_count, data.ucontact_point, data.ucontact_normal,

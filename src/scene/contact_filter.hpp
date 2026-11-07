@@ -19,6 +19,7 @@ constexpr float kContactSolmixMinVal = 1e-15f;
 // One shape's contact parameters; priority and solmix determine the pair's mixing weight.
 struct ContactParamsIn {
     int32_t priority    = 0;
+    bool geometric_friction = false;
     uint8_t condim      = 3;
     union { float friction_mu = 1.0f; float mu1; };
     float   mu2         = 1.0f;
@@ -53,6 +54,13 @@ struct MergedContactParams {
 // --- tiny HD arithmetic (avoid <algorithm> / std:: in the device path) -----
 NUKA_CF_HD inline float CfMaxF(float a, float b) { return (a > b) ? a : b; }
 NUKA_CF_HD inline float CfMinF(float a, float b) { return (a < b) ? a : b; }
+
+// Higher priority selects one material; at equal priority either material can request geometric mixing.
+NUKA_CF_HD inline float MixContactFriction(float a, float b, int32_t priority_a,
+                                           int32_t priority_b, bool geometric) {
+    if (priority_a != priority_b) return priority_a > priority_b ? a : b;
+    return geometric ? sqrtf(a) * sqrtf(b) : CfMaxF(a, b);
+}
 
 // Either shape's contact type can match the other's affinity.
 NUKA_CF_HD inline bool PassesContactBitmask(uint32_t contypeA, uint32_t conaffA,
@@ -94,10 +102,11 @@ NUKA_CF_HD inline MergedContactParams MergeContactParams(const ContactParamsIn& 
         out.friction_roll = w.friction_roll;
     } else {
         out.condim = (A.condim > B.condim) ? A.condim : B.condim;
-        out.friction_mu = CfMaxF(A.friction_mu, B.friction_mu);
-        out.mu2 = CfMaxF(A.mu2, B.mu2);
-        out.friction_spin = CfMaxF(A.friction_spin, B.friction_spin);
-        out.friction_roll = CfMaxF(A.friction_roll, B.friction_roll);
+        const bool geometric = A.geometric_friction || B.geometric_friction;
+        out.friction_mu = MixContactFriction(A.friction_mu, B.friction_mu, A.priority, B.priority, geometric);
+        out.mu2 = MixContactFriction(A.mu2, B.mu2, A.priority, B.priority, geometric);
+        out.friction_spin = MixContactFriction(A.friction_spin, B.friction_spin, A.priority, B.priority, geometric);
+        out.friction_roll = MixContactFriction(A.friction_roll, B.friction_roll, A.priority, B.priority, geometric);
         const bool a_ok = A.solmix >= kContactSolmixMinVal;
         const bool b_ok = B.solmix >= kContactSolmixMinVal;
         if (a_ok && b_ok) mix = A.solmix / (A.solmix + B.solmix);

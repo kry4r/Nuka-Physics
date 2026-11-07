@@ -172,7 +172,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         if (model.particles.surface_self_contact[s] != 0u)
             thickest = std::max(thickest, model.particles.surface_self_thickness[s]);
     }
-    const float query_reach = collision::DatQueryReach(thickest, contact_margin);
+    const float query_reach = collision::ContactQueryReach(thickest, contact_margin);
 
     const bool has_articulation = cap.dofs_per_env > 0 || cap.links_per_env > 0;
     const bool has_bodies       = cap.bodies_per_env > 0;
@@ -544,7 +544,6 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
             for (int k = 0; k < 3; ++k) p_cloth_step_.gravity[k] = cfg.gravity[k];
             p_cloth_step_.layout = vertex_blocks;
             p_cloth_step_.integrator = cfg.cloth_integrator;
-            p_cloth_step_.truncation = 0u;
             p_cloth_step_.position_pass = has_contacts && cfg.pos_iters > 0u;
             add(phi::NkOp::ClothPredict, &p_cloth_step_);
         }
@@ -565,7 +564,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         // the ONE general PairDriven contact path. The family + per-env body
         // geometry travel in the params (the views are pure pointer aggregates).
         const uint32_t bodies_per_env = cap.bodies_per_env;
-        p_aabbs_.margin = std::max(contact_margin, collision::kRigidContactSeparation);
+        p_aabbs_.margin = std::max(contact_margin, collision::kRigidContactQueryMargin);
         p_aabbs_.dt = cfg.dt;
         p_aabbs_.query_reach = query_reach;
         p_aabbs_.family = family;
@@ -892,42 +891,6 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     energy(EnergyStage::Solved);
     mpm_coupling_provider_.PostCouple(coupling_ctx);
 
-    if (cap.ogc_contacts_per_env > 0u) {
-        p_dat_truncate_.dt = cfg.dt;
-        p_dat_truncate_.workspace_bytes = cap.contact_cache_scratch_bytes;
-        p_dat_truncate_.margin = contact_margin;
-        p_dat_truncate_.query_reach = query_reach;
-        p_dat_truncate_.env_count = env_count;
-        p_dat_truncate_.particles_per_env = cap.particles_per_env;
-        p_dat_truncate_.vbd_particle_begin = cap.vbd_particle_begin;
-        p_dat_truncate_.vbd_vertices_per_env = cap.vbd_vertices_per_env;
-        p_dat_truncate_.ogc_body_pairs = p_ogc_detect_.ogc_body_pairs;
-        p_dat_truncate_.surfaces_per_env = cap.particle_surfaces_per_env;
-        p_dat_truncate_.triangles_per_env = cap.particle_surface_triangles;
-        p_dat_truncate_.nodes_per_env = cap.particle_surface_nodes_per_env;
-        p_dat_truncate_.edges_per_env = cap.particle_surface_edges_per_env;
-        p_dat_truncate_.edge_nodes_per_env = cap.particle_surface_edge_nodes_per_env;
-        p_dat_truncate_.bodies_per_env = cap.bodies_per_env;
-        p_dat_truncate_.links_per_env = cap.links_per_env;
-        p_dat_truncate_.articulations_per_env =
-            has_articulation ? cap.articulations_per_env : 0u;
-        p_dat_truncate_.max_dof = max_dof;
-        p_dat_truncate_.mesh_vertices = cap.max_hull_verts;
-        p_dat_truncate_.mesh_triangles = cap.max_mesh_triangles;
-        p_dat_truncate_.mesh_nodes = cap.max_mesh_bvh_nodes;
-        p_dat_truncate_.mesh_edges = cap.max_mesh_edges;
-        p_dat_truncate_.mesh_edge_nodes = cap.max_mesh_edge_nodes;
-        p_dat_truncate_.mesh_vertex_sources = cap.mesh_vertex_source_count;
-        p_dat_truncate_.mesh_edge_sources = cap.mesh_edge_source_count;
-        p_dat_truncate_.excluded_pairs = cap.max_excluded_pairs;
-        p_dat_truncate_.contact_pairs = cap.max_contact_pairs;
-        p_dat_truncate_.slot_stride = cap.max_contacts_per_env;
-        p_dat_truncate_.slot_base = rigid_cap;
-        p_dat_truncate_.slot_capacity = cap.ogc_contacts_per_env;
-        if (has_articulation || has_bodies)
-            add(phi::NkOp::DatSnapshot, &p_dat_truncate_);
-    }
-
     if (has_articulation || has_bodies) {
         p_int_pos_.dt = cfg.dt;
         p_int_pos_.total_link_count = total_link_count;
@@ -945,23 +908,10 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
 
     if (has_particles) row_coupling_provider_.PostCouple(coupling_ctx);
 
-    if (cap.ogc_contacts_per_env > 0u) {
-        if (has_articulation) add(phi::NkOp::FkWorldPoses, &p_fk_);
-        if (has_bodies) add(phi::NkOp::SyncLinkBodyPose, &p_sync_body_pose_);
-        if (cap.particle_surfaces_per_env > 0u) {
-            p_dat_refit_ = p_particle_surfaces_;
-            p_dat_refit_.position_source = 1u;
-            add(phi::NkOp::RefitParticleSurfaces, &p_dat_refit_);
-        }
-        energy(EnergyStage::Projected);
-        add(phi::NkOp::DatTruncate, &p_dat_truncate_);
-    } else {
-        energy(EnergyStage::Projected);
-    }
+    energy(EnergyStage::Projected);
 
     // Commit particle state once after all incremental coupling solves.
     if (has_particles) {
-        if (cap.ogc_contacts_per_env > 0u) p_cloth_step_.truncation = 1u;
         if (vertex_blocks.vertices > 0u) add(phi::NkOp::ClothFinalize, &p_cloth_step_);
     }
 

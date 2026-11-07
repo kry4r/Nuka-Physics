@@ -1,11 +1,12 @@
 #pragma once
 
-#include "collision/dat_geometry.hpp"
+#include "collision/contact_query.hpp"
 #include "collision/ogc_geometry.hpp"
 #include "nk/contact/contact_profile.hpp"
 #include "nk/solve/point_endpoint.hpp"
 #include "scene/contact_filter.hpp"
-#include "phi/backend_cuda/ops/dat_chain.cuh"
+#include "phi/backend_cuda/ops/contact_chain.cuh"
+#include "phi/backend_cuda/ops/contact_features.cuh"
 #include "phi/backend_cuda/ops/prims_types.cuh"
 
 namespace nuka::phi {
@@ -156,7 +157,7 @@ __device__ bool OgcBodyPairAllowed(const OgcDetectParams& p,
     return true;
 }
 
-// Predicted vertex speed bound: the start velocity, raised to the last untruncated DAT motion.
+// The current linear and angular velocities bound the body's vertex speeds.
 __device__ float OgcBodySpeed(const OgcDetectParams& p, const DataView& data,
                               uint32_t env, uint32_t body) {
     const size_t at = size_t{env} * p.bodies_per_env + body;
@@ -166,53 +167,26 @@ __device__ float OgcBodySpeed(const OgcDetectParams& p, const DataView& data,
         fmaxf(fabsf(lo.x - center.x), fabsf(hi.x - center.x)),
         fmaxf(fabsf(lo.y - center.y), fabsf(hi.y - center.y)),
         fmaxf(fabsf(lo.z - center.z), fabsf(hi.z - center.z))};
-    return fmaxf(sqrtf(data.body_linear_velocity[at].LengthSq()) +
+    return sqrtf(data.body_linear_velocity[at].LengthSq()) +
                      sqrtf(data.body_angular_velocity[at].LengthSq()) *
-                         sqrtf(extents.LengthSq()),
-                 data.dat_body_motion[at]);
+                         sqrtf(extents.LengthSq());
 }
 
-// Predicted joint speed bound: the start speed, raised to the last untruncated DAT motion.
-__global__ void OgcJointRateKernel(OgcDetectParams p, DataView data) {
+// Spherical joints use the norm of their three angular rates.
+__global__ void OgcJointRateKernel(OgcDetectParams p, ModelView model, DataView data) {
     const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
     if (link >= p.env_count * p.links_per_env) return;
-    data.dat_joint_rate[link] = fmaxf(fabsf(data.qdot[link]), data.dat_joint_motion[link]);
+    data.dat_joint_rate[link] = static_cast<ArticulationJointType>(model.joint_type[link]) ==
+        ArticulationJointType::Spherical ? sqrtf(data.joint_angular_velocity[link].LengthSq())
+                                       : fabsf(data.qdot[link]);
 }
 
-constexpr uint32_t kOgcQueryLanes = 32u;
-
-// A warp per body: its lanes take the surfaces and the other bodies, and the minimum over them is order-free.
-__global__ void OgcBodyQueryKernel(OgcDetectParams p, ModelView model, DataView data) {
-    const uint32_t item = (blockIdx.x * blockDim.x + threadIdx.x) / kOgcQueryLanes;
-    const uint32_t lane = threadIdx.x % kOgcQueryLanes;
+__global__ void OgcBodySpeedKernel(OgcDetectParams p, DataView data) {
+    const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
     if (item >= p.env_count * p.bodies_per_env) return;
     const uint32_t env = item / p.bodies_per_env;
     const uint32_t body = item % p.bodies_per_env;
-    const float speed = OgcBodySpeed(p, data, env, body);
-    if (lane == 0u) data.dat_body_speed[item] = speed;
-    float radius = p.query_reach;
-    if (model.mesh_surface_info[body].vertex_count > 0u) {
-        for (uint32_t s = lane; s < p.surfaces_per_env; s += kOgcQueryLanes) {
-            if (model.particle_surface_info[s].vertex_count == 0u) continue;
-            const float other = data.particle_surface_max_speed[
-                size_t{env} * p.surfaces_per_env + s];
-            radius = fminf(radius, collision::DatQueryRadius(collision::DatMotionRadius(
-                model.particle_surface_thickness[s] + p.margin, p.dt, speed, other,
-                p.relaxation), p.query_reach));
-        }
-        // Links of one articulation are bounded per pair, relative to their common ancestor.
-        for (uint32_t other = lane; other < p.bodies_per_env; other += kOgcQueryLanes) {
-            if (!OgcBodyPairAllowed(p, model, body, other) ||
-                model.mesh_surface_info[other].vertex_count == 0u ||
-                DatCommonFrame(p, model, env, body, other) != ~0u) continue;
-            radius = fminf(radius, collision::DatQueryRadius(collision::DatMotionRadius(
-                collision::kRigidContactSeparation + p.margin, p.dt, speed, OgcBodySpeed(p, data, env, other),
-                p.relaxation), p.query_reach));
-        }
-    }
-    for (uint32_t offset = kOgcQueryLanes / 2u; offset > 0u; offset /= 2u)
-        radius = fminf(radius, __shfl_xor_sync(~0u, radius, offset));
-    if (lane == 0u) data.dat_body_query_radius[item] = radius;
+    data.dat_body_speed[item] = OgcBodySpeed(p, data, env, body);
 }
 
 __device__ float OgcBodyFriction(const ModelView& model, const DataView& data,
@@ -233,7 +207,17 @@ __device__ float OgcPairFriction(const OgcDetectParams& p, const ModelView& mode
     if (authored != ~0u)
         return data.mat_buckets[(size_t{env} * p.num_material_buckets + authored) *
                                 nk::kContactProfileWordCount + nk::kContactProfileMu1];
-    return fmaxf(source_mu, target_mu);
+    if (source_particle) return fmaxf(source_mu, target_mu);
+    const auto source = nkops::LoadPrimShape(model.shape_table, source_owner);
+    const auto target = nkops::LoadPrimShape(model.shape_table, target_owner);
+    const float* a = data.mat_buckets + (size_t{env} * p.num_material_buckets +
+        source.contact_profile_index) * nk::kContactProfileWordCount;
+    const float* b = data.mat_buckets + (size_t{env} * p.num_material_buckets +
+        target.contact_profile_index) * nk::kContactProfileWordCount;
+    const bool geometric = ((__float_as_uint(a[nk::kContactProfileFlags]) |
+        __float_as_uint(b[nk::kContactProfileFlags])) & nk::kContactProfileFlagGeometricFriction) != 0u;
+    return scene::MixContactFriction(source_mu, target_mu,
+        __float_as_int(a[nk::kContactProfilePriority]), __float_as_int(b[nk::kContactProfilePriority]), geometric);
 }
 
 struct OgcParticleMaterial {
@@ -288,7 +272,7 @@ __device__ void OgcEmitMixedFace(
     bool target_particle, uint32_t target_index, uint32_t target_body,
     const collision::MeshSurfaceInfo& target_info, uint32_t triangle,
     math::Vec3 source_point, float radius, float friction,
-    const collision::OgcTriangleFeature& feature) {
+    const collision::OgcTriangleFeature& feature, float sphere_radius = 0.0f) {
     if (ordinal >= p.slot_capacity) {
         atomicOr(data.env_status + env, kEnvStatusPairOverflow);
         return;
@@ -296,7 +280,7 @@ __device__ void OgcEmitMixedFace(
     const uint32_t slot = env * p.slot_stride + p.slot_base + ordinal;
     const size_t at = size_t{slot} * nk::kPairDrivenPtsPerSlot;
     data.dat_pair_kind[slot] = 1u | (source_particle ? 4u : 0u) |
-        (target_particle ? 8u : 0u);
+        (target_particle ? 8u : 0u) | (sphere_radius > 0.0f ? kContactSourceSphereCenter : 0u);
     data.dat_pair_owner_a[slot] = source_particle ? source_index : source_body;
     data.dat_pair_owner_b[slot] = target_body;
     data.dat_pair_feature_a[slot] = source_vertex;
@@ -304,11 +288,15 @@ __device__ void OgcEmitMixedFace(
     data.ucontact_a[at] = source_particle ? source_index : source_body;
     data.ucontact_a_kind[at] = source_particle
         ? nk::kUContactSideParticle : nk::kUContactSideBody;
+    math::Vec3 reaction_point = (source_point + feature.point) * 0.5f;
+    if (target_particle) reaction_point = source_point;
+    else if (source_particle) reaction_point = feature.point;
+    if (sphere_radius > 0.0f) reaction_point = source_point - feature.normal * sphere_radius;
     if (source_particle && !target_particle) {
         const uint32_t endpoint = env * p.point_endpoints_per_env + p.point_endpoint_first + ordinal * 2u;
         const uint32_t first = env * p.point_endpoint_terms_per_env + p.point_endpoint_term_first + ordinal * 6u;
         if (!OgcVertexEndpoint(p, model, data, env, model.particle_surface_info[source_body], source_vertex,
-                               feature.point, endpoint, first)) return;
+                               reaction_point, endpoint, first)) return;
         data.ucontact_a[at] = endpoint;
         data.ucontact_a_kind[at] = nk::kUContactSidePointEndpoint;
     }
@@ -318,14 +306,14 @@ __device__ void OgcEmitMixedFace(
         const uint32_t first = env * p.point_endpoint_terms_per_env + p.point_endpoint_term_first +
                                ordinal * 6u + 3u;
         if (!OgcTriangleEndpoint(p, model, data, env, target_info, triangle,
-            feature.barycentric, source_point, endpoint, first)) return;
+            feature.barycentric, reaction_point, endpoint, first)) return;
         data.ucontact_b[at] = endpoint;
         data.ucontact_b_kind[at] = nk::kUContactSidePointEndpoint;
     } else {
         data.ucontact_b[at] = target_body;
         data.ucontact_b_kind[at] = nk::kUContactSideBody;
     }
-    data.ucontact_point[at] = (source_point + feature.point) * 0.5f;
+    data.ucontact_point[at] = reaction_point;
     data.ucontact_witness_a[at] = source_point;
     data.ucontact_witness_b[at] = feature.point;
     data.ucontact_normal[at] = feature.normal;
@@ -344,11 +332,12 @@ __device__ void OgcEmitMixedFace(
                                    constraint::ReactionProviderKind::ParticleInvMass,
                                    env * p.surfaces_per_env + target_index}
         : OgcBodyReference(p, model, env, target_body);
-    descriptor.feature_a = source_particle ? 0u :
+    descriptor.feature_a = source_particle || sphere_radius > 0.0f ? 0u :
         model.mesh_surface_info[source_body].vertex_offset + source_vertex;
     descriptor.feature_b =
         ((target_info.triangle_offset + triangle) << 2u) | feature.kind;
-    descriptor.contact_kind = nk::kContactKindOgcVertexFace;
+    descriptor.contact_kind = sphere_radius > 0.0f
+        ? nk::kContactKindSphereFace : nk::kContactKindOgcVertexFace;
     descriptor.normal = feature.normal;
     const nk::ContactId id = nk::MakeContactId(descriptor);
     data.ucontact_id_pair[at] = id.pair;
@@ -441,10 +430,10 @@ __device__ void OgcPreparePair(const OgcDetectParams& p, const ModelView& model,
         !collision::MeshSurfaceRangeValid(pair->target.view, pair->target.info)) return;
     pair->body_query = 0.0f;
     if (!sp && !tp) {
-        const uint32_t frame = DatCommonFrame(p, model, env, a, b);
-        pair->body_query = collision::DatQueryRadius(frame != ~0u
-            ? DatArticMotionRadius(p, model, data, env, a, b, frame, data.q)
-            : collision::DatMotionRadius(collision::kRigidContactSeparation + p.margin, p.dt,
+        const uint32_t frame = ContactCommonFrame(p, model, env, a, b);
+        pair->body_query = collision::ContactQueryRadius(frame != ~0u
+            ? ContactArticMotionRadius(p, model, data, env, a, b, frame, data.q)
+            : collision::ContactMotionRadius(collision::kRigidContactQueryMargin + p.margin, p.dt,
                 pair->source.speed, pair->target.speed, p.relaxation), p.query_reach);
     }
     pair->active = true;
@@ -452,7 +441,7 @@ __device__ void OgcPreparePair(const OgcDetectParams& p, const ModelView& model,
 
 __device__ float OgcSurfaceQuery(const OgcDetectParams& p, const OgcSurfacePair& pair, float radius) {
     return !pair.source.particle && !pair.target.particle ? pair.body_query
-        : collision::DatQueryRadius(collision::DatMotionRadius(radius + p.margin, p.dt,
+        : collision::ContactQueryRadius(collision::ContactMotionRadius(radius + p.margin, p.dt,
             pair.source.speed, pair.target.speed, p.relaxation), p.query_reach);
 }
 
@@ -500,7 +489,7 @@ __global__ void OgcMixedVertexFaceKernel(OgcDetectParams p, ModelView model, Dat
                     entered = true;
                     point = collision::MeshSurfaceVertex(a.view, a.info, vertex);
                     const float radius = a.particle ? model.particle_half_thickness[a.info.vertex_offset + vertex]
-                        : b.particle ? b.radius : collision::kRigidContactSeparation;
+                        : b.particle ? b.radius : 0.0f;
                     query = OgcSurfaceQuery(p, pair, radius);
                     if (!(query > 0.0f)) continue;
                     local = collision::MeshSurfaceLocalPoint(b.view, point);
@@ -527,7 +516,7 @@ __global__ void OgcMixedVertexFaceKernel(OgcDetectParams p, ModelView model, Dat
             const auto source = collision::MeshSurfaceVertex(a.view, a.info, c.source);
             const uint32_t particle = a.info.vertex_offset + c.source;
             const float source_radius = a.particle ? model.particle_half_thickness[particle] : 0.0f;
-            const float radius = source_radius + b.radius + (!a.particle && !b.particle ? collision::kRigidContactSeparation : 0.0f);
+            const float radius = source_radius + b.radius;
             const float reach = OgcSurfaceQuery(p, pair, radius);
             const auto feature = collision::OgcFacetFeature(b.view, b.info, b.edge_array, b.triangle_edges,
                 b.edges, b.vertex_faces, c.target, source, reach);
@@ -567,6 +556,7 @@ __device__ void OgcEmitMixedEdge(
     data.dat_pair_owner_b[slot] = target_body;
     data.dat_pair_feature_a[slot] = source_edge;
     data.dat_pair_feature_b[slot] = target_edge;
+    const math::Vec3 reaction_point = source_particle ? pair.point_b : (pair.point_a + pair.point_b) * 0.5f;
     if (source_particle) {
         const uint32_t endpoint = env * p.point_endpoints_per_env + p.point_endpoint_first +
                                   ordinal * 2u;
@@ -574,7 +564,7 @@ __device__ void OgcEmitMixedEdge(
                                ordinal * 6u;
         const auto info = model.particle_surface_info[source_surface];
         if (!OgcEdgeEndpoint(p, model, data, env, info, edge_a, pair.weight_a,
-                             pair.point_b, endpoint, first)) return;
+                             reaction_point, endpoint, first)) return;
         data.ucontact_a[at] = endpoint;
         data.ucontact_a_kind[at] = nk::kUContactSidePointEndpoint;
     } else {
@@ -583,7 +573,7 @@ __device__ void OgcEmitMixedEdge(
     }
     data.ucontact_b[at] = target_body;
     data.ucontact_b_kind[at] = nk::kUContactSideBody;
-    data.ucontact_point[at] = (pair.point_a + pair.point_b) * 0.5f;
+    data.ucontact_point[at] = reaction_point;
     data.ucontact_witness_a[at] = pair.point_a;
     data.ucontact_witness_b[at] = pair.point_b;
     data.ucontact_normal[at] = pair.normal;
@@ -641,7 +631,7 @@ __global__ void OgcMixedEdgeEdgeKernel(OgcDetectParams p, ModelView model, DataV
         if (!pair.active || pair.target.edges.node_count == 0u) continue;
         const auto& a = pair.source;
         const auto& b = pair.target;
-        const float radius = a.radius + (a.particle ? 0.0f : collision::kRigidContactSeparation);
+        const float radius = a.radius;
         const float query = OgcSurfaceQuery(p, pair, radius), within = query + 1.0e-6f;
         if (!(query > 0.0f)) continue;
         uint32_t edge = share * kWarpLanes + lane, cursor = b.edges.node_count;

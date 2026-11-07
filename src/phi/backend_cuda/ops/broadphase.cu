@@ -46,7 +46,7 @@ namespace { using NkScanSumOp = ::cub::Sum; }
 #include "collision/lbvh_node.cuh"      // LbvhNode (query traversal)
 #include "collision/mesh_surface_types.hpp"
 #include "collision/shape_kind.hpp"     // nuka::collision::ShapeKind (R2: one enum)
-#include "collision/dat_geometry.hpp"
+#include "collision/contact_query.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
 #include "nk/model/generated/views.hpp"  // ModelView / DataView (complete types)
@@ -263,8 +263,8 @@ __global__ void BuildAabbsKernel(const float* __restrict__ shape_table,
     const float radius = sqrtf(he.LengthSq()) + sqrtf((center - xf.position).LengthSq());
     const float speed = fmaxf(previous_motion != nullptr ? previous_motion[gid] : 0.0f,
         sqrtf(linear_velocity[gid].LengthSq()) + sqrtf(angular_velocity[gid].LengthSq()) * radius);
-    const float m = fmaxf(margin, collision::DatQueryRadius(
-        collision::DatMotionRadius(margin, dt, speed, 0.0f, kDatRelaxation), query_reach));
+    const float m = fmaxf(margin, collision::ContactQueryRadius(
+        collision::ContactMotionRadius(margin, dt, speed, 0.0f, kContactQueryRelaxation), query_reach));
     out_lo[gid] = {c.x - he.x - m, c.y - he.y - m, c.z - he.z - m};
     out_hi[gid] = {c.x + he.x + m, c.y + he.y + m, c.z + he.z + m};
 }

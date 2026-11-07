@@ -162,17 +162,20 @@ __global__ void ReadoutContactImpulseKernel(ModelView model, DataView data, Read
             uint32_t count;
             const uint32_t base = ContactRowBase(p, data, env, slot, count);
             for (uint32_t point = 0u; point < points && point < count; ++point) {
-                const auto arm = data.ucontact_point[point_base + point] - origin;
                 for (uint32_t axis = 0u; axis < nk::ContactPointAxes(rows[base + point]); ++axis) {
                     const uint32_t index = base + axis * count + point;
                     const auto& row = rows[index];
                     if (!(row.flags & nk::nk_row_flags::kActive)) continue;
-                    math::Vec3 direction{};
-                    if (side_a) direction += row.a.jlin;
-                    if (side_b) direction += row.b.jlin;
-                    const auto impulse = direction * data.lambda[index];
-                    sum.linear += impulse;
-                    sum.angular += arm.Cross(impulse);
+                    if (side_a) {
+                        const auto impulse = row.a.jlin * data.lambda[index];
+                        sum.linear += impulse;
+                        sum.angular += (data.ucontact_point[point_base + point] - origin).Cross(impulse);
+                    }
+                    if (side_b) {
+                        const auto impulse = row.b.jlin * data.lambda[index];
+                        sum.linear += impulse;
+                        sum.angular += (data.ucontact_point[point_base + point] - origin).Cross(impulse);
+                    }
                 }
             }
         }
@@ -264,9 +267,10 @@ __global__ void ReadoutContactRegionKernel(ModelView model, DataView data, Reado
             for (uint32_t point = 0u; point < points && point < count; ++point) {
                 const auto& normal_row = rows[base + point];
                 if (!(normal_row.flags & nk::nk_row_flags::kActive)) continue;
-                const auto position = mg::RotateByQuatNormalized(inverse, data.ucontact_point[point_base + point] - origin);
                 for (uint32_t side = 0u; side < 2u; ++side) {
                     if (!sides[side]) continue;
+                    const auto position = mg::RotateByQuatNormalized(inverse,
+                        data.ucontact_point[point_base + point] - origin);
                     const auto normal = nk::ContactPointNormal(rows, base + point, count, side != 0u);
                     const auto local_normal = mg::RotateByQuatNormalized(inverse, normal);
                     if (p.kind == sensor::StateSensorKind::Touch) {

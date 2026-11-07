@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <vector>
 
+#include "collision/shape_kind.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
 #include "nk/model/generated/field_ids.hpp"
@@ -136,6 +137,58 @@ Drop ProbeCloth(nk::World& w, uint32_t P, uint32_t first, uint32_t count) {
 }
 
 }  // namespace
+
+TEST(ClothOnBox, SphereContactsFaceAndEdgeBetweenVertices) {
+    if (GetBackend().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
+    const Backend backend = GetBackend();
+    constexpr float radius = 0.03f;
+    for (const float center_y : {0.0f, -0.05f}) {
+        nk::Model model;
+        nk::Model::BodyInit body;
+        body.pose = Transform::Identity();
+        body.pose.position = {0.0f, center_y, radius + 0.001f};
+        body.linear_velocity = {0.0f, 0.0f, -1.0f};
+        body.inv_mass = 1.0f;
+        const float inverse_inertia = 2.5f / (radius * radius);
+        body.inv_inertia = {inverse_inertia, inverse_inertia, inverse_inertia};
+        model.body_init.push_back(body);
+        nk::Model::PairDrivenShape shape;
+        shape.kind = nuka::collision::kShapeSphere;
+        shape.params[0] = radius;
+        shape.contype = shape.conaffinity = 1u;
+        shape.body_id = 0;
+        model.shape_table_rows.push_back(shape);
+        cook::VbdCookInput cloth;
+        cloth.positions = {{-0.05f, -0.05f, 0.0f}, {0.05f, -0.05f, 0.0f}, {0.0f, 0.05f, 0.0f}};
+        cloth.velocities.resize(3u);
+        cloth.inv_mass.assign(3u, 0.0f);
+        cloth.half_thickness.assign(3u, 0.0f);
+        cloth.friction.assign(3u, 0.0f);
+        cloth.vbd_count = 3u;
+        cook::CookParticleSurface surface;
+        surface.triangles = {0u, 1u, 2u};
+        surface.self_contact = false;
+        cloth.surfaces.push_back(surface);
+        FinishModel(model, cloth);
+        for (const auto& vertex : cloth.positions)
+            ASSERT_GT((vertex - body.pose.position).LengthSq(), radius * radius);
+        auto config = Cfg();
+        config.dt = 0.005f;
+        config.gravity[2] = 0.0f;
+        config.vel_iters = 512u;
+        nk::World world(std::move(model), 1u, backend.dev, backend.backend, config);
+        ASSERT_TRUE(world.Ready());
+        ASSERT_TRUE(world.Step().AllOk());
+        Transform pose;
+        Vec3 velocity;
+        world.GetData().DownloadField(nk::FieldId::BodyPose, &pose, sizeof(pose));
+        world.GetData().DownloadField(nk::FieldId::BodyLinearVelocity, &velocity, sizeof(velocity));
+        EXPECT_GE(pose.position.z, radius - 1.0e-6f);
+        EXPECT_GE(velocity.z, -0.201f);
+        EXPECT_NEAR(velocity.x, 0.0f, 1.0e-5f);
+        EXPECT_NEAR(velocity.y, 0.0f, 1.0e-5f);
+    }
+}
 
 // A free cloth panel dropped onto a STATIC box rests on the box top (min z near the
 // box top + the particle radius), never tunnelling to a large negative z.

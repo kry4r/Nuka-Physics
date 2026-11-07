@@ -3,7 +3,7 @@
 #include <cmath>
 #include <cstdint>
 
-#include "collision/dat_geometry.hpp"
+#include "collision/contact_query.hpp"
 #include "math/cuda_vec_ops.cuh"
 #include "nk/model/generated/views.hpp"
 #include "phi/articulation_contract.hpp"
@@ -11,14 +11,8 @@
 namespace nuka::phi {
 namespace {
 
-// Rotation angle between two unit quaternions.
-__device__ float DatQuatArc(math::Quat a, math::Quat b) {
-    const float dot = fabsf(a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z);
-    return 2.0f * acosf(fminf(1.0f, fmaxf(0.0f, dot)));
-}
-
 template <class Params>
-__device__ bool DatBodyLink(const Params& p, const ModelView& model,
+__device__ bool ContactBodyLink(const Params& p, const ModelView& model,
                             uint32_t env, uint32_t body, uint32_t* link,
                             math::Transform* local) {
     const uint32_t global = env * p.bodies_per_env + body;
@@ -40,12 +34,12 @@ __device__ bool DatBodyLink(const Params& p, const ModelView& model,
 
 // Lowest link whose subtree holds both bodies when they belong to one articulation, else ~0u.
 template <class Params>
-__device__ uint32_t DatCommonFrame(const Params& p, const ModelView& model, uint32_t env,
+__device__ uint32_t ContactCommonFrame(const Params& p, const ModelView& model, uint32_t env,
                                    uint32_t body_a, uint32_t body_b) {
     uint32_t a = ~0u, b = ~0u;
     math::Transform local{};
-    if (p.articulations_per_env == 0u || !DatBodyLink(p, model, env, body_a, &a, &local) ||
-        !DatBodyLink(p, model, env, body_b, &b, &local) ||
+    if (p.articulations_per_env == 0u || !ContactBodyLink(p, model, env, body_a, &a, &local) ||
+        !ContactBodyLink(p, model, env, body_b, &b, &local) ||
         model.link_to_articulation[a] != model.link_to_articulation[b]) return ~0u;
     const uint32_t articulation = model.link_to_articulation[a];
     const uint32_t offset = model.articulation_link_offset[articulation];
@@ -65,15 +59,14 @@ __device__ uint32_t DatCommonFrame(const Params& p, const ModelView& model, uint
     return a == b ? a : ~0u;
 }
 
-// Speed bound of every point of a body relative to the frame link: predicted from joint rates
-// when given, else the joint motion of the step from start.
+// Joint rates bound the speed of every body point relative to the common frame.
 template <class Params>
-__device__ float DatChainSpeed(const Params& p, const ModelView& model, const DataView& data,
+__device__ float ContactChainSpeed(const Params& p, const ModelView& model,
                                uint32_t env, uint32_t body, uint32_t frame,
                                const float* rates, const float* start) {
     uint32_t link = ~0u;
     math::Transform local{};
-    if (!DatBodyLink(p, model, env, body, &link, &local)) return INFINITY;
+    if (!ContactBodyLink(p, model, env, body, &link, &local)) return INFINITY;
     const uint32_t articulation = model.link_to_articulation[link];
     const uint32_t offset = model.articulation_link_offset[articulation];
     const uint32_t count = model.articulation_link_count[articulation];
@@ -84,17 +77,15 @@ __device__ float DatChainSpeed(const Params& p, const ModelView& model, const Da
         const uint32_t parent = model.parent_link[link];
         if (parent >= count) break;
         const auto type = static_cast<ArticulationJointType>(model.joint_type[link]);
-        const float rate = rates ? rates[link] : fabsf(data.q[link] - start[link]) / p.dt;
+        const float rate = rates[link];
         if (type == ArticulationJointType::Revolute) speed += rate * radius;
         if (type == ArticulationJointType::Prismatic) speed += rate;
         if (type == ArticulationJointType::Spherical)
-            speed += radius * (rates ? rates[link] : DatQuatArc(data.dat_prev_joint_rotation[link],
-                                                                 data.joint_rotation[link]) / p.dt);
+            speed += radius * rate;
         radius += sqrtf((model.link_local_pose[link].position +
                          model.parent_offset[link]).LengthSq());
         if (type == ArticulationJointType::Prismatic)
-            radius += rates ? fabsf(start[link]) + rate * p.dt
-                            : fmaxf(fabsf(start[link]), fabsf(data.q[link]));
+            radius += fabsf(start[link]) + rate * p.dt;
         link = offset + parent;
     }
     return INFINITY;
@@ -103,12 +94,12 @@ __device__ float DatChainSpeed(const Params& p, const ModelView& model, const Da
 // Uncapped query radius of two links of one articulation, from the joint rates predicted at
 // detection and the start joint positions.
 template <class Params>
-__device__ float DatArticMotionRadius(const Params& p, const ModelView& model,
+__device__ float ContactArticMotionRadius(const Params& p, const ModelView& model,
                                       const DataView& data, uint32_t env, uint32_t a,
                                       uint32_t b, uint32_t frame, const float* start) {
-    return collision::DatMotionRadius(0.0005f + p.margin, p.dt,
-        DatChainSpeed(p, model, data, env, a, frame, data.dat_joint_rate, start),
-        DatChainSpeed(p, model, data, env, b, frame, data.dat_joint_rate, start),
+    return collision::ContactMotionRadius(0.0005f + p.margin, p.dt,
+        ContactChainSpeed(p, model, env, a, frame, data.dat_joint_rate, start),
+        ContactChainSpeed(p, model, env, b, frame, data.dat_joint_rate, start),
         p.relaxation);
 }
 

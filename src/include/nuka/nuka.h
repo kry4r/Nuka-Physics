@@ -800,13 +800,13 @@ typedef enum nuka_state_field_t {
     // WRITE: next position of each zero-inverse-mass particle, in world coordinates.
     NUKA_FIELD_PARTICLE_KINEMATIC_TARGET = 64,
     NUKA_FIELD_OGC_CONTACT_COUNT = 65,
-    // READ: per-environment particle, joint, and free-body truncations in the latest step.
+    // READ: reserved per-environment DAT counters; zero in the discrete contact pipeline.
     NUKA_FIELD_DAT_TRUNCATION_COUNT = 66,
-    // READ: per-environment physical kinetic-energy loss from DAT; negative means energy gain.
+    // READ: reserved per-environment DAT energy; zero in the discrete contact pipeline.
     NUKA_FIELD_DAT_TRUNCATION_ENERGY = 67,
-    // READ: per-environment invalid primitives or inseparable pairs in the latest step.
+    // READ: reserved per-environment DAT failures; zero in the discrete contact pipeline.
     NUKA_FIELD_DAT_FAILURE_COUNT = 68,
-    // READ: per-environment 0 or 1, whether the latest step exceeded the 20 mm query limit.
+    // READ: reserved per-environment DAT query limits; zero in the discrete contact pipeline.
     NUKA_FIELD_DAT_QUERY_LIMIT_COUNT = 69,
     // READ: per environment, current contact points and accepted warm starts.
     NUKA_FIELD_CONTACT_WARM_START_COUNTS = 70,
@@ -824,7 +824,7 @@ typedef enum nuka_state_field_t {
     // READ: per environment, vertex colors, dynamic row colors, chain rows, chain islands, rows of
     // the longest island chain, and articulation Schur rows of the latest colored solve.
     NUKA_FIELD_SOLVER_COLOR_COUNTS = 80,
-    // READ: actual per-particle DAT fraction; valid after a completed DAT step until reset.
+    // Reserved DAT fractions; no elements in the discrete contact pipeline.
     NUKA_FIELD_DAT_PARTICLE_MOTION_FRACTION = 81,
     // READ: [Newton correction m/s, stationarity force N], float bits high32 / ~particle low32.
     // Valid after a completed solve with contact diagnostics enabled, until reset.
@@ -847,21 +847,21 @@ typedef enum nuka_state_field_t {
     NUKA_FIELD_VBD_EFFECTIVE_DT = 89,
     // READ: shared cooked VBD elements as nuka_vbd_element_t, carried by sixteen uint32 words.
     NUKA_FIELD_VBD_ELEMENTS = 90,
-    // READ: env/389 uint64 from the last DAT pass: radius/motion/degenerate/overlap totals, unrecorded, then
-    // (reason<<60|owner<<30|owner, count, max overlap f32 bits); owner = kind(body,link,surface,static)<<28|index.
+    // Reserved DAT failure witnesses; no elements in the discrete contact pipeline.
     NUKA_FIELD_DAT_FAILURE_WITNESS = 91,
-    // READ: per articulation, four uint64 for the vertex motion, particle pair, body pair and chain
-    // travel bounds of the last DAT pass: f32 fraction bits high32, body << 16 | counterpart low32.
+    // Reserved DAT articulation witnesses; no elements in the discrete contact pipeline.
     NUKA_FIELD_DAT_ARTICULATION_WITNESS = 92,
-    // READ: per articulation, the motion fraction the last DAT pass applied.
+    // Reserved DAT articulation fractions; no elements in the discrete contact pipeline.
     NUKA_FIELD_DAT_ARTICULATION_FRACTION = 93,
-    // READ: per body, the predicted vertex speed bound and query radius of the last detection.
+    // READ: per body, the vertex speed bound used by contact queries.
     NUKA_FIELD_DAT_BODY_SPEED = 94,
+    // Reserved DAT query radius; no elements in the discrete contact pipeline.
     NUKA_FIELD_DAT_BODY_QUERY_RADIUS = 95,
-    // READ: per body, the largest untruncated vertex displacement rate of the last DAT pass.
+    // Reserved DAT body motion; no elements in the discrete contact pipeline.
     NUKA_FIELD_DAT_BODY_MOTION = 96,
-    // READ: per link, the untruncated joint speed of the last DAT pass and the detection bound.
+    // Reserved DAT joint motion; no elements in the discrete contact pipeline.
     NUKA_FIELD_DAT_JOINT_MOTION = 97,
+    // READ: per link, the current joint speed bound used by contact queries.
     NUKA_FIELD_DAT_JOINT_RATE = 98,
     // READ: per environment, uint64 nanoseconds for eight solve phases, then five tile setup subphases:
     // mass response, incidence, coloring, Jacobian loading and initial residual; setup includes its subphases.
@@ -896,6 +896,7 @@ typedef enum nuka_state_field_t {
     NUKA_FIELD_JOINT_LIMIT_MARGIN = 116,
     NUKA_FIELD_BODY_INVWEIGHT0 = 117,
     NUKA_FIELD_DOF_INVWEIGHT0 = 118,
+    // READ/WRITE: 22 float32 words per profile; word 1 stores nuka_contact_profile_flag_t bits.
     NUKA_FIELD_CONTACT_PROFILES = 119,
     // READ/WRITE per link: a spherical joint's rotation of the child in its parent joint frame (wxyz; identity
     // elsewhere) and its three DOF velocities, the relative angular velocity in the child frame (rad/s).
@@ -1017,6 +1018,11 @@ typedef enum nuka_gyro_status_t {
     NUKA_GYRO_NOT_CONVERGED = 1,
     NUKA_GYRO_INVALID_INPUT = 2
 } nuka_gyro_status_t;
+
+typedef enum nuka_contact_profile_flag_t {
+    NUKA_CONTACT_PROFILE_REFSAFE = 1u << 0,
+    NUKA_CONTACT_PROFILE_GEOMETRIC_FRICTION = 1u << 1
+} nuka_contact_profile_flag_t;
 
 typedef enum nuka_contact_side_kind_t {
     NUKA_CONTACT_SIDE_RIGID = 0,

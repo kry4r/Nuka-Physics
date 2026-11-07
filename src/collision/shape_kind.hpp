@@ -34,8 +34,8 @@ NUKA_COLLISION_HD inline bool ShapeFilterAdmits(uint32_t contype_a, uint32_t con
 
 enum class MeshContactRoute : uint8_t { Analytic, Ogc, Sdf };
 
-// Rigid surface contacts preserve this clearance in their speculative constraints.
-inline constexpr float kRigidContactSeparation = 0.0005f;
+// Rigid contact searches retain nearby features without inflating the physical surface.
+inline constexpr float kRigidContactQueryMargin = 0.0005f;
 
 // Heightfield triangle prisms share this extrusion in detection and broadphase bounds.
 NUKA_COLLISION_HD inline float HeightfieldPrismExtrusion(float height_range) {

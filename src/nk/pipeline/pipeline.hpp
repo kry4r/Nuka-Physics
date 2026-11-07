@@ -105,9 +105,7 @@ private:
     phi::ReadoutDrivesParams          p_readout_drives_{};
     phi::ArticulationDampingParams    p_damping_{};
     phi::ParticleSurfacesParams       p_particle_surfaces_{};
-    phi::ParticleSurfacesParams       p_dat_refit_{};
     phi::OgcDetectParams              p_ogc_detect_{};
-    phi::DatTruncateParams             p_dat_truncate_{};
     phi::ArticulationDynamicsParams             p_dynamics_{};
     phi::ArticulationDynamicsParams             p_dynamics_prepare_{};
     phi::IntegrateVelocityParams      p_int_vel_{};

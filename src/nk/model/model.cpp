@@ -119,16 +119,19 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
          id == FieldId::ControlTaskMap || id == FieldId::ControlScratch)) return 0u;
     if (!articulated_contact_pairs &&
         (id == FieldId::ChainJacobianB || id == FieldId::RowCjPointB)) return 0u;
-    // Discrete truncation state and OGC witnesses exist only with OGC slots; the per-env counters stay readable.
+    // Reserved DAT fields have no storage; scalar compatibility counters remain zero.
+    if (id == FieldId::DatParticleBeta || id == FieldId::DatBodyBeta || id == FieldId::DatArticBeta ||
+        id == FieldId::DatParticleParent || id == FieldId::DatBodyParent || id == FieldId::DatArticParent ||
+        id == FieldId::DatArticWitness || id == FieldId::DatPrevQ || id == FieldId::DatPrevJointRotation ||
+        id == FieldId::DatPrevBasePose || id == FieldId::DatPrevBodyPose || id == FieldId::DatBodyMotion ||
+        id == FieldId::DatJointMotion || id == FieldId::DatSurfaceMotion || id == FieldId::DatFailureWitness ||
+        id == FieldId::DatBodyQueryRadius)
+        return 0u;
     if (ogc_contacts_per_env == 0u &&
         (id == FieldId::UcontactWitnessA || id == FieldId::UcontactWitnessB ||
-         id == FieldId::DatParticleBeta || id == FieldId::DatBodyBeta || id == FieldId::DatArticBeta ||
-         id == FieldId::DatArticWitness || id == FieldId::DatPrevQ || id == FieldId::DatPrevBasePose ||
-         id == FieldId::DatPrevBodyPose || id == FieldId::DatBodySpeed || id == FieldId::DatBodyQueryRadius ||
-         id == FieldId::DatBodyMotion || id == FieldId::DatJointMotion || id == FieldId::DatJointRate ||
+         id == FieldId::DatBodySpeed || id == FieldId::DatJointRate ||
          id == FieldId::DatPairKind || id == FieldId::DatPairOwnerA || id == FieldId::DatPairOwnerB ||
-         id == FieldId::DatPairFeatureA || id == FieldId::DatPairFeatureB || id == FieldId::DatFailureWitness))
-        return 0u;
+         id == FieldId::DatPairFeatureA || id == FieldId::DatPairFeatureB)) return 0u;
     if (mimic_couplings_per_env == 0u && id == FieldId::MReduced) return 0u;
     if (mpm_grid_nodes_per_env == 0u &&
         (id == FieldId::GridContactAttempted || id == FieldId::GridContactRetained ||
@@ -224,7 +227,7 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
                 ? CheckedProduct({particle_surface_nodes_per_env, env_count}) : 0u;
         if (id == FieldId::ParticleSurfaceEdgeNodes)
             return CheckedProduct({particle_surface_edge_nodes_per_env, env_count});
-        if (id == FieldId::ParticleSurfaceMaxSpeed || id == FieldId::DatSurfaceMotion)
+        if (id == FieldId::ParticleSurfaceMaxSpeed)
             return point_endpoints_per_env > 0u || vbd_vertices_per_env > 0u
                 ? CheckedProduct({particle_surfaces_per_env, env_count}) : 0u;
         if (id == FieldId::PointEndpointRanges) return CheckedProduct({point_endpoints_per_env, env_count});

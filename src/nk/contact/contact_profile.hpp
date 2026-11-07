@@ -8,7 +8,9 @@ namespace nuka::nk {
 
 inline constexpr uint32_t kContactProfileSchemaVersion = 2u;
 inline constexpr uint32_t kContactProfileFlagRefsafe = 1u << 0;
-inline constexpr uint32_t kContactProfileSupportedFlags = kContactProfileFlagRefsafe;
+inline constexpr uint32_t kContactProfileFlagGeometricFriction = 1u << 1;
+inline constexpr uint32_t kContactProfileSupportedFlags =
+    kContactProfileFlagRefsafe | kContactProfileFlagGeometricFriction;
 
 enum ContactProfileLane : uint32_t {
     kContactProfileSchema = 0u,
