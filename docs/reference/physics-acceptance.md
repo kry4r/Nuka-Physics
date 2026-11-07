@@ -61,15 +61,23 @@ balance criterion unmeasured. Analytic balances, matched external reference
 results, timestep/grid convergence and independent CCD require separate evidence
 and remain unmeasured in this program.
 
-Compliant spring rows separate storage from the damping excitation using their
-active response matrix. The explicit damping contribution to `NORMAL_LOSS` or
-`LIMIT_LOSS` samples power at the initial velocity used to evaluate that force.
-For a scalar damper this is `h * c * v0^2`. The discrete impulse work instead uses
-the mean velocity, `-h * c * v0 * (v0 + v1) / 2`; it can be positive when a step
-crosses a turning point. `ROW_PHYSICAL_IMPULSE_WORK` and per-row `WORK` retain that
-signed work. Its difference from sampled damping power remains in `RESIDUAL`,
-together with other integration errors, and must pass timestep-convergence and
-energy checks. No negative term is clamped or discarded.
+Compliant rows evaluate damping at the mean of the initial and solved velocities.
+For the acceleration law `a_ref = -k*r0 - b*v`, let `s = 1 + h*b/2`.
+The existing velocity solve uses regularizer `R/s` and target
+`((1 - h*b/2)*v0 - h*k*r0)/s`. This preserves the continuous reference law;
+its finite-step trajectory differs from an explicit MuJoCo reference acceleration.
+The UABD solve, impulse bounds and friction cones keep their existing contracts.
+The analytic impulse check requests a `1e-7` m/s solve tolerance to resolve its
+`3e-6` m/s velocity assertion. This does not change the production default or
+the iteration budget; representative scene observations use their declared settings.
+
+Compliant spring rows separate storage and damping using the original active
+response matrix, before the regularizer's time-discretization scaling. A scalar
+damper contributes `h*c*((v0+v1)/2)^2` to `NORMAL_LOSS` or `LIMIT_LOSS`.
+`ROW_PHYSICAL_IMPULSE_WORK` and per-row `WORK` retain the actual signed impulse
+work. Spring, position and other integration errors remain in `RESIDUAL` and
+must pass timestep-convergence and energy checks. No negative term is clamped
+or discarded.
 
 For detailed preserved traces, use `DiagnosticSession` and the maintained report
 command:

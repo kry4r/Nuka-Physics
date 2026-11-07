@@ -390,10 +390,11 @@ __global__ void ClearPairDrivenRowsKernel(
 }
 
 // Compliant rows record their reference stiffness and deflection for the energy ledger.
-__device__ inline void StoreCompliantSpring(float* storage, uint32_t rs, float spring, float pos) {
+__device__ inline void StoreCompliantSpring(float* storage, uint32_t rs, float spring, float pos, float damping) {
     if (storage == nullptr) return;
     storage[size_t{rs} * 4u] = spring;
     storage[size_t{rs} * 4u + 1u] = pos;
+    storage[size_t{rs} * 4u + 2u] = damping;
 }
 
 // Each candidate slot emits its manifold rows using ComputeCompliantRow.
@@ -648,6 +649,7 @@ __global__ void EmitPairDrivenRowsKernel(
             const float pos = -ucontact_depth[mp] - merged.margin;
             const auto compliant = constraint::ComputeCompliantRow(solref, solimp,
                 pos, pos, 0.0f, edge_invweight, dt, refsafe);
+            const auto discrete = constraint::DiscretizeCompliantRow(compliant, dt);
             for (uint32_t edge = 0u; edge < 4u; ++edge) {
                 const uint32_t rs = base + edge * points_per_slot + p;
                 NkRow row{};
@@ -663,8 +665,8 @@ __global__ void EmitPairDrivenRowsKernel(
                     row.group_first = rs;
                     row.group_normal_count = 1u;
                     row.env = env;
-                    row.rhs = compliant.aref_bias;
-                    row.compliance_alpha = compliant.R;
+                    row.rhs = discrete.bias;
+                    row.compliance_alpha = discrete.R;
                     row.lower = 0.0f;
                     row.upper = kFltMaxLocal;
                     row.mu = mu1;
@@ -675,9 +677,9 @@ __global__ void EmitPairDrivenRowsKernel(
                     if (kind_b == kNkSideRigid) row.b.jang = (point - com_b).Cross(row.b.jlin);
                     if (kind_a == kNkSideArtic) { row_cj_link[rs] = link_a; row_cj_point[rs] = point; }
                     if (kind_b == kNkSideArtic) { row_cj_link_b[rs] = link_b; row_cj_point_b[rs] = point; }
-                    row_reference_velocity_gain[rs] = 1.0f / dt - compliant.damping;
+                    row_reference_velocity_gain[rs] = discrete.reference_gain;
                     row_invweight[rs] = edge_invweight;
-                    StoreCompliantSpring(row_compliant_storage, rs, compliant.spring, pos);
+                    StoreCompliantSpring(row_compliant_storage, rs, compliant.spring, pos, compliant.damping);
                     ++active_rows;
                 }
                 urows[rs] = row;
@@ -709,6 +711,7 @@ __global__ void EmitPairDrivenRowsKernel(
                 if (!velocity_only)
                     compliant = constraint::ComputeCompliantRow(solref, solimp, pos, pos,
                         0.0f, invweight, dt, refsafe);
+                const auto discrete = constraint::DiscretizeCompliantRow(compliant, dt);
                 row.flags = nk::nk_row_flags::kActive | nk::nk_row_flags::kContactNormal;
                 if (mujoco) row.flags |= nk::nk_row_flags::kMuJoCo;
                 if (merged.condim == 3u) row.flags |= nk::nk_row_flags::kBlockNormal;
@@ -717,15 +720,15 @@ __global__ void EmitPairDrivenRowsKernel(
                 row.group_first = base;
                 row.group_normal_count = points_per_slot;
                 row.env = env;
-                row.rhs = compliant.aref_bias;
+                row.rhs = discrete.bias;
                 // Split impulses recover overlap without adding physical kinetic energy.
                 if (speculative) row.rhs = (fminf(depth, 0.0f) +
                     (position_pass ? 0.0f : fminf(fmaxf(ucontact_depth[mp], 0.0f),
                                                 overlap_recovery_velocity * dt))) / (dt * dt);
-                row_reference_velocity_gain[rs] = 1.0f / dt - compliant.damping;
+                row_reference_velocity_gain[rs] = discrete.reference_gain;
                 row_invweight[rs] = invweight;
-                StoreCompliantSpring(row_compliant_storage, rs, speculative ? 0.0f : compliant.spring, pos);
-                row.compliance_alpha = compliant.R;
+                StoreCompliantSpring(row_compliant_storage, rs, speculative ? 0.0f : compliant.spring, pos, compliant.damping);
+                row.compliance_alpha = discrete.R;
                 row.lower = 0.0f;
                 row.upper = kFltMaxLocal;
                 row.mu = mu1;
@@ -766,11 +769,12 @@ __global__ void EmitPairDrivenRowsKernel(
                     const float tangent_invweight = invweight / impratio * (mu1 * mu1) / (mu * mu);
                     const auto compliant = constraint::ComputeCompliantRow(friction_reference, solimp,
                         -ucontact_depth[mp] - merged.margin, 0.0f, 0.0f, tangent_invweight, dt, refsafe);
+                    const auto discrete = constraint::DiscretizeCompliantRow(compliant, dt);
                     row.flags |= nk::nk_row_flags::kMuJoCo;
-                    row.compliance_alpha = compliant.R;
-                    row_reference_velocity_gain[rs] = 1.0f / dt - compliant.damping;
+                    row.compliance_alpha = discrete.R;
+                    row_reference_velocity_gain[rs] = discrete.reference_gain;
                     row_invweight[rs] = tangent_invweight;
-                    StoreCompliantSpring(row_compliant_storage, rs, 0.0f, 0.0f);
+                    StoreCompliantSpring(row_compliant_storage, rs, 0.0f, 0.0f, compliant.damping);
                 }
                 row.lower = -kFltMaxLocal;
                 row.upper = kFltMaxLocal;
@@ -853,17 +857,18 @@ __device__ void EmitJointLimitRow(
             const float invweight = model.dof_invweight0[size_t{articulation} * dof_stride + dof];
             const auto compliant = constraint::ComputeCompliantRow(reference, reference + 2u,
                 pos, pos, 0.0f, invweight, dt, refsafe);
+            const auto discrete = constraint::DiscretizeCompliantRow(compliant, dt);
             row.flags |= nk::nk_row_flags::kMuJoCo;
             const bool lower_nearest = state.q[link] - lower_limits[link] < upper_limits[link] - state.q[link];
             if (pos >= 0.0f || lower_nearest != (side == 0u)) {
                 row.flags &= ~nk::nk_row_flags::kActive;
                 lambda[rs] = 0.0f;
             }
-            row.rhs = compliant.aref_bias;
-            row.compliance_alpha = compliant.R;
-            data.row_reference_velocity_gain[rs] = 1.0f / dt - compliant.damping;
+            row.rhs = discrete.bias;
+            row.compliance_alpha = discrete.R;
+            data.row_reference_velocity_gain[rs] = discrete.reference_gain;
             data.row_invweight[rs] = invweight;
-            StoreCompliantSpring(data.row_compliant_storage, rs, compliant.spring, pos);
+            StoreCompliantSpring(data.row_compliant_storage, rs, compliant.spring, pos, compliant.damping);
         }
         if (row.flags & nk::nk_row_flags::kActive) atomicAdd(&row_count[env], 1u);
     } else {
@@ -912,11 +917,12 @@ __device__ void EmitJointFrictionRows(
             const float invweight = model.dof_invweight0[size_t{articulation} * dof_stride + dof];
             const auto compliant = constraint::ComputeCompliantRow(reference, reference + 2u,
                 0.0f, 0.0f, 0.0f, invweight, dt, refsafe);
+            const auto discrete = constraint::DiscretizeCompliantRow(compliant, dt);
             row.flags |= nk::nk_row_flags::kMuJoCo;
-            row.compliance_alpha = compliant.R;
-            data.row_reference_velocity_gain[rs] = 1.0f / dt - compliant.damping;
+            row.compliance_alpha = discrete.R;
+            data.row_reference_velocity_gain[rs] = discrete.reference_gain;
             data.row_invweight[rs] = invweight;
-            StoreCompliantSpring(data.row_compliant_storage, rs, 0.0f, 0.0f);
+            StoreCompliantSpring(data.row_compliant_storage, rs, 0.0f, 0.0f, compliant.damping);
         }
         atomicAdd(&row_count[env], 1u);
     }
@@ -1163,8 +1169,6 @@ __global__ void PrepareContactRowsKernel(
         row, forward, row, forward, mass_factor, body_inv_mass, body_world_inv_inertia, point_masses,
         dof_stride);
     if (book) {
-        // Damping excitation -b v0 of the reference acceleration and the row's diagonal response.
-        row_compliant_storage[size_t{rs} * 4u + 2u] = -(1.0f / dt - row_reference_velocity_gain[rs]) * initial_velocity;
         row_compliant_storage[size_t{rs} * 4u + 3u] = diagonal;
     }
     if (!respond) return;

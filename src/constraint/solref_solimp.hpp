@@ -28,6 +28,19 @@ struct CompliantContactRow {
     float spring = 0.0f;  // k * imp, the reference stiffness on the constraint coordinate
 };
 
+struct CompliantVelocityRow {
+    float R;
+    float bias;
+    float reference_gain;
+};
+
+// Midpoint damping keeps the acceleration law while solving for the end velocity.
+NUKA_SRSI_HD inline CompliantVelocityRow DiscretizeCompliantRow(const CompliantContactRow& row, float dt) {
+    const double scale = 1.0 + 0.5 * double(dt) * row.damping;
+    return {float(row.R / scale), float(row.aref_bias / scale),
+            float((1.0 / double(dt) - 0.5 * row.damping) / scale)};
+}
+
 struct CompliantRowTerms {
     float k = 0.0f;
     float b = 0.0f;

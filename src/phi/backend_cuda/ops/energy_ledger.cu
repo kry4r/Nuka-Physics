@@ -339,7 +339,6 @@ __global__ void EnergyLinkFramesKernel(ModelView m, DataView d, ReadoutEnergyLed
 
 struct RowPower {
     double physical = 0.0;
-    double reference = 0.0;
     double rate = 0.0;
     double applied = 0.0;
     double kinematic = 0.0;
@@ -356,15 +355,12 @@ __device__ RowPower SidePower(const NkRowSide& side, bool second, uint32_t row,
         const size_t tile = size_t{side.index} * p.dofs_per_artic;
         for (uint32_t k = 0u; k < p.dofs_per_artic; ++k) {
             out.physical += double(jacobian[k]) * 0.5 * (d.step_qdot_flat[tile + k] + d.qdot_flat[tile + k]);
-            out.reference += double(jacobian[k]) * d.step_qdot_flat[tile + k];
         }
         out.rate = out.applied = out.physical;
     } else if (side.kind == nk::kNkSideRigid) {
         const uint32_t body = side.index;
         out.physical = 0.5 * (Dot(side.jlin, d.step_body_linear_velocity[body] + d.body_linear_velocity[body]) +
             Dot(side.jang, d.step_body_angular_velocity[body] + d.body_angular_velocity[body]));
-        out.reference = Dot(side.jlin, d.step_body_linear_velocity[body]) +
-            Dot(side.jang, d.step_body_angular_velocity[body]);
         out.rate = out.applied = out.physical;
     } else if (PointMassView::IsPointSide(side.kind)) {
         PointMassView points;
@@ -389,8 +385,6 @@ __device__ RowPower SidePower(const NkRowSide& side, bool second, uint32_t row,
                     (jacobian.x * (entry[0] / mass + velocity.x) +
                      jacobian.y * (entry[1] / mass + velocity.y) +
                      jacobian.z * (entry[2] / mass + velocity.z)) : 0.0;
-                out.reference += mass > 0.0 ?
-                    (jacobian.x * entry[0] + jacobian.y * entry[1] + jacobian.z * entry[2]) / mass : 0.0;
                 out.physical += power;
                 out.rate += power;
                 if (d.grid_inv_mass[node] > 0.0f) out.applied += power;
@@ -401,7 +395,6 @@ __device__ RowPower SidePower(const NkRowSide& side, bool second, uint32_t row,
             const uint32_t particle = term.index;
             const double physical = 0.5 * Dot(term.jacobian,
                 d.step_particle_velocity[particle] + ParticleVelocity(d, p, particle));
-            out.reference += Dot(term.jacobian, d.step_particle_velocity[particle]);
             out.physical += physical;
             out.rate += 0.5 * Dot(term.jacobian,
                 d.step_particle_velocity[particle] + d.particle_vel[particle]);
@@ -575,7 +568,12 @@ __global__ void EnergyDampingSplitKernel(DataView d, ReadoutEnergyLedgerParams p
         __syncthreads();
         for (uint32_t k = threadIdx.x; k < n; k += blockDim.x) {
             const uint32_t row = members[k];
-            rhs[k] = (rows[row].flags & nk::nk_row_flags::kMuJoCo) ? double(storage[size_t{row} * 4u + 2u]) : 0.0;
+            rhs[k] = 0.0;
+            if (rows[row].flags & nk::nk_row_flags::kMuJoCo) {
+                const auto a = SidePower(rows[row].a, false, row, {}, d, p);
+                const auto b = SidePower(rows[row].b, true, row, {}, d, p);
+                rhs[k] = -double(storage[size_t{row} * 4u + 2u]) * (a.physical + b.physical);
+            }
         }
         __syncthreads();
         // Each connected response block uses the environment's matrix prefix.
@@ -588,7 +586,11 @@ __global__ void EnergyDampingSplitKernel(DataView d, ReadoutEnergyLedgerParams p
                 const RowForward fj = StoredForward(rows[rj], d.energy_split_forward + size_t{rj} * 2u * dofs, dofs);
                 double coupling = PairDrivenRowCoupling(rows[ri], fi, rows[rj], fj, mass_factor, inv_mass, inv_inertia,
                                                         points, dofs);
-                if (i == j) coupling += rows[ri].compliance_alpha;
+                if (i == j) {
+                    const double scale = (rows[ri].flags & nk::nk_row_flags::kMuJoCo)
+                        ? 1.0 + 0.5 * double(p.dt) * storage[size_t{ri} * 4u + 2u] : 1.0;
+                    coupling += double(rows[ri].compliance_alpha) * scale;
+                }
                 a[size_t{i} * n + j] = coupling;
             }
             original[i] = a[size_t{i} * n + i];
@@ -1148,17 +1150,14 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
                 continue;
             }
             // Storage follows the row's own displacement; a pyramid edge splits it into normal and friction parts.
-            const auto store = [&](nk::EnergyRowKind kind, double normal_rate, double normal_reference, EnergyColumn loss,
+            const auto store = [&](nk::EnergyRowKind kind, double normal_rate, EnergyColumn loss,
                                    EnergyColumn tangent_loss) {
                 const double displacement = double(p.dt) * (SideDisplacementRate(r.a, false, row, d, p) +
                     SideDisplacementRate(r.b, true, row, d, p));
                 const auto share = CompliantStorageForce(r, row, impulse, d, p);
-                // Explicit damping power uses its reference velocity; its mean-velocity work defect stays in Residual.
-                const double normal = share.conservative * normal_rate +
-                    share.damping * (normal_rate - normal_reference);
+                const double normal = share.conservative * normal_rate;
                 values[Column(loss)] += normal;
-                values[Column(tangent_loss)] += share.conservative * (a.physical + b.physical) +
-                    share.damping * (a.physical + b.physical - a.reference - b.reference) - normal;
+                values[Column(tangent_loss)] += share.conservative * (a.physical + b.physical) - normal;
                 values[Column(EnergyColumn::ConstraintStorage)] += share.force * displacement;
                 record(kind, share.force * displacement, share);
             };
@@ -1176,7 +1175,6 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
                 add(EnergyColumn::NormalLoss, -normal_work);
                 add(EnergyColumn::FrictionLoss, normal_work - work);
                 store(nk::EnergyRowKind::PyramidEdge, 0.5 * (n0a.physical + n0b.physical + n1a.physical + n1b.physical),
-                      0.5 * (n0a.reference + n0b.reference + n1a.reference + n1b.reference),
                       EnergyColumn::NormalLoss, EnergyColumn::FrictionLoss);
             } else if ((r.flags & nk::nk_row_flags::kBlockTangent) ||
                 (local >= first_friction && local < first_drive)) {
@@ -1184,11 +1182,11 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
                 record(nk::EnergyRowKind::Friction, 0.0, {});
             } else if (r.flags & (nk::nk_row_flags::kContactNormal | nk::nk_row_flags::kBlockNormal)) {
                 add(EnergyColumn::NormalLoss, -work);
-                store(nk::EnergyRowKind::Normal, a.physical + b.physical, a.reference + b.reference, EnergyColumn::NormalLoss,
+                store(nk::EnergyRowKind::Normal, a.physical + b.physical, EnergyColumn::NormalLoss,
                       EnergyColumn::NormalLoss);
             } else if (r.flags & nk::nk_row_flags::kJointLimit) {
                 add(EnergyColumn::LimitLoss, -work);
-                store(nk::EnergyRowKind::Limit, a.physical + b.physical, a.reference + b.reference, EnergyColumn::LimitLoss,
+                store(nk::EnergyRowKind::Limit, a.physical + b.physical, EnergyColumn::LimitLoss,
                       EnergyColumn::LimitLoss);
             }
             else {

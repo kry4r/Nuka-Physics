@@ -65,6 +65,26 @@ nk::Pipeline::SolverConfig Config() {
     return config;
 }
 
+struct ScopedSolverTolerance {
+    std::string previous;
+    bool existed;
+    explicit ScopedSolverTolerance(const char* tolerance) {
+        const char* value = std::getenv("NUKA_SOLVER_VEL_TOLERANCE");
+        existed = value != nullptr;
+        if (existed) previous = value;
+        Set(tolerance);
+    }
+    ~ScopedSolverTolerance() { Set(existed ? previous.c_str() : nullptr); }
+    static void Set(const char* value) {
+#if defined(_WIN32)
+        _putenv_s("NUKA_SOLVER_VEL_TOLERANCE", value ? value : "");
+#else
+        if (value) setenv("NUKA_SOLVER_VEL_TOLERANCE", value, 1);
+        else unsetenv("NUKA_SOLVER_VEL_TOLERANCE");
+#endif
+    }
+};
+
 template <typename T>
 std::vector<T> Read(nk::World& world, nk::FieldId field, size_t count) {
     std::vector<T> result(count);
@@ -227,10 +247,12 @@ TEST(PairDrivenRigidRelease, ContactReadoutMatchesSolvedRowsAcrossEnvironments) 
     EXPECT_EQ(active, 2u);
 }
 
-// Acceleration-level contact damping uses the incoming velocity, including under-resolved inputs.
-TEST(PairDrivenRigidRelease, MuJoCoDampingMatchesAccelerationReferenceAcrossMasses) {
+// Midpoint damping follows the same acceleration law, including under-resolved inputs.
+TEST(PairDrivenRigidRelease, MidpointDampingMatchesAnalyticImpulseAcrossMasses) {
     auto& backend = Device();
     if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    // Resolve the discrete equation more accurately than the analytic velocity assertion.
+    const ScopedSolverTolerance tolerance("1e-7");
     constexpr float approach = -0.2f;
     constexpr float dt = 0.002f;
     constexpr float impedance = 0.95f;
@@ -262,8 +284,9 @@ TEST(PairDrivenRigidRelease, MuJoCoDampingMatchesAccelerationReferenceAcrossMass
                     ASSERT_TRUE(world.Ready());
                     ASSERT_TRUE(world.Step().AllOk());
                     const auto velocity = Read<Vec3>(world, nk::FieldId::BodyLinearVelocity, 4u);
-                    const float expected = approach * (1.0f - impedance * damping * dt) +
-                        (1.0f - impedance) * gravity * dt;
+                    const float half_decay = 0.5f * impedance * damping * dt;
+                    const float expected = (approach * (1.0f - half_decay) +
+                        (1.0f - impedance) * gravity * dt) / (1.0f + half_decay);
                     for (uint32_t env = 0; env < 2u; ++env) {
                         EXPECT_NEAR(velocity[env * 2u + 1u].z, expected, 3.0e-6f);
                     }
@@ -380,9 +403,11 @@ TEST(PairDrivenRigidRelease, IndependentCompliantContactsShareNoStorageCapacity)
             const double start = double(before[body].position.z) - radius;
             const double end = double(after[body].position.z) - radius;
             stored += 0.5 * spring * (end * end - start * start);
-            loss += response_mass * damping * double(initial) * initial * dt;
+            const double midpoint = 0.5 * (double(initial) + velocity[body].z);
+            loss += response_mass * damping * midpoint * midpoint * dt;
             kinetic += 0.5 * mass * (double(velocity[body].z) * velocity[body].z - double(initial) * initial);
-            const double exact = initial - dt * (spring * start + response_mass * damping * initial) / mass;
+            const double half_decay = 0.5 * dt * response_mass * damping / mass;
+            const double exact = (initial * (1.0 - half_decay) - dt * spring * start / mass) / (1.0 + half_decay);
             EXPECT_NEAR(velocity[body].z, exact, phi::kTileVelocityTolerance);
             tolerance += 2.0e-8 * mass + mass * std::abs(velocity[body].z) * phi::kTileVelocityTolerance;
         }
@@ -446,12 +471,14 @@ TEST(PairDrivenRigidRelease, CompliantStorageAndDampingUseIndependentPhysicalTer
                         const double start = double(before[body].position.z) - double(0.1f);
                         const double end = double(after[body].position.z) - double(0.1f);
                         const double stored = 0.5 * spring * (end * end - start * start);
-                        const double loss = response_mass * damping * double(initial) * initial * dt;
+                        const double midpoint = 0.5 * (double(initial) + velocity[body].z);
+                        const double loss = response_mass * damping * midpoint * midpoint * dt;
                         const auto value = [&](nk::EnergyColumn column) {
                             return ledger[env * nk::kEnergyColumnCount + uint32_t(column)];
                         };
-                        const double exact_velocity = initial - dt *
-                            (spring * start + response_mass * damping * initial) / mass;
+                        const double half_decay = 0.5 * dt * response_mass * damping / mass;
+                        const double exact_velocity = (initial * (1.0 - half_decay) - dt * spring * start / mass) /
+                            (1.0 + half_decay);
                         EXPECT_NEAR(velocity[body].z, exact_velocity, phi::kTileVelocityTolerance);
                         // A velocity residual epsilon bounds impulse work error by mass*epsilon*|v1|.
                         const double storage_tolerance = 2.0e-8 * mass +
