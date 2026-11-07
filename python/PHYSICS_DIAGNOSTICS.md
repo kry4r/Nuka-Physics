@@ -3,7 +3,23 @@
 `nuka.diagnostics.DiagnosticSession` records production readouts from a `World`.
 The session requests diagnostics before stepping, stores every environment and
 physics interval, and preserves completed chunks when a run stops or fails.
-Readouts do not update positions, velocities, impulses or DAT fractions.
+Readouts do not update positions, velocities or impulses.
+
+`Field.CONTACT_PROFILES` contains 22 float32 words per material profile. Word 1
+stores the bits of `ContactProfileFlag`; reinterpret it as uint32 before editing.
+`GEOMETRIC_FRICTION` requests geometric-mean mixing of sliding, spinning and rolling
+friction. At equal priority, either shape can request this rule; otherwise the
+higher-priority shape supplies the coefficients. The default is maximum mixing.
+Authored contact pairs keep their own coefficients. Mesh and primitive contacts
+use the same rule, and zero geometric-mean friction disables tangential response.
+Upload modified profiles through `World.upload_field`. Contact assembly uses the
+updated parameters and invalidates caches whose resolved material values changed.
+
+Production stepping uses discrete contact constraints without CCD or displacement
+truncation. Historical DAT field IDs remain reserved: scalar counters and energy
+columns are zero, while fraction, history and witness arrays have no elements.
+The `BEFORE_DAT_*` energy columns describe the projected state before velocity
+finalization. Offline trajectory geometry audits do not participate in stepping.
 
 ## Capture
 
@@ -33,7 +49,7 @@ diagnostic decisions remain unmeasured until a complete interval is recorded.
 
 | Field | Per environment and substep | Meaning |
 |---|---|---|
-| `ENERGY_LEDGER` | 32 float32 values | State energies, actual work, signed losses, original residual, validity |
+| `ENERGY_LEDGER` | 44 float32 values | State energies, actual work, signed losses, original residual, validity, MPM transfer and material terms |
 | `PHYSICS_STAGE_METRICS` | 5 × 44 float32 values | Physical momentum, finite counts, VBD force defect, discrete momentum and substep solver residuals |
 | `CONTACT_AUDIT_COUNTS` | 8 uint32 values | Contact and violation counts over active contact rows |
 | `CONTACT_AUDIT_METRICS` | 7 uint64 values | Maximum audit values and their global row witnesses |
@@ -41,12 +57,68 @@ diagnostic decisions remain unmeasured until a complete interval is recorded.
 | `VBD_ELEMENTS` | Shared cooked model, sixteen uint32 words per element | Exact elastic topology and material parameters |
 | `VBD_SOLVE_AUDIT` | 20 float32 values per VBD vertex, latest solve call | Final force and Newton correction; local descent direction, scale, energy change and counters |
 
+`DiagnosticSession(..., interval_states=True)` additionally retains the committed
+particle positions and velocities, MPM deformation and affine matrices and plastic
+history, collidable body poses and velocities, and joint coordinates, rates,
+rotations, spatial velocities and base poses after every physical interval.
+The corresponding `Field.INTERVAL_*` arrays have environment, substep, owner,
+component order. `INTERVAL_STATE_DT` has environment and substep axes; zero marks
+an unwritten or reset interval, whose other stored values must be ignored.
+Non-MPM particle matrices are identity for deformation and zero for affine rate;
+their plastic strain is zero. Body poses include articulated colliders after FK.
+These optional buffers are allocated on first demand and have no solver consumers.
+Enabling the readout rebuilds a captured execution plan without changing physical
+updates. It increases capture memory and latency and belongs in untimed validation.
+
+The C++ pipeline benchmark accepts `--interval-output <new-directory>` for the
+same readout during its quality replay. `manifest.json` describes the byte offsets,
+element sizes and counts in `initial.bin`, `inputs.bin` and each policy frame of
+`intervals.bin`. Inputs include the cooked model and persistent data fields; their
+typed layouts come from the bound `src/nk/model/fields.yaml`. The manifest remains
+`recording` on interruption and becomes `closed` after replay, with the measured
+`timed_replay_bit_equal` result. This export does not establish physical acceptance.
+For MPM spatial convergence, `--mpm-grid-refinement n` divides cell and particle
+spacing by `n`, preserves the material domain and total mass, and increases the
+contact reserve with the particle count. `--substeps` controls time refinement.
+
+`--quality-only 1` executes that complete quality replay without a preceding timed
+pass. All warmup and measured-window physical steps still run, with optional
+rendering and state export. Performance samples and timed replay binding are
+unmeasured in this mode; it cannot supply a performance denominator.
+
 Stages are `BEGIN`, `FREE`, `SOLVED`, `PROJECTED`, `END`.
 `FREE` follows gravity and controls. Contact impulses and work are measured at
-`SOLVED`; closest-feature gaps are measured at `END`, after DAT.
+`SOLVED`; closest-feature gaps are measured at the committed `END` state.
 Python enums in `nuka.diagnostics.schema` define column order and stage units.
+
+`EXTERNAL_WORK` includes applied world-frame body forces and COM torques, including
+articulation link wrenches. Their interval impulses are paired with the mean
+`BEGIN`/`SOLVED` COM velocity and angular velocity. Loads are captured before the
+step consumes them; position corrections do no external work. Integration error
+remains in `RESIDUAL`. This readout allocates 48 additional bytes per body and per
+link only when energy diagnostics are requested.
 `decode_maxima` in `nuka.diagnostics.report` decodes packed values and row IDs.
 A row ID belongs to its recorded interval; slots can be reused in later steps.
+
+MPM kinetic energy includes the affine velocity field and the full compact-kernel
+covariance. Stored energy follows the authored elastic law and recoverable J2
+hardening. `MPM_P2G_LOSS` and `MPM_G2P_LOSS` measure the weighted least-squares
+velocity residual at the entry stencil. Transfer roundoff remains in the energy
+residual. `MPM_PLASTIC_LOSS` measures energy released by return
+mapping. `MPM_AFFINE_TRANSPORT` and `MPM_VOLUME_AVERAGE_WORK` are signed changes
+from representation transport and volume averaging. They are reported separately
+and require convergence checks. `MPM_STRESS_WORK` is internal elastic work;
+`MPM_BOUNDARY_WORK` includes reactions at prescribed grid velocities, and
+`MPM_VISCOUS_LOSS` measures explicit viscous stress work. Implicit viscous stress
+and nonzero stress on prescribed MPM particles retain incomplete coverage flags.
+These observations use private buffers allocated on first energy demand.
+`POSITION_KINETIC_WORK` compares kinetic energy at the projected pose with a
+private pose advanced by physical velocity alone, including articulated inertia
+and conserved rigid angular momentum. `POSITION_POTENTIAL` records the associated
+potential change. These numerical contributions are separate from physical loads
+and require convergence checks; joint load work excludes pseudo displacement.
+Older captures with 31 or 43 energy columns remain readable; missing appended terms
+are represented by NaN and keep energy coverage incomplete.
 
 `SOLVED` retains all four solver residual classes in m/s for every physical
 interval. `SOLVER_RESIDUAL_MEASURED` is one when those residuals were written.

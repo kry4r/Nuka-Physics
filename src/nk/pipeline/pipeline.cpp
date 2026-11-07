@@ -76,7 +76,7 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
             p_block_descent_.iterations = count;
         }
     }
-    if ((readout_demand & kReadoutEnergyLedger) != 0u)
+    if ((readout_demand & (kReadoutEnergyLedger | kReadoutIntervalState)) != 0u)
         p_energy_.resize(size_t{substeps} * kEnergyStageCount);
     if (!(interval.dt > 0.0f) || !std::isfinite(interval.dt) ||
         !std::isfinite(1.0f / interval.dt) || !std::isfinite(1.0f / cfg.dt))
@@ -130,7 +130,8 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
         if (substeps > 1u && cap.joint_limit_rows_per_env != 0u)
             outputs.flags |= phi::kAccumulateJointLimit;
         for (const auto& call : interval_calls) {
-            if (call.op == phi::NkOp::ReadoutEnergyLedger || call.op == phi::NkOp::ReadoutContactAudit) {
+            if (call.op == phi::NkOp::ReadoutEnergyLedger || call.op == phi::NkOp::ReadoutContactAudit ||
+                call.op == phi::NkOp::ReadoutIntervalState) {
                 const auto& source = *static_cast<const phi::ReadoutEnergyLedgerParams*>(call.params);
                 auto& energy = p_energy_[size_t{step} * kEnergyStageCount + static_cast<uint32_t>(source.stage)];
                 if (step != 0u) energy = source;
@@ -274,7 +275,9 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     // Step-start velocity remains the acceleration reference; finalization adds contact deltas once.
 
     const auto energy = [&](EnergyStage stage) {
-        if ((readout_demand & kReadoutEnergyLedger) == 0u) return;
+        const bool ledger = (readout_demand & kReadoutEnergyLedger) != 0u;
+        const bool state = stage == EnergyStage::End && (readout_demand & kReadoutIntervalState) != 0u;
+        if (!ledger && !state) return;
         auto& p = p_energy_[static_cast<uint32_t>(stage)];
         p.stage = stage;
         p.physics_diagnostics = (readout_demand & kReadoutPhysicsDiagnostics) != 0u;
@@ -293,6 +296,14 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p.substeps = cap.integration_substeps;
         p.particles_per_env = cap.particles_per_env;
         p.mpm_particles_per_env = grid_particles_per_env;
+        p.grid_nodes_per_env = cap.mpm_grid_nodes_per_env;
+        std::copy(model.particles.mpm_grid_dims, model.particles.mpm_grid_dims + 3u, p.grid_dims);
+        p.grid_origin[0] = model.particles.mpm_grid_min.x;
+        p.grid_origin[1] = model.particles.mpm_grid_min.y;
+        p.grid_origin[2] = model.particles.mpm_grid_min.z;
+        p.grid_dx = model.particles.mpm_cell_size;
+        p.mpm_material_count = cap.mpm_material_count;
+        p.mpm_implicit_stress = cap.mpm_stress_cells_per_env > 0u ? 1u : 0u;
         p.point_endpoints_per_env = cap.point_endpoints_per_env;
         p.floor_normal[0] = model.particles.mpm_floor_normal.x;
         p.floor_normal[1] = model.particles.mpm_floor_normal.y;
@@ -311,15 +322,14 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p.limit_rows = cap.joint_limit_rows_per_env;
         p.friction_rows = cap.joint_friction_rows_per_env;
         p.drive_rows = cap.joint_drive_rows_per_env;
-        p.has_dat = cap.ogc_contacts_per_env > 0u;
+        p.implicit_passive_damping = mujoco_damping ? 1u : 0u;
         p.has_aero = cap.aero_tris_per_env > 0u &&
             (model.particles.aero_drag_normal != 0.0f || model.particles.aero_drag_tangent != 0.0f);
         p.pos_pass = has_contacts && cfg.pos_iters > 0u;
-        if (has_mpm) p.coverage_status |= energy_status::kGridMaterial;
-        if (cap.particles_per_env != cap.vbd_vertices_per_env)
-            p.coverage_status |= energy_status::kOtherParticleMaterial;
-        add(phi::NkOp::ReadoutEnergyLedger, &p);
-        if ((stage == EnergyStage::Solved || stage == EnergyStage::End) &&
+        p.coverage_status = 0u;
+        if (ledger) add(phi::NkOp::ReadoutEnergyLedger, &p);
+        if (state) add(phi::NkOp::ReadoutIntervalState, &p);
+        if (ledger && (stage == EnergyStage::Solved || stage == EnergyStage::End) &&
             (readout_demand & kReadoutContactAudit) != 0u)
             add(phi::NkOp::ReadoutContactAudit, &p);
     };

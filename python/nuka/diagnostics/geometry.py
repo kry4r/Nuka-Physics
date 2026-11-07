@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
+from ..energy import EnergyColumn
 from .capture import iter_record_blocks, sha256, write_json
 
 
@@ -20,7 +21,8 @@ def audit_mesh_trace(source, geometry):
         raise FileExistsError(target)
     manifest_path = source / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
-    if manifest["status"] != "closed" or manifest["substeps"] != 1:
+    interval_states = "INTERVAL_PARTICLE_POSITION" in manifest.get("interval_state_fields", [])
+    if manifest["status"] != "closed" or (manifest["substeps"] != 1 and not interval_states):
         raise ValueError("audit requires a closed trace with every physics interval's positions")
     geometry_hash = sha256(geometry)
     if manifest.get("initial_geometry_sha256") != geometry_hash:
@@ -83,19 +85,30 @@ def audit_mesh_trace(source, geometry):
     for block, block_manifest in iter_record_blocks(source, states=True):
         if block_manifest != manifest:
             raise ValueError("physics manifest changed during the trajectory audit")
-        if "state_PARTICLE_POSITION" not in block:
+        field = "state_INTERVAL_PARTICLE_POSITION" if interval_states else "state_PARTICLE_POSITION"
+        if field not in block:
             raise ValueError("physics trace requires particle positions at every interval")
-        states = np.asarray(block["state_PARTICLE_POSITION"])
+        states = np.asarray(block[field])
         steps = block["policy_step"]
-        expected_shapes = ((len(steps),) + initial.shape,
-                           (len(steps), manifest["env_count"] * vertices, 3),
-                           (len(steps), manifest["env_count"] * vertices * 3))
+        expected_shapes = ((len(steps), manifest["env_count"], manifest["substeps"], vertices, 3),) if interval_states else (
+            (len(steps),) + initial.shape, (len(steps), manifest["env_count"] * vertices, 3),
+            (len(steps), manifest["env_count"] * vertices * 3))
         if states.shape not in expected_shapes:
             raise ValueError("particle state shape differs from the initial geometry and environment extent")
         if not np.issubdtype(states.dtype, np.number) or np.iscomplexobj(states):
             raise ValueError("physics trajectory requires finite real particle coordinates")
-        states = states.reshape((len(steps),) + initial.shape)
-        for step, current in zip(steps, states):
+        if interval_states:
+            dt = np.asarray(block.get("state_INTERVAL_STATE_DT"))
+            if dt.shape != (len(steps), manifest["env_count"], manifest["substeps"]) or not (
+                    np.isfinite(dt).all() and (dt > 0).all() and
+                    np.array_equal(dt, block["energy"][..., EnergyColumn.DT])):
+                raise ValueError("interval state must cover every measured physical interval")
+            states = states.transpose(0, 2, 1, 3, 4).reshape((-1,) + initial.shape)
+        else:
+            states = states.reshape((len(steps),) + initial.shape)
+        for index, current in enumerate(states):
+            step = steps[index // manifest["substeps"]]
+            substep = index % manifest["substeps"]
             for env, mesh in enumerate(meshes):
                 start = np.asfortranarray(previous[env], dtype=np.float64)
                 end = np.asfortranarray(current[env], dtype=np.float64)
@@ -109,7 +122,8 @@ def audit_mesh_trace(source, geometry):
                 if not np.isfinite(fraction) or not 0 <= fraction <= 1:
                     raise ValueError(f"invalid CCD fraction at policy step {step}")
                 if fraction < 1.0:
-                    events.append({"policy_step": int(step), "environment": env, "fraction": float(fraction)})
+                    events.append({"policy_step": int(step), "substep": int(substep),
+                                   "environment": env, "fraction": float(fraction)})
                 safety_fraction = ipctk.compute_collision_free_stepsize(mesh, start, end)
                 if not np.isfinite(safety_fraction) or not 0 <= safety_fraction <= 1:
                     raise ValueError(f"invalid safety-alarm fraction at policy step {step}")
@@ -132,6 +146,8 @@ def audit_mesh_trace(source, geometry):
         "default_alarm_configuration": {"conservative_rescaling": 0.8},
         "initial_position_source": initial_position_source,
         "covered_contact_domains": ["particle_mesh_self"],
+        "physical_intervals_per_policy_step": manifest["substeps"],
+        "position_field": field,
         "trajectory": "Piecewise linear particle vertex trajectories",
         "thickness_scope": "Zero-distance mesh crossing; finite offsets and rigid rotation require separate checks"}
     write_json(target, report)

@@ -368,6 +368,7 @@ __global__ void ResetEnvsKernel(DataView data, ResetEnvsParams p) {
         data.energy_ledger[record * nk::kEnergyColumnCount + static_cast<uint32_t>(nk::EnergyColumn::Valid)] = 0.0f;
         data.energy_ledger_status[record] = 0u;
         data.vbd_force_residual_work[record] = 0.0f;
+        if (data.interval_state_dt) data.interval_state_dt[record] = 0.0f;
     }
     for (uint32_t metric = threadIdx.x; metric < constraint::kContactSolveMetricCount; metric += blockDim.x)
         data.contact_solve_metrics[env * constraint::kContactSolveMetricCount + metric] = 0u;

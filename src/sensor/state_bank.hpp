@@ -37,7 +37,7 @@ public:
     void RemoveLast(uint32_t id);
     phi::Status ConfigureError(uint32_t id, uint32_t channel, const ObservationConfig& config);
     void SetGravity(math::Vec3 gravity);
-    void StepCompleted() { ++step_; }
+    void StepCompleted(uint32_t count = 1u) { step_ += count; }
     double SimulationTime(uint32_t env) const { return double(step_ - reset_steps_.at(env)) * outer_dt_; }
     phi::Status Reset(const std::vector<uint32_t>& env_ids);
     phi::Status Capture(StateSensorBankSnapshot* snapshot) const;

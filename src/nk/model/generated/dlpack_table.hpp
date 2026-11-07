@@ -41,6 +41,8 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::Qddot, DlpackDtype::kF32, 1, false},  // qddot
     {FieldId::Tau, DlpackDtype::kF32, 1, false},  // tau
     {FieldId::LinkVelocity, DlpackDtype::kF32, 2, false},  // link_velocity
+    {FieldId::JointRotation, DlpackDtype::kF32, 2, false},  // joint_rotation
+    {FieldId::JointAngularVelocity, DlpackDtype::kF32, 2, false},  // joint_angular_velocity
     {FieldId::LinkAcceleration, DlpackDtype::kF32, 2, false},  // link_acceleration
     {FieldId::LinkVelocityBias, DlpackDtype::kF32, 2, false},  // link_velocity_bias
     {FieldId::LinkXup, DlpackDtype::kF32, 2, false},  // link_xup
@@ -50,9 +52,12 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::DriveStiffness, DlpackDtype::kF32, 1, false},  // drive_stiffness
     {FieldId::DriveDamping, DlpackDtype::kF32, 1, false},  // drive_damping
     {FieldId::DriveForceLimit, DlpackDtype::kF32, 1, false},  // drive_force_limit
+    {FieldId::DriveJointForceLimit, DlpackDtype::kF32, 1, false},  // drive_joint_force_limit
     {FieldId::SnapshotQ, DlpackDtype::kF32, 1, false},  // snapshot_q
     {FieldId::SnapshotQdot, DlpackDtype::kF32, 1, false},  // snapshot_qdot
     {FieldId::SnapshotLinkVelocity, DlpackDtype::kF32, 2, false},  // snapshot_link_velocity
+    {FieldId::SnapshotJointRotation, DlpackDtype::kF32, 2, false},  // snapshot_joint_rotation
+    {FieldId::SnapshotJointAngularVelocity, DlpackDtype::kF32, 2, false},  // snapshot_joint_angular_velocity
     {FieldId::SnapshotBasePose, DlpackDtype::kF32, 2, false},  // snapshot_base_pose
     {FieldId::SnapshotBodyPose, DlpackDtype::kF32, 2, false},  // snapshot_body_pose
     {FieldId::SnapshotBodyLinearVelocity, DlpackDtype::kF32, 2, false},  // snapshot_body_linear_velocity
@@ -104,7 +109,8 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::Urows, DlpackDtype::kF32, 2, false},  // urows
     {FieldId::RowContactResponse, DlpackDtype::kF32, 2, false},  // row_contact_response
     {FieldId::ChainJacobian, DlpackDtype::kF32, 1, false},  // chain_jacobian
-    {FieldId::RowDamping, DlpackDtype::kF32, 1, false},  // row_damping
+    {FieldId::RowReferenceVelocityGain, DlpackDtype::kF32, 1, false},  // row_reference_velocity_gain
+    {FieldId::RowInvweight, DlpackDtype::kF32, 1, false},  // row_invweight
     {FieldId::RowCjLink, DlpackDtype::kU32, 1, false},  // row_cj_link
     {FieldId::RowCjPoint, DlpackDtype::kF32, 2, false},  // row_cj_point
     {FieldId::QdotFlat, DlpackDtype::kF32, 1, false},  // qdot_flat
@@ -115,6 +121,8 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::DofToComponent, DlpackDtype::kU32, 1, false},  // dof_to_component
     {FieldId::ShapeTable, DlpackDtype::kF32, 1, false},  // shape_table
     {FieldId::ExcludedPairs, DlpackDtype::kU64, 1, false},  // excluded_pairs
+    {FieldId::ContactPairKeys, DlpackDtype::kU64, 1, false},  // contact_pair_keys
+    {FieldId::ContactPairProfiles, DlpackDtype::kU32, 1, false},  // contact_pair_profiles
     {FieldId::SampPoints, DlpackDtype::kF32, 1, false},  // samp_points
     {FieldId::SampRanges, DlpackDtype::kU32, 1, false},  // samp_ranges
     {FieldId::SdfHeaders, DlpackDtype::kF32, 1, false},  // sdf_headers
@@ -182,6 +190,8 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::MpmBodyReaction, DlpackDtype::kF32, 2, true},  // mpm_body_reaction
     {FieldId::MpmBodyAngReaction, DlpackDtype::kF32, 2, true},  // mpm_body_ang_reaction
     {FieldId::JointFrictionloss, DlpackDtype::kF32, 1, false},  // joint_frictionloss
+    {FieldId::JointStiffness, DlpackDtype::kF32, 1, false},  // joint_stiffness
+    {FieldId::JointSpringReference, DlpackDtype::kF32, 1, false},  // joint_spring_reference
     {FieldId::BodyCollidableLink, DlpackDtype::kU32, 1, false},  // body_collidable_link
     {FieldId::BodyCollidableLocal, DlpackDtype::kF32, 2, false},  // body_collidable_local
     {FieldId::BodyCollidableBody, DlpackDtype::kU32, 1, false},  // body_collidable_body
@@ -305,7 +315,10 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::ParticleSurfaceVertexTriangleOffsets, DlpackDtype::kU32, 1, false},  // particle_surface_vertex_triangle_offsets
     {FieldId::ParticleSurfaceVertexTriangles, DlpackDtype::kU32, 1, false},  // particle_surface_vertex_triangles
     {FieldId::ParticleSurfaceThickness, DlpackDtype::kF32, 1, false},  // particle_surface_thickness
+    {FieldId::ParticleSurfaceSelfThickness, DlpackDtype::kF32, 1, false},  // particle_surface_self_thickness
+    {FieldId::ParticleSurfaceSelfContact, DlpackDtype::kU32, 1, false},  // particle_surface_self_contact
     {FieldId::ParticleHalfThickness, DlpackDtype::kF32, 1, false},  // particle_half_thickness
+    {FieldId::ParticleSelfHalfThickness, DlpackDtype::kF32, 1, false},  // particle_self_half_thickness
     {FieldId::ParticleFriction, DlpackDtype::kF32, 1, false},  // particle_friction
     {FieldId::ParticleRestPos, DlpackDtype::kF32, 2, false},  // particle_rest_pos
     {FieldId::ParticleSurfaceNodes, DlpackDtype::kU8, 2, false},  // particle_surface_nodes
@@ -346,6 +359,7 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::DatArticBeta, DlpackDtype::kU32, 1, false},  // dat_artic_beta
     {FieldId::DatArticWitness, DlpackDtype::kU64, 2, false},  // dat_artic_witness
     {FieldId::DatPrevQ, DlpackDtype::kF32, 1, false},  // dat_prev_q
+    {FieldId::DatPrevJointRotation, DlpackDtype::kF32, 2, false},  // dat_prev_joint_rotation
     {FieldId::DatPrevBasePose, DlpackDtype::kF32, 2, false},  // dat_prev_base_pose
     {FieldId::DatPrevBodyPose, DlpackDtype::kF32, 2, false},  // dat_prev_body_pose
     {FieldId::DatBodySpeed, DlpackDtype::kF32, 1, false},  // dat_body_speed
@@ -379,6 +393,8 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::VbdVelocitySweepCount, DlpackDtype::kU32, 1, true},  // vbd_velocity_sweep_count
     {FieldId::SolverResidual, DlpackDtype::kF32, 2, true},  // solver_residual
     {FieldId::SolverSweepTrace, DlpackDtype::kF32, 2, true},  // solver_sweep_trace
+    {FieldId::SolverWorkTrace, DlpackDtype::kU32, 2, true},  // solver_work_trace
+    {FieldId::SolverDenseMotionTrace, DlpackDtype::kF32, 1, true},  // solver_dense_motion_trace
     {FieldId::SolverColorCounts, DlpackDtype::kU32, 2, false},  // solver_color_counts
     {FieldId::SolverPhaseTime, DlpackDtype::kU64, 2, false},  // solver_phase_time
     {FieldId::DatSurfaceMotion, DlpackDtype::kF32, 1, false},  // dat_surface_motion
@@ -417,6 +433,14 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::DatBodyParent, DlpackDtype::kU32, 1, false},  // dat_body_parent
     {FieldId::DatArticParent, DlpackDtype::kU32, 1, false},  // dat_artic_parent
     {FieldId::Telemetry, DlpackDtype::kU32, 1, true},  // telemetry
+    {FieldId::JointLawSource, DlpackDtype::kU32, 1, false},  // joint_law_source
+    {FieldId::JointLimitReference, DlpackDtype::kF32, 2, false},  // joint_limit_reference
+    {FieldId::JointFrictionReference, DlpackDtype::kF32, 2, false},  // joint_friction_reference
+    {FieldId::JointLimitMargin, DlpackDtype::kF32, 1, false},  // joint_limit_margin
+    {FieldId::BodyInvweight0, DlpackDtype::kF32, 2, false},  // body_invweight0
+    {FieldId::DofInvweight0, DlpackDtype::kF32, 1, false},  // dof_invweight0
+    {FieldId::ParticleSurfaceNeighbourOffsets, DlpackDtype::kU32, 1, false},  // particle_surface_neighbour_offsets
+    {FieldId::ParticleSurfaceNeighbours, DlpackDtype::kU32, 1, false},  // particle_surface_neighbours
 };
 
 } // namespace nuka::nk

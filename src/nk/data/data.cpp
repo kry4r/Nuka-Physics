@@ -17,6 +17,22 @@ namespace {
 // default (those are ModelView members, not here).
 void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
     switch (id) {
+        case FieldId::IntervalStateDt: v.interval_state_dt = static_cast<float*>(p); break;
+        case FieldId::IntervalParticlePos: v.interval_particle_pos = static_cast<math::Vec3*>(p); break;
+        case FieldId::IntervalParticleVel: v.interval_particle_vel = static_cast<math::Vec3*>(p); break;
+        case FieldId::IntervalParticleF: v.interval_particle_F = static_cast<float*>(p); break;
+        case FieldId::IntervalParticleC: v.interval_particle_C = static_cast<float*>(p); break;
+        case FieldId::IntervalParticlePlasticF: v.interval_particle_plastic_F = static_cast<float*>(p); break;
+        case FieldId::IntervalParticlePlastic: v.interval_particle_plastic = static_cast<float*>(p); break;
+        case FieldId::IntervalBodyPose: v.interval_body_pose = static_cast<math::Transform*>(p); break;
+        case FieldId::IntervalBodyLinearVelocity: v.interval_body_linear_velocity = static_cast<math::Vec3*>(p); break;
+        case FieldId::IntervalBodyAngularVelocity: v.interval_body_angular_velocity = static_cast<math::Vec3*>(p); break;
+        case FieldId::IntervalQ: v.interval_q = static_cast<float*>(p); break;
+        case FieldId::IntervalQdot: v.interval_qdot = static_cast<float*>(p); break;
+        case FieldId::IntervalJointRotation: v.interval_joint_rotation = static_cast<math::Quat*>(p); break;
+        case FieldId::IntervalJointAngularVelocity: v.interval_joint_angular_velocity = static_cast<math::Vec3*>(p); break;
+        case FieldId::IntervalLinkVelocity: v.interval_link_velocity = static_cast<Spatial6*>(p); break;
+        case FieldId::IntervalBasePose: v.interval_base_pose = static_cast<math::Transform*>(p); break;
         case FieldId::EnergyLedger: v.energy_ledger = static_cast<float*>(p); break;
         case FieldId::EnergyLedgerSum: v.energy_ledger_sum = static_cast<double*>(p); break;
         case FieldId::EnergyLedgerStatus: v.energy_ledger_status = static_cast<uint32_t*>(p); break;
@@ -29,9 +45,26 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::EnergyKinematicContactImpulse: v.energy_kinematic_contact_impulse = static_cast<math::Vec3*>(p); break;
         case FieldId::EnergyLinkStartQ: v.energy_link_start_q = static_cast<float*>(p); break;
         case FieldId::EnergyLinkStartQdot: v.energy_link_start_qdot = static_cast<float*>(p); break;
+        case FieldId::EnergyJointStartAngularVelocity: v.energy_joint_start_angular_velocity = static_cast<math::Vec3*>(p); break;
         case FieldId::EnergyLinkPose: v.energy_link_pose = static_cast<math::Transform*>(p); break;
         case FieldId::EnergyLinkUnprojectedPose: v.energy_link_unprojected_pose = static_cast<math::Transform*>(p); break;
         case FieldId::EnergyLinkVelocity: v.energy_link_velocity = static_cast<Spatial6*>(p); break;
+        case FieldId::EnergyBodyWrench: v.energy_body_wrench = static_cast<Spatial6*>(p); break;
+        case FieldId::EnergyBodyStartVelocity: v.energy_body_start_velocity = static_cast<Spatial6*>(p); break;
+        case FieldId::EnergyLinkWrench: v.energy_link_wrench = static_cast<Spatial6*>(p); break;
+        case FieldId::EnergyLinkStartVelocity: v.energy_link_start_velocity = static_cast<Spatial6*>(p); break;
+        case FieldId::EnergyMpmStartF: v.energy_mpm_start_F = static_cast<float*>(p); break;
+        case FieldId::EnergyMpmStartPlasticF: v.energy_mpm_start_plastic_F = static_cast<float*>(p); break;
+        case FieldId::EnergyMpmStartPlastic: v.energy_mpm_start_plastic = static_cast<float*>(p); break;
+        case FieldId::EnergyGridEntryMomentum: v.energy_grid_entry_momentum = static_cast<double*>(p); break;
+        case FieldId::EnergyGridEntryMass: v.energy_grid_entry_mass = static_cast<double*>(p); break;
+        case FieldId::EnergyGridStressImpulse: v.energy_grid_stress_impulse = static_cast<double*>(p); break;
+        case FieldId::EnergyGridViscousImpulse: v.energy_grid_viscous_impulse = static_cast<double*>(p); break;
+        case FieldId::EnergyGridFreeVelocity: v.energy_grid_free_velocity = static_cast<math::Vec3*>(p); break;
+        case FieldId::EnergyGridPrescribed: v.energy_grid_prescribed = static_cast<uint32_t*>(p); break;
+        case FieldId::EnergyBaseStartPose: v.energy_base_start_pose = static_cast<math::Transform*>(p); break;
+        case FieldId::EnergyLinkStartRotation: v.energy_link_start_rotation = static_cast<math::Quat*>(p); break;
+        case FieldId::EnergyLinkUnprojectedVelocity: v.energy_link_unprojected_velocity = static_cast<Spatial6*>(p); break;
         case FieldId::ParticleSurfaceNodes: v.particle_surface_nodes = static_cast<collision::MeshBvhNode*>(p); break;
         case FieldId::ParticleSurfaceEdgeNodes: v.particle_surface_edge_nodes = static_cast<collision::MeshBvhNode*>(p); break;
         case FieldId::ParticleSurfaceMaxSpeed: v.particle_surface_max_speed = static_cast<float*>(p); break;

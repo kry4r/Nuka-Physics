@@ -53,7 +53,6 @@ inline nk::Pipeline::SolverConfig Cfg() {
     cfg.gravity[0] = 0.06f; cfg.gravity[1] = -0.04f; cfg.gravity[2] = -9.81f;
     cfg.contact_margin = 0.0f;
     cfg.vel_iters = 48u;
-    cfg.pos_iters = 0u;
     cfg.max_pairs = 64u;
     return cfg;
 }
@@ -178,6 +177,7 @@ struct PreparedScene {
     std::vector<Transform> settled_bases;
     std::vector<float> settled_link_velocity;
     Vec3 front_foot;
+    float front_radius;
 };
 
 inline PreparedScene Prepare(const std::filesystem::path& path, phi::Device* device,
@@ -235,7 +235,8 @@ inline PreparedScene Prepare(const std::filesystem::path& path, phi::Device* dev
     std::fprintf(stderr, "[robot-coupling] front_centre=(%.4f,%.4f) cloth_z=%.4f\n",
                  front_centre.x, front_centre.y, cloth_z);
     return {path, config, front_centre, cloth_z, front_link, link_geom_local,
-        std::move(settled_q), std::move(settled_qdot), std::move(settled_bases), std::move(settled_link_velocity), front_foot};
+        std::move(settled_q), std::move(settled_qdot), std::move(settled_bases), std::move(settled_link_velocity),
+        front_foot, wp.GetModel().articulation.link_geom_params.at(size_t{front_link} * 4u)};
 }
 
 inline nk::Model CookPrepared(const PreparedScene& scene, uint32_t envs = 1u,
@@ -280,10 +281,16 @@ inline std::vector<uint32_t> LatticeBoundary(const std::array<uint32_t, 3>& dime
 }
 
 inline nk::Model CookMpmPrepared(const PreparedScene& prepared, uint32_t envs,
-                                SceneVisuals* visuals = nullptr, bool implicit_stress = false) {
-    constexpr float radius = 0.028f, mass = 0.15f, dx = 0.02f;
-    // The membrane starts 1 mm into the loaded front feet, so they rest on it.
-    const float cloth_z = prepared.cloth_z - 0.0175f + 0.001f;
+                                SceneVisuals* visuals = nullptr, bool implicit_stress = false,
+                                uint32_t grid_refinement = 1u) {
+    Require(grid_refinement > 0u && grid_refinement <= UINT32_MAX / 14u,
+            "invalid material grid refinement");
+    const uint64_t samples = uint64_t{grid_refinement} * grid_refinement;
+    Require(samples <= UINT32_MAX / 2048u / grid_refinement,
+            "material refinement exceeds contact capacity range");
+    constexpr float radius = 0.028f, mass = 0.15f;
+    const float dx = 0.02f / float(grid_refinement);
+    const float cloth_z = prepared.cloth_z - prepared.front_radius;
     auto scene = RobotScene(prepared.path, true);
     auto free_body = nuka::scene::kInvalidBody;
     for (const auto& body : scene.Bodies())
@@ -293,8 +300,8 @@ inline nk::Model CookMpmPrepared(const PreparedScene& prepared, uint32_t envs,
     body.mass = mass;
     body.inertia = Vec3{1, 1, 1} * (0.4f * mass * radius * radius);
     body.inertial_transform = Transform::Identity();
-    body.local_transform.position = {prepared.front_foot.x + 0.039f,
-                                     prepared.front_foot.y, cloth_z + radius};
+    body.local_transform.position = {prepared.front_foot.x + prepared.front_radius + radius,
+                                     prepared.front_foot.y, cloth_z + radius + prepared.config.pos_slop};
     std::vector<nuka::scene::ShapeId> shapes;
     for (const auto& shape : scene.Shapes())
         if (shape.body_id == free_body) shapes.push_back(shape.id);
@@ -303,7 +310,7 @@ inline nk::Model CookMpmPrepared(const PreparedScene& prepared, uint32_t envs,
     const float cloth_span = body.local_transform.position.x - prepared.front_foot.x + 0.25f * radius;
     auto impact_body = body;
     impact_body.name = "impact_body";
-    impact_body.local_transform.position.x = prepared.front_foot.x - radius - dx;
+    impact_body.local_transform.position.x = prepared.front_foot.x - radius - 0.02f;
     const auto impact_id = scene.AddRigidBody(impact_body);
     nuka::scene::CollisionShapeRecord impact_shape;
     impact_shape.body_id = impact_id;
@@ -331,12 +338,13 @@ inline nk::Model CookMpmPrepared(const PreparedScene& prepared, uint32_t envs,
     mpm.implicit_stress = implicit_stress;
     const Vec3 centre{prepared.front_foot.x + 0.01f, prepared.front_foot.y, cloth_z};
     const float spacing = 0.5f * dx;
-    constexpr std::array<uint32_t, 3> dimensions{13u, 9u, 4u};
+    const std::array<uint32_t, 3> dimensions{13u * grid_refinement, 9u * grid_refinement,
+                                            4u * grid_refinement};
     for (uint32_t z = 0u; z < dimensions[2]; ++z)
         for (uint32_t y = 0u; y < dimensions[1]; ++y)
             for (uint32_t x = 0u; x < dimensions[0]; ++x)
-                mpm.positions.push_back(centre + Vec3{(float(x) - 6.0f) * spacing,
-                    (float(y) - 4.0f) * spacing, (float(z) - 3.5f) * spacing});
+                mpm.positions.push_back(centre + Vec3{(float(x) + 0.5f) * spacing - 0.065f,
+                    (float(y) + 0.5f) * spacing - 0.045f, (float(z) + 0.5f) * spacing - 0.04f});
     mpm.material.youngs = 10000.0f;
     mpm.material.poisson = 0.3f;
     mpm.material.density = 1000.0f;
@@ -345,12 +353,12 @@ inline nk::Model CookMpmPrepared(const PreparedScene& prepared, uint32_t envs,
     mpm.inv_mass.assign(mpm.positions.size(), 1.0f / (mpm.material.density * volume));
     mpm.velocities.assign(mpm.positions.size(), Vec3{0.0f, 0.0f, 0.5f});
     mpm.grid_origin = centre - Vec3{0.14f, 0.14f, 0.14f};
-    mpm.grid_dims[0] = mpm.grid_dims[1] = mpm.grid_dims[2] = 15u;
+    mpm.grid_dims[0] = mpm.grid_dims[1] = mpm.grid_dims[2] = 14u * grid_refinement + 1u;
     mpm.dx = dx;
     mpm.substeps = 4u;
     mpm.floor_d = cloth_z - 0.04f;
     mpm.floor_friction = 0.6f;
-    mpm.contact_capacity = 2048u;
+    mpm.contact_capacity = static_cast<uint32_t>(2048u * samples * grid_refinement);
     cook::CookMpmVbd(model, envs, mpm, cloth);
     model.particles.pp_contact_d_min = kClothSpacing;
     model.particles.mpm_body_friction = 0.6f;

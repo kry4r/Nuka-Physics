@@ -21,12 +21,14 @@ enum class FieldId : uint16_t {
     ArticulationBias,  // articulation_bias (per:articulation_dof arena:scratch owner:data)
     MFactor,  // m_factor (per:articulation_dof2 arena:scratch owner:data)
     ParticlePos,  // particle_pos (per:particle arena:persistent owner:data)
-    MatBuckets,  // mat_buckets (per:scalar arena:persistent owner:data count:num_buckets*16 flags:[param])
+    MatBuckets,  // mat_buckets (per:scalar arena:persistent owner:data count:num_buckets*22*env_count flags:[param])
     MatIndex,  // mat_index (per:body arena:persistent owner:data flags:[param])
     LinkContactWrench,  // link_contact_wrench (per:link arena:scratch owner:data flags:[readout])
     Qddot,  // qddot (per:link arena:persistent owner:data)
     Tau,  // tau (per:link arena:persistent owner:data)
     LinkVelocity,  // link_velocity (per:link arena:persistent owner:data)
+    JointRotation,  // joint_rotation (per:link arena:persistent owner:data)
+    JointAngularVelocity,  // joint_angular_velocity (per:link arena:persistent owner:data)
     LinkAcceleration,  // link_acceleration (per:link arena:scratch owner:data)
     LinkVelocityBias,  // link_velocity_bias (per:link arena:scratch owner:data)
     LinkXup,  // link_xup (per:link arena:scratch owner:data)
@@ -36,9 +38,12 @@ enum class FieldId : uint16_t {
     DriveStiffness,  // drive_stiffness (per:link arena:persistent owner:data flags:[param])
     DriveDamping,  // drive_damping (per:link arena:persistent owner:data flags:[param])
     DriveForceLimit,  // drive_force_limit (per:link arena:persistent owner:data flags:[param])
+    DriveJointForceLimit,  // drive_joint_force_limit (per:link arena:persistent owner:data flags:[param])
     SnapshotQ,  // snapshot_q (per:link arena:persistent owner:data)
     SnapshotQdot,  // snapshot_qdot (per:link arena:persistent owner:data)
     SnapshotLinkVelocity,  // snapshot_link_velocity (per:link arena:persistent owner:data)
+    SnapshotJointRotation,  // snapshot_joint_rotation (per:link arena:persistent owner:data)
+    SnapshotJointAngularVelocity,  // snapshot_joint_angular_velocity (per:link arena:persistent owner:data)
     SnapshotBasePose,  // snapshot_base_pose (per:articulation arena:persistent owner:data)
     SnapshotBodyPose,  // snapshot_body_pose (per:body arena:persistent owner:data)
     SnapshotBodyLinearVelocity,  // snapshot_body_linear_velocity (per:body arena:persistent owner:data)
@@ -90,7 +95,8 @@ enum class FieldId : uint16_t {
     Urows,  // urows (per:row_slot arena:scratch owner:data elem:26)
     RowContactResponse,  // row_contact_response (per:row_slot arena:scratch owner:data)
     ChainJacobian,  // chain_jacobian (per:row_dof arena:scratch owner:data)
-    RowDamping,  // row_damping (per:row_slot arena:scratch owner:data)
+    RowReferenceVelocityGain,  // row_reference_velocity_gain (per:row_slot arena:scratch owner:data)
+    RowInvweight,  // row_invweight (per:row_slot arena:scratch owner:data)
     RowCjLink,  // row_cj_link (per:row_slot arena:scratch owner:data)
     RowCjPoint,  // row_cj_point (per:row_slot arena:scratch owner:data)
     QdotFlat,  // qdot_flat (per:articulation_dof arena:scratch owner:data)
@@ -101,6 +107,8 @@ enum class FieldId : uint16_t {
     DofToComponent,  // dof_to_component (per:dof arena:persistent owner:model)
     ShapeTable,  // shape_table (per:scalar arena:persistent owner:model count:max_bodies_total*13)
     ExcludedPairs,  // excluded_pairs (per:scalar arena:persistent owner:model count:max_excluded_pairs)
+    ContactPairKeys,  // contact_pair_keys (per:scalar arena:persistent owner:model count:max_contact_pairs)
+    ContactPairProfiles,  // contact_pair_profiles (per:scalar arena:persistent owner:model count:max_contact_pairs)
     SampPoints,  // samp_points (per:scalar arena:persistent owner:model count:max_samp_points*3)
     SampRanges,  // samp_ranges (per:scalar arena:persistent owner:model count:max_bodies_total*2)
     SdfHeaders,  // sdf_headers (per:scalar arena:persistent owner:model count:max_sdf_grids*8)
@@ -168,6 +176,8 @@ enum class FieldId : uint16_t {
     MpmBodyReaction,  // mpm_body_reaction (per:body arena:scratch owner:data flags:[readout])
     MpmBodyAngReaction,  // mpm_body_ang_reaction (per:body arena:scratch owner:data flags:[readout])
     JointFrictionloss,  // joint_frictionloss (per:link arena:persistent owner:model flags:[param])
+    JointStiffness,  // joint_stiffness (per:link arena:persistent owner:model)
+    JointSpringReference,  // joint_spring_reference (per:link arena:persistent owner:model)
     BodyCollidableLink,  // body_collidable_link (per:body arena:persistent owner:model)
     BodyCollidableLocal,  // body_collidable_local (per:body arena:persistent owner:model)
     BodyCollidableBody,  // body_collidable_body (per:body arena:persistent owner:model)
@@ -175,13 +185,13 @@ enum class FieldId : uint16_t {
     UcontactIdFeature,  // ucontact_id_feature (per:contact_slot arena:scratch owner:data elem:4)
     ContactCachePair,  // contact_cache_pair (per:contact_slot arena:persistent owner:data elem:4)
     ContactCacheFeature,  // contact_cache_feature (per:contact_slot arena:persistent owner:data elem:4)
-    ContactCacheLambda,  // contact_cache_lambda (per:contact_slot arena:persistent owner:data elem:12)
+    ContactCacheLambda,  // contact_cache_lambda (per:contact_slot arena:persistent owner:data elem:16)
     ContactCacheNormal,  // contact_cache_normal (per:contact_slot arena:persistent owner:data elem:4)
     ContactCacheMaterial,  // contact_cache_material (per:contact_slot arena:persistent owner:data elem:4)
     ContactCacheAge,  // contact_cache_age (per:contact_slot arena:persistent owner:data elem:4)
     ContactCacheSnapshotPair,  // contact_cache_snapshot_pair (per:contact_slot arena:scratch owner:data elem:4)
     ContactCacheSnapshotFeature,  // contact_cache_snapshot_feature (per:contact_slot arena:scratch owner:data elem:4)
-    ContactCacheSnapshotLambda,  // contact_cache_snapshot_lambda (per:contact_slot arena:scratch owner:data elem:12)
+    ContactCacheSnapshotLambda,  // contact_cache_snapshot_lambda (per:contact_slot arena:scratch owner:data elem:16)
     ContactCacheSnapshotNormal,  // contact_cache_snapshot_normal (per:contact_slot arena:scratch owner:data elem:4)
     ContactCacheSnapshotMaterial,  // contact_cache_snapshot_material (per:contact_slot arena:scratch owner:data elem:4)
     ContactCacheSnapshotAge,  // contact_cache_snapshot_age (per:contact_slot arena:scratch owner:data elem:4)
@@ -291,7 +301,10 @@ enum class FieldId : uint16_t {
     ParticleSurfaceVertexTriangleOffsets,  // particle_surface_vertex_triangle_offsets (per:scalar arena:persistent owner:model count:particles_per_env+1)
     ParticleSurfaceVertexTriangles,  // particle_surface_vertex_triangles (per:scalar arena:persistent owner:model count:particle_surface_triangles*3)
     ParticleSurfaceThickness,  // particle_surface_thickness (per:scalar arena:persistent owner:model count:particle_surfaces_per_env)
+    ParticleSurfaceSelfThickness,  // particle_surface_self_thickness (per:scalar arena:persistent owner:model count:particle_surfaces_per_env)
+    ParticleSurfaceSelfContact,  // particle_surface_self_contact (per:scalar arena:persistent owner:model count:particle_surfaces_per_env)
     ParticleHalfThickness,  // particle_half_thickness (per:scalar arena:persistent owner:model count:particles_per_env)
+    ParticleSelfHalfThickness,  // particle_self_half_thickness (per:scalar arena:persistent owner:model count:particles_per_env)
     ParticleFriction,  // particle_friction (per:scalar arena:persistent owner:model count:particles_per_env)
     ParticleRestPos,  // particle_rest_pos (per:scalar arena:persistent owner:model count:particles_per_env)
     ParticleSurfaceNodes,  // particle_surface_nodes (per:scalar arena:scratch owner:data count:particle_surface_nodes_per_env*env_count)
@@ -332,6 +345,7 @@ enum class FieldId : uint16_t {
     DatArticBeta,  // dat_artic_beta (per:articulation arena:scratch owner:data)
     DatArticWitness,  // dat_artic_witness (per:articulation arena:scratch owner:data elem:4)
     DatPrevQ,  // dat_prev_q (per:link arena:scratch owner:data)
+    DatPrevJointRotation,  // dat_prev_joint_rotation (per:link arena:scratch owner:data)
     DatPrevBasePose,  // dat_prev_base_pose (per:articulation arena:scratch owner:data)
     DatPrevBodyPose,  // dat_prev_body_pose (per:body arena:scratch owner:data)
     DatBodySpeed,  // dat_body_speed (per:body arena:scratch owner:data)
@@ -365,8 +379,10 @@ enum class FieldId : uint16_t {
     VbdVelocitySweepCount,  // vbd_velocity_sweep_count (per:env arena:scratch owner:data flags:[readout])
     SolverResidual,  // solver_residual (per:env arena:scratch owner:data elem:4 flags:[readout])
     SolverSweepTrace,  // solver_sweep_trace (per:scalar arena:scratch owner:data elem:4 count:solver_trace_sweeps*env_count flags:[readout])
+    SolverWorkTrace,  // solver_work_trace (per:scalar arena:scratch owner:data elem:3 count:solver_trace_sweeps*env_count flags:[readout])
+    SolverDenseMotionTrace,  // solver_dense_motion_trace (per:scalar arena:scratch owner:data count:solver_trace_sweeps*env_count flags:[readout])
     SolverColorCounts,  // solver_color_counts (per:env arena:scratch owner:data elem:6)
-    SolverPhaseTime,  // solver_phase_time (per:env arena:scratch owner:data elem:8)
+    SolverPhaseTime,  // solver_phase_time (per:env arena:scratch owner:data elem:13)
     DatSurfaceMotion,  // dat_surface_motion (per:scalar arena:scratch owner:data count:particle_surfaces_per_env*env_count)
     EnergyLedger,  // energy_ledger (per:scalar arena:scratch owner:data elem:31 count:integration_substeps*env_count flags:[readout])
     EnergyLedgerSum,  // energy_ledger_sum (per:scalar arena:scratch owner:data elem:31 count:integration_substeps*env_count)
@@ -403,6 +419,14 @@ enum class FieldId : uint16_t {
     DatBodyParent,  // dat_body_parent (per:body arena:scratch owner:data)
     DatArticParent,  // dat_artic_parent (per:articulation arena:scratch owner:data)
     Telemetry,  // telemetry (per:scalar arena:scratch owner:data count:telemetry_words flags:[readout])
+    JointLawSource,  // joint_law_source (per:link arena:persistent owner:model flags:[param])
+    JointLimitReference,  // joint_limit_reference (per:link arena:persistent owner:model elem:7 flags:[param])
+    JointFrictionReference,  // joint_friction_reference (per:link arena:persistent owner:model elem:7 flags:[param])
+    JointLimitMargin,  // joint_limit_margin (per:link arena:persistent owner:model flags:[param])
+    BodyInvweight0,  // body_invweight0 (per:body arena:persistent owner:model elem:2 flags:[param])
+    DofInvweight0,  // dof_invweight0 (per:articulation_dof arena:persistent owner:model flags:[param])
+    ParticleSurfaceNeighbourOffsets,  // particle_surface_neighbour_offsets (per:scalar arena:persistent owner:model count:particles_per_env+1)
+    ParticleSurfaceNeighbours,  // particle_surface_neighbours (per:scalar arena:persistent owner:model count:particle_surface_neighbours_per_env)
     Count
 };
 
@@ -425,6 +449,8 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "qddot",
     "tau",
     "link_velocity",
+    "joint_rotation",
+    "joint_angular_velocity",
     "link_acceleration",
     "link_velocity_bias",
     "link_xup",
@@ -434,9 +460,12 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "drive_stiffness",
     "drive_damping",
     "drive_force_limit",
+    "drive_joint_force_limit",
     "snapshot_q",
     "snapshot_qdot",
     "snapshot_link_velocity",
+    "snapshot_joint_rotation",
+    "snapshot_joint_angular_velocity",
     "snapshot_base_pose",
     "snapshot_body_pose",
     "snapshot_body_linear_velocity",
@@ -488,7 +517,8 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "urows",
     "row_contact_response",
     "chain_jacobian",
-    "row_damping",
+    "row_reference_velocity_gain",
+    "row_invweight",
     "row_cj_link",
     "row_cj_point",
     "qdot_flat",
@@ -499,6 +529,8 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "dof_to_component",
     "shape_table",
     "excluded_pairs",
+    "contact_pair_keys",
+    "contact_pair_profiles",
     "samp_points",
     "samp_ranges",
     "sdf_headers",
@@ -566,6 +598,8 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "mpm_body_reaction",
     "mpm_body_ang_reaction",
     "joint_frictionloss",
+    "joint_stiffness",
+    "joint_spring_reference",
     "body_collidable_link",
     "body_collidable_local",
     "body_collidable_body",
@@ -689,7 +723,10 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "particle_surface_vertex_triangle_offsets",
     "particle_surface_vertex_triangles",
     "particle_surface_thickness",
+    "particle_surface_self_thickness",
+    "particle_surface_self_contact",
     "particle_half_thickness",
+    "particle_self_half_thickness",
     "particle_friction",
     "particle_rest_pos",
     "particle_surface_nodes",
@@ -730,6 +767,7 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "dat_artic_beta",
     "dat_artic_witness",
     "dat_prev_q",
+    "dat_prev_joint_rotation",
     "dat_prev_base_pose",
     "dat_prev_body_pose",
     "dat_body_speed",
@@ -763,6 +801,8 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "vbd_velocity_sweep_count",
     "solver_residual",
     "solver_sweep_trace",
+    "solver_work_trace",
+    "solver_dense_motion_trace",
     "solver_color_counts",
     "solver_phase_time",
     "dat_surface_motion",
@@ -801,6 +841,14 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "dat_body_parent",
     "dat_artic_parent",
     "telemetry",
+    "joint_law_source",
+    "joint_limit_reference",
+    "joint_friction_reference",
+    "joint_limit_margin",
+    "body_invweight0",
+    "dof_invweight0",
+    "particle_surface_neighbour_offsets",
+    "particle_surface_neighbours",
 };
 inline constexpr const char* FieldName(FieldId id) {
     return static_cast<int>(id) < kFieldCount ? kFieldNames[static_cast<int>(id)] : "unknown";

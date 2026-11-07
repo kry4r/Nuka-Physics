@@ -12,6 +12,15 @@ from ..energy import EnergyColumn, EnergyLedgerSampler
 from .schema import (AuditCount, AuditMetric, DiagnosticThresholds, SolverPhase, SolverResidual, SolverWork, Stage,
                      StageColumn, VbdSolveAuditColumn, stage_units, vbd_solve_audit_units)
 
+INTERVAL_STATE_FIELDS = (
+    "INTERVAL_STATE_DT", "INTERVAL_PARTICLE_POSITION", "INTERVAL_PARTICLE_VELOCITY",
+    "INTERVAL_PARTICLE_F", "INTERVAL_PARTICLE_C", "INTERVAL_PARTICLE_PLASTIC_F",
+    "INTERVAL_PARTICLE_PLASTIC", "INTERVAL_BODY_POSE", "INTERVAL_BODY_LINEAR_VELOCITY",
+    "INTERVAL_BODY_ANGULAR_VELOCITY",
+    "INTERVAL_Q", "INTERVAL_QDOT", "INTERVAL_JOINT_ROTATION",
+    "INTERVAL_JOINT_ANGULAR_VELOCITY", "INTERVAL_LINK_VELOCITY", "INTERVAL_BASE_POSE",
+)
+
 
 def sha256(path):
     digest = hashlib.sha256()
@@ -44,7 +53,7 @@ class DiagnosticSession:
         return PerformanceCapture(device, world, output, metadata)
 
     def __init__(self, world, output, metadata, *, env_count=1, chunk_steps=128,
-                 state_fields=(), thresholds=None, trace_sweeps=False):
+                 state_fields=(), thresholds=None, trace_sweeps=False, interval_states=False):
         self.world = world
         self.output = Path(output)
         self.output.mkdir(parents=True, exist_ok=False)
@@ -55,7 +64,17 @@ class DiagnosticSession:
         self.closed = False
         self.samples = []
         self.steps = 0
-        self.state_fields = tuple(state_fields)
+        self.interval_states = bool(interval_states)
+        counts = world.resource_info() if interval_states else {}
+        interval_fields = [name for name in INTERVAL_STATE_FIELDS if interval_states and (
+            name == "INTERVAL_STATE_DT" or
+            (name.startswith("INTERVAL_PARTICLE_") and counts["particles_per_env"] > 0) or
+            (name.startswith("INTERVAL_BODY_") and counts["bodies_per_env"] > 0) or
+            (name in ("INTERVAL_Q", "INTERVAL_QDOT", "INTERVAL_JOINT_ROTATION",
+                      "INTERVAL_JOINT_ANGULAR_VELOCITY", "INTERVAL_LINK_VELOCITY", "INTERVAL_BASE_POSE")
+             and world.base_link_count > 0))]
+        requested_states = tuple(getattr(Field, name) for name in interval_fields)
+        self.state_fields = tuple(dict.fromkeys(tuple(state_fields) + requested_states))
         self.thresholds = thresholds or DiagnosticThresholds()
         # Sweep telemetry keeps each env's residuals per sweep and the solve's phase times.
         self.trace_sweeps = world.velocity_iterations() if trace_sweeps else 0
@@ -83,7 +102,10 @@ class DiagnosticSession:
             "solver_phases": [c.name for c in SolverPhase],
             "solver_work_columns": [c.name for c in SolverWork],
             "dense_motion_units": "m/s",
-            "state_fields": [f.name for f in state_fields],
+            "state_fields": [f.name for f in self.state_fields],
+            "contact_motion_policy": "discrete_constraints",
+            "interval_state_fields": interval_fields,
+            "interval_state_axes": ["environment", "substep", "owner", "component"],
             "timing_scope": "Host step call wall time; excludes capture and file I/O; not GPU event latency.",
         }
         audit_field = getattr(Field, "VBD_SOLVE_AUDIT", None)
@@ -123,7 +145,19 @@ class DiagnosticSession:
             sample["dense_motion_trace"] = read(Field.SOLVER_DENSE_MOTION_TRACE, (self.env_count, self.trace_sweeps))
             sample["phase_ns"] = read(Field.SOLVER_PHASE_TIME, (self.env_count, len(SolverPhase)))
         for field in self.state_fields if state_fields is None else state_fields:
-            sample["state_" + field.name] = np.asarray(self.world.download_field(field)).copy()
+            value = np.asarray(self.world.download_field(field)).copy()
+            if self.interval_states and field.name in INTERVAL_STATE_FIELDS:
+                if field.name == "INTERVAL_STATE_DT":
+                    value = value.reshape(extent)
+                else:
+                    width = (7 if field.name in ("INTERVAL_BODY_POSE", "INTERVAL_BASE_POSE") else
+                             6 if field.name == "INTERVAL_LINK_VELOCITY" else
+                             4 if field.name == "INTERVAL_JOINT_ROTATION" else
+                             9 if field.name.endswith(("_F", "_C")) else
+                             1 if field.name in ("INTERVAL_PARTICLE_PLASTIC", "INTERVAL_Q", "INTERVAL_QDOT") else 3)
+                    count = value.size // (self.env_count * self.substeps * width)
+                    value = value.reshape(extent + (count, width))
+            sample["state_" + field.name] = value
         if controls is not None:
             sample["controls"] = np.asarray(controls).copy()
         return sample
@@ -249,7 +283,9 @@ def iter_record_blocks(root, *, states=False):
     for name, enum in columns.items():
         if manifest.get(name) != [column.name for column in enum]:
             raise ValueError(f"diagnostic column order mismatch: {name}")
-    if "energy_columns" in manifest and manifest["energy_columns"] != [c.name for c in EnergyColumn]:
+    energy_columns = manifest.get("energy_columns", [c.name for c in EnergyColumn][:31])
+    if (not isinstance(energy_columns, list) or len(energy_columns) not in (31, 43, len(EnergyColumn)) or
+            energy_columns != [c.name for c in EnergyColumn][:len(energy_columns)]):
         raise ValueError("diagnostic energy column order mismatch")
     for name in ("env_count", "substeps", "steps"):
         if type(manifest.get(name)) is not int or manifest[name] < 1:
@@ -263,7 +299,7 @@ def iter_record_blocks(root, *, states=False):
         raise ValueError("no completed physics records")
     extent = (manifest["env_count"], manifest["substeps"])
     environments = (manifest["env_count"],)
-    shapes = {"energy": extent + (len(EnergyColumn),), "energy_status": extent,
+    shapes = {"energy": extent + (len(energy_columns),), "energy_status": extent,
               "stages": extent + (len(Stage), len(stage_columns)),
               "audit_counts": extent + (len(AuditCount),),
               "audit_metrics": extent + (len(AuditMetric),), "force_residual_work": extent,
@@ -344,6 +380,10 @@ def iter_record_blocks(root, *, states=False):
         if len(stage_columns) < len(StageColumn):
             block["stages"] = np.pad(block["stages"],
                 [(0, 0)] * (block["stages"].ndim - 1) + [(0, len(StageColumn) - len(stage_columns))])
+        if len(energy_columns) < len(EnergyColumn):
+            block["energy"] = np.pad(block["energy"],
+                [(0, 0)] * (block["energy"].ndim - 1) + [(0, len(EnergyColumn) - len(energy_columns))],
+                constant_values=np.nan)
         yield block, manifest
     if next_step - 1 != manifest["steps"]:
         raise ValueError("diagnostic chunks do not cover the declared total steps")

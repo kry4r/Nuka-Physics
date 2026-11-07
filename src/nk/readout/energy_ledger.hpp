@@ -1,6 +1,9 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
+
+#include "nk/model/generated/field_ids.hpp"
 
 namespace nuka::nk {
 
@@ -13,11 +16,28 @@ enum class EnergyColumn : uint32_t {
     DriveWork, AeroWork, ExternalWork, KinematicElasticWork, KinematicContactWork,
     FrictionLoss, NormalLoss, LimitLoss, PassiveLoss, RayleighLoss,
     PositionPotential, DatKineticLoss, DatPotential, Residual, Throughput, Dt,
-    RowRateWork, RowPhysicalImpulseWork, UnclassifiedRowWork, Valid, Count
+    RowRateWork, RowPhysicalImpulseWork, UnclassifiedRowWork, Valid,
+    MpmBeginAffineKinetic, MpmEndAffineKinetic, MpmP2gLoss, MpmG2pLoss,
+    MpmAffineTransport, MpmPlasticLoss, MpmVolumeAverageWork, MpmStressWork,
+    MpmBoundaryWork, MpmViscousLoss, MpmGridBeginKinetic, MpmGridSolvedKinetic,
+    PositionKineticWork, Count
 };
 
 inline constexpr uint32_t kEnergyColumnCount = static_cast<uint32_t>(EnergyColumn::Count);
 inline constexpr uint32_t kEnergyStageCount = static_cast<uint32_t>(EnergyStage::Count);
+
+inline constexpr std::array<FieldId, 3> kEnergyMpmParticleFields = {
+    FieldId::EnergyMpmStartF, FieldId::EnergyMpmStartPlasticF, FieldId::EnergyMpmStartPlastic};
+inline constexpr std::array<FieldId, 6> kEnergyMpmGridFields = {
+    FieldId::EnergyGridEntryMomentum, FieldId::EnergyGridStressImpulse,
+    FieldId::EnergyGridViscousImpulse, FieldId::EnergyGridFreeVelocity, FieldId::EnergyGridPrescribed,
+    FieldId::EnergyGridEntryMass};
+inline constexpr std::array<FieldId, 4> kEnergyArticulationFields = {
+    FieldId::EnergyBaseStartPose, FieldId::EnergyLinkStartRotation, FieldId::EnergyLinkUnprojectedVelocity,
+    FieldId::EnergyJointStartAngularVelocity};
+inline constexpr std::array<FieldId, 4> kEnergyLoadFields = {
+    FieldId::EnergyBodyWrench, FieldId::EnergyBodyStartVelocity,
+    FieldId::EnergyLinkWrench, FieldId::EnergyLinkStartVelocity};
 
 namespace energy_status {
 inline constexpr uint32_t kNonfinite = 1u << 0;

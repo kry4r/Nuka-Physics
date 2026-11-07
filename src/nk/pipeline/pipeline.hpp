@@ -62,6 +62,7 @@ public:
         // The solve's telemetry record each substep, and its residual samples at chosen sweeps.
         kReadoutTelemetry = 1u << 5,
         kReadoutTelemetrySweeps = 1u << 6,
+        kReadoutIntervalState = 1u << 7,
     };
 
     // All emitted physics ops are required; unsupported demands leave no runnable calls.

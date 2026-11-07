@@ -21,6 +21,8 @@
 #include "nk/solve/vertex_block_hierarchy.hpp"
 #include "nk/contact/contact_identity.hpp"
 #include "nk/material/hencky_j2.hpp"
+#include "nk/readout/interval_state.hpp"
+#include "nk/readout/energy_ledger.hpp"
 #include "phi/op_schema.hpp"  // phi::kShapeTableRowStride / kSdfHeaderStride (host-safe)
 #include "phi/articulation_contract.hpp"
 
@@ -113,6 +115,30 @@ uint64_t ModelCapacities::ParticleContactReserve(uint32_t grid_particles) const 
 
 uint64_t ModelCapacities::ElementCount(FieldId id) const {
     const FieldLayout& lay = LayoutOf(id);
+    for (FieldId field : kEnergyMpmParticleFields)
+        if (id == field) return energy_readout && mpm_grid_nodes_per_env > 0u &&
+            (field != FieldId::EnergyMpmStartPlasticF || mpm_plastic_state)
+            ? CheckedProduct({particles_per_env, env_count}) : 0u;
+    for (FieldId field : kEnergyMpmGridFields)
+        if (id == field) return energy_readout
+            ? CheckedProduct({mpm_grid_nodes_per_env, env_count}) : 0u;
+    for (FieldId field : kEnergyArticulationFields)
+        if (id == field && !energy_readout) return 0u;
+    for (FieldId field : kEnergyLoadFields)
+        if (id == field && !energy_readout) return 0u;
+    if (id == FieldId::IntervalStateDt)
+        return interval_state_readout ? CheckedProduct({integration_substeps, env_count}) : 0u;
+    for (FieldId field : kIntervalParticleFields)
+        if (id == field) return interval_state_readout
+            ? CheckedProduct({integration_substeps, env_count, particles_per_env}) : 0u;
+    for (FieldId field : kIntervalBodyFields)
+        if (id == field) return interval_state_readout
+            ? CheckedProduct({integration_substeps, env_count, bodies_per_env}) : 0u;
+    for (FieldId field : kIntervalLinkFields)
+        if (id == field) return interval_state_readout
+            ? CheckedProduct({integration_substeps, env_count, links_per_env}) : 0u;
+    if (id == FieldId::IntervalBasePose) return interval_state_readout
+        ? CheckedProduct({integration_substeps, env_count, articulations_per_env}) : 0u;
     if (!inverse_dynamics_controls &&
         (id == FieldId::ControlMass || id == FieldId::ControlFactor ||
          id == FieldId::ControlJacobian || id == FieldId::ControlResponse ||

@@ -799,9 +799,9 @@ fields:
   # acceleration, dual, check.
   - {name: solver_phase_time, dtype: u64, per: env, elem: 13, arena: scratch, owner: data}
   - {name: dat_surface_motion, dtype: f32, per: scalar, count: "particle_surfaces_per_env*env_count", arena: scratch, owner: data}
-  - {name: energy_ledger, dtype: f32, per: scalar, count: "integration_substeps*env_count", elem: 31, arena: scratch, owner: data, flags: [readout]}
+  - {name: energy_ledger, dtype: f32, per: scalar, count: "integration_substeps*env_count", elem: 44, arena: scratch, owner: data, flags: [readout]}
   # The ledger record in double; residuals difference stage energies far larger than their change.
-  - {name: energy_ledger_sum, dtype: f64, per: scalar, count: "integration_substeps*env_count", elem: 31, arena: scratch, owner: data}
+  - {name: energy_ledger_sum, dtype: f64, per: scalar, count: "integration_substeps*env_count", elem: 44, arena: scratch, owner: data}
   - {name: energy_ledger_status, dtype: u32, per: scalar, count: "integration_substeps*env_count", arena: scratch, owner: data, flags: [readout]}
   - {name: physics_stage_metrics, dtype: f32, per: scalar, count: "integration_substeps*env_count", elem: 220, arena: scratch, owner: data, flags: [readout]}
   - {name: contact_audit_counts, dtype: u32, per: scalar, count: "integration_substeps*env_count", elem: 8, arena: scratch, owner: data, flags: [readout]}
@@ -857,3 +857,41 @@ fields:
   - {name: particle_surface_neighbours, dtype: u32, per: scalar, count: "particle_surface_neighbours_per_env", arena: persistent, owner: model}
   # World-space impulse toward side A at each manifold point; unused points are zero.
   - {name: ucontact_impulse, dtype: vec3, per: contact_slot, elem: 4, arena: scratch, owner: data, flags: [readout]}
+  # Optional committed state in environment, physical interval, owner order; dt=0 marks unwritten records.
+  - {name: interval_state_dt, dtype: f32, per: scalar, count: "integration_substeps*env_count", arena: scratch, owner: data, flags: [readout]}
+  - {name: interval_particle_pos, dtype: vec3, per: scalar, count: "integration_substeps*env_count*particles_per_env", arena: scratch, owner: data, flags: [readout]}
+  - {name: interval_particle_vel, dtype: vec3, per: scalar, count: "integration_substeps*env_count*particles_per_env", arena: scratch, owner: data, flags: [readout]}
+  - {name: interval_particle_F, dtype: f32, per: scalar, count: "integration_substeps*env_count*particles_per_env", elem: 9, arena: scratch, owner: data, flags: [readout]}
+  - {name: interval_particle_C, dtype: f32, per: scalar, count: "integration_substeps*env_count*particles_per_env", elem: 9, arena: scratch, owner: data, flags: [readout]}
+  - {name: interval_particle_plastic_F, dtype: f32, per: scalar, count: "integration_substeps*env_count*particles_per_env", elem: 9, arena: scratch, owner: data, flags: [readout]}
+  - {name: interval_particle_plastic, dtype: f32, per: scalar, count: "integration_substeps*env_count*particles_per_env", arena: scratch, owner: data, flags: [readout]}
+  - {name: interval_body_pose, dtype: transform, per: scalar, count: "integration_substeps*env_count*bodies_per_env", arena: scratch, owner: data, flags: [readout]}
+  - {name: interval_body_linear_velocity, dtype: vec3, per: scalar, count: "integration_substeps*env_count*bodies_per_env", arena: scratch, owner: data, flags: [readout]}
+  - {name: interval_body_angular_velocity, dtype: vec3, per: scalar, count: "integration_substeps*env_count*bodies_per_env", arena: scratch, owner: data, flags: [readout]}
+  - {name: energy_mpm_start_F, dtype: f32, per: scalar, count: "particles_per_env*env_count", elem: 9, arena: scratch, owner: data}
+  - {name: energy_mpm_start_plastic_F, dtype: f32, per: scalar, count: "particles_per_env*env_count", elem: 9, arena: scratch, owner: data}
+  - {name: energy_mpm_start_plastic, dtype: f32, per: scalar, count: "particles_per_env*env_count", arena: scratch, owner: data}
+  - {name: energy_grid_entry_momentum, dtype: f64, per: scalar, count: "mpm_grid_nodes_per_env*env_count", elem: 3, arena: scratch, owner: data}
+  - {name: energy_grid_stress_impulse, dtype: f64, per: scalar, count: "mpm_grid_nodes_per_env*env_count", elem: 3, arena: scratch, owner: data}
+  - {name: energy_grid_viscous_impulse, dtype: f64, per: scalar, count: "mpm_grid_nodes_per_env*env_count", elem: 3, arena: scratch, owner: data}
+  - {name: energy_grid_free_velocity, dtype: vec3, per: scalar, count: "mpm_grid_nodes_per_env*env_count", arena: scratch, owner: data}
+  - {name: energy_grid_prescribed, dtype: u32, per: scalar, count: "mpm_grid_nodes_per_env*env_count", arena: scratch, owner: data}
+  - {name: energy_base_start_pose, dtype: transform, per: articulation, arena: scratch, owner: data}
+  - {name: energy_link_start_rotation, dtype: quat, per: link, arena: scratch, owner: data}
+  - {name: energy_link_unprojected_velocity, dtype: spatial6, per: link, arena: scratch, owner: data}
+  - {name: interval_q, dtype: f32, per: scalar, count: "integration_substeps*env_count*links_per_env", arena: scratch, owner: data, flags: [readout]}
+  - {name: interval_qdot, dtype: f32, per: scalar, count: "integration_substeps*env_count*links_per_env", arena: scratch, owner: data, flags: [readout]}
+  - {name: interval_joint_rotation, dtype: quat, per: scalar, count: "integration_substeps*env_count*links_per_env", arena: scratch, owner: data, flags: [readout]}
+  - {name: interval_joint_angular_velocity, dtype: vec3, per: scalar, count: "integration_substeps*env_count*links_per_env", arena: scratch, owner: data, flags: [readout]}
+  - {name: interval_link_velocity, dtype: spatial6, per: scalar, count: "integration_substeps*env_count*links_per_env", arena: scratch, owner: data, flags: [readout]}
+  - {name: interval_base_pose, dtype: transform, per: scalar, count: "integration_substeps*env_count*articulations_per_env", arena: scratch, owner: data, flags: [readout]}
+  - {name: energy_grid_entry_mass, dtype: f64, per: scalar, count: "mpm_grid_nodes_per_env*env_count", arena: scratch, owner: data}
+  # Applied world-frame wrenches and initial COM twists for interval work.
+  - {name: energy_body_wrench, dtype: spatial6, per: body, arena: scratch, owner: data}
+  - {name: energy_body_start_velocity, dtype: spatial6, per: body, arena: scratch, owner: data}
+  - {name: energy_link_wrench, dtype: spatial6, per: link, arena: scratch, owner: data}
+  - {name: energy_link_start_velocity, dtype: spatial6, per: link, arena: scratch, owner: data}
+  - {name: body_gravity_compensation, dtype: f32, per: body, arena: persistent, owner: data, flags: [param]}
+  - {name: joint_actuator_gravity_compensation, dtype: u32, per: link, arena: persistent, owner: model}
+  - {name: joint_gravity_force, dtype: f32, per: link, arena: scratch, owner: data, flags: [readout]}
+  - {name: energy_joint_start_angular_velocity, dtype: vec3, per: link, arena: scratch, owner: data}

@@ -36,7 +36,11 @@ class PipelinePhysicsAcceptance {
         "kinematic_elastic_work", "kinematic_contact_work", "friction_loss", "normal_loss",
         "limit_loss", "passive_loss", "rayleigh_loss", "position_potential", "dat_kinetic_loss",
         "dat_potential", "residual", "throughput", "dt", "row_rate_work",
-        "row_physical_impulse_work", "unclassified_row_work", "valid"};
+        "row_physical_impulse_work", "unclassified_row_work", "valid",
+        "mpm_begin_affine_kinetic", "mpm_end_affine_kinetic", "mpm_p2g_loss", "mpm_g2p_loss",
+        "mpm_affine_transport", "mpm_plastic_loss", "mpm_volume_average_work", "mpm_stress_work",
+        "mpm_boundary_work", "mpm_viscous_loss", "mpm_grid_begin_kinetic", "mpm_grid_solved_kinetic",
+        "position_kinetic_work"};
 
     struct Maximum {
         double value = 0.0;
@@ -188,7 +192,7 @@ public:
         }
     }
 
-    Json Report(bool replay_equal) const {
+    Json Report(bool replay_equal, bool replay_measured = true) const {
         Json result = Json::Object(), checks = Json::Object();
         const bool contacts = count_totals_[static_cast<uint32_t>(C::Contacts)] != 0u;
         checks.Set("finite_state_and_execution", Decision(nonfinite_ || physics_failure_, records_ != 0u && unwritten_stages_ == 0u));
@@ -207,7 +211,7 @@ public:
         checks.Set("matched_external_reference", Decision(false, false));
         checks.Set("timestep_and_grid_convergence", Decision(false, false));
         checks.Set("independent_ccd", Decision(false, false));
-        checks.Set("timed_replay_binding", Decision(!replay_equal, records_ != 0u));
+        checks.Set("timed_replay_binding", Decision(replay_measured && !replay_equal, replay_measured && records_ != 0u));
         bool failed = false, complete = true;
         for (const auto& check : checks.Items()) {
             const auto& status = check.second.At("status").AsString();
@@ -220,7 +224,7 @@ public:
         result.Set("scope", Json::Str("untimed quality replay, every step/environment/physical interval including warmup"));
         result.Set("interval_records", Json::Int(records_));
         result.Set("unwritten_stage_records", Json::Int(unwritten_stages_));
-        result.Set("timed_replay_bit_equal", Json::Bool(replay_equal));
+        result.Set("timed_replay_bit_equal", replay_measured ? Json::Bool(replay_equal) : Json::Null());
         Json counts = Json::Object(), maxima = Json::Object();
         for (uint32_t c = 0u; c < nk::kContactAuditCountSize; ++c) counts.Set(kCountNames[c], Json::Int(count_totals_[c]));
         for (uint32_t c = 0u; c < nk::kContactAuditMetricCount; ++c) maxima.Set(kMetricNames[c], contact_max_[c].Report(true));
@@ -264,7 +268,8 @@ public:
         result.Set("vbd_solved_momentum_velocity_error_m_s", vbd_error_.Report());
         result.Set("passive_row_positive_work_J", passive_gain_.Report());
         result.Set("dat_truncation_count_visits", Json::Int(dat_visits_));
-        result.Set("dat_count_scope", Json::Str("last physical interval per policy step/environment; does not cover earlier substeps"));
+        result.Set("contact_motion_policy", Json::Str("discrete_constraints"));
+        result.Set("dat_count_scope", Json::Str("reserved compatibility counter; no DAT operator"));
         return result;
     }
 

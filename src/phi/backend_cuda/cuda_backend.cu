@@ -125,6 +125,10 @@ struct CudaPlan {
     cudaGraph_t     graph;
     cudaGraphExec_t exec;
     PlanMetrics metrics{};
+    bool allows_child_graph = false;
+    cudaGraph_t repeated_graph = nullptr;
+    cudaGraphExec_t repeated_exec = nullptr;
+    uint32_t repetitions = 0u;
 };
 
 struct CudaEvent {
@@ -314,9 +318,15 @@ Plan* BackendPlanCreateImpl(Backend* b, const ModelView& model,
     std::vector<cudaGraphNode_t> nodes(count);
     cudaGraphGetNodes(graph, nodes.data(), &count);
     metrics.nodes = count;
+    bool allows_child_graph = true;
     for (auto node : nodes) {
         cudaGraphNodeType type;
-        cudaGraphNodeGetType(node, &type);
+        if (cudaGraphNodeGetType(node, &type) != cudaSuccess) {
+            allows_child_graph = false;
+            continue;
+        }
+        allows_child_graph &= type != cudaGraphNodeTypeConditional &&
+            type != cudaGraphNodeTypeMemAlloc && type != cudaGraphNodeTypeMemFree;
         metrics.kernels += type == cudaGraphNodeTypeKernel;
         metrics.clears += type == cudaGraphNodeTypeMemset;
         metrics.copies += type == cudaGraphNodeTypeMemcpy;
@@ -328,7 +338,7 @@ Plan* BackendPlanCreateImpl(Backend* b, const ModelView& model,
     cudaGraphGetEdges(graph, from.data(), to.data(), edges.data(), &edge_count);
     for (const auto& edge : edges)
         metrics.early_launch_dependencies += edge.type == cudaGraphDependencyTypeProgrammatic;
-    CudaPlan* plan = new (std::nothrow) CudaPlan{graph, exec, metrics};
+    CudaPlan* plan = new (std::nothrow) CudaPlan{graph, exec, metrics, allows_child_graph};
     if (!plan) {
         cudaGraphExecDestroy(exec);
         cudaGraphDestroy(graph);
@@ -350,6 +360,58 @@ Status BackendPlanExecuteImpl(Backend* b, Plan* p, ExecutionError* error) {
                              status == cudaSuccess ? "" : cudaGetErrorString(status));
 }
 
+Status BackendPlanExecuteRepeatedImpl(Backend* b, Plan* p, uint32_t count,
+                                      uint32_t* submitted, ExecutionError* error) {
+    *submitted = 0u;
+    if (count <= 1u) {
+        const auto status = count == 0u ? Status::Ok : BackendPlanExecuteImpl(b, p, error);
+        if (status == Status::Ok) *submitted = count;
+        return status;
+    }
+    auto* cb = AsBackend(b);
+    auto* plan = AsPlan(p);
+    if (plan == nullptr || plan->graph == nullptr)
+        return SetExecutionError(error, Status::InvalidArgument, NkOp::Count,
+                                 cudaErrorInvalidValue, "graph is not initialized");
+    auto status = cudaSetDevice(cb->device_id);
+    if (status == cudaSuccess && !plan->allows_child_graph) {
+        // CUDA cannot nest graphs containing conditional or allocation nodes.
+        for (; *submitted < count; ++*submitted) {
+            status = cudaGraphLaunch(plan->exec, cb->main);
+            if (status != cudaSuccess) break;
+        }
+        return SetExecutionError(error, CudaStatus(status), NkOp::Count, status,
+                                 status == cudaSuccess ? "" : cudaGetErrorString(status));
+    }
+    if (status == cudaSuccess && plan->repetitions != count) {
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t exec = nullptr;
+        status = cudaGraphCreate(&graph, 0u);
+        cudaGraphNode_t previous = nullptr;
+        for (uint32_t i = 0u; status == cudaSuccess && i < count; ++i) {
+            cudaGraphNode_t next = nullptr;
+            status = cudaGraphAddChildGraphNode(&next, graph, previous ? &previous : nullptr,
+                                                previous ? 1u : 0u, plan->graph);
+            previous = next;
+        }
+        if (status == cudaSuccess) status = cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+        if (status == cudaSuccess) {
+            if (plan->repeated_exec) cudaGraphExecDestroy(plan->repeated_exec);
+            if (plan->repeated_graph) cudaGraphDestroy(plan->repeated_graph);
+            plan->repeated_graph = graph;
+            plan->repeated_exec = exec;
+            plan->repetitions = count;
+        } else {
+            if (exec) cudaGraphExecDestroy(exec);
+            if (graph) cudaGraphDestroy(graph);
+        }
+    }
+    if (status == cudaSuccess) status = cudaGraphLaunch(plan->repeated_exec, cb->main);
+    if (status == cudaSuccess) *submitted = count;
+    return SetExecutionError(error, CudaStatus(status), NkOp::Count, status,
+                             status == cudaSuccess ? "" : cudaGetErrorString(status));
+}
+
 void BackendPlanFreeImpl(Backend*, Plan* p) {
     CudaPlan* plan = AsPlan(p);
     if (plan == nullptr) {
@@ -357,6 +419,8 @@ void BackendPlanFreeImpl(Backend*, Plan* p) {
     }
     if (plan->exec != nullptr)  { (void)cudaGraphExecDestroy(plan->exec); }
     if (plan->graph != nullptr) { (void)cudaGraphDestroy(plan->graph); }
+    if (plan->repeated_exec != nullptr) (void)cudaGraphExecDestroy(plan->repeated_exec);
+    if (plan->repeated_graph != nullptr) (void)cudaGraphDestroy(plan->repeated_graph);
     delete plan;
 }
 
@@ -437,6 +501,7 @@ const BackendI kCudaBackendI = {
     /*event_elapsed_ms =*/ &BackendEventElapsedMsImpl,
     /*resource_info =*/ &BackendResourceInfoImpl,
     /*plan_metrics =*/ &BackendPlanMetricsImpl,
+    /*plan_execute_repeated =*/ &BackendPlanExecuteRepeatedImpl,
 };
 
 // ---------------------------------------------------------------------------

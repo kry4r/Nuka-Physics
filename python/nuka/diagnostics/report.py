@@ -195,13 +195,17 @@ def energy_analysis(records, flags, limits):
     finite = np.isfinite(records).all(axis=1)
     covered = (flags == 0) & (records[:, E.VALID] == 1) & finite
     reasons = [s.name for s in EnergyStatus if np.any(flags & int(s))]
+    if not finite.all():
+        reasons.append("MISSING_OR_NONFINITE_ENERGY_COLUMNS")
     if not covered.all():
         return decision(False, False, covered_records=int(covered.sum()), records=len(records),
                         coverage_reasons=reasons)
     r, flow = records[:, E.RESIDUAL], records[:, E.THROUGHPUT]
     ratios = window_ratios(r, flow, records[:, E.DT], limits.window_seconds)
     total_flow = float(flow.sum())
-    losses = records[:, E.FRICTION_LOSS:E.RAYLEIGH_LOSS + 1]
+    loss_columns = list(range(E.FRICTION_LOSS, E.RAYLEIGH_LOSS + 1)) + [
+        E.MPM_P2G_LOSS, E.MPM_G2P_LOSS, E.MPM_PLASTIC_LOSS, E.MPM_VISCOUS_LOSS]
+    losses = records[:, loss_columns]
     below = losses < -limits.negative_loss_tolerance_j
     # Contact rows are attributed at the interval mean velocity; the contact audit gates their sign per row.
     negative = int(below[:, E.LIMIT_LOSS - E.FRICTION_LOSS:].sum())
@@ -219,10 +223,11 @@ def energy_analysis(records, flags, limits):
         net_residual_j=float(r.sum()), absolute_residual_j=float(np.abs(r).sum()),
         positive_residual_j=float(np.maximum(r, 0).sum()), throughput_j=total_flow,
         max_positive_window_ratio=float(ratios.max()), negative_loss_terms=negative,
-        negative_loss_terms_by_class={E(E.FRICTION_LOSS + i).name: int(below[:, i].sum())
-                                      for i in range(losses.shape[1])},
+        negative_loss_terms_by_class={E(column).name: int(below[:, i].sum())
+                                      for i, column in enumerate(loss_columns)},
         max_absolute_residual_j=float(np.abs(r).max()), dat_kinetic_loss_j=float(trunc.sum()),
-        terms_j={c.name: float(records[:, c].sum()) for c in E if E.DRIVE_WORK <= c <= E.DAT_POTENTIAL})
+        terms_j={c.name: float(records[:, c].sum()) for c in E
+                 if E.DRIVE_WORK <= c <= E.DAT_POTENTIAL or c >= E.MPM_BEGIN_AFFINE_KINETIC})
 
 
 def particle_history(values, env, manifest, initial_velocity, initial_previous_velocity=None):

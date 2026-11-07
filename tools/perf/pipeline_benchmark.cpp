@@ -24,6 +24,7 @@
 #include "nk/solve/block_row_schedule.hpp"
 #include "nk/solve/point_endpoint.hpp"
 #include "nk/solve/vertex_block.hpp"
+#include "nk/readout/interval_state.hpp"
 #include "render/render_world.hpp"
 #include "render/sensor_backend.hpp"
 #include "render/rt_adapter.hpp"
@@ -46,11 +47,14 @@ void CheckCuda(cudaError_t result) {
 
 struct Options {
     std::string scene = "robot-cloth-fluid", execution = "eager", output = "-", state_output, wrench_output;
+    std::string interval_output;
     uint32_t envs = 1u, steps = 200u, warmup = 250u, seed = 20260908u;
     float dt = 1.0f / 240.0f;
     uint32_t capacity_scale = 1u;
     uint32_t substeps = 1u;
     uint32_t mpm_implicit_stress = 0u;
+    uint32_t mpm_grid_refinement = 1u;
+    uint32_t quality_only = 0u;
     uint32_t velocity_iterations = 48u;
     bool velocity_iterations_explicit = false;
     uint32_t state_sensors = 0u;
@@ -83,6 +87,8 @@ Options Parse(int argc, char** argv) {
         else if (flag == "--warmup") options.warmup = ParseU32(value);
         else if (flag == "--substeps") options.substeps = ParseU32(value);
         else if (flag == "--mpm-implicit-stress") options.mpm_implicit_stress = ParseU32(value);
+        else if (flag == "--mpm-grid-refinement") options.mpm_grid_refinement = ParseU32(value);
+        else if (flag == "--quality-only") options.quality_only = ParseU32(value);
         else if (flag == "--velocity-iterations") {
             options.velocity_iterations = ParseU32(value);
             options.velocity_iterations_explicit = true;
@@ -98,6 +104,7 @@ Options Parse(int argc, char** argv) {
         else if (flag == "--execution") options.execution = value;
         else if (flag == "--perf-json") options.output = value;
         else if (flag == "--state-output") options.state_output = value;
+        else if (flag == "--interval-output") options.interval_output = value;
         else if (flag == "--wrench-output") options.wrench_output = value;
         else if (flag == "--capacity-scale") options.capacity_scale = ParseU32(value);
         else if (flag == "--cloth-grid") options.cloth_nx = ParseU32(value);
@@ -113,9 +120,10 @@ Options Parse(int argc, char** argv) {
         else throw std::invalid_argument("unknown option " + flag);
     }
     if (options.envs == 0u || options.steps == 0u || options.capacity_scale == 0u || options.substeps == 0u ||
+        options.mpm_grid_refinement == 0u ||
         options.velocity_iterations == 0u || options.velocity_iterations > UINT16_MAX ||
         (options.scene == "robot-rigid-mpm-cloth" && options.cloth_nx != fixture::kClothNx) ||
-        options.state_sensors > 2u || options.imaging_models > 1u || options.mpm_implicit_stress > 1u ||
+        options.state_sensors > 2u || options.imaging_models > 1u || options.mpm_implicit_stress > 1u || options.quality_only > 1u ||
         uint64_t{options.tactile_grid} * options.tactile_grid + 1u > UINT32_MAX ||
         !(options.dt > 0.0f) || !std::isfinite(options.dt) ||
         uint64_t{options.steps} + options.warmup > std::numeric_limits<uint32_t>::max() ||
@@ -262,9 +270,9 @@ std::vector<uint8_t> StateSensorBytes(nk::World& world, bool include_tactile = t
     return bytes;
 }
 
-constexpr std::array<nk::FieldId, 14> kPhysicalFields{
+constexpr std::array<nk::FieldId, 16> kPhysicalFields{
     nk::FieldId::BasePose, nk::FieldId::Q, nk::FieldId::Qdot,
-    nk::FieldId::LinkVelocity, nk::FieldId::BodyPose,
+    nk::FieldId::LinkVelocity, nk::FieldId::JointRotation, nk::FieldId::JointAngularVelocity, nk::FieldId::BodyPose,
     nk::FieldId::BodyLinearVelocity, nk::FieldId::BodyAngularVelocity,
     nk::FieldId::ParticlePos, nk::FieldId::ParticlePrevPos, nk::FieldId::ParticleVel,
     nk::FieldId::ParticleF, nk::FieldId::ParticleC, nk::FieldId::ParticlePlastic, nk::FieldId::ParticlePlasticF};
@@ -313,6 +321,172 @@ Json StateLayout(const nk::World& world) {
     }
     return fields;
 }
+
+class IntervalStateTrace {
+public:
+    IntervalStateTrace(nk::World& world, const std::string& destination,
+                       const nk::Pipeline::SolverConfig& config) : directory_(destination) {
+        if (destination.empty()) return;
+        fixture::Require(!std::filesystem::exists(directory_), "interval trace output already exists");
+        std::filesystem::create_directories(directory_);
+        fixture::Require(world.FieldPtr(nk::FieldId::IntervalStateDt) != nullptr,
+                         "interval state readout demand failed");
+        fields_.push_back(nk::FieldId::IntervalStateDt);
+        for (auto field : nk::kIntervalParticleFields) fields_.push_back(field);
+        for (auto field : nk::kIntervalBodyFields) fields_.push_back(field);
+        for (auto field : nk::kIntervalLinkFields) fields_.push_back(field);
+        fields_.push_back(nk::FieldId::IntervalBasePose);
+        for (auto field : {nk::FieldId::EnergyLedger, nk::FieldId::EnergyLedgerStatus,
+                          nk::FieldId::PhysicsStageMetrics, nk::FieldId::ContactAuditCounts,
+                          nk::FieldId::ContactAuditMetrics, nk::FieldId::EnvStatus}) fields_.push_back(field);
+        manifest_ = Json::Object();
+        manifest_.Set("schema_version", Json::Int(1));
+        manifest_.Set("scope", Json::Str("Untimed quality replay; committed state after every physical interval"));
+        const auto& cap = world.GetModel().capacities;
+        manifest_.Set("environments", Json::Int(cap.env_count));
+        manifest_.Set("substeps", Json::Int(cap.integration_substeps));
+        manifest_.Set("particles_per_env", Json::Int(cap.particles_per_env));
+        manifest_.Set("mpm_particles_per_env", Json::Int(world.GetModel().MpmParticlesPerEnv()));
+        manifest_.Set("bodies_per_env", Json::Int(cap.bodies_per_env));
+        manifest_.Set("links_per_env", Json::Int(cap.links_per_env));
+        manifest_.Set("articulations_per_env", Json::Int(cap.articulations_per_env));
+        manifest_.Set("policy_dt", Json::Float(config.dt));
+        manifest_.Set("position_iterations", Json::Int(config.pos_iters));
+        manifest_.Set("position_slop", Json::Float(config.pos_slop));
+        manifest_.Set("position_beta", Json::Float(config.pos_beta));
+        manifest_.Set("cloth_integrator", Json::Int(config.cloth_integrator));
+        manifest_.Set("mpm_transfer_loss", Json::Str("weighted least-squares velocity residual; floating-point transfer defects remain in the energy residual"));
+        Json gravity = Json::Array();
+        for (float value : config.gravity) gravity.PushBack(Json::Float(value));
+        manifest_.Set("gravity", std::move(gravity));
+        const auto& particles = world.GetModel().particles;
+        Json grid = Json::Object(), origin = Json::Array(), dims = Json::Array(), floor = Json::Array();
+        for (float value : {particles.mpm_grid_min.x, particles.mpm_grid_min.y, particles.mpm_grid_min.z})
+            origin.PushBack(Json::Float(value));
+        for (uint32_t value : particles.mpm_grid_dims) dims.PushBack(Json::Int(value));
+        for (float value : {particles.mpm_floor_normal.x, particles.mpm_floor_normal.y, particles.mpm_floor_normal.z})
+            floor.PushBack(Json::Float(value));
+        grid.Set("origin", std::move(origin));
+        grid.Set("dims", std::move(dims));
+        grid.Set("dx", Json::Float(particles.mpm_cell_size));
+        grid.Set("nodes_per_env", Json::Int(cap.mpm_grid_nodes_per_env));
+        grid.Set("lattices", Json::Int(nk::kMpmLattices));
+        grid.Set("floor_normal", std::move(floor));
+        grid.Set("floor_d", Json::Float(particles.mpm_floor_d));
+        grid.Set("floor_friction", Json::Float(particles.mpm_floor_friction));
+        manifest_.Set("mpm_grid", std::move(grid));
+        manifest_.Set("initial_fields", WriteFields(world, directory_ / "initial.bin", StateFields(true)));
+        std::vector<nk::FieldId> inputs;
+        for (int i = 0; i < nk::kFieldCount; ++i) {
+            const auto field = static_cast<nk::FieldId>(i);
+            const auto layout = nk::LayoutOf(field);
+            if (layout.owner == nk::FieldOwner::Model || layout.arena == nk::FieldArena::Persistent)
+                inputs.push_back(field);
+        }
+        manifest_.Set("input_fields", WriteFields(world, directory_ / "inputs.bin", inputs));
+        manifest_.Set("interval_fields", Layout(world, fields_));
+        for (auto field : fields_)
+            frame_bytes_ += cap.ElementCount(field) * nk::LayoutOf(field).elem_size;
+        manifest_.Set("bytes_per_policy_step", Json::Int(frame_bytes_));
+        manifest_.Set("contact_motion_policy", Json::Str("discrete_constraints"));
+        last_fields_ = {nk::FieldId::DatParticleTruncationCount, nk::FieldId::DatParticleTruncationEnergy,
+            nk::FieldId::DatParticleTruncationMomentum, nk::FieldId::DatBodyTruncationCount,
+            nk::FieldId::DatBodyTruncationEnergy, nk::FieldId::DatJointTruncationCount,
+            nk::FieldId::DatJointTruncationEnergy, nk::FieldId::DatQueryLimitCount};
+        manifest_.Set("last_interval_fields", Layout(world, last_fields_));
+        manifest_.Set("last_interval_scope", Json::Str("One sample per policy step: its final physical interval only"));
+        uint64_t last_bytes = 0u;
+        for (auto field : last_fields_) last_bytes += cap.ElementCount(field) * nk::LayoutOf(field).elem_size;
+        manifest_.Set("last_interval_bytes_per_policy_step", Json::Int(last_bytes));
+        last_output_.open(directory_ / "last_intervals.bin", std::ios::binary);
+        fixture::Require(last_output_.is_open(), "cannot open last interval trace");
+        output_.open(directory_ / "intervals.bin", std::ios::binary);
+        fixture::Require(output_.is_open(), "cannot open interval trace");
+        Save();
+    }
+
+    void Observe(nk::World& world) {
+        if (directory_.empty()) return;
+        Write(world, output_, fields_);
+        Write(world, last_output_, last_fields_);
+        ++steps_;
+        if (steps_ % 25u == 0u) { output_.flush(); last_output_.flush(); Save(); }
+    }
+
+    void Close(bool replay_equal, bool replay_measured = true) {
+        if (directory_.empty()) return;
+        output_.close();
+        fixture::Require(!output_.fail(), "cannot close interval trace");
+        last_output_.close();
+        fixture::Require(!last_output_.fail(), "cannot close last interval trace");
+        closed_ = true;
+        replay_equal_ = replay_equal;
+        replay_measured_ = replay_measured;
+        Save();
+    }
+
+private:
+    static Json Layout(nk::World& world, const std::vector<nk::FieldId>& fields) {
+        Json result = Json::Array();
+        uint64_t offset = 0u;
+        for (auto field : fields) {
+            const auto layout = nk::LayoutOf(field);
+            const uint64_t count = world.GetModel().capacities.ElementCount(field);
+            Json item = Json::Object();
+            item.Set("name", Json::Str(nk::FieldName(field)));
+            item.Set("offset", Json::Int(offset));
+            item.Set("element_count", Json::Int(count));
+            item.Set("element_bytes", Json::Int(layout.elem_size));
+            result.PushBack(std::move(item));
+            offset += count * layout.elem_size;
+        }
+        return result;
+    }
+
+    static void Write(nk::World& world, std::ofstream& output, const std::vector<nk::FieldId>& fields) {
+        for (auto field : fields) {
+            const auto layout = nk::LayoutOf(field);
+            const uint64_t bytes = world.GetModel().capacities.ElementCount(field) * layout.elem_size;
+            if (!bytes) continue;
+            std::vector<uint8_t> values(bytes);
+            const auto status = layout.owner == nk::FieldOwner::Model
+                ? world.GetModel().DownloadFieldStatus(field, values.data(), bytes)
+                : world.GetData().DownloadFieldStatus(field, values.data(), bytes);
+            fixture::Require(status == phi::Status::Ok, "interval trace download failed");
+            output.write(reinterpret_cast<const char*>(values.data()), values.size());
+        }
+        fixture::Require(output.good(), "cannot write interval trace");
+    }
+
+    static Json WriteFields(nk::World& world, const std::filesystem::path& path,
+                            const std::vector<nk::FieldId>& fields) {
+        std::ofstream output(path, std::ios::binary);
+        fixture::Require(output.is_open(), "cannot open interval input trace");
+        Write(world, output, fields);
+        return Layout(world, fields);
+    }
+
+    void Save() {
+        Json manifest = manifest_;
+        manifest.Set("status", Json::Str(closed_ ? "closed" : "recording"));
+        manifest.Set("policy_steps", Json::Int(steps_));
+        if (closed_) manifest.Set("timed_replay_bit_equal",
+            replay_measured_ ? Json::Bool(replay_equal_) : Json::Null());
+        std::ofstream output(directory_ / "manifest.json");
+        output << manifest.Dump() << '\n';
+        fixture::Require(output.good(), "cannot write interval trace manifest");
+    }
+
+    std::filesystem::path directory_;
+    std::vector<nk::FieldId> fields_;
+    std::vector<nk::FieldId> last_fields_;
+    std::ofstream output_;
+    std::ofstream last_output_;
+    Json manifest_;
+    uint64_t frame_bytes_ = 0u;
+    uint32_t steps_ = 0u;
+    bool closed_ = false, replay_equal_ = false, replay_measured_ = false;
+};
 
 Json StateDifferences(nk::World& world, const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
     fixture::Require(a.size() == b.size(), "state extent changed during replay");
@@ -914,14 +1088,13 @@ Json BlockWorkload(nk::World& world, const std::vector<nk::NkRow>& rows, uint32_
             fixture::Require(keys[item] < total_half_cells && keys[item] / half_cells_per_env == env,
                              "material Predict half-cell key is invalid or crosses environments");
             fixture::Require(std::isfinite(volume[particle]), "material reference volume is nonfinite");
-            const uint32_t cell = static_cast<uint32_t>((keys[item] % half_cells_per_env) /
-                                                       nk::kMpmHalfCellsPerLatticeNode);
-            occupied_cells[env].insert(cell);
-            if (volume[particle] > 0.0f) expected_cells[env].insert(cell);
+            const uint32_t local = particle % caps.particles_per_env;
+            occupied_cells[env].insert(local);
+            if (volume[particle] > 0.0f) expected_cells[env].insert(local);
         }
         for (uint32_t env = 0u; env < p.env_count; ++env)
             fixture::Require(occupied_cells[env].size() <= p.material_cells_per_env,
-                             "occupied material cells exceed the reserved per-environment capacity");
+                             "material points exceed the reserved per-environment capacity");
     }
 
     std::vector<bool> scheduled(rows.size(), false), visited(rows.size(), false);
@@ -1018,19 +1191,17 @@ Json BlockWorkload(nk::World& world, const std::vector<nk::NkRow>& rows, uint32_
     if (p.material_cells_per_env != 0u) {
         for (uint32_t env = 0u; env < p.env_count; ++env) {
             std::set<uint32_t> expected_heads;
-            uint32_t ordinal = 0u;
-            for (uint32_t cell : occupied_cells[env]) {
-                if (expected_cells[env].count(cell) != 0u) {
+            for (uint32_t ordinal : occupied_cells[env]) {
+                if (expected_cells[env].count(ordinal) != 0u) {
                     const uint64_t head = nuka::CheckedAdd(nuka::CheckedProduct({env, p.rows_per_env}),
                         nuka::CheckedAdd(material_begin, nuka::CheckedProduct({ordinal, nk::kMpmStressRowsPerCell})));
                     fixture::Require(head < rows.size(), "expected material head exceeds reserved row storage");
                     expected_heads.insert(static_cast<uint32_t>(head));
                 }
-                ++ordinal;
             }
             fixture::Require(material_heads[env].size() == expected_cells[env].size() &&
                              material_heads[env] == expected_heads,
-                             "active material heads do not cover positive-volume occupied cells in the reserved tail");
+                             "active material heads do not cover positive-volume material points in the reserved tail");
         }
     }
     fixture::Require(expected_incidence_count == incidence.size(), "block CSR incidence total is incomplete or excessive");
@@ -1102,15 +1273,15 @@ Json BlockWorkload(nk::World& world, const std::vector<nk::NkRow>& rows, uint32_
     }
     result.Set("grid_dims", std::move(grid_dimensions));
     result.Set("material_blocks_by_env", std::move(material_counts));
-    result.Set("expected_occupied_stress_cells_by_env",
+    result.Set("expected_material_points_by_env",
                p.material_cells_per_env != 0u ? std::move(expected_material_counts) : Json::Null());
     result.Set("material_coverage_scope", Json::Str(p.material_cells_per_env != 0u ?
-        "last substep Predict Data MpmGridCellKey/MpmGridPartIdx and positive ParticleVol0; per-env stress cells and Exchange reserved heads" :
+        "last substep Predict particle identities and positive ParticleVol0; per-point stress blocks in the Exchange reserved tail" :
         "unmeasured: implicit material stress is disabled"));
     result.Set("material_key_boundary_rule",
                Json::Str("Predict clamps each half-cell coordinate to [0, 2*grid_dim-1]; grid escape remains an environment failure"));
     result.Set("material_head_order",
-               Json::Str("per-env ordinal in all occupied stress cells sorted by half-cell key / kMpmHalfCellsPerLatticeNode"));
+               Json::Str("environment-local material point index"));
     result.Set("solver_failure_owners", std::move(solver_failure_owners));
     result.Set("solver_failure_equations", std::move(solver_failure_equations));
     constexpr std::array<const char*, nk::kBlockSolveFailureEquationColumnCount> equation_names{
@@ -1594,7 +1765,8 @@ Json Run(const Options& options) {
     const double preparation_ms = Milliseconds(prepare_start);
     const auto cook_start = Clock::now();
     fixture::SceneVisuals visuals;
-    auto model = four_systems ? fixture::CookMpmPrepared(prepared, options.envs, &visuals, options.mpm_implicit_stress != 0u)
+    auto model = four_systems ? fixture::CookMpmPrepared(prepared, options.envs, &visuals,
+        options.mpm_implicit_stress != 0u, options.mpm_grid_refinement)
                              : fixture::CookPrepared(prepared, options.envs, true, options.cloth_nx, &visuals);
     const auto slots = uint64_t{model.capacities.max_contacts_per_env} * options.capacity_scale;
     const auto rows = slots * nk::kPairDrivenRowsPerSlot;
@@ -1615,57 +1787,61 @@ Json Run(const Options& options) {
     const auto initial = State(world, false);
     fixture::Require(MismatchedReplicas(world, initial).empty(), "benchmark inputs are not identical replicas");
 
-    double capture_ms = 0.0;
-    if (options.execution == "graph") {
-        const auto capture_start = Clock::now();
-        Step(world, options);
-        CheckCuda(cudaStreamSynchronize(stream));
-        capture_ms = Milliseconds(capture_start);
-        fixture::Require(world.Reset() == phi::Status::Ok, "reset after capture failed");
-    }
-    const auto warmup_start = Clock::now();
-    for (uint32_t i = 0; i < options.warmup; ++i) Step(world, options);
-    CheckCuda(cudaStreamSynchronize(stream));
-    const double warmup_ms = Milliseconds(warmup_start);
-
-    Events events(size_t{options.steps} * 2u + 2u);
-    std::vector<double> host_us(options.steps), gpu_us(options.steps);
-    const auto timed_start = Clock::now();
-    CheckCuda(cudaEventRecord(events.events.front(), stream));
-    const auto submit_start = Clock::now();
-    for (uint32_t i = 0; i < options.steps; ++i) {
-        CheckCuda(cudaEventRecord(events.events[size_t{i} * 2u + 1u], stream));
-        const auto host_start = Clock::now();
-        Step(world, options);
-        host_us[i] = Milliseconds(host_start) * 1000.0;
-        CheckCuda(cudaEventRecord(events.events[size_t{i} * 2u + 2u], stream));
-    }
-    CheckCuda(cudaEventRecord(events.events.back(), stream));
-    const double submission_ms = Milliseconds(submit_start);
-    CheckCuda(cudaEventSynchronize(events.events.back()));
-    const double wall_ms = Milliseconds(timed_start);
+    double capture_ms = 0.0, warmup_ms = 0.0, submission_ms = 0.0, wall_ms = 0.0;
     float gpu_ms = 0.0f;
-    CheckCuda(cudaEventElapsedTime(&gpu_ms, events.events.front(), events.events.back()));
-    for (uint32_t i = 0; i < options.steps; ++i) {
-        float elapsed = 0.0f;
-        CheckCuda(cudaEventElapsedTime(&elapsed, events.events[size_t{i} * 2u + 1u],
-                                      events.events[size_t{i} * 2u + 2u]));
-        gpu_us[i] = static_cast<double>(elapsed) * 1000.0;
-    }
-    const auto timed_state = State(world);
-    const auto timed_sensors = StateSensorBytes(world);
-    const auto timed_memory = Memory(world);
-    Json render_measurements = Json::Null();
+    std::vector<double> host_us(options.steps), gpu_us(options.steps);
+    std::vector<uint8_t> timed_state, timed_sensors;
+    Json timed_memory = Json::Null(), render_measurements = Json::Null();
     bool render_valid = true;
-    if (options.render_sensors != 0u) {
-        render_measurements = RenderMeasurements(world, visuals, options, timed_state);
-        render_valid = render_measurements.At("valid").AsBool();
+    if (!options.quality_only) {
+        if (options.execution == "graph") {
+            const auto capture_start = Clock::now();
+            Step(world, options);
+            CheckCuda(cudaStreamSynchronize(stream));
+            capture_ms = Milliseconds(capture_start);
+            fixture::Require(world.Reset() == phi::Status::Ok, "reset after capture failed");
+        }
+        const auto warmup_start = Clock::now();
+        for (uint32_t i = 0; i < options.warmup; ++i) Step(world, options);
+        CheckCuda(cudaStreamSynchronize(stream));
+        warmup_ms = Milliseconds(warmup_start);
+
+        Events events(size_t{options.steps} * 2u + 2u);
+        const auto timed_start = Clock::now();
+        CheckCuda(cudaEventRecord(events.events.front(), stream));
+        const auto submit_start = Clock::now();
+        for (uint32_t i = 0; i < options.steps; ++i) {
+            CheckCuda(cudaEventRecord(events.events[size_t{i} * 2u + 1u], stream));
+            const auto host_start = Clock::now();
+            Step(world, options);
+            host_us[i] = Milliseconds(host_start) * 1000.0;
+            CheckCuda(cudaEventRecord(events.events[size_t{i} * 2u + 2u], stream));
+        }
+        CheckCuda(cudaEventRecord(events.events.back(), stream));
+        submission_ms = Milliseconds(submit_start);
+        CheckCuda(cudaEventSynchronize(events.events.back()));
+        wall_ms = Milliseconds(timed_start);
+        CheckCuda(cudaEventElapsedTime(&gpu_ms, events.events.front(), events.events.back()));
+        for (uint32_t i = 0; i < options.steps; ++i) {
+            float elapsed = 0.0f;
+            CheckCuda(cudaEventElapsedTime(&elapsed, events.events[size_t{i} * 2u + 1u],
+                                          events.events[size_t{i} * 2u + 2u]));
+            gpu_us[i] = static_cast<double>(elapsed) * 1000.0;
+        }
+        timed_state = State(world);
+        timed_sensors = StateSensorBytes(world);
+        timed_memory = Memory(world);
+        if (options.render_sensors != 0u) {
+            render_measurements = RenderMeasurements(world, visuals, options, timed_state);
+            render_valid = render_measurements.At("valid").AsBool();
+        }
     }
 
     const auto quality_start = Clock::now();
     nuka::perf::PipelinePhysicsAcceptance physics_acceptance(world);
     fixture::Require(world.Reset() == phi::Status::Ok, "quality replay reset failed");
     const bool reset_equal = State(world, false) == initial;
+    IntervalStateTrace interval_trace(world, options.interval_output, config);
     std::vector<uint32_t> status(options.envs);
     uint32_t status_union = 0u;
     std::vector<uint32_t> status_first_failure_step_by_env(options.envs, 0u);
@@ -1690,6 +1866,7 @@ Json Run(const Options& options) {
     for (uint32_t i = 0; i < options.warmup + options.steps; ++i) {
         Step(world, options);
         physics_acceptance.Observe(world, i + 1u);
+        interval_trace.Observe(world);
         fixture::Require(world.GetData().DownloadField(nk::FieldId::EnvStatus, status.data(),
                          status.size() * sizeof(uint32_t)), "status download failed");
         bool first_failure_step = false;
@@ -1731,6 +1908,7 @@ Json Run(const Options& options) {
         if (periodic_sample) vbd_samples.PushBack(std::move(vbd_quality));
     }
     const auto replay_state = State(world);
+    interval_trace.Close(timed_state == replay_state, !options.quality_only);
     const auto replay_sensors = StateSensorBytes(world);
     const auto replay_existing_sensors = StateSensorBytes(world, false);
     bool finite = true;
@@ -1746,6 +1924,10 @@ Json Run(const Options& options) {
         output.write(reinterpret_cast<const char*>(replay_state.data()), replay_state.size());
         fixture::Require(output.good(), "cannot write state output");
     }
+    if (options.quality_only && options.render_sensors != 0u) {
+        render_measurements = RenderMeasurements(world, visuals, options, replay_state);
+        render_valid = render_measurements.At("valid").AsBool();
+    }
     const std::vector<uint32_t> reset_envs{0u};
     fixture::Require(world.Reset(reset_envs) == phi::Status::Ok, "masked reset failed");
     const auto masked_reset_errors = MaskedResetMismatches(world, initial, physical_state,
@@ -1757,15 +1939,17 @@ Json Run(const Options& options) {
     result.Set("scene", Json::Str(options.scene));
     Json configuration = Json::Object();
     configuration.Set("envs", Json::Int(options.envs));
+    configuration.Set("quality_only", Json::Bool(options.quality_only != 0u));
     configuration.Set("dt", Json::Float(options.dt));
     configuration.Set("substeps", Json::Int(options.substeps));
     configuration.Set("mpm_substeps", Json::Int(world.GetModel().particles.mpm_substeps));
+    configuration.Set("mpm_grid_refinement", Json::Int(options.mpm_grid_refinement));
     configuration.Set("mpm_particles_per_env", Json::Int(world.GetModel().MpmParticlesPerEnv()));
     Json mpm_stress = Json::Object();
     mpm_stress.Set("requested", Json::Bool(options.mpm_implicit_stress != 0u));
     mpm_stress.Set("actual", Json::Bool(caps.mpm_stress_cells_per_env != 0u));
     mpm_stress.Set("capacity", Json::Int(caps.mpm_stress_cells_per_env));
-    mpm_stress.Set("capacity_scope", Json::Str("reserved material stress cells per environment"));
+    mpm_stress.Set("capacity_scope", Json::Str("reserved material point stress blocks per environment"));
     configuration.Set("mpm_implicit_stress", std::move(mpm_stress));
     configuration.Set("state_sensors", Json::Int(options.state_sensors));
     configuration.Set("tactile_grid", Json::Int(options.tactile_grid));
@@ -1836,33 +2020,42 @@ Json Run(const Options& options) {
     execution.Set("graph_forked_operators", Json::Int(graph.forked_operators));
     execution.Set("warmup", Json::Int(options.warmup));
     execution.Set("steps", Json::Int(options.steps));
-    execution.Set("boundary", Json::Str("full physics pipeline with contact readout; held control; per-step GPU events; no timed D2H"));
+    execution.Set("boundary", Json::Str(options.quality_only ? "full physical quality replay; no timed pass" :
+        "full physics pipeline with contact readout; held control; per-step GPU events; no timed D2H"));
     result.Set("execution", std::move(execution));
-    timing.Set("scene_preparation_ms", Json::Float(preparation_ms));
-    timing.Set("host_clock", Json::Str(Clock::Name()));
-    timing.Set("cook_ms", Json::Float(cook_ms));
-    timing.Set("create_upload_ms", Json::Float(creation_ms));
-    timing.Set("capture_first_execute_ms", Json::Float(capture_ms));
-    timing.Set("warmup_ms", Json::Float(warmup_ms));
-    timing.Set("host_submission_ms", Json::Float(submission_ms));
-    timing.Set("gpu_completion_ms", Json::Float(gpu_ms));
-    timing.Set("synchronized_wall_ms", Json::Float(wall_ms));
-    timing.Set("gpu_to_host_duration_ratio", Json::Float(gpu_ms / wall_ms));
-    timing.Set("batch_step_ms", Json::Float(static_cast<double>(gpu_ms) / options.steps));
-    timing.Set("env_steps_per_s", Json::Float(static_cast<double>(options.envs) * options.steps * 1000.0 / wall_ms));
-    timing.Set("amortized_env_step_us", Json::Float(gpu_ms * 1000.0 / options.steps / options.envs));
-    timing.Set("rtf", Json::Float(static_cast<double>(options.dt) * options.steps * 1000.0 / gpu_ms));
+    if (!options.quality_only) {
+        timing.Set("scene_preparation_ms", Json::Float(preparation_ms));
+        timing.Set("host_clock", Json::Str(Clock::Name()));
+        timing.Set("cook_ms", Json::Float(cook_ms));
+        timing.Set("create_upload_ms", Json::Float(creation_ms));
+        timing.Set("capture_first_execute_ms", Json::Float(capture_ms));
+        timing.Set("warmup_ms", Json::Float(warmup_ms));
+        timing.Set("host_submission_ms", Json::Float(submission_ms));
+        timing.Set("gpu_completion_ms", Json::Float(gpu_ms));
+        timing.Set("synchronized_wall_ms", Json::Float(wall_ms));
+        timing.Set("gpu_to_host_duration_ratio", Json::Float(gpu_ms / wall_ms));
+        timing.Set("batch_step_ms", Json::Float(static_cast<double>(gpu_ms) / options.steps));
+        timing.Set("env_steps_per_s", Json::Float(static_cast<double>(options.envs) * options.steps * 1000.0 / wall_ms));
+        timing.Set("amortized_env_step_us", Json::Float(gpu_ms * 1000.0 / options.steps / options.envs));
+        timing.Set("rtf", Json::Float(static_cast<double>(options.dt) * options.steps * 1000.0 / gpu_ms));
+    }
     timing.Set("quality_replay_ms", Json::Float(quality_ms));
+    if (options.quality_only) {
+        timing = Json::Object();
+        timing.Set("status", Json::Str("unmeasured"));
+        timing.Set("scope", Json::Str("quality-only run; no performance samples"));
+        timing.Set("quality_replay_ms", Json::Float(quality_ms));
+    }
     result.Set("timing", std::move(timing));
     Json per_tag = Json::Object();
-    per_tag.Set("gpu_step", Distribution(std::move(gpu_us)));
-    per_tag.Set("host_step_submission", Distribution(std::move(host_us)));
+    per_tag.Set("gpu_step", options.quality_only ? Json::Null() : Distribution(std::move(gpu_us)));
+    per_tag.Set("host_step_submission", options.quality_only ? Json::Null() : Distribution(std::move(host_us)));
     result.Set("per_tag", std::move(per_tag));
     result.Set("memory", Memory(world));
     result.Set("timed_memory", timed_memory);
     Json sensors = Json::Object();
     sensors.Set("count", Json::Int(world.StateSensors().Count()));
-    sensors.Set("timed_replay_bit_equal", Json::Bool(timed_sensors == replay_sensors));
+    sensors.Set("timed_replay_bit_equal", options.quality_only ? Json::Null() : Json::Bool(timed_sensors == replay_sensors));
     sensors.Set("state_fnv1a64", Json::Str(Digest(replay_sensors)));
     sensors.Set("existing_state_fnv1a64", Json::Str(Digest(replay_existing_sensors)));
     sensors.Set("tactile_count", Json::Int(options.tactile_grid ? 1u + options.tactile_grid * options.tactile_grid : 0u));
@@ -1914,8 +2107,8 @@ Json Run(const Options& options) {
     Json masked_errors = Json::Array();
     for (uint32_t env : masked_reset_errors) masked_errors.PushBack(Json::Int(env));
     quality.Set("masked_reset_mismatch_envs", std::move(masked_errors));
-    quality.Set("timed_replay_bit_equal", Json::Bool(timed_state == replay_state));
-    quality.Set("timed_replay_differences", StateDifferences(world, timed_state, replay_state));
+    quality.Set("timed_replay_bit_equal", options.quality_only ? Json::Null() : Json::Bool(timed_state == replay_state));
+    quality.Set("timed_replay_differences", options.quality_only ? Json::Null() : StateDifferences(world, timed_state, replay_state));
     quality.Set("state_fnv1a64", Json::Str(Digest(replay_state)));
     quality.Set("authoritative_state_fnv1a64", Json::Str(Digest(
         std::vector<uint8_t>(replay_state.begin(), replay_state.begin() + initial.size()))));
@@ -1929,7 +2122,7 @@ Json Run(const Options& options) {
     quality.Set("coupling_acceptance", coupling_acceptance.Report());
     quality.Set("vbd_samples", std::move(vbd_samples));
     quality.Set("vbd_acceptance", vbd_acceptance.Report());
-    const auto physical_acceptance = physics_acceptance.Report(timed_state == replay_state);
+    const auto physical_acceptance = physics_acceptance.Report(timed_state == replay_state, !options.quality_only);
     quality.Set("physical_acceptance", physical_acceptance);
     result.Set("quality", std::move(quality));
     if (options.render_sensors != 0u) {
@@ -1947,10 +2140,11 @@ Json Run(const Options& options) {
     hardware.Set("total_device_bytes", Json::Int(properties.totalGlobalMem));
     result.Set("hardware", std::move(hardware));
     Json validity = Json::Object(), unavailable = Json::Array();
-    const bool valid = finite && wrench_finite && status_union == 0u && reset_equal && masked_reset_errors.empty() && timed_state == replay_state &&
+    const bool valid = finite && wrench_finite && status_union == 0u && reset_equal && masked_reset_errors.empty() &&
+                       (options.quality_only || timed_state == replay_state) &&
                        solver_workload_valid &&
                        coupling_valid && mismatched_envs.empty() && vbd_acceptance.Valid() && render_valid &&
-                       timed_sensors == replay_sensors;
+                       (options.quality_only || timed_sensors == replay_sensors);
     validity.Set("valid", Json::Bool(valid));
     validity.Set("valid_scope", Json::Str("lifecycle/state/render/deformation/coupling workload contracts"));
     validity.Set("passes_full_physics_acceptance", physical_acceptance.At("passes_full_physics_acceptance"));
@@ -1966,7 +2160,7 @@ Json Run(const Options& options) {
     if (!coupling_valid) failures.PushBack(Json::Str("missing rows or positive impulse for a required system pair in the timed window of an environment"));
     if (!masked_reset_errors.empty()) failures.PushBack(Json::Str("masked reset changed unselected state or missed selected state"));
     if (!render_valid) failures.PushBack(Json::Str("sensor lifecycle, output or physics parity failed"));
-    if (timed_sensors != replay_sensors) failures.PushBack(Json::Str("mounted sensor replay mismatch"));
+    if (!options.quality_only && timed_sensors != replay_sensors) failures.PushBack(Json::Str("mounted sensor replay mismatch"));
     validity.Set("failures", std::move(failures));
     unavailable.PushBack(Json::Str("GPU clocks, source/binary SHA256 and process identity are collected by the sweep runner"));
     unavailable.PushBack(Json::Str("full energy balance, independent CCD, matched external references and convergence remain unmeasured; committed gap and multi-substep residual coverage may be incomplete"));

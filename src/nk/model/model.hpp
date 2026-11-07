@@ -121,6 +121,8 @@ struct ModelCapacities {
     uint64_t contact_index_scratch_bytes = 0;
     // The contact index exists once a contact readout is demanded, in buffers of its own.
     bool contact_readout = false;
+    bool interval_state_readout = false;
+    bool energy_readout = false;
     // Coulomb block responses exist only while a solve measures contact residuals.
     bool contact_response = false;
     uint64_t pair_sample_chunk_words = 0;

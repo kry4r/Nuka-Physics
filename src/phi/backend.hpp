@@ -98,6 +98,8 @@ struct BackendI {
     float       (*event_elapsed_ms)(Backend*, Event*, Event*);
     ResourceInfo (*resource_info)(Backend*);
     PlanMetrics (*plan_metrics)(Backend*, Plan*);
+    // Submit ordered repetitions of the complete plan and report the number successfully submitted.
+    Status (*plan_execute_repeated)(Backend*, Plan*, uint32_t, uint32_t*, ExecutionError*) = nullptr;
 };
 
 // ---------------------------------------------------------------------------
@@ -147,6 +149,19 @@ inline Plan* BackendPlanCreate(Backend* b, const ModelView& m, const DataView& d
 }
 inline Status BackendPlanExecute(Backend* b, Plan* p, ExecutionError* error = nullptr) {
     return IfaceOf(b)->plan_execute(b, p, error);
+}
+inline Status BackendPlanExecuteRepeated(Backend* b, Plan* p, uint32_t count,
+                                         uint32_t* submitted, ExecutionError* error = nullptr) {
+    *submitted = 0u;
+    if (error) *error = {};
+    if (count == 0u) return Status::Ok;
+    if (IfaceOf(b)->plan_execute_repeated)
+        return IfaceOf(b)->plan_execute_repeated(b, p, count, submitted, error);
+    for (; *submitted < count; ++*submitted) {
+        const auto status = BackendPlanExecute(b, p, error);
+        if (status != Status::Ok) return status;
+    }
+    return Status::Ok;
 }
 inline void        BackendPlanFree(Backend* b, Plan* p)    { IfaceOf(b)->plan_free(b, p); }
 inline Event*      BackendEventNew(Backend* b)             { return IfaceOf(b)->event_new(b); }

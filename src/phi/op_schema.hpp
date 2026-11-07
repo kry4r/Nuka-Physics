@@ -743,6 +743,12 @@ struct ReadoutEnergyLedgerParams {
     uint32_t slot = 0u;
     uint32_t particles_per_env = 0u;
     uint32_t mpm_particles_per_env = 0u;
+    uint32_t grid_nodes_per_env = 0u;
+    uint32_t grid_dims[3]{};
+    float grid_origin[3]{};
+    float grid_dx = 0.0f;
+    uint32_t mpm_material_count = 0u;
+    uint32_t mpm_implicit_stress = 0u;
     uint32_t point_endpoints_per_env = 0u;
     float floor_normal[3]{};
     float floor_d = 0.0f;
@@ -759,8 +765,8 @@ struct ReadoutEnergyLedgerParams {
     uint32_t limit_rows = 0u;
     uint32_t friction_rows = 0u;
     uint32_t drive_rows = 0u;
+    uint32_t implicit_passive_damping = 0u;
     uint32_t has_aero = 0u;
-    uint32_t has_dat = 0u;
     uint32_t pos_pass = 0u;
     uint32_t coverage_status = 0u;
     uint32_t physics_diagnostics = 0u;

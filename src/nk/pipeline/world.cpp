@@ -14,6 +14,7 @@
 #include "phi/articulation_contract.hpp"
 #include "nk/model/contact_capacity.hpp"
 #include "nk/readout/physics_diagnostics.hpp"
+#include "nk/readout/interval_state.hpp"
 #include "nk/solve/nk_row.hpp"
 
 namespace nuka::nk {
@@ -718,6 +719,25 @@ phi::Status World::StepConfigured() {
     return execution_mode_ == ExecutionMode::Graph ? StepPlanned() : Step().result;
 }
 
+phi::Status World::StepConfigured(uint32_t count, uint32_t* submitted) {
+    if (submitted == nullptr) return last_status_ = phi::Status::InvalidArgument;
+    *submitted = 0u;
+    if (count == 0u) return last_status_ = phi::Status::Ok;
+    if (execution_mode_ != ExecutionMode::Graph) {
+        for (; *submitted < count; ++*submitted) {
+            const auto status = Step().result;
+            if (status != phi::Status::Ok) return status;
+        }
+        return last_status_;
+    }
+    const auto status = PrepareGraph();
+    if (status != phi::Status::Ok) return status;
+    last_status_ = phi::BackendPlanExecuteRepeated(backend_, plan_, count, submitted, &execution_error_);
+    graph_replays_ += *submitted;
+    state_sensors_.StepCompleted(*submitted);
+    return last_status_;
+}
+
 phi::Status World::Synchronize() {
     if (!ready_ || !backend_) return last_status_ = phi::Status::Failed;
     return last_status_ = phi::BackendSynchronize(backend_, &execution_error_);
@@ -875,6 +895,7 @@ phi::Status World::SetLinkParam(FieldId id, uint32_t link_index, const float* va
 
 phi::Status World::DemandReadout(FieldId id) {
     uint32_t bit = 0u;
+    if (IsIntervalStateField(id)) bit = Pipeline::kReadoutIntervalState;
     if (id == FieldId::VbdSolveAudit)
         bit = Pipeline::kReadoutVbdSolveAudit;
     if (id == FieldId::PhysicsStageMetrics)
@@ -903,6 +924,18 @@ phi::Status World::DemandReadout(FieldId id) {
     if (last_status_ != phi::Status::Ok) return last_status_;
     phi::BufferType* bt = phi::BackendDeviceBufferType(backend_);
     auto& cap = model_.capacities;
+    if ((bit & Pipeline::kReadoutIntervalState) != 0u && !cap.interval_state_readout) {
+        ModelCapacities demanded = cap;
+        demanded.interval_state_readout = true;
+        for (uint32_t field = 0u; field < kFieldCount; ++field) {
+            const FieldId output = static_cast<FieldId>(field);
+            if (!IsIntervalStateField(output) || demanded.ElementCount(output) == 0u) continue;
+            last_status_ = data_.AllocateField(bt, output,
+                CheckedProduct({demanded.ElementCount(output), uint64_t{LayoutOf(output).elem_size}}));
+            if (last_status_ != phi::Status::Ok) return last_status_;
+        }
+        cap.interval_state_readout = true;
+    }
     if ((bit & Pipeline::kReadoutContactWrench) != 0u && !cap.contact_readout) {
         ModelCapacities demanded = cap;
         demanded.contact_readout = true;
@@ -952,6 +985,32 @@ uint32_t World::Demand(uint32_t telemetry_mask) const {
 phi::Status World::BuildDemanded(uint32_t demand, std::unique_ptr<Pipeline>* out) {
     phi::BufferType* bt = phi::BackendDeviceBufferType(backend_);
     auto& cap = model_.capacities;
+    if ((demand & Pipeline::kReadoutEnergyLedger) != 0u && !cap.energy_readout) {
+        ModelCapacities demanded = cap;
+        demanded.energy_readout = true;
+        const auto allocate = [&](FieldId field) {
+            const uint64_t count = demanded.ElementCount(field);
+            return count == 0u ? phi::Status::Ok : data_.AllocateField(bt, field,
+                CheckedProduct({count, uint64_t{LayoutOf(field).elem_size}}));
+        };
+        for (FieldId field : kEnergyMpmParticleFields) {
+            const auto status = allocate(field);
+            if (status != phi::Status::Ok) return status;
+        }
+        for (FieldId field : kEnergyMpmGridFields) {
+            const auto status = allocate(field);
+            if (status != phi::Status::Ok) return status;
+        }
+        for (FieldId field : kEnergyArticulationFields) {
+            const auto status = allocate(field);
+            if (status != phi::Status::Ok) return status;
+        }
+        for (FieldId field : kEnergyLoadFields) {
+            const auto status = allocate(field);
+            if (status != phi::Status::Ok) return status;
+        }
+        cap.energy_readout = true;
+    }
     auto candidate = std::make_unique<Pipeline>();
     auto status = candidate->Build(model_, cfg_, device_, demand, &state_sensors_);
     if (status != phi::Status::Ok) return status;

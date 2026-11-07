@@ -39,6 +39,19 @@ class EnergyColumn(IntEnum):
     ROW_PHYSICAL_IMPULSE_WORK = 28
     UNCLASSIFIED_ROW_WORK = 29
     VALID = 30
+    MPM_BEGIN_AFFINE_KINETIC = 31
+    MPM_END_AFFINE_KINETIC = 32
+    MPM_P2G_LOSS = 33
+    MPM_G2P_LOSS = 34
+    MPM_AFFINE_TRANSPORT = 35
+    MPM_PLASTIC_LOSS = 36
+    MPM_VOLUME_AVERAGE_WORK = 37
+    MPM_STRESS_WORK = 38
+    MPM_BOUNDARY_WORK = 39
+    MPM_VISCOUS_LOSS = 40
+    MPM_GRID_BEGIN_KINETIC = 41
+    MPM_GRID_SOLVED_KINETIC = 42
+    POSITION_KINETIC_WORK = 43
 
 
 class EnergyStatus(IntFlag):
@@ -112,7 +125,9 @@ def _summarize_stream(values, status):
     absolute_residual = float(np.abs(residual).sum())
     net_residual = float(residual.sum())
     truncation = float(records[:, c.DAT_KINETIC_LOSS].sum())
-    negative_losses = int((records[:, c.FRICTION_LOSS:c.RAYLEIGH_LOSS + 1] < -1e-9).sum())
+    loss_columns = list(range(c.FRICTION_LOSS, c.RAYLEIGH_LOSS + 1)) + [
+        c.MPM_P2G_LOSS, c.MPM_G2P_LOSS, c.MPM_PLASTIC_LOSS, c.MPM_VISCOUS_LOSS]
+    negative_losses = int((records[:, loss_columns] < -1e-9).sum())
     report.update({
         "throughput_j": throughput, "net_residual_j": net_residual,
         "absolute_residual_j": absolute_residual, "positive_residual_j": float(np.maximum(residual, 0).sum()),

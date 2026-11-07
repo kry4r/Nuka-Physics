@@ -705,26 +705,26 @@ nuka_result_t nuka_world_step_n(nuka_world_handle world, uint32_t step_count) {
     if (step_count == 0u) {
         return NUKA_RESULT_OK;
     }
+    uint32_t submitted = 0u;
+    nuka_result_t outcome = NUKA_RESULT_INTERNAL;
     try {
-        for (uint32_t step = 0u; step < step_count; ++step) {
-            const auto result = record->world->StepConfigured();
-            if (result != nuka::phi::Status::Ok) {
-                const auto& error = record->world->LastExecutionError();
-                std::fprintf(stderr, "[World] step %u failed at op %u (native %d): %s\n",
-                    record->simulated_step_count, static_cast<unsigned>(error.failed_op),
-                    error.native_code, error.message);
-                return nuka::c_abi::MapStatusToResult(result);
-            }
-            ++record->simulated_step_count;
+        const auto result = record->world->StepConfigured(step_count, &submitted);
+        if (result != nuka::phi::Status::Ok) {
+            const auto& error = record->world->LastExecutionError();
+            std::fprintf(stderr, "[World] step %u failed at op %u (native %d): %s\n",
+                record->simulated_step_count + submitted, static_cast<unsigned>(error.failed_op),
+                error.native_code, error.message);
         }
-        return NUKA_RESULT_OK;
+        outcome = nuka::c_abi::MapStatusToResult(result);
     } catch (const std::bad_alloc&) {
-        return NUKA_RESULT_OUT_OF_MEMORY;
+        outcome = NUKA_RESULT_OUT_OF_MEMORY;
     } catch (const std::exception& error) {
-        return nuka::c_abi::MapExceptionToResult(error);
+        outcome = nuka::c_abi::MapExceptionToResult(error);
     } catch (...) {
-        return NUKA_RESULT_INTERNAL;
+        outcome = NUKA_RESULT_INTERNAL;
     }
+    record->simulated_step_count += submitted;
+    return outcome;
 }
 
 nuka_result_t nuka_world_set_execution_mode(nuka_world_handle world, nuka_execution_mode_t mode) {
@@ -754,7 +754,10 @@ nuka_result_t nuka_world_get_velocity_iterations(nuka_world_handle world, uint32
 }
 
 nuka_result_t nuka_world_get_solver_options(nuka_world_handle world, nuka_solver_options_t* out) {
+    if (out == nullptr) return NUKA_RESULT_INVALID_ARG;
     const auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->world) return NUKA_RESULT_NOT_SUPPORTED;
     const auto& options = record->world->GetModel().solver_options;
     *out = {static_cast<uint32_t>(options.cone), static_cast<uint32_t>(options.integrator),
             options.impratio, options.refsafe ? 1u : 0u};
@@ -762,14 +765,22 @@ nuka_result_t nuka_world_get_solver_options(nuka_world_handle world, nuka_solver
 }
 
 nuka_result_t nuka_world_get_contact_profile_count(nuka_world_handle world, uint32_t* out) {
+    if (out == nullptr) return NUKA_RESULT_INVALID_ARG;
     const auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->world) return NUKA_RESULT_NOT_SUPPORTED;
     *out = static_cast<uint32_t>(record->world->GetModel().contact_profile_shapes.size());
     return NUKA_RESULT_OK;
 }
 
 nuka_result_t nuka_world_get_contact_profile_name(nuka_world_handle world, uint32_t index, const char** out) {
+    if (out == nullptr) return NUKA_RESULT_INVALID_ARG;
     const auto* record = nuka::c_abi::WorldTable().Get(world);
-    *out = record->world->GetModel().contact_profile_shapes[index].c_str();
+    if (record == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->world) return NUKA_RESULT_NOT_SUPPORTED;
+    const auto& shapes = record->world->GetModel().contact_profile_shapes;
+    if (index >= shapes.size()) return NUKA_RESULT_INVALID_ARG;
+    *out = shapes[index].c_str();
     return NUKA_RESULT_OK;
 }
 

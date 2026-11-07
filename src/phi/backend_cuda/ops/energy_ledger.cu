@@ -1,4 +1,6 @@
 #include <cuda_runtime.h>
+
+#include "collision/analytical_manifold.hpp"
 #include "phi/backend_cuda/ops/contact_row_layout.cuh"
 
 #include <cmath>
@@ -6,12 +8,14 @@
 #include <limits>
 
 #include "nk/readout/energy_ledger.hpp"
+#include "nk/material/mpm_constitutive.hpp"
+#include "nk/material/mpm_energy.hpp"
 #include "nk/readout/physics_diagnostics.hpp"
 #include "nk/solve/vertex_block.hpp"
 #include "collision/ogc_geometry.hpp"
 #include "phi/backend_cuda/launch.cuh"
 #include "phi/backend_cuda/ops/articulation_types.cuh"
-#include "phi/backend_cuda/ops/dat_motion.cuh"
+#include "phi/backend_cuda/ops/contact_features.cuh"
 #include "phi/backend_cuda/ops/kinematics.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
@@ -31,7 +35,7 @@ constexpr uint32_t kThreads = 128u;
 constexpr uint32_t kColumns = nk::kEnergyColumnCount;
 constexpr uint32_t kForceWorkColumn = kColumns;
 constexpr uint32_t kReductionColumns = kColumns + 1u;
-static_assert(kColumns == 31u, "energy field record must match its named columns");
+static_assert(kColumns == 44u, "energy field record must match its named columns");
 
 __device__ uint32_t Column(EnergyColumn value) { return static_cast<uint32_t>(value); }
 __device__ double Dot(Vec3 a, Vec3 b) {
@@ -39,6 +43,18 @@ __device__ double Dot(Vec3 a, Vec3 b) {
 }
 __device__ Vec3 InverseRotate(math::Quat q, Vec3 value) {
     return mg::RotateByQuatNormalized(mg::MakeQuat(q.w, -q.x, -q.y, -q.z), value);
+}
+__device__ nk::Spatial6 ComTwist(Vec3 angular, Vec3 linear) {
+    return {{angular.x, angular.y, angular.z, linear.x, linear.y, linear.z}};
+}
+// Wrenches contain world force then COM torque; twists contain angular then COM linear velocity.
+__device__ double LoadWork(const nk::Spatial6& wrench, const nk::Spatial6& before,
+                          const nk::Spatial6& solved, float dt) {
+    double work = 0.0;
+    for (uint32_t k = 0u; k < 3u; ++k)
+        work += double(wrench.v[k]) * (double(before.v[k + 3u]) + solved.v[k + 3u]) +
+                double(wrench.v[k + 3u]) * (double(before.v[k]) + solved.v[k]);
+    return 0.5 * dt * work;
 }
 __device__ bool IsVertex(const ReadoutEnergyLedgerParams& p, uint32_t particle) {
     const uint32_t local = particle % p.particles_per_env;
@@ -61,6 +77,177 @@ __device__ Vec3 ParticleVelocity(const DataView& d, const ReadoutEnergyLedgerPar
                                     d.vbd_free_velocity[slot], p.dt, d.vbd_step[slot]);
 }
 
+__device__ void MpmEnergyAxes(Vec3 position, const ReadoutEnergyLedgerParams& p,
+                             nk::MpmCompactAxis (&axes)[3]) {
+    const float inverse_dx = 1.0f / p.grid_dx;
+    const float coordinate[3] = {(position.x - p.grid_origin[0]) * inverse_dx,
+        (position.y - p.grid_origin[1]) * inverse_dx, (position.z - p.grid_origin[2]) * inverse_dx};
+    for (int a = 0; a < 3; ++a) axes[a] = nk::MpmCompactWeights(coordinate[a]);
+}
+
+__device__ nk::MpmMaterial EnergyMpmMaterial(const DataView& d, uint32_t particle) {
+    return reinterpret_cast<const nk::MpmMaterial*>(d.mpm_material_table)[d.particle_material_id[particle]];
+}
+
+__global__ void EnergyGridClearKernel(DataView d, ReadoutEnergyLedgerParams p) {
+    const size_t node = size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+    if (node >= size_t{p.env_count} * p.grid_nodes_per_env) return;
+    d.energy_grid_entry_mass[node] = 0.0;
+    for (uint32_t a = 0u; a < 3u; ++a) {
+        d.energy_grid_entry_momentum[3u * node + a] = 0.0;
+        d.energy_grid_stress_impulse[3u * node + a] = 0.0;
+        d.energy_grid_viscous_impulse[3u * node + a] = 0.0;
+    }
+    d.energy_grid_free_velocity[node] = d.grid_velocity[node];
+    d.energy_grid_prescribed[node] = 0u;
+}
+
+// Reconstruct transfer contributions in private double sums without changing the simulation grid.
+__global__ void EnergyMpmTransferKernel(DataView d, ReadoutEnergyLedgerParams p) {
+    const uint32_t at = blockIdx.x * blockDim.x + threadIdx.x;
+    if (at >= p.env_count * p.mpm_particles_per_env) return;
+    const uint32_t env = at / p.mpm_particles_per_env;
+    const uint32_t particle = env * p.particles_per_env + at % p.mpm_particles_per_env;
+    const size_t record = size_t{env} * p.substeps + p.slot;
+    if (d.particle_material_id[particle] >= p.mpm_material_count) {
+        atomicOr(d.energy_ledger_status + record, nk::energy_status::kGridMaterial);
+        return;
+    }
+    const auto material = EnergyMpmMaterial(d, particle);
+    const Vec3 position = d.particle_pos[particle], velocity = d.particle_vel[particle];
+    const double mass = d.particle_inv_mass[particle] > 0.0f ? 1.0 / d.particle_inv_mass[particle] : 0.0;
+    const float* affine = d.particle_C + size_t{particle} * 9u;
+    const float* stress = d.mpm_particle_stress + size_t{particle} * 9u;
+    const float* deformation = d.particle_F + size_t{particle} * 9u;
+    const double j_visc = nk::material::detail::Determinant(deformation) * material.viscosity;
+    nk::MpmCompactAxis axes[3];
+    MpmEnergyAxes(position, p, axes);
+    float inverse[6];
+    if (!nk::MpmApicInverse(axes, 1.0f / p.grid_dx, inverse)) {
+        atomicOr(d.energy_ledger_status + record, nk::energy_status::kGridMaterial);
+        return;
+    }
+    if (p.mpm_implicit_stress && material.viscosity > 0.0f)
+        atomicOr(d.energy_ledger_status + record, nk::energy_status::kGridMaterial);
+    if (mass == 0.0)
+        for (int k = 0; k < 9; ++k)
+            if (stress[k] != 0.0f) atomicOr(d.energy_ledger_status + record, nk::energy_status::kGridMaterial);
+    for (uint32_t lattice = 0u; lattice < nk::kMpmLattices; ++lattice)
+        for (uint32_t z = 0u; z < nk::kMpmStencilWidth; ++z)
+            for (uint32_t y = 0u; y < nk::kMpmStencilWidth; ++y)
+                for (uint32_t x = 0u; x < nk::kMpmStencilWidth; ++x) {
+                    const int64_t node = nk::MpmNodeIndex(env, lattice, axes[0].base[lattice] + x,
+                        axes[1].base[lattice] + y, axes[2].base[lattice] + z, p.grid_dims, p.grid_nodes_per_env);
+                    if (node < 0) continue;
+                    const double weight = double(nk::kMpmLatticeShare) * axes[0].w[lattice][x] *
+                        axes[1].w[lattice][y] * axes[2].w[lattice][z];
+                    if (mass == 0.0 && float(weight * d.particle_vol0[particle]) > 0.0f)
+                        atomicExch(d.energy_grid_prescribed + node, 1u);
+                    atomicAdd(d.energy_grid_entry_mass + node, weight * mass);
+                    const float shift = nk::MpmLatticeOffset(lattice);
+                    const double offset[3] = {
+                        p.grid_origin[0] + (float(axes[0].base[lattice] + x) + shift) * p.grid_dx - position.x,
+                        p.grid_origin[1] + (float(axes[1].base[lattice] + y) + shift) * p.grid_dx - position.y,
+                        p.grid_origin[2] + (float(axes[2].base[lattice] + z) + shift) * p.grid_dx - position.z};
+                    const double gradient[3] = {
+                        inverse[0] * offset[0] + inverse[3] * offset[1] + inverse[4] * offset[2],
+                        inverse[3] * offset[0] + inverse[1] * offset[1] + inverse[5] * offset[2],
+                        inverse[4] * offset[0] + inverse[5] * offset[1] + inverse[2] * offset[2]};
+                    const float linear[3] = {velocity.x, velocity.y, velocity.z};
+                    for (uint32_t a = 0u; a < 3u; ++a) {
+                        double momentum = linear[a], impulse = 0.0, viscous = 0.0;
+                        for (uint32_t b = 0u; b < 3u; ++b) {
+                            momentum += affine[3u * a + b] * offset[b];
+                            impulse += stress[3u * a + b] * gradient[b];
+                            viscous += j_visc * (affine[3u * a + b] + affine[3u * b + a]) * gradient[b];
+                        }
+                        atomicAdd(d.energy_grid_entry_momentum + 3u * node + a, weight * mass * momentum);
+                        if (!p.mpm_implicit_stress) {
+                            const double scale = -double(p.dt) * weight * d.particle_vol0[particle];
+                            atomicAdd(d.energy_grid_stress_impulse + 3u * node + a, scale * impulse);
+                            atomicAdd(d.energy_grid_viscous_impulse + 3u * node + a, scale * viscous);
+                        }
+                    }
+                }
+}
+
+// Transfer loss is the weighted least-squares residual, so subtraction of almost equal energies cannot change its sign.
+__device__ double MpmTransferLoss(const DataView& d, const ReadoutEnergyLedgerParams& p,
+    uint32_t particle, Vec3 position, Vec3 velocity, const float* affine, bool scatter) {
+    const uint32_t env = particle / p.particles_per_env;
+    const double mass = 1.0 / d.particle_inv_mass[particle];
+    const float linear[3] = {velocity.x, velocity.y, velocity.z};
+    nk::MpmCompactAxis axes[3];
+    MpmEnergyAxes(position, p, axes);
+    double loss = 0.0;
+    for (uint32_t lattice = 0u; lattice < nk::kMpmLattices; ++lattice)
+        for (uint32_t z = 0u; z < nk::kMpmStencilWidth; ++z)
+            for (uint32_t y = 0u; y < nk::kMpmStencilWidth; ++y)
+                for (uint32_t x = 0u; x < nk::kMpmStencilWidth; ++x) {
+                    const int64_t node = nk::MpmNodeIndex(env, lattice, axes[0].base[lattice] + x,
+                        axes[1].base[lattice] + y, axes[2].base[lattice] + z, p.grid_dims, p.grid_nodes_per_env);
+                    if (node < 0) continue;
+                    const double weight = double(nk::kMpmLatticeShare) * axes[0].w[lattice][x] *
+                        axes[1].w[lattice][y] * axes[2].w[lattice][z];
+                    const float shift = nk::MpmLatticeOffset(lattice);
+                    const double offset[3] = {
+                        scatter ? p.grid_origin[0] + (float(axes[0].base[lattice] + x) + shift) * p.grid_dx - position.x
+                                : axes[0].offset[lattice][x] * p.grid_dx,
+                        scatter ? p.grid_origin[1] + (float(axes[1].base[lattice] + y) + shift) * p.grid_dx - position.y
+                                : axes[1].offset[lattice][y] * p.grid_dx,
+                        scatter ? p.grid_origin[2] + (float(axes[2].base[lattice] + z) + shift) * p.grid_dx - position.z
+                                : axes[2].offset[lattice][z] * p.grid_dx};
+                    const Vec3 solved = d.grid_velocity[node];
+                    const double grid[3] = {solved.x, solved.y, solved.z};
+                    const double entry_mass = d.energy_grid_entry_mass[node];
+                    for (uint32_t a = 0u; a < 3u; ++a) {
+                        double fitted = linear[a];
+                        for (uint32_t b = 0u; b < 3u; ++b) fitted += affine[3u * a + b] * offset[b];
+                        const double reference = scatter ?
+                            (d.grid_inv_mass[node] > 0.0f && entry_mass > 0.0
+                                ? d.energy_grid_entry_momentum[3u * node + a] / entry_mass : 0.0) : grid[a];
+                        const double error = fitted - reference;
+                        loss += 0.5 * mass * weight * error * error;
+                    }
+                }
+    return loss;
+}
+
+struct EnergyMpmArithmetic {
+    __device__ static float Sum3(float a, float b, float c) { return __fadd_rn(__fadd_rn(a, b), c); }
+};
+
+__device__ bool MpmReturnEnergy(const DataView& d, const ReadoutEnergyLedgerParams& p,
+    uint32_t particle, const nk::MpmMaterial& material, double* plastic_loss, double* averaging_work) {
+    const size_t base = size_t{particle} * 9u;
+    const float* initial = d.energy_mpm_start_F + base;
+    const float* affine = d.particle_C + base;
+    const float alpha = d.energy_mpm_start_plastic[particle];
+    const float* plastic = d.energy_mpm_start_plastic_F ? d.energy_mpm_start_plastic_F + base : nullptr;
+    nk::material::MpmMaterialTrial accepted;
+    const auto status = nk::material::EvaluateMpmMaterialTrial<EnergyMpmArithmetic>(
+        material, {initial, plastic, alpha}, affine, p.dt, accepted);
+    if (status != nk::material::ConstitutiveStatus::Ok) return false;
+    double accepted_energy = 0.0, actual_energy = 0.0;
+    const float next_alpha = accepted.has_plastic_history ? accepted.equivalent_plastic_strain : alpha;
+    if (nk::material::EvaluateMpmStoredEnergy(material, accepted.elastic_f, next_alpha, accepted_energy) !=
+            nk::material::ConstitutiveStatus::Ok ||
+        nk::material::EvaluateMpmStoredEnergy(material, d.particle_F + base,
+            d.particle_plastic[particle], actual_energy) != nk::material::ConstitutiveStatus::Ok) return false;
+    *averaging_work = d.particle_vol0[particle] * (actual_energy - accepted_energy);
+    *plastic_loss = 0.0;
+    if (material.model_kind == nk::MpmMaterial::kHenckyJ2 || material.model_kind == 4.0f) {
+        float map[9], unreturned[9];
+        for (int k = 0; k < 9; ++k) map[k] = p.dt * affine[k] + (k % 4 == 0 ? 1.0f : 0.0f);
+        nk::material::mpm_detail::Mat3Mul<EnergyMpmArithmetic>(map, initial, unreturned);
+        double trial_energy = 0.0;
+        if (nk::material::EvaluateMpmStoredEnergy(material, unreturned, alpha, trial_energy) !=
+            nk::material::ConstitutiveStatus::Ok) return false;
+        *plastic_loss = d.particle_vol0[particle] * (trial_energy - accepted_energy);
+    }
+    return true;
+}
+
 // Skip cleared contact rows while retaining each thread's row order and noncontact assignments.
 __device__ uint32_t LedgerRow(uint32_t row, uint32_t bound, uint32_t contacts) {
     if (row < contacts && row >= bound)
@@ -79,25 +266,39 @@ __global__ void EnergyLinkFramesKernel(ModelView m, DataView d, ReadoutEnergyLed
         const uint32_t parent = m.parent_link[link];
         const auto type = static_cast<ArticulationJointType>(m.joint_type[link]);
         math::Transform pose{}, unprojected{};
-        Vec3 angular{}, linear{};
+        Vec3 angular{}, linear{}, no_angular{}, no_linear{};
+        const bool projected = p.stage == EnergyStage::Projected && p.pos_pass;
+        if (p.stage == EnergyStage::Begin) d.energy_link_start_rotation[link] = d.joint_rotation[link];
         if (parent == ~0u && type == ArticulationJointType::FloatingBase) {
             pose = unprojected = d.base_pose[art];
+            if (p.stage == EnergyStage::Begin) d.energy_base_start_pose[art] = pose;
             const auto velocity = d.link_velocity[link];
             angular = mg::RotateByQuatNormalized(pose.rotation,
                 {velocity.v[0], velocity.v[1], velocity.v[2]});
             linear = mg::RotateByQuatNormalized(pose.rotation,
                 {velocity.v[3], velocity.v[4], velocity.v[5]});
+            no_angular = angular;
+            no_linear = linear;
+            if (projected) {
+                unprojected = d.energy_base_start_pose[art];
+                unprojected.position += linear * p.dt;
+                const float h = 0.5f * p.dt;
+                unprojected.rotation = mg::QuatNormalizeRsqrt(mg::QuatMul(unprojected.rotation,
+                    mg::MakeQuat(1.0f, h * velocity.v[0], h * velocity.v[1], h * velocity.v[2])), 1.0e-12f);
+                no_angular = mg::RotateByQuatNormalized(unprojected.rotation,
+                    {velocity.v[0], velocity.v[1], velocity.v[2]});
+            }
         } else {
             const float coordinate = d.q[link];
-            const float no_position = coordinate -
-                (p.stage == EnergyStage::Projected && p.pos_pass ? p.dt * d.qdot_pseudo[link] : 0.0f);
+            const float no_position = projected ? d.energy_link_start_q[link] + p.dt * d.qdot[link] : coordinate;
             const math::Quat rotation = d.joint_rotation[link];
             math::Quat no_turn = rotation;
-            if (type == ArticulationJointType::Spherical && p.stage == EnergyStage::Projected && p.pos_pass) {
-                const auto pseudo = d.link_velocity_pseudo[link].v;
-                const float h = -0.5f * p.dt;
+            if (type == ArticulationJointType::Spherical && projected) {
+                const auto velocity = d.joint_angular_velocity[link];
+                const float h = 0.5f * p.dt;
                 no_turn = mg::QuatNormalizeRsqrt(
-                    mg::QuatMul(rotation, mg::MakeQuat(1.0f, h * pseudo[0], h * pseudo[1], h * pseudo[2])), 1.0e-12f);
+                    mg::QuatMul(d.energy_link_start_rotation[link],
+                        mg::MakeQuat(1.0f, h * velocity.x, h * velocity.y, h * velocity.z)), 1.0e-12f);
             }
             pose = JointRelativeFrame(type, m.joint_axis[link], m.link_local_pose[link],
                                        m.parent_offset[link], coordinate, rotation);
@@ -106,21 +307,32 @@ __global__ void EnergyLinkFramesKernel(ModelView m, DataView d, ReadoutEnergyLed
             if (parent != ~0u) {
                 const uint32_t parent_link = offset + parent;
                 const auto pv = d.energy_link_velocity[parent_link];
+                const auto npv = d.energy_link_unprojected_velocity[parent_link];
                 angular = {pv.v[0], pv.v[1], pv.v[2]};
+                no_angular = {npv.v[0], npv.v[1], npv.v[2]};
                 pose = ComposeFrame(d.energy_link_pose[parent_link], pose);
                 unprojected = ComposeFrame(d.energy_link_unprojected_pose[parent_link], unprojected);
                 linear = Vec3{pv.v[3], pv.v[4], pv.v[5]} +
                     angular.Cross(pose.position - d.energy_link_pose[parent_link].position);
+                no_linear = Vec3{npv.v[3], npv.v[4], npv.v[5]} + no_angular.Cross(
+                    unprojected.position - d.energy_link_unprojected_pose[parent_link].position);
             }
             const Vec3 axis = mg::RotateByQuatNormalized(pose.rotation, JointUnitAxis(m.joint_axis[link]));
+            const Vec3 no_axis = mg::RotateByQuatNormalized(unprojected.rotation, JointUnitAxis(m.joint_axis[link]));
             if (type == ArticulationJointType::Revolute) angular += axis * d.qdot[link];
+            if (type == ArticulationJointType::Revolute) no_angular += no_axis * d.qdot[link];
             if (type == ArticulationJointType::Prismatic) linear += axis * d.qdot[link];
-            if (type == ArticulationJointType::Spherical)
+            if (type == ArticulationJointType::Prismatic) no_linear += no_axis * d.qdot[link];
+            if (type == ArticulationJointType::Spherical) {
                 angular += mg::RotateByQuatNormalized(pose.rotation, d.joint_angular_velocity[link]);
+                no_angular += mg::RotateByQuatNormalized(unprojected.rotation, d.joint_angular_velocity[link]);
+            }
         }
         d.energy_link_pose[link] = pose;
         d.energy_link_unprojected_pose[link] = unprojected;
         d.energy_link_velocity[link] = {{angular.x, angular.y, angular.z, linear.x, linear.y, linear.z}};
+        d.energy_link_unprojected_velocity[link] = {{no_angular.x, no_angular.y, no_angular.z,
+            no_linear.x, no_linear.y, no_linear.z}};
     }
 }
 
@@ -129,11 +341,12 @@ struct RowPower {
     double rate = 0.0;
     double applied = 0.0;
     double kinematic = 0.0;
+    double grid_boundary = 0.0;
 };
 
 // Row power at the interval mean velocity, so the gravity integrated before the solve does no row work.
 __device__ RowPower SidePower(const NkRowSide& side, bool second, uint32_t row,
-    const ModelView&, const DataView& d, const ReadoutEnergyLedgerParams& p) {
+    const ModelView&, const DataView& d, const ReadoutEnergyLedgerParams& p, uint32_t material_axis = 0u) {
     RowPower out;
     if (side.kind == nk::kNkSideArtic) {
         const float* jacobian = (second ? d.chain_jacobian_b : d.chain_jacobian) +
@@ -153,6 +366,29 @@ __device__ RowPower SidePower(const NkRowSide& side, bool second, uint32_t row,
         points.terms = d.point_endpoint_terms;
         for (uint32_t k = 0u; k < points.Count(side); ++k) {
             const auto term = points.At(side, k);
+            if (term.kind == nk::kNkSideGrid) {
+                Vec3 jacobian = term.jacobian;
+                if (material_axis > 0u) {
+                    float components[3];
+                    nk::material::MpmDeviatorGradient(material_axis - 1u,
+                        jacobian.x, jacobian.y, jacobian.z, components);
+                    jacobian = {components[0], components[1], components[2]};
+                }
+                const uint32_t node = term.index;
+                if (!(d.grid_inv_mass[node] > 0.0f) && d.energy_grid_prescribed[node] == 0u) continue;
+                const double mass = d.grid_mass[node];
+                const double* entry = d.energy_grid_entry_momentum + size_t{node} * 3u;
+                const auto velocity = d.grid_velocity[node];
+                const double power = mass > 0.0 ? 0.5 *
+                    (jacobian.x * (entry[0] / mass + velocity.x) +
+                     jacobian.y * (entry[1] / mass + velocity.y) +
+                     jacobian.z * (entry[2] / mass + velocity.z)) : 0.0;
+                out.physical += power;
+                out.rate += power;
+                if (d.grid_inv_mass[node] > 0.0f) out.applied += power;
+                else out.grid_boundary += power;
+                continue;
+            }
             if (term.kind != nk::kNkSideParticle) continue;
             const uint32_t particle = term.index;
             const double physical = 0.5 * Dot(term.jacobian,
@@ -253,7 +489,7 @@ __device__ KinematicElasticResponse KinematicElasticReaction(const ModelView& m,
             for (uint32_t j = 0u; j < nk::VbdElementVertexCount(element.kind); ++j) {
                 const uint32_t point = base + element.vertex[j];
                 frozen.start[j] = d.particle_prev_pos[point];
-                rates[j] = d.particle_vel[point];
+                rates[j] = ParticleVelocity(d, p, point);
             }
             Vec3 applied;
             nk::vbd::ElementRayleighBlock(element, local, frozen, rates, &applied, &hessian);
@@ -295,13 +531,22 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
         if (c >= Column(EnergyColumn::DriveWork) && c <= Column(EnergyColumn::ExternalWork))
             values[Column(EnergyColumn::Throughput)] += fabs(value);
         if (c >= Column(EnergyColumn::FrictionLoss) && c <= Column(EnergyColumn::RayleighLoss))
-            values[Column(EnergyColumn::Throughput)] += value;
+            values[Column(EnergyColumn::Throughput)] += fabs(value);
     };
-    double kinetic = 0.0, gravity = 0.0, elastic = 0.0, position = 0.0;
+    double kinetic = 0.0, gravity = 0.0, elastic = 0.0, position = 0.0, position_kinetic = 0.0;
     const Vec3 g{p.gravity[0], p.gravity[1], p.gravity[2]};
     for (uint32_t local = threadIdx.x; local < p.particles_per_env; local += blockDim.x) {
         const uint32_t particle = env * p.particles_per_env + local;
         if (p.stage == EnergyStage::Begin) d.energy_particle_start[particle] = d.particle_pos[particle];
+        const bool grid_particle = local < p.mpm_particles_per_env;
+        if (grid_particle && p.stage == EnergyStage::Begin) {
+            for (uint32_t k = 0u; k < 9u; ++k) {
+                d.energy_mpm_start_F[size_t{particle} * 9u + k] = d.particle_F[size_t{particle} * 9u + k];
+                if (d.energy_mpm_start_plastic_F)
+                    d.energy_mpm_start_plastic_F[size_t{particle} * 9u + k] = d.particle_plastic_F[size_t{particle} * 9u + k];
+            }
+            d.energy_mpm_start_plastic[particle] = d.particle_plastic[particle];
+        }
         const Vec3 velocity = ParticleVelocity(d, p, particle);
         if (p.stage == EnergyStage::Free) {
             d.energy_kinematic_contact_impulse[particle] = {};
@@ -324,6 +569,46 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
             continue;
         }
         const double mass = 1.0 / inverse_mass;
+        if (grid_particle) {
+            if (p.stage == EnergyStage::Free) {
+                add(EnergyColumn::MpmP2gLoss, MpmTransferLoss(d, p, particle,
+                    d.particle_pos[particle], velocity, d.particle_C + size_t{particle} * 9u, true));
+                continue;
+            }
+            if (p.stage == EnergyStage::Solved) continue;
+            if (d.particle_material_id[particle] >= p.mpm_material_count) {
+                atomicOr(coverage, nk::energy_status::kGridMaterial);
+                continue;
+            }
+            const auto material = EnergyMpmMaterial(d, particle);
+            double stored = 0.0;
+            if (nk::material::EvaluateMpmStoredEnergy(material, d.particle_F + size_t{particle} * 9u,
+                d.particle_plastic[particle], stored) != nk::material::ConstitutiveStatus::Ok)
+                atomicOr(coverage, nk::energy_status::kGridMaterial);
+            else elastic += d.particle_vol0[particle] * stored;
+            nk::MpmCompactAxis axes[3];
+            MpmEnergyAxes(d.particle_pos[particle], p, axes);
+            const float* affine = d.particle_C + size_t{particle} * 9u;
+            const double affine_kinetic = nk::material::MpmAffineKinetic(affine, mass, axes, p.grid_dx);
+            kinetic += affine_kinetic;
+            if (p.stage == EnergyStage::Begin) {
+                add(EnergyColumn::MpmBeginAffineKinetic, affine_kinetic);
+            } else if (p.stage == EnergyStage::End) add(EnergyColumn::MpmEndAffineKinetic, affine_kinetic);
+            else if (p.stage == EnergyStage::Projected) {
+                MpmEnergyAxes(d.energy_particle_start[particle], p, axes);
+                const double gathered_affine = nk::material::MpmAffineKinetic(affine, mass, axes, p.grid_dx);
+                add(EnergyColumn::MpmG2pLoss, MpmTransferLoss(d, p, particle,
+                    d.energy_particle_start[particle], velocity, affine, false));
+                add(EnergyColumn::MpmAffineTransport, affine_kinetic - gathered_affine);
+                double plastic_loss = 0.0, averaging_work = 0.0;
+                if (!MpmReturnEnergy(d, p, particle, material, &plastic_loss, &averaging_work))
+                    atomicOr(coverage, nk::energy_status::kGridMaterial);
+                else {
+                    add(EnergyColumn::MpmPlasticLoss, plastic_loss);
+                    add(EnergyColumn::MpmVolumeAverageWork, averaging_work);
+                }
+            }
+        }
         if (p.stage == EnergyStage::Solved && IsVertex(p, particle)) {
             const uint32_t vertex = local - p.vbd_begin;
             const uint32_t slot = env * p.vbd_vertices + vertex;
@@ -333,6 +618,10 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
             block.offsets = m.vbd_incidence_offsets;
             block.incidence = m.vbd_incidence;
             block.start = d.particle_prev_pos;
+            block.free_rate = d.vbd_free_rate;
+            block.free_velocity = d.vbd_free_velocity;
+            block.inertia = d.vbd_inertia;
+            block.effective_step = d.vbd_step;
             block.layout.begin = p.vbd_begin;
             block.layout.vertices = p.vbd_vertices;
             block.layout.elements = p.vbd_elements;
@@ -347,20 +636,66 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
         }
         kinetic += 0.5 * mass * Dot(velocity, velocity);
         gravity -= mass * Dot(g, d.particle_pos[particle]);
-        if (p.stage == EnergyStage::Projected && p.pos_pass)
-            position -= mass * Dot(g, d.particle_pseudo_vel[particle]) * p.dt;
+        if (p.stage == EnergyStage::Projected && p.pos_pass) {
+            const Vec3 correction = grid_particle
+                ? d.particle_pos[particle] - d.energy_particle_start[particle] - velocity * p.dt
+                : d.particle_pseudo_vel[particle] * p.dt;
+            position -= mass * Dot(g, correction);
+        }
         if (p.stage == EnergyStage::End && p.has_aero)
             add(EnergyColumn::AeroWork, Dot(d.energy_aero_impulse[particle],
                 d.particle_pos[particle] - d.energy_particle_start[particle]) / p.dt);
     }
+    for (uint32_t local = threadIdx.x; local < p.grid_nodes_per_env; local += blockDim.x) {
+        if (p.stage != EnergyStage::Free && p.stage != EnergyStage::Solved) break;
+        const uint32_t node = env * p.grid_nodes_per_env + local;
+        const double mass = d.grid_mass[node];
+        if (!(mass > 0.0)) continue;
+        if (!(d.grid_inv_mass[node] > 0.0f) && d.energy_grid_prescribed[node] == 0u) continue;
+        const Vec3 velocity = d.grid_velocity[node];
+        kinetic += 0.5 * mass * Dot(velocity, velocity);
+        const double* initial = d.energy_grid_entry_momentum + size_t{node} * 3u;
+        const double before[3] = {initial[0] / mass, initial[1] / mass, initial[2] / mass};
+        if (p.stage == EnergyStage::Free) {
+            const double entry_kinetic = 0.5 * mass *
+                (before[0] * before[0] + before[1] * before[1] + before[2] * before[2]);
+            add(EnergyColumn::MpmGridBeginKinetic, entry_kinetic);
+            continue;
+        }
+        const double solved_kinetic = 0.5 * mass * Dot(velocity, velocity);
+        add(EnergyColumn::MpmGridSolvedKinetic, solved_kinetic);
+        const Vec3 free = d.energy_grid_free_velocity[node];
+        const float solved[3] = {velocity.x, velocity.y, velocity.z};
+        const float predicted[3] = {free.x, free.y, free.z};
+        double stress_work = 0.0, viscous_work = 0.0, boundary_work = 0.0;
+        for (uint32_t a = 0u; a < 3u; ++a) {
+            const size_t at = size_t{node} * 3u + a;
+            const double mean = 0.5 * (before[a] + solved[a]);
+            stress_work += d.energy_grid_stress_impulse[at] * mean;
+            viscous_work += d.energy_grid_viscous_impulse[at] * mean;
+            const double boundary = mass * (predicted[a] - before[a] - double(p.gravity[a]) * p.dt) -
+                d.energy_grid_stress_impulse[at];
+            if (d.energy_grid_prescribed[node] != 0u) boundary_work += boundary * mean;
+        }
+        add(EnergyColumn::MpmStressWork, stress_work - viscous_work);
+        add(EnergyColumn::MpmViscousLoss, -viscous_work);
+        add(EnergyColumn::MpmBoundaryWork, boundary_work);
+    }
     for (uint32_t local = threadIdx.x; local < p.bodies_per_env; local += blockDim.x) {
         const uint32_t body = env * p.bodies_per_env + local;
         if (m.body_to_link && m.body_to_link[body] != ~0u) continue;
-        if (p.stage == EnergyStage::Begin &&
-            (d.body_force[body].LengthSq() != 0.0f || d.body_torque[body].LengthSq() != 0.0f))
-            atomicOr(coverage, nk::energy_status::kExternalBodyLoad);
         const float inverse_mass = d.body_inv_mass[body];
         if (!(inverse_mass > 0.0f)) continue;
+        const auto twist = ComTwist(d.body_angular_velocity[body], d.body_linear_velocity[body]);
+        if (p.stage == EnergyStage::Begin) {
+            const Vec3 force = d.body_force[body] - g * (d.body_gravity_compensation[body] / inverse_mass);
+            const Vec3 torque = d.body_torque[body];
+            d.energy_body_wrench[body] = {{force.x, force.y, force.z, torque.x, torque.y, torque.z}};
+            d.energy_body_start_velocity[body] = twist;
+        } else if (p.stage == EnergyStage::Solved) {
+            add(EnergyColumn::ExternalWork, LoadWork(d.energy_body_wrench[body],
+                d.energy_body_start_velocity[body], twist, p.dt));
+        }
         const auto principal = ComposeFrame(d.body_pose[body], d.body_inertial_frame[body]);
         const Vec3 angular = InverseRotate(principal.rotation, d.body_angular_velocity[body]);
         const Vec3 inverse_inertia = d.body_inv_inertia[body];
@@ -372,8 +707,27 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
         gravity -= mass * Dot(g, principal.position);
         if (p.stage == EnergyStage::Projected && p.pos_pass) {
             position -= mass * Dot(g, d.body_pseudo_linear_velocity[body]) * p.dt;
-            if (d.body_pseudo_angular_velocity[body].LengthSq() != 0.0f)
-                atomicOr(coverage, nk::energy_status::kRigidAngularPositionWork);
+            const Vec3 pseudo = d.body_pseudo_angular_velocity[body];
+            if (pseudo.LengthSq() != 0.0f) {
+                const float h = -0.5f * p.dt;
+                const auto no_rotation = mg::QuatNormalizeRsqrt(mg::QuatMul(
+                    mg::MakeQuat(1.0f, h * pseudo.x, h * pseudo.y, h * pseudo.z),
+                    d.body_pose[body].rotation), 1.0e-12f);
+                const auto no_principal = mg::QuatNormalizeRsqrt(mg::QuatMul(no_rotation,
+                    d.body_inertial_frame[body].rotation), 1.0e-12f);
+                const Vec3 momentum = mg::RotateByQuatNormalized(principal.rotation,
+                    {inverse_inertia.x > 0.0f ? angular.x / inverse_inertia.x : 0.0f,
+                     inverse_inertia.y > 0.0f ? angular.y / inverse_inertia.y : 0.0f,
+                     inverse_inertia.z > 0.0f ? angular.z / inverse_inertia.z : 0.0f});
+                const Vec3 local = InverseRotate(no_principal, momentum);
+                const double before = 0.5 * (double(local.x) * local.x * inverse_inertia.x +
+                    double(local.y) * local.y * inverse_inertia.y + double(local.z) * local.z * inverse_inertia.z);
+                double after = 0.0;
+                if (inverse_inertia.x > 0.0f) after += 0.5 * double(angular.x) * angular.x / inverse_inertia.x;
+                if (inverse_inertia.y > 0.0f) after += 0.5 * double(angular.y) * angular.y / inverse_inertia.y;
+                if (inverse_inertia.z > 0.0f) after += 0.5 * double(angular.z) * angular.z / inverse_inertia.z;
+                position_kinetic += after - before;
+            }
         }
     }
     for (uint32_t local = threadIdx.x; local < p.links_per_env; local += blockDim.x) {
@@ -381,12 +735,26 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
         if (p.stage == EnergyStage::Begin) {
             d.energy_link_start_q[link] = d.q[link];
             d.energy_link_start_qdot[link] = d.qdot[link];
-            bool external = false;
-            for (uint32_t k = 0u; k < 6u; ++k) external |= d.link_wrench[link].v[k] != 0.0f;
-            if (external) atomicOr(coverage, nk::energy_status::kExternalBodyLoad);
+            d.energy_joint_start_angular_velocity[link] = d.joint_angular_velocity[link];
+            d.energy_link_wrench[link] = d.link_wrench[link];
+            if (m.link_body[link] < p.bodies_per_env) {
+                const uint32_t body = env * p.bodies_per_env + m.link_body[link];
+                const float scale = d.body_gravity_compensation[body] * m.link_inertia[link].m[21];
+                d.energy_link_wrench[link].v[0] -= scale * g.x;
+                d.energy_link_wrench[link].v[1] -= scale * g.y;
+                d.energy_link_wrench[link].v[2] -= scale * g.z;
+            }
         }
         const auto pose = d.energy_link_pose[link];
         const auto world = d.energy_link_velocity[link];
+        const Vec3 world_angular{world.v[0], world.v[1], world.v[2]};
+        const Vec3 offset = mg::RotateByQuatNormalized(pose.rotation, m.link_inertial_frame[link].position);
+        const auto twist = ComTwist(world_angular,
+            Vec3{world.v[3], world.v[4], world.v[5]} + world_angular.Cross(offset));
+        if (p.stage == EnergyStage::Begin) d.energy_link_start_velocity[link] = twist;
+        else if (p.stage == EnergyStage::Solved)
+            add(EnergyColumn::ExternalWork, LoadWork(d.energy_link_wrench[link],
+                d.energy_link_start_velocity[link], twist, p.dt));
         const Vec3 angular = InverseRotate(pose.rotation, {world.v[0], world.v[1], world.v[2]});
         const Vec3 linear = InverseRotate(pose.rotation, {world.v[3], world.v[4], world.v[5]});
         const float velocity[6] = {angular.x, angular.y, angular.z, linear.x, linear.y, linear.z};
@@ -397,22 +765,54 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
         const double mass = inertia.m[21];
         const auto com = ComposeFrame(pose, m.link_inertial_frame[link]);
         gravity -= mass * Dot(g, com.position);
-        if (m.joint_armature[link] != 0.0f) atomicOr(coverage, nk::energy_status::kArmatureEnergy);
-        if (p.stage == EnergyStage::Projected && p.pos_pass) {
-            const auto no_position = ComposeFrame(d.energy_link_unprojected_pose[link], m.link_inertial_frame[link]);
-            position -= mass * Dot(g, com.position - no_position.position);
-            if (static_cast<ArticulationJointType>(m.joint_type[link]) == ArticulationJointType::FloatingBase)
-                for (uint32_t k = 0u; k < 6u; ++k)
-                    if (d.link_velocity_pseudo[link].v[k] != 0.0f)
-                        atomicOr(coverage, nk::energy_status::kFloatingPositionWork);
+        const auto joint_type = static_cast<ArticulationJointType>(m.joint_type[link]);
+        if (JointDofCountDevice(joint_type) == 1u) {
+            if (p.stage == EnergyStage::Solved)
+                add(EnergyColumn::ExternalWork, -0.5 * double(p.dt) * d.joint_gravity_force[link] *
+                    (double(d.energy_link_start_qdot[link]) + d.qdot[link]));
+            kinetic += 0.5 * double(m.joint_armature[link]) * d.qdot[link] * d.qdot[link];
+            const double stretch = double(d.q[link]) - m.joint_spring_reference[link];
+            const double stiffness = m.joint_stiffness[link];
+            elastic += 0.5 * stiffness * stretch * stretch;
+            if (p.stage == EnergyStage::Projected && p.pos_pass) {
+                const float coordinate = d.energy_link_start_q[link] + p.dt * d.qdot[link];
+                const double unprojected = double(coordinate) - m.joint_spring_reference[link];
+                position += 0.5 * stiffness * (stretch * stretch - unprojected * unprojected);
+            }
         }
-        if (p.stage == EnergyStage::End) {
-            const double displacement = double(d.q[link]) - d.energy_link_start_q[link];
+        if (joint_type == ArticulationJointType::Spherical)
+            kinetic += 0.5 * double(m.joint_armature[link]) *
+                Dot(d.joint_angular_velocity[link], d.joint_angular_velocity[link]);
+        if (joint_type == ArticulationJointType::FloatingBase && m.joint_armature[link] != 0.0f)
+            atomicOr(coverage, nk::energy_status::kArmatureEnergy);
+        if (p.stage == EnergyStage::Projected && p.pos_pass) {
+            const auto no_pose = d.energy_link_unprojected_pose[link];
+            const auto no_position = ComposeFrame(no_pose, m.link_inertial_frame[link]);
+            position -= mass * Dot(g, com.position - no_position.position);
+            const auto no_world = d.energy_link_unprojected_velocity[link];
+            const Vec3 no_angular = InverseRotate(no_pose.rotation, {no_world.v[0], no_world.v[1], no_world.v[2]});
+            const Vec3 no_linear = InverseRotate(no_pose.rotation, {no_world.v[3], no_world.v[4], no_world.v[5]});
+            const float no_velocity[6] = {no_angular.x, no_angular.y, no_angular.z,
+                no_linear.x, no_linear.y, no_linear.z};
+            for (uint32_t r = 0u; r < 6u; ++r)
+                for (uint32_t c = 0u; c < 6u; ++c)
+                    position_kinetic += 0.5 * (double(velocity[r]) * inertia.m[r * 6u + c] * velocity[c] -
+                        double(no_velocity[r]) * inertia.m[r * 6u + c] * no_velocity[c]);
+        }
+        if (p.stage == EnergyStage::End && joint_type == ArticulationJointType::Spherical) {
+            const Vec3 velocity = d.joint_angular_velocity[link];
+            const Vec3 damping_velocity = p.implicit_passive_damping
+                ? velocity : d.energy_joint_start_angular_velocity[link];
+            add(EnergyColumn::PassiveLoss, double(m.joint_damping[link]) * p.dt * Dot(damping_velocity, velocity));
+        }
+        if (p.stage == EnergyStage::End && JointDofCountDevice(joint_type) == 1u) {
+            const double displacement = double(d.q[link]) - d.energy_link_start_q[link] -
+                (p.pos_pass ? double(p.dt) * d.qdot_pseudo[link] : 0.0);
             const double effort = p.drive_rows ? d.actuator_effort[link] : 0.0;
             add(EnergyColumn::DriveWork, effort * displacement);
             add(EnergyColumn::ExternalWork, (double(d.tau[link]) - effort) * displacement);
             add(EnergyColumn::PassiveLoss, double(m.joint_damping[link]) *
-                d.energy_link_start_qdot[link] * displacement);
+                (p.implicit_passive_damping ? d.qdot[link] : d.energy_link_start_qdot[link]) * displacement);
         }
     }
     for (uint32_t i = threadIdx.x; i < p.vbd_elements; i += blockDim.x) {
@@ -427,7 +827,7 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
                 x.start[j] = d.particle_prev_pos[particle];
                 x.delta[j] = (d.particle_vel[particle] - d.particle_vel[anchor]) * p.dt;
                 frozen.start[j] = d.particle_prev_pos[particle];
-                rates[j] = d.particle_vel[particle];
+                rates[j] = ParticleVelocity(d, p, particle);
             } else {
                 x.start[j] = d.particle_pos[particle];
             }
@@ -457,15 +857,28 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
         for (uint32_t local = LedgerRow(threadIdx.x, bound, p.contact_rows); local < p.rows_per_env;
              local = LedgerRow(local + blockDim.x, bound, p.contact_rows)) {
             const uint32_t row = env * p.rows_per_env + local;
-            const double impulse = d.lambda[row];
-            if (impulse == 0.0) continue;
             const auto r = rows[row];
             if (!(r.flags & nk::nk_row_flags::kActive)) continue;
+            if (r.flags & nk::nk_row_flags::kMaterialBlock) {
+                for (uint32_t axis = 0u; axis < nk::kMpmStressRowsPerCell; ++axis) {
+                    const double impulse = d.lambda[row + axis];
+                    if (impulse == 0.0) continue;
+                    const auto power = SidePower(r.a, false, row, m, d, p, axis);
+                    add(EnergyColumn::MpmStressWork, impulse * power.physical);
+                    add(EnergyColumn::RowRateWork, impulse * power.rate);
+                    add(EnergyColumn::RowPhysicalImpulseWork, impulse * power.applied);
+                    add(EnergyColumn::MpmBoundaryWork, -impulse * power.grid_boundary);
+                }
+                continue;
+            }
+            const double impulse = d.lambda[row];
+            if (impulse == 0.0) continue;
             const auto a = SidePower(r.a, false, row, m, d, p);
             const auto b = SidePower(r.b, true, row, m, d, p);
             const double work = impulse * (a.physical + b.physical);
             add(EnergyColumn::RowRateWork, impulse * (a.rate + b.rate));
             add(EnergyColumn::RowPhysicalImpulseWork, impulse * (a.applied + b.applied));
+            add(EnergyColumn::MpmBoundaryWork, -impulse * (a.grid_boundary + b.grid_boundary));
             if (local >= first_drive && local < first_drive + p.drive_rows) continue;
             if (r.flags & nk::nk_row_flags::kPyramidal) {
                 const uint32_t contact = nkops::ContactSlotForRow(d.ucontact_row_range,
@@ -501,6 +914,7 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
         add(EnergyColumn::BeforeDatGravity, gravity);
         add(EnergyColumn::BeforeDatElastic, elastic);
         add(EnergyColumn::PositionPotential, position);
+        add(EnergyColumn::PositionKineticWork, position_kinetic);
     } else {
         add(EnergyColumn::EndKinetic, kinetic);
         add(EnergyColumn::EndGravity, gravity);
@@ -526,9 +940,9 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
     const auto set = [&](EnergyColumn column, double value) {
         output[Column(column)] = float(sum[Column(column)] = value);
     };
-    set(EnergyColumn::DatKineticLoss, get(EnergyColumn::BeforeDatKinetic) - get(EnergyColumn::EndKinetic));
-    set(EnergyColumn::DatPotential, get(EnergyColumn::EndGravity) + get(EnergyColumn::EndElastic) -
-        get(EnergyColumn::BeforeDatGravity) - get(EnergyColumn::BeforeDatElastic));
+    // Reserved DAT columns stay zero in the discrete contact pipeline.
+    set(EnergyColumn::DatKineticLoss, 0.0);
+    set(EnergyColumn::DatPotential, 0.0);
     const double change = get(EnergyColumn::EndKinetic) + get(EnergyColumn::EndGravity) + get(EnergyColumn::EndElastic) -
         get(EnergyColumn::BeginKinetic) - get(EnergyColumn::BeginGravity) - get(EnergyColumn::BeginElastic);
     double work = 0.0, losses = 0.0;
@@ -538,8 +952,16 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
     for (uint32_t c = Column(EnergyColumn::FrictionLoss); c <= Column(EnergyColumn::RayleighLoss); ++c) {
         losses += sum[c];
     }
+    for (EnergyColumn column : {EnergyColumn::MpmP2gLoss, EnergyColumn::MpmG2pLoss,
+                              EnergyColumn::MpmPlasticLoss, EnergyColumn::MpmViscousLoss})
+        losses += get(column);
+    work += get(EnergyColumn::MpmBoundaryWork);
+    set(EnergyColumn::Throughput, get(EnergyColumn::Throughput) + fabs(get(EnergyColumn::MpmBoundaryWork)) +
+        fabs(get(EnergyColumn::MpmP2gLoss)) + fabs(get(EnergyColumn::MpmG2pLoss)) +
+        fabs(get(EnergyColumn::MpmPlasticLoss)) + fabs(get(EnergyColumn::MpmViscousLoss)));
     const double residual = change - work + losses + get(EnergyColumn::DatKineticLoss) -
-                             get(EnergyColumn::PositionPotential);
+        get(EnergyColumn::PositionPotential) - get(EnergyColumn::MpmAffineTransport) -
+        get(EnergyColumn::MpmVolumeAverageWork) - get(EnergyColumn::PositionKineticWork);
     output[Column(EnergyColumn::Dt)] = p.dt;
     output[Column(EnergyColumn::Valid)] = 1.0f;
     if (d.env_status[env] != 0u) atomicOr(coverage, nk::energy_status::kPhysicsFailure);
@@ -605,6 +1027,16 @@ __global__ void PhysicsStageMetricsKernel(ModelView m, DataView d, ReadoutEnergy
                 vector(C::VbdElasticBoundaryImpulseX, KinematicElasticReaction(m, d, p, particle).gradient * p.dt);
             continue;
         }
+        if (local < p.mpm_particles_per_env) {
+            if (p.stage == EnergyStage::Free || p.stage == EnergyStage::Solved) continue;
+            nk::MpmCompactAxis axes[3];
+            MpmEnergyAxes(position, p, axes);
+            double spin[3];
+            nk::material::MpmAffineAngularMomentum(d.particle_C + size_t{particle} * 9u,
+                1.0 / inverse_mass, axes, p.grid_dx, spin);
+            for (uint32_t a = 0u; a < 3u; ++a)
+                values[static_cast<uint32_t>(C::AngularMomentumX) + a] += spin[a];
+        }
         momentum(1.0 / inverse_mass, position, velocity, {});
         if (!IsVertex(p, particle)) continue;
         if (restarted_history) {
@@ -639,6 +1071,10 @@ __global__ void PhysicsStageMetricsKernel(ModelView m, DataView d, ReadoutEnergy
         block.offsets = m.vbd_incidence_offsets;
         block.incidence = m.vbd_incidence;
         block.start = d.particle_prev_pos;
+        block.free_rate = d.vbd_free_rate;
+        block.free_velocity = d.vbd_free_velocity;
+        block.inertia = d.vbd_inertia;
+        block.effective_step = d.vbd_step;
         block.layout.begin = p.vbd_begin;
         block.layout.vertices = p.vbd_vertices;
         block.layout.elements = p.vbd_elements;
@@ -658,6 +1094,20 @@ __global__ void PhysicsStageMetricsKernel(ModelView m, DataView d, ReadoutEnergy
         maximum(C::MaxVbdForce, Finite(force)
             ? fmaxf(fabsf(force.x), fmaxf(fabsf(force.y), fabsf(force.z))) : nanf(""));
         maximum(C::MaxAbsoluteVertexResidualWork, fabs(Dot(force, displacement)));
+    }
+    for (uint32_t local = threadIdx.x; local < p.grid_nodes_per_env; local += blockDim.x) {
+        if (p.stage != EnergyStage::Free && p.stage != EnergyStage::Solved) break;
+        const uint32_t node = env * p.grid_nodes_per_env + local;
+        const uint32_t lattice_nodes = p.grid_nodes_per_env / nk::kMpmLattices;
+        const uint32_t lattice = local / lattice_nodes, index = local % lattice_nodes;
+        const float shift = nk::MpmLatticeOffset(lattice);
+        const Vec3 position{p.grid_origin[0] + (index % p.grid_dims[0] + shift) * p.grid_dx,
+            p.grid_origin[1] + ((index / p.grid_dims[0]) % p.grid_dims[1] + shift) * p.grid_dx,
+            p.grid_origin[2] + (index / (p.grid_dims[0] * p.grid_dims[1]) + shift) * p.grid_dx};
+        const Vec3 velocity = d.grid_velocity[node];
+        const float mass = d.grid_mass[node];
+        if (!Finite(velocity) || !isfinite(mass)) add(C::NonfiniteParticles, 1.0);
+        if (mass > 0.0f) momentum(mass, position, velocity, {});
     }
     for (uint32_t local = threadIdx.x; local < p.bodies_per_env; local += blockDim.x) {
         const uint32_t body = env * p.bodies_per_env + local;
@@ -713,6 +1163,7 @@ __global__ void PhysicsStageMetricsKernel(ModelView m, DataView d, ReadoutEnergy
             if (!(r.flags & nk::nk_row_flags::kActive)) continue;
             add(C::ActiveRows, 1.0);
             if (local >= first_drive && local < first_drive + p.drive_rows) continue;
+            if (r.flags & nk::nk_row_flags::kMaterialBlock) continue;
             const auto a = SidePower(r.a, false, row, m, d, p);
             const auto b = SidePower(r.b, true, row, m, d, p);
             const double work = double(d.lambda[row]) * (a.physical + b.physical);
@@ -831,24 +1282,47 @@ __device__ bool AuditOgcParticleGap(const NkRow& row, PointMassView points,
     return AuditFeatureGap(a, na, b, nb, d, at, gap);
 }
 
-// Mixed slots place their features at the committed poses the DAT certified.
+// Mixed slots place their retained contact features at the committed poses.
 __device__ bool AuditMixedGap(const ModelView& m, const DataView& d, const ReadoutEnergyLedgerParams& p,
     uint32_t env, uint32_t slot, size_t at, double* gap) {
     if (d.dat_pair_kind == nullptr || d.dat_pair_kind[slot] == 0u) return false;
-    DatTruncateParams q;
-    q.particles_per_env = p.particles_per_env;
-    q.surfaces_per_env = p.surfaces_per_env;
-    q.bodies_per_env = p.bodies_per_env;
-    q.links_per_env = p.links_per_env;
-    DatPointRef ra[3], rb[3];
+    ContactPointRef ra[3], rb[3];
     uint32_t na = 0u, nb = 0u;
-    if (!DatMixedRefs(q, m, d, env, slot, ra, &na, rb, &nb)) return false;
+    if (!ContactFeatureRefs(p, m, d, env, slot, ra, &na, rb, &nb)) return false;
     Vec3 a[3]{}, b[3]{};
     for (uint32_t i = 0u; i < na; ++i)
-        a[i] = ra[i].particle ? d.particle_pos[ra[i].owner] : DatPointAt(q, m, d, env, ra[i], 1.0f);
+        a[i] = ContactFeaturePoint(m, d, env, p.bodies_per_env, ra[i]);
     for (uint32_t i = 0u; i < nb; ++i)
-        b[i] = rb[i].particle ? d.particle_pos[rb[i].owner] : DatPointAt(q, m, d, env, rb[i], 1.0f);
+        b[i] = ContactFeaturePoint(m, d, env, p.bodies_per_env, rb[i]);
     return AuditFeatureGap(a, na, b, nb, d, at, gap);
+}
+
+// Rigid pairs query their geometry again at committed poses, without contact margins or position bias.
+__device__ bool AuditBodyPairGap(const ModelView& m, const DataView& d, const ReadoutEnergyLedgerParams& p,
+    uint32_t env, size_t at, double* gap) {
+    if (d.ucontact_a_kind[at] != nk::kUContactSideBody ||
+        d.ucontact_b_kind[at] != nk::kUContactSideBody) return false;
+    const uint32_t a = d.ucontact_a[at], b = d.ucontact_b[at];
+    if (a >= p.bodies_per_env || b >= p.bodies_per_env) return false;
+    const auto sa = LoadPrimShape(m.shape_table, a), sb = LoadPrimShape(m.shape_table, b);
+    const auto primitive = [&](uint32_t body, const PrimShapeDev& shape) {
+        collision::amf::PrimParams out;
+        out.frame = collision::amf::BuildPrimFrameDevice(d.body_pose[size_t{env} * p.bodies_per_env + body]);
+        out.radius = shape.params[0];
+        out.half_height = shape.params[1];
+        out.half_extents = {shape.params[0], shape.params[1], shape.params[2]};
+        return out;
+    };
+    constraint::ContactManifold manifold;
+    if (!collision::amf::PrimitivePair(sa.kind, primitive(a, sa), sb.kind, primitive(b, sb),
+                                      FLT_MAX, &manifold) || manifold.point_count == 0u) return false;
+    double penetration = -DBL_MAX;
+    for (uint32_t i = 0u; i < manifold.point_count; ++i) {
+        if (!isfinite(manifold.points[i].penetration)) return false;
+        penetration = fmax(penetration, double(manifold.points[i].penetration));
+    }
+    *gap = -penetration;
+    return isfinite(*gap);
 }
 
 // Particle-body slots measure the particle sphere against the body surface at its committed pose.
@@ -983,7 +1457,8 @@ __global__ void ContactAuditKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
                 local_contact - p.rigid_contact_slots < p.ogc_contact_slots;
             if (ogc ? AuditOgcParticleGap(normal, points, d, at, &gap) ||
                       AuditMixedGap(m, d, p, env, global_contact, at, &gap)
-                    : AuditBodyParticleGap(m, d, p, surfaces, env, at, &gap) ||
+                    : AuditBodyPairGap(m, d, p, env, at, &gap) ||
+                      AuditBodyParticleGap(m, d, p, surfaces, env, at, &gap) ||
                       AuditMpmGap(normal, points, m, d, p, surfaces, env, at, &gap)) {
                 if (gap < -p.pos_slop) count(C::GapViolations);
                 maximum(M::GapPenetration, float(-gap), slot);
@@ -1047,6 +1522,66 @@ __global__ void ContactAuditKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
     }
 }
 
+__global__ void IntervalStateKernel(DataView d, ReadoutEnergyLedgerParams p) {
+    const uint32_t env = blockIdx.x;
+    const size_t record = size_t{env} * p.substeps + p.slot;
+    for (uint32_t local = threadIdx.x; local < p.particles_per_env; local += blockDim.x) {
+        const size_t source = size_t{env} * p.particles_per_env + local;
+        const size_t target = record * p.particles_per_env + local;
+        const bool mpm = local < p.mpm_particles_per_env;
+        d.interval_particle_pos[target] = d.particle_pos[source];
+        d.interval_particle_vel[target] = d.particle_vel[source];
+        d.interval_particle_plastic[target] = mpm && d.particle_plastic ? d.particle_plastic[source] : 0.0f;
+        for (uint32_t k = 0u; k < 9u; ++k) {
+            const float identity = k % 4u == 0u ? 1.0f : 0.0f;
+            d.interval_particle_F[target * 9u + k] = mpm && d.particle_F
+                ? d.particle_F[source * 9u + k] : identity;
+            d.interval_particle_C[target * 9u + k] = mpm && d.particle_C
+                ? d.particle_C[source * 9u + k] : 0.0f;
+            d.interval_particle_plastic_F[target * 9u + k] = mpm && d.particle_plastic_F
+                ? d.particle_plastic_F[source * 9u + k] : identity;
+        }
+    }
+    for (uint32_t local = threadIdx.x; local < p.bodies_per_env; local += blockDim.x) {
+        const size_t source = size_t{env} * p.bodies_per_env + local;
+        const size_t target = record * p.bodies_per_env + local;
+        d.interval_body_pose[target] = d.body_pose[source];
+        d.interval_body_linear_velocity[target] = d.body_linear_velocity[source];
+        d.interval_body_angular_velocity[target] = d.body_angular_velocity[source];
+    }
+    for (uint32_t local = threadIdx.x; local < p.links_per_env; local += blockDim.x) {
+        const size_t source = size_t{env} * p.links_per_env + local;
+        const size_t target = record * p.links_per_env + local;
+        d.interval_q[target] = d.q[source];
+        d.interval_qdot[target] = d.qdot[source];
+        d.interval_joint_rotation[target] = d.joint_rotation[source];
+        d.interval_joint_angular_velocity[target] = d.joint_angular_velocity[source];
+        d.interval_link_velocity[target] = d.link_velocity[source];
+    }
+    for (uint32_t local = threadIdx.x; local < p.artics_per_env; local += blockDim.x)
+        d.interval_base_pose[record * p.artics_per_env + local] =
+            d.base_pose[size_t{env} * p.artics_per_env + local];
+    __syncthreads();
+    if (threadIdx.x == 0u) d.interval_state_dt[record] = p.dt;
+}
+
+Status OpReadoutIntervalState(const ModelView&, const DataView& d, const void* params, cudaStream_t stream) {
+    const auto* p = static_cast<const ReadoutEnergyLedgerParams*>(params);
+    if (!p || !(p->dt > 0.0f) || !std::isfinite(p->dt) || p->slot >= p->substeps ||
+        p->stage != EnergyStage::End || !d.interval_state_dt) return Status::InvalidArgument;
+    if (p->particles_per_env > 0u && (!d.interval_particle_pos || !d.interval_particle_vel ||
+        !d.interval_particle_F || !d.interval_particle_C || !d.interval_particle_plastic_F ||
+        !d.interval_particle_plastic)) return Status::InvalidArgument;
+    if (p->bodies_per_env > 0u && (!d.interval_body_pose || !d.interval_body_linear_velocity ||
+        !d.interval_body_angular_velocity)) return Status::InvalidArgument;
+    if (p->links_per_env > 0u && (!d.interval_q || !d.interval_qdot || !d.interval_joint_rotation ||
+        !d.interval_joint_angular_velocity || !d.interval_link_velocity)) return Status::InvalidArgument;
+    if (p->artics_per_env > 0u && !d.interval_base_pose) return Status::InvalidArgument;
+    if (p->env_count > 0u)
+        LaunchCuda(IntervalStateKernel, dim3(p->env_count), dim3(kThreads), 0u, stream, d, *p);
+    return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
+}
+
 Status OpReadoutContactAudit(const ModelView& m, const DataView& d, const void* params, cudaStream_t stream) {
     const auto* p = static_cast<const ReadoutEnergyLedgerParams*>(params);
     if (!p || p->slot >= p->substeps || !d.contact_audit_counts || !d.contact_audit_metrics)
@@ -1062,9 +1597,25 @@ Status OpReadoutEnergyLedger(const ModelView& m, const DataView& d, const void* 
     const auto* p = static_cast<const ReadoutEnergyLedgerParams*>(params);
     if (!p || !(p->dt > 0.0f) || !std::isfinite(p->dt) || p->slot >= p->substeps ||
         static_cast<uint32_t>(p->stage) >= nk::kEnergyStageCount || !d.energy_ledger || !d.energy_ledger_status ||
-        (p->physics_diagnostics && !d.physics_stage_metrics))
+        (p->physics_diagnostics && !d.physics_stage_metrics) ||
+        (p->bodies_per_env > 0u && (!d.energy_body_wrench || !d.energy_body_start_velocity)) ||
+        (p->links_per_env > 0u && (!d.energy_link_wrench || !d.energy_link_start_velocity)))
         return Status::InvalidArgument;
     if (p->env_count == 0u) return Status::Ok;
+    if (p->mpm_particles_per_env > 0u) {
+        if (!(p->grid_dx > 0.0f) || !d.energy_mpm_start_F || !d.energy_mpm_start_plastic ||
+            !d.energy_grid_entry_momentum || !d.energy_grid_entry_mass || !d.energy_grid_stress_impulse ||
+            !d.energy_grid_viscous_impulse || !d.energy_grid_free_velocity || !d.energy_grid_prescribed)
+            return Status::InvalidArgument;
+        if (p->stage == EnergyStage::Free) {
+            const uint64_t nodes = uint64_t{p->env_count} * p->grid_nodes_per_env;
+            const uint64_t particles = uint64_t{p->env_count} * p->mpm_particles_per_env;
+            LaunchCuda(EnergyGridClearKernel, dim3((nodes + kThreads - 1u) / kThreads), dim3(kThreads),
+                0u, stream, d, *p);
+            LaunchCuda(EnergyMpmTransferKernel, dim3((particles + kThreads - 1u) / kThreads), dim3(kThreads),
+                0u, stream, d, *p);
+        }
+    }
     if (p->artics_per_env > 0u)
         LaunchCuda(EnergyLinkFramesKernel, dim3(p->env_count * p->artics_per_env), dim3(32u), 0u, stream, m, d, *p);
     if (p->stage == EnergyStage::Solved && p->rows_per_env > 0u) {
@@ -1082,6 +1633,7 @@ Status OpReadoutEnergyLedger(const ModelView& m, const DataView& d, const void* 
 }  // namespace
 
 void RegisterNkEnergyLedgerOps() {
+    SetCudaOp(NkOp::ReadoutIntervalState, &OpReadoutIntervalState);
     SetCudaOp(NkOp::ReadoutEnergyLedger, &OpReadoutEnergyLedger);
     SetCudaOp(NkOp::ReadoutContactAudit, &OpReadoutContactAudit);
 }

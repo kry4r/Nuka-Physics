@@ -100,6 +100,7 @@ public:
     phi::Status PrepareGraph();
     phi::Status SetExecutionMode(ExecutionMode mode);
     phi::Status StepConfigured();
+    phi::Status StepConfigured(uint32_t count, uint32_t* submitted);
     phi::Status Synchronize();
     ExecutionMode GetExecutionMode() const { return execution_mode_; }
     bool GraphReady() const { return plan_ != nullptr; }
