@@ -418,19 +418,19 @@ __device__ bool CompliantSpringRow(const NkRow& r, const DataView& d, uint32_t r
            d.row_compliant_storage[size_t{row} * 4u] > 0.0f;
 }
 
-// Negated conservative force of a compliant row at the midpoint of its own displacement: the solved impulse less
-// the active set's response to the damping excitation alone, with the spring's change on the diagonal response.
-__device__ CompliantShare CompliantStorageForce(const NkRow& r, uint32_t row, double impulse, double displacement,
+// Negated conservative force at the midpoint of the solved displacement, with the active set
+// responding to both damping and the change in spring excitation.
+__device__ CompliantShare CompliantStorageForce(const NkRow& r, uint32_t row, double impulse,
                                                 const DataView& d, const ReadoutEnergyLedgerParams& p) {
     CompliantShare out;
     if (!CompliantSpringRow(r, d, row) || !(p.dt > 0.0f)) return out;
     const float* stored = d.row_compliant_storage + size_t{row} * 4u;
-    const double spring = stored[0], damping_impulse = stored[2];
+    const double damping_impulse = stored[2];
     out.response = stored[3];
     const double inverse_mass = out.response + double(r.compliance_alpha);
     if (!(impulse > 0.0) || !(inverse_mass > 0.0)) return out;
     out.conservative = impulse - damping_impulse;
-    out.force = -out.conservative / double(p.dt) + 0.5 * spring * displacement / inverse_mass;
+    out.force = -out.conservative / double(p.dt) + 0.5 * stored[1];
     return out;
 }
 
@@ -457,8 +457,11 @@ __device__ RowForward StoredForward(const NkRow& r, const float* base, uint32_t 
     return forward;
 }
 
-// Solves (A + R) f_d = -B v0 on each env's active set with a semidefinite Cholesky that drops dependent rows,
-// and leaves the damping impulse f_d dt in each member's storage record for the ledger.
+__device__ double SideDisplacementRate(const NkRowSide& side, bool second, uint32_t row,
+    const DataView& d, const ReadoutEnergyLedgerParams& p);
+
+// One active-set factor solves the damping excitation and the change in spring excitation.
+// Dependent rows carry zero force in the semidefinite solve.
 __global__ void EnergyDampingSplitKernel(DataView d, ReadoutEnergyLedgerParams p) {
     constexpr uint32_t capacity = nk::kEnergySplitCapacity;
     __shared__ uint32_t members[capacity];
@@ -481,7 +484,10 @@ __global__ void EnergyDampingSplitKernel(DataView d, ReadoutEnergyLedgerParams p
         const uint32_t local = base + threadIdx.x, row = first + local;
         const bool scanned = local < p.rows_per_env && (local >= p.contact_rows || local < bound);
         const bool member = scanned && DampingSplitMember(rows, d.lambda, row);
-        if (scanned && !member) storage[size_t{row} * 4u + 2u] = 0.0f;
+        if (scanned && !member) {
+            storage[size_t{row} * 4u + 1u] = 0.0f;
+            storage[size_t{row} * 4u + 2u] = 0.0f;
+        }
         spring |= member && CompliantSpringRow(rows[row], d, row) && d.lambda[row] > 0.0f;
         const uint32_t ballot = __ballot_sync(0xffffffffu, member);
         if (lane == 0u) warp_counts[warp] = __popc(ballot);
@@ -548,21 +554,44 @@ __global__ void EnergyDampingSplitKernel(DataView d, ReadoutEnergyLedgerParams p
         }
         __syncthreads();
     }
+    // The pivot reference diagonals are no longer needed after factorization.
+    double* const spring_change = original;
+    for (uint32_t k = threadIdx.x; k < n; k += blockDim.x) {
+        const uint32_t row = members[k];
+        const double displacement = double(p.dt) * (SideDisplacementRate(rows[row].a, false, row, d, p) +
+            SideDisplacementRate(rows[row].b, true, row, d, p));
+        spring_change[k] = CompliantSpringRow(rows[row], d, row) ? storage[size_t{row} * 4u] * displacement : 0.0;
+    }
+    __syncthreads();
     for (uint32_t k = 0u; k < n; ++k) {
-        if (threadIdx.x == 0u) rhs[k] = dropped[k] ? 0.0 : rhs[k] / a[size_t{k} * n + k];
+        if (threadIdx.x == 0u) {
+            rhs[k] = dropped[k] ? 0.0 : rhs[k] / a[size_t{k} * n + k];
+            spring_change[k] = dropped[k] ? 0.0 : spring_change[k] / a[size_t{k} * n + k];
+        }
         __syncthreads();
-        for (uint32_t i = k + 1u + threadIdx.x; i < n; i += blockDim.x) rhs[i] -= a[size_t{i} * n + k] * rhs[k];
+        for (uint32_t i = k + 1u + threadIdx.x; i < n; i += blockDim.x) {
+            rhs[i] -= a[size_t{i} * n + k] * rhs[k];
+            spring_change[i] -= a[size_t{i} * n + k] * spring_change[k];
+        }
         __syncthreads();
     }
     for (uint32_t k = n; k > 0u; --k) {
         const uint32_t c = k - 1u;
-        if (threadIdx.x == 0u) rhs[c] = dropped[c] ? 0.0 : rhs[c] / a[size_t{c} * n + c];
+        if (threadIdx.x == 0u) {
+            rhs[c] = dropped[c] ? 0.0 : rhs[c] / a[size_t{c} * n + c];
+            spring_change[c] = dropped[c] ? 0.0 : spring_change[c] / a[size_t{c} * n + c];
+        }
         __syncthreads();
-        for (uint32_t i = threadIdx.x; i < c; i += blockDim.x) rhs[i] -= a[size_t{c} * n + i] * rhs[c];
+        for (uint32_t i = threadIdx.x; i < c; i += blockDim.x) {
+            rhs[i] -= a[size_t{c} * n + i] * rhs[c];
+            spring_change[i] -= a[size_t{c} * n + i] * spring_change[c];
+        }
         __syncthreads();
     }
-    for (uint32_t k = threadIdx.x; k < n; k += blockDim.x)
+    for (uint32_t k = threadIdx.x; k < n; k += blockDim.x) {
+        storage[size_t{members[k]} * 4u + 1u] = float(spring_change[k]);
         storage[size_t{members[k]} * 4u + 2u] = float(rhs[k] * double(p.dt));
+    }
 }
 
 // Writes one row's solved-stage ledger terms when the per-row readout is allocated.
@@ -1062,11 +1091,12 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
             // Storage follows the row's own displacement; a pyramid edge splits it into normal and friction parts.
             const auto store = [&](nk::EnergyRowKind kind, double normal_rate, EnergyColumn loss,
                                    EnergyColumn tangent_loss) {
-                const double displacement = double(p.dt) * (a.physical + b.physical);
-                const auto share = CompliantStorageForce(r, row, impulse, displacement, d, p);
-                const double normal = share.force * double(p.dt) * normal_rate;
-                values[Column(loss)] -= normal;
-                values[Column(tangent_loss)] -= share.force * displacement - normal;
+                const double displacement = double(p.dt) * (SideDisplacementRate(r.a, false, row, d, p) +
+                    SideDisplacementRate(r.b, true, row, d, p));
+                const auto share = CompliantStorageForce(r, row, impulse, d, p);
+                const double normal = share.conservative * normal_rate;
+                values[Column(loss)] += normal;
+                values[Column(tangent_loss)] += share.conservative * (a.physical + b.physical) - normal;
                 values[Column(EnergyColumn::ConstraintStorage)] += share.force * displacement;
                 record(kind, share.force * displacement, share);
             };

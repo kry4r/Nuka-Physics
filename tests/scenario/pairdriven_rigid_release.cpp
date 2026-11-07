@@ -10,6 +10,7 @@
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/model/model.hpp"
 #include "nk/pipeline/world.hpp"
+#include "nk/readout/energy_ledger.hpp"
 #include "nk/solve/nk_row.hpp"
 
 namespace {
@@ -324,6 +325,80 @@ TEST(PairDrivenRigidRelease, ResolvedContactDampingConvergesToAnalyticDecay) {
                         previous_error = error;
                     }
                     EXPECT_LT(previous_error, 1.0e-3f);
+                }
+            }
+        }
+    }
+}
+
+TEST(PairDrivenRigidRelease, CompliantStorageAndDampingUseIndependentPhysicalTerms) {
+    auto& backend = Device();
+    if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    constexpr float impedance = 0.95f, stiffness = 1000.0f;
+    struct BodyCase { uint32_t kind; float mass; uint32_t points; };
+    for (const BodyCase body_case : {BodyCase{nuka::collision::kShapeSphere, 0.2f, 1u},
+             BodyCase{nuka::collision::kShapeSphere, 2.0f, 1u},
+             BodyCase{nuka::collision::kShapeBox, 0.2f, 4u}, BodyCase{nuka::collision::kShapeBox, 2.0f, 4u}}) {
+        const float mass = body_case.mass;
+        for (float initial : {-0.02f, 0.0f}) {
+            for (float damping : {0.0f, 10.0f}) {
+                for (float dt : {0.001f, 0.0005f}) {
+                    SCOPED_TRACE(::testing::Message() << "shape=" << body_case.kind << " mass=" << mass << " initial=" << initial
+                        << " damping=" << damping << " dt=" << dt);
+                    nk::Model model;
+                    AddBody(model, nuka::collision::kShapePlane, {0, 0, 0}, 0.0f, 0.0f);
+                    AddBody(model, body_case.kind, {0, 0, 0.0995f}, 0.1f, mass);
+                    model.body_init[1].linear_velocity = {0, 0, initial};
+                    nk::ContactProfileV1 profile;
+                    profile.law_source = nuka::constraint::LawSource::MuJoCo;
+                    profile.condim = 1u;
+                    profile.solref[0] = -stiffness * impedance * impedance;
+                    profile.solref[1] = -damping * impedance;
+                    profile.solimp[0] = profile.solimp[1] = impedance;
+                    model.material_buckets.emplace_back(profile);
+                    Finish(model);
+                    model.capacities.num_material_buckets = 1u;
+                    auto config = Config();
+                    config.dt = dt;
+                    config.pos_iters = 0u;
+                    nk::World world(std::move(model), 2u, backend.device, backend.backend, config);
+                    ASSERT_TRUE(world.Ready());
+                    ASSERT_NE(world.FieldPtr(nk::FieldId::EnergyLedger), nullptr);
+                    const auto before = Read<Transform>(world, nk::FieldId::BodyPose, 4u);
+                    ASSERT_TRUE(world.Step().AllOk());
+                    const auto after = Read<Transform>(world, nk::FieldId::BodyPose, 4u);
+                    const auto velocity = Read<Vec3>(world, nk::FieldId::BodyLinearVelocity, 4u);
+                    const auto ledger = Read<float>(world, nk::FieldId::EnergyLedger, 2u * nk::kEnergyColumnCount);
+                    EXPECT_EQ(Read<uint32_t>(world, nk::FieldId::EnergyLedgerStatus, 2u), std::vector<uint32_t>(2u));
+                    uint32_t points = 0u;
+                    for (uint32_t count : Read<uint32_t>(world, nk::FieldId::UcontactCount, 64u)) points += count;
+                    EXPECT_EQ(points, 2u * body_case.points);
+                    // Symmetric corner reactions cancel torque; their summed response is points/mass + R.
+                    const double response_mass = double(mass) * impedance * body_case.points /
+                        (1.0 + double(body_case.points - 1u) * impedance);
+                    const double spring = response_mass * impedance * stiffness;
+                    for (uint32_t env = 0u; env < 2u; ++env) {
+                        const uint32_t body = 2u * env + 1u;
+                        const double start = double(before[body].position.z) - double(0.1f);
+                        const double end = double(after[body].position.z) - double(0.1f);
+                        const double stored = 0.5 * spring * (end * end - start * start);
+                        const double loss = response_mass * damping * initial *
+                            0.5 * (double(initial) + velocity[body].z) * dt;
+                        const auto value = [&](nk::EnergyColumn column) {
+                            return ledger[env * nk::kEnergyColumnCount + uint32_t(column)];
+                        };
+                        const double exact_velocity = initial - dt *
+                            (spring * start + response_mass * damping * initial) / mass;
+                        EXPECT_NEAR(velocity[body].z, exact_velocity, phi::kTileVelocityTolerance);
+                        // A velocity residual epsilon bounds impulse work error by mass*epsilon*|v1|.
+                        const double storage_tolerance = 2.0e-8 * mass +
+                            mass * std::abs(velocity[body].z) * phi::kTileVelocityTolerance;
+                        EXPECT_NEAR(value(nk::EnergyColumn::ConstraintStorage), stored, storage_tolerance);
+                        EXPECT_NEAR(value(nk::EnergyColumn::NormalLoss), loss, 2.0e-8 * mass);
+                        const double kinetic = 0.5 * mass * (double(velocity[body].z) * velocity[body].z -
+                            double(initial) * initial);
+                        EXPECT_NEAR(value(nk::EnergyColumn::Residual), kinetic + stored + loss, storage_tolerance + 1.0e-8 * mass);
+                    }
                 }
             }
         }
