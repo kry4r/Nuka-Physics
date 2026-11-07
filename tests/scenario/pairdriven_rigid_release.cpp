@@ -331,6 +331,70 @@ TEST(PairDrivenRigidRelease, ResolvedContactDampingConvergesToAnalyticDecay) {
     }
 }
 
+TEST(PairDrivenRigidRelease, IndependentCompliantContactsShareNoStorageCapacity) {
+    auto& backend = Device();
+    if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    constexpr uint32_t spheres = nk::kEnergySplitCapacity + 1u;
+    constexpr float mass = 0.2f, radius = 0.1f, initial = -0.02f, dt = 0.001f;
+    constexpr float impedance = 0.95f, stiffness = 1000.0f, damping = 10.0f;
+    nk::Model model;
+    AddBody(model, nuka::collision::kShapePlane, {}, 0.0f, 0.0f);
+    for (uint32_t i = 0u; i < spheres; ++i) {
+        AddBody(model, nuka::collision::kShapeSphere, {float(i) * 3.0f * radius, 0.0f, 0.0995f}, radius, mass);
+        model.body_init.back().linear_velocity = {0.0f, 0.0f, initial};
+    }
+    nk::ContactProfileV1 profile;
+    profile.law_source = nuka::constraint::LawSource::MuJoCo;
+    profile.condim = 1u;
+    profile.solref[0] = -stiffness * impedance * impedance;
+    profile.solref[1] = -damping * impedance;
+    profile.solimp[0] = profile.solimp[1] = impedance;
+    model.material_buckets.emplace_back(profile);
+    Finish(model);
+    model.capacities.num_material_buckets = 1u;
+    model.capacities.max_contacts_per_env = spheres;
+    model.capacities.max_rows_per_env = spheres * nk::kPairDrivenRowsPerSlot;
+    auto config = Config();
+    config.dt = dt;
+    config.pos_iters = 0u;
+    config.max_pairs = spheres;
+    nk::World world(std::move(model), 2u, backend.device, backend.backend, config);
+    ASSERT_TRUE(world.Ready());
+    const uint32_t bodies = 2u * (spheres + 1u);
+    ASSERT_NE(world.FieldPtr(nk::FieldId::EnergyLedger), nullptr);
+    const auto before = Read<Transform>(world, nk::FieldId::BodyPose, bodies);
+    ASSERT_TRUE(world.Step().AllOk());
+    const auto after = Read<Transform>(world, nk::FieldId::BodyPose, bodies);
+    const auto velocity = Read<Vec3>(world, nk::FieldId::BodyLinearVelocity, bodies);
+    const auto ledger = Read<float>(world, nk::FieldId::EnergyLedger, 2u * nk::kEnergyColumnCount);
+    EXPECT_EQ(Read<uint32_t>(world, nk::FieldId::EnergyLedgerStatus, 2u), std::vector<uint32_t>(2u));
+    uint32_t points = 0u;
+    for (uint32_t count : Read<uint32_t>(world, nk::FieldId::UcontactCount, 2u * spheres)) points += count;
+    ASSERT_EQ(points, 2u * spheres);
+    const double response_mass = double(mass) * impedance;
+    const double spring = response_mass * impedance * stiffness;
+    for (uint32_t env = 0u; env < 2u; ++env) {
+        double stored = 0.0, loss = 0.0, kinetic = 0.0, tolerance = 0.0;
+        for (uint32_t i = 1u; i <= spheres; ++i) {
+            const uint32_t body = env * (spheres + 1u) + i;
+            const double start = double(before[body].position.z) - radius;
+            const double end = double(after[body].position.z) - radius;
+            stored += 0.5 * spring * (end * end - start * start);
+            loss += response_mass * damping * initial * 0.5 * (double(initial) + velocity[body].z) * dt;
+            kinetic += 0.5 * mass * (double(velocity[body].z) * velocity[body].z - double(initial) * initial);
+            const double exact = initial - dt * (spring * start + response_mass * damping * initial) / mass;
+            EXPECT_NEAR(velocity[body].z, exact, phi::kTileVelocityTolerance);
+            tolerance += 2.0e-8 * mass + mass * std::abs(velocity[body].z) * phi::kTileVelocityTolerance;
+        }
+        const auto value = [&](nk::EnergyColumn column) {
+            return ledger[env * nk::kEnergyColumnCount + uint32_t(column)];
+        };
+        EXPECT_NEAR(value(nk::EnergyColumn::ConstraintStorage), stored, tolerance);
+        EXPECT_NEAR(value(nk::EnergyColumn::NormalLoss), loss, 2.0e-8 * mass * spheres);
+        EXPECT_NEAR(value(nk::EnergyColumn::Residual), kinetic + stored + loss, tolerance + 1.0e-8 * mass * spheres);
+    }
+}
+
 TEST(PairDrivenRigidRelease, CompliantStorageAndDampingUseIndependentPhysicalTerms) {
     auto& backend = Device();
     if (!backend.backend) GTEST_SKIP() << "no CUDA backend";

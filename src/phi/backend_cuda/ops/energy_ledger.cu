@@ -460,16 +460,15 @@ __device__ RowForward StoredForward(const NkRow& r, const float* base, uint32_t 
 __device__ double SideDisplacementRate(const NkRowSide& side, bool second, uint32_t row,
     const DataView& d, const ReadoutEnergyLedgerParams& p);
 
-// One active-set factor solves the damping excitation and the change in spring excitation.
+// Independent response components share a factor buffer; each factor splits damping and spring excitation.
 // Dependent rows carry zero force in the semidefinite solve.
 __global__ void EnergyDampingSplitKernel(DataView d, ReadoutEnergyLedgerParams p) {
     constexpr uint32_t capacity = nk::kEnergySplitCapacity;
-    __shared__ uint32_t members[capacity];
-    __shared__ double rhs[capacity];
-    __shared__ double original[capacity];
-    __shared__ uint32_t dropped[capacity];
-    __shared__ uint32_t warp_counts[kThreads / 32u];
-    __shared__ uint32_t total;
+    constexpr size_t double_words = sizeof(double) / sizeof(uint32_t);
+    __shared__ uint32_t members[capacity], small_members[capacity];
+    __shared__ double rhs[capacity], original[capacity];
+    __shared__ uint32_t dropped[capacity], warp_counts[kThreads / 32u];
+    __shared__ uint32_t total, component_count, selected;
     const uint32_t env = blockIdx.x;
     if (env >= p.env_count) return;
     const auto* rows = reinterpret_cast<const NkRow*>(d.urows);
@@ -477,6 +476,11 @@ __global__ void EnergyDampingSplitKernel(DataView d, ReadoutEnergyLedgerParams p
     const uint32_t first = env * p.rows_per_env, dofs = p.dofs_per_artic;
     const uint32_t bound = ContactRowBound(d.contact_row_extent, env, p.contact_rows);
     const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5u;
+    // A larger arena holds the active list at its tail, beyond a capacity-squared matrix prefix.
+    uint32_t* const active = p.rows_per_env > capacity
+        ? reinterpret_cast<uint32_t*>(d.energy_split_matrix + size_t{first} * capacity) +
+              size_t{p.rows_per_env} * (double_words * capacity - 1u)
+        : small_members;
     if (threadIdx.x == 0u) total = 0u;
     __syncthreads();
     bool spring = false;
@@ -494,103 +498,148 @@ __global__ void EnergyDampingSplitKernel(DataView d, ReadoutEnergyLedgerParams p
         __syncthreads();
         uint32_t offset = total + __popc(ballot & ((1u << lane) - 1u));
         for (uint32_t w = 0u; w < warp; ++w) offset += warp_counts[w];
-        if (member && offset < capacity) members[offset] = row;
+        if (member) active[offset] = row;
         __syncthreads();
         if (threadIdx.x == 0u)
             for (uint32_t w = 0u; w < blockDim.x / 32u; ++w) total += warp_counts[w];
         __syncthreads();
     }
     if (!__syncthreads_or(spring)) return;
-    const uint32_t n = total;
-    if (n > capacity) {
-        for (uint32_t local = threadIdx.x; local < p.rows_per_env; local += blockDim.x)
-            storage[size_t{first + local} * 4u] = 0.0f;
-        if (threadIdx.x == 0u)
-            atomicOr(d.energy_ledger_status + size_t{env} * p.substeps + p.slot, nk::energy_status::kStorageCapacity);
-        return;
-    }
     const auto* mass_factor = static_cast<const float*>(d.m_factor);
     const auto* inv_mass = static_cast<const float*>(d.body_inv_mass);
     const auto* inv_inertia = static_cast<const math::SymmetricMat3*>(d.body_world_inv_inertia);
     const auto points = PointMasses(d);
-    for (uint32_t k = threadIdx.x; k < n; k += blockDim.x) {
-        const uint32_t row = members[k];
+    for (uint32_t k = threadIdx.x; k < total; k += blockDim.x) {
+        const uint32_t row = active[k];
         if (dofs > 0u)
             ForwardRowSides(rows[row], row, d.chain_jacobian, d.chain_jacobian_b, mass_factor, dofs,
                             d.energy_split_forward + size_t{row} * 2u * dofs);
-        rhs[k] = (rows[row].flags & nk::nk_row_flags::kMuJoCo) ? double(storage[size_t{row} * 4u + 2u]) : 0.0;
     }
     __syncthreads();
-    // The env's n <= min(capacity, rows) members pack their n x n response into its row slots.
-    double* const a = d.energy_split_matrix + size_t{first} * capacity;
-    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
-        const uint32_t ri = members[i];
-        const RowForward fi = StoredForward(rows[ri], d.energy_split_forward + size_t{ri} * 2u * dofs, dofs);
-        for (uint32_t j = 0u; j <= i; ++j) {
-            const uint32_t rj = members[j];
-            const RowForward fj = StoredForward(rows[rj], d.energy_split_forward + size_t{rj} * 2u * dofs, dofs);
-            double coupling = PairDrivenRowCoupling(rows[ri], fi, rows[rj], fj, mass_factor, inv_mass, inv_inertia,
-                                                    points, dofs);
-            if (i == j) coupling += rows[ri].compliance_alpha;
-            a[size_t{i} * n + j] = coupling;
-        }
-        original[i] = a[size_t{i} * n + i];
-    }
-    __syncthreads();
-    for (uint32_t k = 0u; k < n; ++k) {
+    for (uint32_t seed = 0u; seed < total; ++seed) {
+        if (threadIdx.x == 0u) selected = active[seed];
+        __syncthreads();
+        if (selected == ~0u) continue;
         if (threadIdx.x == 0u) {
-            const double pivot = a[size_t{k} * n + k];
-            dropped[k] = pivot > 1e-9 * original[k] && pivot > 0.0 ? 0u : 1u;
-            a[size_t{k} * n + k] = dropped[k] ? 1.0 : sqrt(pivot);
+            members[0] = selected;
+            active[seed] = ~0u;
+            component_count = 1u;
         }
         __syncthreads();
-        const double diagonal = a[size_t{k} * n + k];
-        for (uint32_t i = k + 1u + threadIdx.x; i < n; i += blockDim.x)
-            a[size_t{i} * n + k] = dropped[k] ? 0.0 : a[size_t{i} * n + k] / diagonal;
+        for (uint32_t front = 0u; front < component_count; ++front) {
+            const uint32_t ri = members[front];
+            const RowForward fi = StoredForward(rows[ri], d.energy_split_forward + size_t{ri} * 2u * dofs, dofs);
+            bool finite = true;
+            for (uint32_t at = threadIdx.x; at < total; at += blockDim.x) {
+                const uint32_t rj = active[at];
+                if (rj == ~0u) continue;
+                const RowForward fj = StoredForward(rows[rj], d.energy_split_forward + size_t{rj} * 2u * dofs, dofs);
+                const double coupling = ri >= rj
+                    ? PairDrivenRowCoupling(rows[ri], fi, rows[rj], fj, mass_factor, inv_mass, inv_inertia, points, dofs)
+                    : PairDrivenRowCoupling(rows[rj], fj, rows[ri], fi, mass_factor, inv_mass, inv_inertia, points, dofs);
+                finite &= isfinite(coupling);
+                if (coupling == 0.0) continue;
+                const uint32_t index = atomicAdd(&component_count, 1u);
+                if (index < capacity) members[index] = rj;
+                active[at] = ~0u;
+            }
+            const bool invalid = __syncthreads_or(!finite) != 0;
+            if (component_count > capacity || invalid) {
+                for (uint32_t local = threadIdx.x; local < p.rows_per_env; local += blockDim.x)
+                    storage[size_t{first + local} * 4u] = 0.0f;
+                if (threadIdx.x == 0u)
+                    atomicOr(d.energy_ledger_status + size_t{env} * p.substeps + p.slot,
+                        invalid ? nk::energy_status::kNonfinite : nk::energy_status::kStorageCapacity);
+                return;
+            }
+        }
+        const uint32_t n = component_count;
+        // Slot order makes the factor independent of the discovery order across threads.
+        if (threadIdx.x == 0u)
+            for (uint32_t i = 1u; i < n; ++i) {
+                const uint32_t value = members[i];
+                uint32_t j = i;
+                for (; j > 0u && members[j - 1u] > value; --j) members[j] = members[j - 1u];
+                members[j] = value;
+            }
         __syncthreads();
-        for (uint32_t i = k + 1u + threadIdx.x; i < n; i += blockDim.x) {
-            const double lik = a[size_t{i} * n + k];
-            for (uint32_t j = k + 1u; j <= i; ++j) a[size_t{i} * n + j] -= lik * a[size_t{j} * n + k];
+        for (uint32_t k = threadIdx.x; k < n; k += blockDim.x) {
+            const uint32_t row = members[k];
+            rhs[k] = (rows[row].flags & nk::nk_row_flags::kMuJoCo) ? double(storage[size_t{row} * 4u + 2u]) : 0.0;
         }
         __syncthreads();
-    }
-    // The pivot reference diagonals are no longer needed after factorization.
-    double* const spring_change = original;
-    for (uint32_t k = threadIdx.x; k < n; k += blockDim.x) {
-        const uint32_t row = members[k];
-        const double displacement = double(p.dt) * (SideDisplacementRate(rows[row].a, false, row, d, p) +
-            SideDisplacementRate(rows[row].b, true, row, d, p));
-        spring_change[k] = CompliantSpringRow(rows[row], d, row) ? storage[size_t{row} * 4u] * displacement : 0.0;
-    }
-    __syncthreads();
-    for (uint32_t k = 0u; k < n; ++k) {
-        if (threadIdx.x == 0u) {
-            rhs[k] = dropped[k] ? 0.0 : rhs[k] / a[size_t{k} * n + k];
-            spring_change[k] = dropped[k] ? 0.0 : spring_change[k] / a[size_t{k} * n + k];
+        // Each connected response block uses the environment's matrix prefix.
+        double* const a = d.energy_split_matrix + size_t{first} * capacity;
+        for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+            const uint32_t ri = members[i];
+            const RowForward fi = StoredForward(rows[ri], d.energy_split_forward + size_t{ri} * 2u * dofs, dofs);
+            for (uint32_t j = 0u; j <= i; ++j) {
+                const uint32_t rj = members[j];
+                const RowForward fj = StoredForward(rows[rj], d.energy_split_forward + size_t{rj} * 2u * dofs, dofs);
+                double coupling = PairDrivenRowCoupling(rows[ri], fi, rows[rj], fj, mass_factor, inv_mass, inv_inertia,
+                                                        points, dofs);
+                if (i == j) coupling += rows[ri].compliance_alpha;
+                a[size_t{i} * n + j] = coupling;
+            }
+            original[i] = a[size_t{i} * n + i];
         }
         __syncthreads();
-        for (uint32_t i = k + 1u + threadIdx.x; i < n; i += blockDim.x) {
-            rhs[i] -= a[size_t{i} * n + k] * rhs[k];
-            spring_change[i] -= a[size_t{i} * n + k] * spring_change[k];
+        for (uint32_t k = 0u; k < n; ++k) {
+            if (threadIdx.x == 0u) {
+                const double pivot = a[size_t{k} * n + k];
+                dropped[k] = pivot > 1e-9 * original[k] && pivot > 0.0 ? 0u : 1u;
+                a[size_t{k} * n + k] = dropped[k] ? 1.0 : sqrt(pivot);
+            }
+            __syncthreads();
+            const double diagonal = a[size_t{k} * n + k];
+            for (uint32_t i = k + 1u + threadIdx.x; i < n; i += blockDim.x)
+                a[size_t{i} * n + k] = dropped[k] ? 0.0 : a[size_t{i} * n + k] / diagonal;
+            __syncthreads();
+            for (uint32_t i = k + 1u + threadIdx.x; i < n; i += blockDim.x) {
+                const double lik = a[size_t{i} * n + k];
+                for (uint32_t j = k + 1u; j <= i; ++j) a[size_t{i} * n + j] -= lik * a[size_t{j} * n + k];
+            }
+            __syncthreads();
+        }
+        // The pivot reference diagonals are no longer needed after factorization.
+        double* const spring_change = original;
+        for (uint32_t k = threadIdx.x; k < n; k += blockDim.x) {
+            const uint32_t row = members[k];
+            const double displacement = double(p.dt) * (SideDisplacementRate(rows[row].a, false, row, d, p) +
+                SideDisplacementRate(rows[row].b, true, row, d, p));
+            spring_change[k] = CompliantSpringRow(rows[row], d, row) ? storage[size_t{row} * 4u] * displacement : 0.0;
         }
         __syncthreads();
-    }
-    for (uint32_t k = n; k > 0u; --k) {
-        const uint32_t c = k - 1u;
-        if (threadIdx.x == 0u) {
-            rhs[c] = dropped[c] ? 0.0 : rhs[c] / a[size_t{c} * n + c];
-            spring_change[c] = dropped[c] ? 0.0 : spring_change[c] / a[size_t{c} * n + c];
+        for (uint32_t k = 0u; k < n; ++k) {
+            if (threadIdx.x == 0u) {
+                rhs[k] = dropped[k] ? 0.0 : rhs[k] / a[size_t{k} * n + k];
+                spring_change[k] = dropped[k] ? 0.0 : spring_change[k] / a[size_t{k} * n + k];
+            }
+            __syncthreads();
+            for (uint32_t i = k + 1u + threadIdx.x; i < n; i += blockDim.x) {
+                rhs[i] -= a[size_t{i} * n + k] * rhs[k];
+                spring_change[i] -= a[size_t{i} * n + k] * spring_change[k];
+            }
+            __syncthreads();
+        }
+        for (uint32_t k = n; k > 0u; --k) {
+            const uint32_t c = k - 1u;
+            if (threadIdx.x == 0u) {
+                rhs[c] = dropped[c] ? 0.0 : rhs[c] / a[size_t{c} * n + c];
+                spring_change[c] = dropped[c] ? 0.0 : spring_change[c] / a[size_t{c} * n + c];
+            }
+            __syncthreads();
+            for (uint32_t i = threadIdx.x; i < c; i += blockDim.x) {
+                rhs[i] -= a[size_t{c} * n + i] * rhs[c];
+                spring_change[i] -= a[size_t{c} * n + i] * spring_change[c];
+            }
+            __syncthreads();
+        }
+        for (uint32_t k = threadIdx.x; k < n; k += blockDim.x) {
+            storage[size_t{members[k]} * 4u + 1u] = float(spring_change[k]);
+            storage[size_t{members[k]} * 4u + 2u] = float(rhs[k] * double(p.dt));
         }
         __syncthreads();
-        for (uint32_t i = threadIdx.x; i < c; i += blockDim.x) {
-            rhs[i] -= a[size_t{c} * n + i] * rhs[c];
-            spring_change[i] -= a[size_t{c} * n + i] * spring_change[c];
-        }
-        __syncthreads();
-    }
-    for (uint32_t k = threadIdx.x; k < n; k += blockDim.x) {
-        storage[size_t{members[k]} * 4u + 1u] = float(spring_change[k]);
-        storage[size_t{members[k]} * 4u + 2u] = float(rhs[k] * double(p.dt));
     }
 }
 
