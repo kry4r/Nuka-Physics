@@ -600,11 +600,13 @@ __device__ void InitializeTileHead(DataView data, BlockDescentSolveParams p, Blo
 }
 
 // A thread per head incidence finds its support on its block's coordinates, the last nonzero being a single
-// row's unit; kTileRow holds the rows an incidence stages until PlaceWideTileRows orders them.
+// row's unit; kTileRow holds the rows an incidence stages until PlaceTileRows orders them.
 template <uint32_t kN>
-__device__ void FindWideTileSupport(DataView data, BlockDescentSolveParams p, BlockScratch s, const TileContext& c) {
+__device__ void FindTileRowSupport(DataView data, BlockDescentSolveParams p, BlockScratch s, const TileContext& c) {
     const auto* row_data = reinterpret_cast<const NkRow*>(data.urows);
-    for (uint32_t item = threadIdx.x; item < 2u * c.heads; item += blockDim.x) {
+    const uint32_t first = TileSpan<kN>() == 1u ? c.member * kTileLanes + c.lane : threadIdx.x;
+    const uint32_t stride = TileSpan<kN>() == 1u ? c.team * kTileLanes : blockDim.x;
+    for (uint32_t item = first; item < 2u * c.heads; item += stride) {
         const uint32_t h = item / 2u, incidence = item % 2u;
         const uint32_t block = c.Index(kTileOwner + incidence, h);
         if (block == kNoTileBlock) continue;
@@ -635,10 +637,12 @@ __device__ void FindWideTileSupport(DataView data, BlockDescentSolveParams p, Bl
 
 // A warp per placed head copies its Jacobian rows over the block's coordinates.
 template <uint32_t kN>
-__device__ void CopyWideTileRows(DataView data, BlockDescentSolveParams p, BlockScratch s, const TileContext& c) {
+__device__ void CopyTileRows(DataView data, BlockDescentSolveParams p, BlockScratch s, const TileContext& c) {
     const auto* row_data = reinterpret_cast<const NkRow*>(data.urows);
-    const uint32_t lane = threadIdx.x % kTileLanes, warps = blockDim.x / kTileLanes;
-    for (uint32_t h = threadIdx.x / kTileLanes; h < c.heads; h += warps) {
+    const uint32_t lane = threadIdx.x % kTileLanes;
+    const uint32_t first = TileSpan<kN>() == 1u ? c.member : threadIdx.x / kTileLanes;
+    const uint32_t warps = TileSpan<kN>() == 1u ? c.team : blockDim.x / kTileLanes;
+    for (uint32_t h = first; h < c.heads; h += warps) {
         const uint32_t slot = c.Index(kTileSlot, h), stride = c.Index(kTileStride, h);
         const uint32_t axes = c.Index(kTileAxes, h);
         for (uint32_t incidence = 0u; incidence < 2u; ++incidence) {
@@ -680,11 +684,31 @@ __device__ float SerialSideSpeed(BlockDescentSolveParams p, BlockScratch s, cons
     return along;
 }
 
-// InitializeTileResiduals past a warp of coordinates, a thread per head axis.
+// Narrow rows keep the coordinate reduction tree; wider rows use a thread per axis.
 template <uint32_t kN>
-__device__ void InitializeWideTileResiduals(DataView data, BlockDescentSolveParams p, BlockScratch s,
-                                            const TileContext& c) {
+__device__ void InitializeTileResiduals(DataView data, BlockDescentSolveParams p, BlockScratch s,
+                                       const TileContext& c) {
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
+    if constexpr (TileSpan<kN>() == 1u) {
+        const uint32_t lane = c.lane;
+        for (uint32_t h = c.member; h < c.heads; h += c.team) {
+            const uint32_t slot = c.Index(kTileSlot, h), stride = c.Index(kTileStride, h);
+            Vec3 velocity{}, rhs{};
+            for (uint32_t axis = 0u; axis < c.Index(kTileAxes, h); ++axis) {
+                const uint32_t at = slot + axis * stride;
+                const NkRow row = rows[at];
+                const float along = TileSideVelocity(p, s, row.a, data.chain_jacobian, at, lane) +
+                                    TileSideVelocity(p, s, row.b, data.chain_jacobian_b, at, lane);
+                SetAxisComponent(velocity, axis, along);
+                SetAxisComponent(rhs, axis, __fmul_rn(row.rhs, p.dt));
+            }
+            velocity = TileWarpSum3(velocity);
+            if (lane == 0u)
+                c.Store3(kTileResidual, h, {__fsub_rn(rhs.x, velocity.x), __fsub_rn(rhs.y, velocity.y),
+                                           __fsub_rn(rhs.z, velocity.z)});
+        }
+        return;
+    }
     for (uint32_t item = threadIdx.x; item < 3u * c.heads; item += blockDim.x) {
         const uint32_t h = item / 3u, axis = item % 3u;
         float residual = 0.0f;
@@ -763,9 +787,9 @@ __device__ __forceinline__ void ExecuteTileWork(DataView data, BlockDescentSolve
         case TileWork::Products: AssembleTileChunk<kN>(work, at); break;
         case TileWork::Scale: ScaleTileRows<kN>(work, at); break;
         case TileWork::Factor: FactorTileColumns<kN>(work, at); break;
-        case TileWork::Support: FindWideTileSupport<kN>(data, p, s, *work.heads); break;
-        case TileWork::Rows: CopyWideTileRows<kN>(data, p, s, *work.heads); break;
-        case TileWork::Residuals: InitializeWideTileResiduals<kN>(data, p, s, *work.heads); break;
+        case TileWork::Support: FindTileRowSupport<kN>(data, p, s, *work.heads); break;
+        case TileWork::Rows: CopyTileRows<kN>(data, p, s, *work.heads); break;
+        case TileWork::Residuals: InitializeTileResiduals<kN>(data, p, s, *work.heads); break;
         case TileWork::Couplings: ComputeWideTileCouplings<kN>(data, p, *work.heads, at); break;
     }
 }
@@ -900,75 +924,8 @@ __device__ void LoadTileColors(TileContext& c) {
     c.colors = __ballot_sync(~0u, c.color_stop != (c.lane == 0u ? 0u : start));
 }
 
-// Jacobians on moving blocks: single-coordinate rows store their coordinate and value;
-// other rows store one vector of block coordinates per axis.
-template <uint32_t kN>
-__device__ void InitializeTileRows(DataView data, BlockDescentSolveParams p, BlockScratch s, const TileContext& c) {
-    constexpr uint32_t kSpan = TileSpan<kN>();
-    const auto* row_data = reinterpret_cast<const NkRow*>(data.urows);
-    uint32_t rows = 0u;
-    for (uint32_t h = 0u; h < c.heads; ++h) {
-        const uint32_t slot = c.Index(kTileSlot, h);
-        const uint32_t stride = c.Index(kTileStride, h);
-        const uint32_t axes = c.Index(kTileAxes, h);
-        for (uint32_t incidence = 0u; incidence < 2u; ++incidence) {
-            const uint32_t block = c.Index(kTileOwner + incidence, h);
-            TileBlock b{};
-            if (block != kNoTileBlock) b = LoadTileBlock(data, p, s, c, block);
-            // A side off the tile's blocks keeps the empty block, whose dimension is zero.
-            float value[3][kSpan]{};
-            bool finite = true;
-#pragma unroll
-            for (uint32_t axis = 0u; axis < 3u; ++axis) {
-                if (axis >= axes) continue;
-                const uint32_t row_slot = slot + axis * stride;
-                const NkRow& row = row_data[row_slot];
-#pragma unroll
-                for (uint32_t r = 0u; r < kSpan; ++r) {
-                    const uint32_t i = c.lane + r * kTileLanes;
-                    if (i < b.dimension) value[axis][r] = b.Jacobian(data, p, row, row_slot, i);
-                    finite &= isfinite(value[axis][r]);
-                }
-            }
-            if (block == kNoTileBlock) continue;
-            if (!__all_sync(~0u, finite) && c.lane == 0u)
-                RecordTileFailure(data, p, s, c, b.owner, nk::BlockSolveFailure::InvalidRow);
-            uint32_t support[kSpan], supported = 0u;
-#pragma unroll
-            for (uint32_t r = 0u; r < kSpan; ++r) {
-                support[r] = __ballot_sync(~0u, value[0][r] != 0.0f);
-                supported += __popc(support[r]);
-            }
-            uint32_t row = ~0u, unit = ~0u;
-            float unit_value = 0.0f;
-            if (axes == 1u && supported <= 1u) {
-                unit = 0u;
-#pragma unroll
-                for (uint32_t r = 0u; r < kSpan; ++r)
-                    if (support[r] != 0u) unit = r * kTileLanes + __ffs(support[r]) - 1u;
-                unit_value = TileCoordinate(value[0], unit);
-            } else {
-                row = rows;
-#pragma unroll
-                for (uint32_t axis = 0u; axis < 3u; ++axis)
-#pragma unroll
-                    for (uint32_t r = 0u; r < kSpan; ++r)
-                        if (axis < axes && c.lane + r * kTileLanes < c.width)
-                            c.jacobian[size_t{row + axis} * c.width + c.lane + r * kTileLanes] = value[axis][r];
-                rows += axes;
-            }
-            if (c.lane == 0u) {
-                c.Index(kTileRow + incidence, h) = row;
-                c.Index(kTileUnit + incidence, h) = unit;
-                c.Value(kTileUnitValue + incidence, h) = unit_value;
-            }
-        }
-    }
-    __syncwarp();
-}
-
-// Jacobian rows in head order: a warp scan over the counts FindWideTileSupport left in kTileRow.
-__device__ void PlaceWideTileRows(const TileContext& c) {
+// Jacobian rows in head order: a warp scan over the counts FindTileRowSupport left in kTileRow.
+__device__ void PlaceTileRows(const TileContext& c) {
     uint32_t rows = 0u;
     for (uint32_t chunk = 0u; chunk < c.heads; chunk += kTileLanes) {
         const uint32_t h = chunk + c.lane;
@@ -992,36 +949,6 @@ __device__ void PlaceWideTileRows(const TileContext& c) {
             c.Index(kTileRow + incidence, h) = staged[incidence] != 0u ? row : ~0u;
             row += staged[incidence];
         }
-    }
-    __syncwarp();
-}
-
-template <uint32_t kN>
-__device__ void InitializeTileResiduals(DataView data, BlockDescentSolveParams p, BlockScratch s,
-                                        const TileContext& c) {
-    const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
-    const uint32_t first = TileSpan<kN>() == 1u ? 0u : c.lane;
-    const uint32_t step = TileSpan<kN>() == 1u ? 1u : kTileLanes;
-    for (uint32_t h = first; h < c.heads; h += step) {
-        const uint32_t slot = c.Index(kTileSlot, h), stride = c.Index(kTileStride, h);
-        Vec3 velocity{}, rhs{};
-        for (uint32_t axis = 0u; axis < c.Index(kTileAxes, h); ++axis) {
-            const uint32_t at = slot + axis * stride;
-            const NkRow row = rows[at];
-            float along;
-            if constexpr (TileSpan<kN>() == 1u)
-                along = TileSideVelocity(p, s, row.a, data.chain_jacobian, at, c.lane) +
-                        TileSideVelocity(p, s, row.b, data.chain_jacobian_b, at, c.lane);
-            else
-                along = TileSideSpeed(p, s, row.a, data.chain_jacobian, at) +
-                        TileSideSpeed(p, s, row.b, data.chain_jacobian_b, at);
-            SetAxisComponent(velocity, axis, along);
-            SetAxisComponent(rhs, axis, __fmul_rn(row.rhs, p.dt));
-        }
-        if constexpr (TileSpan<kN>() == 1u) velocity = TileWarpSum3(velocity);
-        if (TileSpan<kN>() > 1u || c.lane == 0u)
-            c.Store3(kTileResidual, h, {__fsub_rn(rhs.x, velocity.x), __fsub_rn(rhs.y, velocity.y),
-                                        __fsub_rn(rhs.z, velocity.z)});
     }
     __syncwarp();
 }
@@ -1136,17 +1063,14 @@ __device__ void InitializeTile(ArticulationDeviceState state, DataView data, Blo
             if (base + c.lane < heads) s.active_rows[at + c.lane] = c.Index(kTileSlot, base + c.lane);
         }
     }
-    if constexpr (TileSpan<kN>() == 1u) {
-        InitializeTileRows<kN>(data, p, s, c);
-    } else {
+    if constexpr (TileSpan<kN>() > 1u) {
         RunTileWork<kN>(data, p, s, c, TileWork::Support);
-        PlaceWideTileRows(c);
+        PlaceTileRows(c);
         RunTileWork<kN>(data, p, s, c, TileWork::Rows);
+        clock.Stamp(kPhaseSetupJacobian);
+        RunTileWork<kN>(data, p, s, c, TileWork::Residuals);
+        clock.Stamp(kPhaseSetupResidual);
     }
-    clock.Stamp(kPhaseSetupJacobian);
-    if constexpr (TileSpan<kN>() == 1u) InitializeTileResiduals<kN>(data, p, s, c);
-    else RunTileWork<kN>(data, p, s, c, TileWork::Residuals);
-    clock.Stamp(kPhaseSetupResidual);
 }
 
 // Hold the current normal multiplier as the friction radius through the block solve, as LoadLocalTerm.
@@ -2379,6 +2303,18 @@ __device__ void DescendTile(ArticulationDeviceState state, DataView data, BlockD
     TilePhaseClock clock(p.telemetry != 0u);
     if (c.member == 0u) InitializeTile<kN>(state, data, p, s, c, clock);
     c.heads = TeamBroadcast(c, c.heads);
+    if constexpr (TileSpan<kN>() == 1u) {
+        FindTileRowSupport<kN>(data, p, s, c);
+        TeamSync(c);
+        if (c.member == 0u) PlaceTileRows(c);
+        TeamSync(c);
+        CopyTileRows<kN>(data, p, s, c);
+        TeamSync(c);
+        clock.Stamp(kPhaseSetupJacobian);
+        InitializeTileResiduals<kN>(data, p, s, c);
+        TeamSync(c);
+        clock.Stamp(kPhaseSetupResidual);
+    }
     LoadTileColors(c);
     clock.Stamp(kPhaseSetup);
     // Lane k holds the residual of class k.
@@ -2411,9 +2347,9 @@ __device__ void DescendTile(ArticulationDeviceState state, DataView data, BlockD
             c.residual >= p.velocity_tolerance && c.residual < FLT_MAX) {
             MeasureTilePrimals<kN>(data, p, s, c, true);
             if (c.residual < FLT_MAX) {
-                if (c.member == 0u) {
-                    if constexpr (TileSpan<kN>() == 1u) InitializeTileResiduals<kN>(data, p, s, c);
-                    else RunTileWork<kN>(data, p, s, c, TileWork::Residuals);
+                if constexpr (TileSpan<kN>() == 1u) InitializeTileResiduals<kN>(data, p, s, c);
+                else if (c.member == 0u) {
+                    RunTileWork<kN>(data, p, s, c, TileWork::Residuals);
                 }
                 TeamSync(c);
                 clock.Stamp(kPhaseDense);
