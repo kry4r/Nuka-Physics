@@ -2041,10 +2041,11 @@ __device__ void MeasureTilePrimal(DataView data, BlockDescentSolveParams p, Bloc
 }
 
 // Evaluate row residuals and optionally commit the dual update; read-only evaluation uses physical multipliers.
-// Returns normal, tangent, other-row and multiplier-step residuals; position impulses stay in the tile.
-__device__ float4 UpdateTileDuals(DataView data, const TileContext& c, float beta, bool velocity = true,
+// The restart measure sums all accelerated rows in their proximal metric.
+__device__ float3 UpdateTileDuals(DataView data, const TileContext& c, DualMomentum* momentum, bool velocity = true,
                                    bool commit = true) {
     uint32_t steps[kResidualClasses] = {0u, 0u, 0u, 0u};
+    double restart = 0.0;
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
     for (uint32_t h = c.member * kTileLanes + c.lane; h < c.heads; h += c.team * kTileLanes) {
         TileHead t = LoadTileHead(c, h);
@@ -2068,7 +2069,6 @@ __device__ float4 UpdateTileDuals(DataView data, const TileContext& c, float bet
             const Vec3 delta = nk::augmented::EllipticMultiplierStep(t.dual, dual, t.rho, t.cone_compliance);
             step = {delta.x, fmaxf(delta.y, delta.z)};
         }
-        steps[kResidualMomentum] = max(steps[kResidualMomentum], ResidualBits(fmaxf(step.x, step.y)));
         const Vec3 physical = commit ? dual : t.dual;
         if (!contact) {
             const bool normal_row = (rows[slot].flags & nk::nk_row_flags::kContactNormal) != 0u;
@@ -2103,17 +2103,46 @@ __device__ float4 UpdateTileDuals(DataView data, const TileContext& c, float bet
         if (velocity) data.lambda[slot] = dual.x;
         // The blocks descend against the extrapolated multipliers; data.lambda keeps the unextrapolated ones.
         const bool extrapolate = contact || t.response.dual_scale != 0.0f;
-        c.Store3(kTileDual, h, ExtrapolateDual(c.Load3(kTileBase, h), dual, extrapolate ? beta : 0.0f, t.lower, t.upper, contact,
-                                               t.mu_first, t.mu_second));
+        const Vec3 base = c.Load3(kTileBase, h);
+        const Vec3 metric = t.elliptic
+            ? nk::augmented::ComputeEllipticResponse(t.rho, t.cone_compliance).residual_scale
+            : MultiplierMetric(t.response.residual_scale, t.rho, contact, t.mu_first, t.mu_second);
+        if (extrapolate) restart += nk::augmented::MultiplierMomentumRestart(t.dual, dual, base, metric);
+        // Completed block moves can hold the old physical base until the direction reduction finishes.
+        if (momentum != nullptr) c.Store3(kTileMove, h, base);
+        c.Store3(kTileDual, h, dual);
         c.Store3(kTileBase, h, dual);
     }
     __syncwarp();
     const uint4 largest = TeamMax(c, make_uint4(__reduce_max_sync(~0u, steps[kResidualNormal]),
                                                 __reduce_max_sync(~0u, steps[kResidualTangent]),
                                                 __reduce_max_sync(~0u, steps[kResidualJoint]),
-                                                __reduce_max_sync(~0u, steps[kResidualMomentum])));
-    return {__uint_as_float(largest.x), __uint_as_float(largest.y), __uint_as_float(largest.z),
-            __uint_as_float(largest.w)};
+                                                0u));
+    restart = WarpSum(restart);
+    if (c.team > 1u) {
+        if (c.lane == 0u)
+            c.team_share[c.member] = {static_cast<uint32_t>(__double2loint(restart)),
+                                     static_cast<uint32_t>(__double2hiint(restart)), 0u, 0u};
+        TeamSync(c);
+        restart = 0.0;
+        for (uint32_t member = 0u; member < c.team; ++member) {
+            const uint4 value = c.team_share[member];
+            restart += __hiloint2double(static_cast<int>(value.y), static_cast<int>(value.x));
+        }
+        TeamSync(c);
+    }
+    if (momentum != nullptr) {
+        AdvanceDualMomentum(*momentum, restart);
+        for (uint32_t h = c.member * kTileLanes + c.lane; h < c.heads; h += c.team * kTileLanes) {
+            const TileHead t = LoadTileHead(c, h);
+            const bool contact = t.axes == 3u;
+            const bool extrapolate = contact || t.response.dual_scale != 0.0f;
+            c.Store3(kTileDual, h, ExtrapolateDual(c.Load3(kTileMove, h), c.Load3(kTileBase, h),
+                extrapolate ? momentum->beta : 0.0f, t.lower, t.upper, contact, t.mu_first, t.mu_second));
+        }
+        TeamSync(c);
+    }
+    return {__uint_as_float(largest.x), __uint_as_float(largest.y), __uint_as_float(largest.z)};
 }
 
 // Final velocities as the tails of DescendArticulationsKernel and DescendRigidBlocksKernel, then the
@@ -2321,7 +2350,6 @@ __device__ void DescendTile(ArticulationDeviceState state, DataView data, BlockD
     float residual = 0.0f;
     uint32_t sweeps = 0u;
     DualMomentum momentum = StartDualMomentum();
-    float step = FLT_MAX;
     while (sweeps < p.iterations) {
         c.iteration = sweeps++;
         c.momentum = 0.0f;
@@ -2334,10 +2362,8 @@ __device__ void DescendTile(ArticulationDeviceState state, DataView data, BlockD
         c.momentum = __uint_as_float(block_residual.x);
         c.residual = __uint_as_float(block_residual.y);
         clock.Stamp(kPhaseDense);
-        AdvanceDualMomentum(momentum, step);
         clock.Stamp(kPhaseMomentum);
-        float4 rows = UpdateTileDuals(data, c, momentum.beta);
-        step = rows.w;
+        auto rows = UpdateTileDuals(data, c, &momentum);
         clock.Stamp(kPhaseDual);
         if ((p.telemetry & nk::kTelemetrySweeps) != 0u || sweeps == p.iterations ||
             fmaxf(fmaxf(rows.x, rows.y), fmaxf(rows.z, c.residual)) < p.velocity_tolerance)
@@ -2353,7 +2379,7 @@ __device__ void DescendTile(ArticulationDeviceState state, DataView data, BlockD
                 }
                 TeamSync(c);
                 clock.Stamp(kPhaseDense);
-                rows = UpdateTileDuals(data, c, 0.0f, true, false);
+                rows = UpdateTileDuals(data, c, nullptr, true, false);
                 clock.Stamp(kPhaseDual);
                 c.residual = 0.0f;
                 MeasureTilePrimals<kN>(data, p, s, c);
@@ -2387,7 +2413,7 @@ __device__ void DescendTile(ArticulationDeviceState state, DataView data, BlockD
         for (uint32_t iteration = 0u; iteration < positions; ++iteration) {
             c.iteration = sweeps + iteration;
             DescendTileBlocks<kN>(data, p, s, c, true);
-            if (iteration + 1u < positions) UpdateTileDuals(data, c, 0.0f, false);
+            if (iteration + 1u < positions) UpdateTileDuals(data, c, nullptr, false);
         }
         if (c.member == 0u) FinishTilePositions(state, data, p, s, c);
     }

@@ -241,10 +241,9 @@ __host__ __device__ uint32_t TileJacobianWidth(const BlockDescentSolveParams& p)
 // Warps the tile kernel keeps resident; each stages one environment at a time in its own slot.
 uint32_t TileWarpSlots(const BlockDescentSolveParams& p);
 
-// FISTA momentum of an env's multipliers, restarted when its last multiplier step grew.
+// FISTA momentum of an environment's multipliers, restarted when its update opposes descent.
 struct DualMomentum {
     float t;
-    float previous;
     float beta;
     uint32_t restarts;
 };
@@ -264,10 +263,10 @@ struct BlockScratch {
     float* penalty;
     Vec3* particle_snapshot;
     Vec3* particle_free;
-    // The sweep path's unextrapolated multipliers, momentum per env and its running sweep's largest multiplier step.
+    // The sweep path's unextrapolated multipliers, momentum and accumulated restart measure per environment.
     float* dual_base;
     DualMomentum* dual_momentum;
-    uint32_t* dual_step;
+    double* dual_restart;
     uint32_t* articulation_roots;
     uint32_t* articulation_dimensions;
     float* articulation_free;
@@ -499,7 +498,8 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     s.dense_coupled = take(tile ? 0u : uint64_t{p.total_body_count} + p.articulation_count);
     s.dual_base = reinterpret_cast<float*>(take(tile ? 0u : rows));
     s.dual_momentum = reinterpret_cast<DualMomentum*>(take(sweep_envs * sizeof(DualMomentum) / sizeof(uint32_t)));
-    s.dual_step = take(sweep_envs);
+    at = (at + 1u) & ~uint64_t{1u};
+    s.dual_restart = reinterpret_cast<double*>(take(2u * sweep_envs));
     s.articulation_roots = take(dofs);
     s.articulation_dimensions = take(p.articulation_count);
     s.articulation_free = reinterpret_cast<float*>(take(dofs));
@@ -700,6 +700,17 @@ __device__ void RaiseWarpResidual(BlockScratch s, uint32_t env, uint32_t kind, u
     if (env != ~0u && threadIdx.x % warpSize == __ffs(peers) - 1u) RaiseResidual(s, env, kind, largest);
 }
 
+__device__ void RaiseWarpRestart(double* values, uint32_t env, double value) {
+    for (uint32_t pending = __ballot_sync(~0u, env != ~0u); pending != 0u;) {
+        const uint32_t leader = __ffs(pending) - 1u;
+        const uint32_t target = __shfl_sync(~0u, env, leader);
+        const bool same = env == target;
+        const double sum = WarpSum(same ? value : 0.0);
+        if (threadIdx.x % warpSize == leader) atomicAdd(values + target, sum);
+        pending &= ~__ballot_sync(~0u, same);
+    }
+}
+
 // A row's multiplier steps at its dual update in velocity units: the normal (or scalar) step over its residual
 // scale, the tangent steps over their normalized cone penalties, which is the slip velocity inside the cone.
 __device__ float2 MultiplierSteps(Vec3 dual, Vec3 next, float scale, float dual_scale, float rho,
@@ -718,18 +729,24 @@ __device__ float Along(float impulse, float velocity) {
     return impulse > 0.0f ? velocity : impulse < 0.0f ? -velocity : 0.0f;
 }
 
-__host__ __device__ inline DualMomentum StartDualMomentum() { return {1.0f, FLT_MAX, 0.0f, 0u}; }
+__host__ __device__ inline DualMomentum StartDualMomentum() { return {1.0f, 0.0f, 0u}; }
 
-// One FISTA step of an env's momentum from its last largest multiplier step; a grown step restarts it at rest.
-__device__ void AdvanceDualMomentum(DualMomentum& m, float step) {
-    if (step > m.previous) {
+// The committed dual update supplies the direction test before extrapolation.
+__device__ void AdvanceDualMomentum(DualMomentum& m, double restart) {
+    if (restart > 0.0) {
         m.t = 1.0f;
         ++m.restarts;
     }
-    m.previous = step;
     const float t = 0.5f * (1.0f + sqrtf(fmaf(4.0f * m.t, m.t, 1.0f)));
     m.beta = (m.t - 1.0f) / t;
     m.t = t;
+}
+
+__device__ Vec3 MultiplierMetric(float scale, float rho, bool contact, float mu_first, float mu_second) {
+    const float friction = fmaxf(mu_first, mu_second);
+    const float first = contact && mu_first > 0.0f ? mu_first / friction : 0.0f;
+    const float second = contact && mu_second > 0.0f ? mu_second / friction : 0.0f;
+    return {scale, rho * first * first, rho * second * second};
 }
 
 // A row's next multiplier at its residual: the bound projection `normal`, the friction cone of that normal
@@ -2186,11 +2203,11 @@ __global__ void DescendParticlesKernel(ModelView model, DataView data, BlockDesc
     }
 }
 
-// Seed the next sweep from the committed velocities; incremental grid residuals accumulate rounding
-// within a sweep and must not carry that error into later multiplier updates.
-__global__ void DualUpdateKernel(DataView data, BlockDescentSolveParams p, BlockScratch s, bool seed) {
+// Commit physical multipliers and reduce their direction test before choosing extrapolation.
+__global__ void DualUpdateKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
-    uint32_t env = ~0u, joint = 0u, step = 0u;
+    uint32_t env = ~0u, joint = 0u;
+    double restart = 0.0;
     for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < *s.active_count;
          item += gridDim.x * blockDim.x) {
         const uint32_t slot = s.active_rows[item];
@@ -2200,7 +2217,6 @@ __global__ void DualUpdateKernel(DataView data, BlockDescentSolveParams p, Block
             UpdateMaterialDual(data, p, s, slot);
             continue;
         }
-        const bool grid_only = p.total_grid_count != 0u && GridOnlyRow(s, p.vertex_blocks.colors, slot);
         const AugmentedRowState current = ComputeAugmentedRowState(data, p, s, slot, false);
         const LocalTerm t = LoadLocalTerm(data, p, s, slot, ~0u, false, &current);
         const uint32_t stride = rows[slot].group_normal_count;
@@ -2210,11 +2226,12 @@ __global__ void DualUpdateKernel(DataView data, BlockDescentSolveParams p, Block
                              t.mu_second, s.contact_relaxation + slot);
         if (row_env != env && env != ~0u) {
             RaiseResidual(s, env, kResidualJoint, joint);
-            atomicMax(s.dual_step + env, step);
-            joint = step = 0u;
+            atomicAdd(s.dual_restart + env, restart);
+            joint = 0u;
+            restart = 0.0;
         }
         env = row_env;
-        // Every row's multiplier step drives the momentum restart; a non-contact row's is its residual too.
+        // Non-contact rows retain their multiplier-step residual.
         float2 change = MultiplierSteps(t.dual, next, static_cast<float>(t.response.residual_scale),
             static_cast<float>(t.response.dual_scale), t.penalty,
             t.contact ? t.mu_first : 0.0f, t.contact ? t.mu_second : 0.0f);
@@ -2224,53 +2241,77 @@ __global__ void DualUpdateKernel(DataView data, BlockDescentSolveParams p, Block
         }
         if (!t.contact && !(rows[slot].flags & nk::nk_row_flags::kContactNormal))
             joint = max(joint, ResidualBits(change.x));
-        step = max(step, ResidualBits(fmaxf(change.x, change.y)));
         // The primal reads the extrapolated multipliers; the unextrapolated ones stay in dual_base.
         const Vec3 base{s.dual_base[slot], t.contact ? s.dual_base[slot + stride] : 0.0f,
                         t.contact ? s.dual_base[slot + 2u * stride] : 0.0f};
         const bool extrapolate = t.contact || t.response.dual_scale != 0.0;
-        const Vec3 y = ExtrapolateDual(base, next, extrapolate ? s.dual_momentum[row_env].beta : 0.0f, t.lower, t.upper, t.contact,
-                                       t.mu_first, t.mu_second);
+        const Vec3 metric = t.elliptic
+            ? nk::augmented::ComputeEllipticResponse(t.penalty, t.cone_compliance).residual_scale
+            : MultiplierMetric(static_cast<float>(t.response.residual_scale), t.penalty,
+                               t.contact, t.mu_first, t.mu_second);
+        if (extrapolate) restart += nk::augmented::MultiplierMomentumRestart(t.dual, next, base, metric);
+        data.lambda[slot] = next.x;
+        if (t.contact) {
+            data.lambda[slot + stride] = next.y;
+            data.lambda[slot + 2u * stride] = next.z;
+        }
+    }
+    RaiseWarpResidual(s, env, kResidualJoint, joint);
+    RaiseWarpRestart(s.dual_restart, env, restart);
+}
+
+// Extrapolate after the environment's direction test, then seed rows from committed velocities.
+__global__ void ExtrapolateDualKernel(DataView data, BlockDescentSolveParams p, BlockScratch s, bool seed) {
+    const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
+    for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < *s.active_count;
+         item += gridDim.x * blockDim.x) {
+        const uint32_t slot = s.active_rows[item], env = slot / p.rows_per_env;
+        const NkRow row = rows[slot];
+        if (!EnvRunning(data, env) || (row.flags & nk::nk_row_flags::kMaterialBlock)) continue;
+        const bool contact = (row.flags & nk::nk_row_flags::kBlockNormal) != 0u;
+        const uint32_t stride = row.group_normal_count;
+        const Vec3 base{s.dual_base[slot], contact ? s.dual_base[slot + stride] : 0.0f,
+                        contact ? s.dual_base[slot + 2u * stride] : 0.0f};
+        const Vec3 next{data.lambda[slot], contact ? data.lambda[slot + stride] : 0.0f,
+                        contact ? data.lambda[slot + 2u * stride] : 0.0f};
+        const bool extrapolate = contact || s.scalar_response[slot].dual_scale != 0.0;
+        const Vec3 y = ExtrapolateDual(base, next, extrapolate ? s.dual_momentum[env].beta : 0.0f,
+                                       row.lower, row.upper, contact, row.mu, row.friction_secondary);
         s.dual_base[slot] = next.x;
         data.lambda[slot] = y.x;
-        if (t.contact) {
+        if (contact) {
             s.dual_base[slot + stride] = next.y;
             s.dual_base[slot + 2u * stride] = next.z;
             data.lambda[slot + stride] = y.y;
             data.lambda[slot + 2u * stride] = y.z;
         }
+        const bool grid_only = p.total_grid_count != 0u && GridOnlyRow(s, p.vertex_blocks.colors, slot);
         const uint32_t dense_color = p.vertex_blocks.colors + 1u;
         const bool dense = (s.row_cache_colors[size_t{slot} * s.color_words + dense_color / 32u] &
                             (1u << (dense_color % 32u))) != 0u;
         if (seed && (dense || (p.total_grid_count == 0u
                 ? ParticleRowFirstColor(s, p.vertex_blocks.colors, slot) != kNoCacheColor : grid_only))) {
-            AugmentedRowState seeded{};
-            seeded.residual = t.residual;
-            seeded.dual = y;
-            seeded.normal_bound = AugmentedRowBound(s, rows[slot], slot, seeded);
-            s.row_state[slot] = seeded;
+            s.row_state[slot] = ComputeAugmentedRowState(data, p, s, slot, false);
         }
     }
-    RaiseWarpResidual(s, env, kResidualJoint, joint);
-    RaiseWarpMax(s.dual_step, env, step);
 }
 
-// No momentum before the first sweep; the first restart test passes against the largest step.
+// The first sweep starts without extrapolation or a pending restart.
 __global__ void StartDualMomentumKernel(BlockDescentSolveParams p, BlockScratch s) {
     for (uint32_t env = blockIdx.x * blockDim.x + threadIdx.x; env < p.env_count;
          env += gridDim.x * blockDim.x) {
         s.dual_momentum[env] = StartDualMomentum();
-        s.dual_step[env] = __float_as_uint(FLT_MAX);
+        s.dual_restart[env] = 0.0;
     }
 }
 
-// A running env's momentum for this sweep's dual update, from the step its last update took.
+// A running environment's current direction test governs the pending extrapolation.
 __global__ void AdvanceDualMomentumKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
     for (uint32_t env = blockIdx.x * blockDim.x + threadIdx.x; env < p.env_count;
          env += gridDim.x * blockDim.x) {
         if (!EnvRunning(data, env)) continue;
-        AdvanceDualMomentum(s.dual_momentum[env], __uint_as_float(s.dual_step[env]));
-        s.dual_step[env] = 0u;
+        AdvanceDualMomentum(s.dual_momentum[env], s.dual_restart[env]);
+        s.dual_restart[env] = 0.0;
     }
 }
 
@@ -3142,15 +3183,15 @@ Status SolveBlockDescent(const ModelView& model, const DataView& data,
                 LaunchWork(CoarseApplyKernel, p->total_particle_count, kThreads, stream,
                     data, *p, s) != cudaSuccess) return Status::Failed;
         }
-        if (!stamp(kPhaseMomentum, stream) ||
-            LaunchWork(AdvanceDualMomentumKernel, p->env_count, kThreads, stream, data, *p, s) != cudaSuccess)
-            return Status::Failed;
         if (!stamp(kPhaseDual, stream)) return Status::Failed;
         if (p->material_cells_per_env > 0u &&
             LaunchWork(CacheMaterialRowsKernel, s.rows, kThreads / 32u, stream,
                 data, *p, s, false, kAllCacheColors) != cudaSuccess) return Status::Failed;
         // The next solve's first sweep recaches every row, so the last sweep's seeds go unread.
-        if (LaunchWork(DualUpdateKernel, s.rows, kThreads, stream, data, *p, s, true) != cudaSuccess)
+        if (LaunchWork(DualUpdateKernel, s.rows, kThreads, stream, data, *p, s) != cudaSuccess ||
+            !stamp(kPhaseMomentum, stream) ||
+            LaunchWork(AdvanceDualMomentumKernel, p->env_count, kThreads, stream, data, *p, s) != cudaSuccess ||
+            LaunchWork(ExtrapolateDualKernel, s.rows, kThreads, stream, data, *p, s, true) != cudaSuccess)
             return Status::Failed;
         return Status::Ok;
     };

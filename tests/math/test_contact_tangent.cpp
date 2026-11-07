@@ -5,6 +5,18 @@
 
 #include "nk/solve/augmented_row.hpp"
 
+TEST(ContactTangent, MomentumRestartsForOpposedMotionRatherThanGrowingDescent) {
+    namespace augmented = nuka::nk::augmented;
+    using nuka::math::Vec3;
+    const Vec3 scale{2.0f, 4.0f, 0.0f};
+    EXPECT_LT(augmented::MultiplierMomentumRestart({1.0f, 2.0f, 0.0f},
+        {0.8f, 1.8f, 0.0f}, {1.1f, 2.1f, 0.0f}, scale), 0.0);
+    EXPECT_GT(augmented::MultiplierMomentumRestart({0.4f, 1.4f, 0.0f},
+        {0.5f, 1.5f, 0.0f}, {0.8f, 1.8f, 0.0f}, scale), 0.0);
+    EXPECT_DOUBLE_EQ(augmented::MultiplierMomentumRestart({1.0f, 2.0f, 3.0f},
+        {1.0f, 2.0f, 3.0f}, {0.0f, 0.0f, 0.0f}, scale), 0.0);
+}
+
 TEST(ContactTangent, RelaxationFindsLinearRootAfterExtrapolation) {
     namespace augmented = nuka::nk::augmented;
     using nuka::math::Vec3;

@@ -114,6 +114,15 @@ struct ContactRelaxation {
     math::Vec3 point{};
 };
 
+// The proximal-gradient direction against the accepted displacement in the row's velocity metric.
+// A positive sum across an environment indicates momentum opposing the current descent direction.
+NUKA_AUGMENTED_HD inline double MultiplierMomentumRestart(
+    math::Vec3 point, math::Vec3 next, math::Vec3 base, math::Vec3 scale) {
+    return (scale.x > 0.0f ? (double(point.x) - next.x) * (double(next.x) - base.x) / scale.x : 0.0) +
+           (scale.y > 0.0f ? (double(point.y) - next.y) * (double(next.y) - base.y) / scale.y : 0.0) +
+           (scale.z > 0.0f ? (double(point.z) - next.z) * (double(next.z) - base.z) / scale.z : 0.0);
+}
+
 // The secant uses actual evaluation points, including any extrapolation and projection between updates.
 // Convex weights in (0, 1] keep the cone and the fixed point unchanged.
 NUKA_AUGMENTED_HD inline math::Vec3 RelaxContactImpulse(math::Vec3 dual, math::Vec3 next, ContactRelaxation* last) {
