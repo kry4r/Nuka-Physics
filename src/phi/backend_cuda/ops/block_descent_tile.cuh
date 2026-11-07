@@ -95,15 +95,6 @@ __device__ __forceinline__ float TileCoordinate(const float (&x)[kSpan], uint32_
     return __shfl_sync(~0u, value, k % kTileLanes);
 }
 
-// A lane's share of a dot product over its coordinates.
-template <uint32_t kSpan>
-__device__ __forceinline__ float TileDot(const float (&a)[kSpan], const float (&b)[kSpan]) {
-    float value = a[0] * b[0];
-#pragma unroll
-    for (uint32_t r = 1u; r < kSpan; ++r) value += a[r] * b[r];
-    return value;
-}
-
 struct TileContext;
 
 // Producer and worker warps rendezvous from distinct control paths at the same named barrier.
@@ -1665,59 +1656,32 @@ __device__ nk::BlockSolveFailure TileNewtonDirection(TileContext& c, const TileB
     return nk::BlockSolveFailure::None;
 }
 
-// w = J d of every head on the block: a row on one coordinate scales that coordinate's step, other rows
-// sum over the warp.
-template <uint32_t kSpan>
-__device__ void TileRowSteps(const TileContext& c, uint32_t block, const float (&d)[kSpan]) {
-    const uint32_t end = c.incident_end[block];
-    for (uint32_t chunk = c.IncidentBegin(block); chunk < end; chunk += kTileLanes) {
-        const bool listed = chunk + c.lane < end;
-        const uint32_t own = listed ? c.incident[chunk + c.lane] : 0u;
-        const uint32_t incidence = listed ? c.Incidence(own, block) : kNoTileIncidence;
-        const bool touches = incidence != kNoTileIncidence;
-        const uint32_t unit = touches ? c.Index(kTileUnit + incidence, own) : ~0u;
-        const uint32_t first = touches ? c.Index(kTileRow + incidence, own) : 0u;
-        const uint32_t axes = touches ? c.Index(kTileAxes, own) : 1u;
-        // Each lane reads its own head's coordinate, so every part of d crosses the warp.
-        const uint32_t coordinate = unit != ~0u ? unit : 0u;
-        float along = __shfl_sync(~0u, d[0], coordinate % kTileLanes);
+// Preserve the coordinate warp's reduction order when a lane evaluates its entire row.
+template <uint32_t kN>
+__device__ float TileStagedDot(const float* jacobian, const float* step, uint32_t n) {
+    if constexpr (TileSpan<kN>() == 1u) {
+        float products[kN];
 #pragma unroll
-        for (uint32_t r = 1u; r < kSpan; ++r) {
-            const float part = __shfl_sync(~0u, d[r], coordinate % kTileLanes);
-            along = coordinate / kTileLanes == r ? part : along;
+        for (uint32_t i = 0u; i < kN; ++i)
+            products[i] = i < n ? __fmul_rn(jacobian[i], step[i]) : 0.0f;
+#pragma unroll
+        for (uint32_t offset = kTileLanes / 2u; offset > 0u; offset /= 2u) {
+#pragma unroll
+            for (uint32_t i = 0u; i < kN; ++i)
+                if (i < offset)
+                    products[i] = __fadd_rn(products[i], i + offset < kN ? products[i + offset] : 0.0f);
         }
-        Vec3 step{};
-        if (unit != ~0u) step.x = c.Value(kTileUnitValue + incidence, own) * along;
-        for (uint32_t pending = __ballot_sync(~0u, touches && unit == ~0u); pending != 0u; pending &= pending - 1u) {
-            const uint32_t source = __ffs(pending) - 1u;
-            const float* jacobian = c.jacobian + size_t{__shfl_sync(~0u, first, source)} * c.width;
-            float j0[kSpan];
-#pragma unroll
-            for (uint32_t r = 0u; r < kSpan; ++r)
-                j0[r] = c.lane + r * kTileLanes < c.width ? jacobian[c.lane + r * kTileLanes] : 0.0f;
-            Vec3 w{};
-            if (__shfl_sync(~0u, axes, source) == 1u) {
-                w.x = TileWarpSum(TileDot(j0, d));
-            } else {
-                float j1[kSpan], j2[kSpan];
-#pragma unroll
-                for (uint32_t r = 0u; r < kSpan; ++r) {
-                    const uint32_t i = c.lane + r * kTileLanes;
-                    j1[r] = i < c.width ? jacobian[c.width + i] : 0.0f;
-                    j2[r] = i < c.width ? jacobian[2u * c.width + i] : 0.0f;
-                }
-                w = TileWarpSum3({TileDot(j0, d), TileDot(j1, d), TileDot(j2, d)});
-            }
-            if (c.lane == source) step = w;
-        }
-        if (touches) c.Store3(kTileStep, own, step);
+        return products[0];
+    } else {
+        float value = 0.0f;
+        for (uint32_t i = 0u; i < n; ++i) value = fmaf(jacobian[i], step[i], value);
+        return value;
     }
-    __syncwarp();
 }
 
-// TileRowSteps past a warp of coordinates: the step goes through the factor buffer, and a lane takes a head.
+// The block step is staged once, then each lane evaluates a separate incident head.
 template <uint32_t kN, uint32_t kSpan = TileSpan<kN>()>
-__device__ void WideTileRowSteps(const TileContext& c, uint32_t block, uint32_t n, const float (&d)[kSpan]) {
+__device__ void TileRowSteps(const TileContext& c, uint32_t block, uint32_t n, const float (&d)[kSpan]) {
     float* const staged = c.factor;
 #pragma unroll
     for (uint32_t r = 0u; r < kSpan; ++r)
@@ -1733,12 +1697,10 @@ __device__ void WideTileRowSteps(const TileContext& c, uint32_t block, uint32_t 
         } else {
             const float* const jacobian = c.jacobian + size_t{c.Index(kTileRow + incidence, h)} * c.width;
             const bool three = c.Index(kTileAxes, h) == 3u;
-            for (uint32_t i = 0u; i < n; ++i) {
-                step.x = fmaf(jacobian[i], staged[i], step.x);
-                if (three) {
-                    step.y = fmaf(jacobian[c.width + i], staged[i], step.y);
-                    step.z = fmaf(jacobian[2u * c.width + i], staged[i], step.z);
-                }
+            step.x = TileStagedDot<kN>(jacobian, staged, n);
+            if (three) {
+                step.y = TileStagedDot<kN>(jacobian + c.width, staged, n);
+                step.z = TileStagedDot<kN>(jacobian + 2u * c.width, staged, n);
             }
         }
         c.Store3(kTileStep, h, step);
@@ -1885,8 +1847,7 @@ __device__ void DescendTileBlock(DataView data, BlockDescentSolveParams p, Block
             if (coordinate[r]) TileAddProduct(curvature, d[r], mass_step[r]);
         const float inertial_curvature = TileWarpTotal(curvature);
         if (inertial_curvature > 0.0f && isfinite(inertial_curvature)) {
-            if constexpr (kSpan == 1u) TileRowSteps(c, b.local, d);
-            else WideTileRowSteps<kN>(c, b.local, n, d);
+            TileRowSteps<kN>(c, b.local, n, d);
             const float alpha = SearchTileLine(c, b.local, -inertial_curvature, inertial_curvature);
             if (alpha > 0.0f) {
 #pragma unroll
@@ -1947,8 +1908,7 @@ __device__ void DescendTileBlock(DataView data, BlockDescentSolveParams p, Block
             break;
         }
         if (!(total_decrement > 0.0f)) break;
-        if constexpr (kSpan == 1u) TileRowSteps(c, b.local, d);
-        else WideTileRowSteps<kN>(c, b.local, n, d);
+        TileRowSteps<kN>(c, b.local, n, d);
         const float alpha = SearchTileLine(c, b.local, inertial_slope, inertial_curvature);
         float after[kSpan];
         bool finite = true, rounded = true;
