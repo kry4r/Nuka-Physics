@@ -61,6 +61,16 @@ balance criterion unmeasured. Analytic balances, matched external reference
 results, timestep/grid convergence and independent CCD require separate evidence
 and remain unmeasured in this program.
 
+Compliant spring rows separate storage from the damping excitation using their
+active response matrix. The explicit damping contribution to `NORMAL_LOSS` or
+`LIMIT_LOSS` samples power at the initial velocity used to evaluate that force.
+For a scalar damper this is `h * c * v0^2`. The discrete impulse work instead uses
+the mean velocity, `-h * c * v0 * (v0 + v1) / 2`; it can be positive when a step
+crosses a turning point. `ROW_PHYSICAL_IMPULSE_WORK` and per-row `WORK` retain that
+signed work. Its difference from sampled damping power remains in `RESIDUAL`,
+together with other integration errors, and must pass timestep-convergence and
+energy checks. No negative term is clamped or discarded.
+
 For detailed preserved traces, use `DiagnosticSession` and the maintained report
 command:
 

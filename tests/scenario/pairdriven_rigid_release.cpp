@@ -380,7 +380,7 @@ TEST(PairDrivenRigidRelease, IndependentCompliantContactsShareNoStorageCapacity)
             const double start = double(before[body].position.z) - radius;
             const double end = double(after[body].position.z) - radius;
             stored += 0.5 * spring * (end * end - start * start);
-            loss += response_mass * damping * initial * 0.5 * (double(initial) + velocity[body].z) * dt;
+            loss += response_mass * damping * double(initial) * initial * dt;
             kinetic += 0.5 * mass * (double(velocity[body].z) * velocity[body].z - double(initial) * initial);
             const double exact = initial - dt * (spring * start + response_mass * damping * initial) / mass;
             EXPECT_NEAR(velocity[body].z, exact, phi::kTileVelocityTolerance);
@@ -404,7 +404,7 @@ TEST(PairDrivenRigidRelease, CompliantStorageAndDampingUseIndependentPhysicalTer
              BodyCase{nuka::collision::kShapeSphere, 2.0f, 1u},
              BodyCase{nuka::collision::kShapeBox, 0.2f, 4u}, BodyCase{nuka::collision::kShapeBox, 2.0f, 4u}}) {
         const float mass = body_case.mass;
-        for (float initial : {-0.02f, 0.0f}) {
+        for (float initial : {-0.02f, -0.0001f, 0.0f}) {
             for (float damping : {0.0f, 10.0f}) {
                 for (float dt : {0.001f, 0.0005f}) {
                     SCOPED_TRACE(::testing::Message() << "shape=" << body_case.kind << " mass=" << mass << " initial=" << initial
@@ -446,8 +446,7 @@ TEST(PairDrivenRigidRelease, CompliantStorageAndDampingUseIndependentPhysicalTer
                         const double start = double(before[body].position.z) - double(0.1f);
                         const double end = double(after[body].position.z) - double(0.1f);
                         const double stored = 0.5 * spring * (end * end - start * start);
-                        const double loss = response_mass * damping * initial *
-                            0.5 * (double(initial) + velocity[body].z) * dt;
+                        const double loss = response_mass * damping * double(initial) * initial * dt;
                         const auto value = [&](nk::EnergyColumn column) {
                             return ledger[env * nk::kEnergyColumnCount + uint32_t(column)];
                         };
@@ -461,6 +460,7 @@ TEST(PairDrivenRigidRelease, CompliantStorageAndDampingUseIndependentPhysicalTer
                         EXPECT_NEAR(value(nk::EnergyColumn::NormalLoss), loss, 2.0e-8 * mass);
                         const double kinetic = 0.5 * mass * (double(velocity[body].z) * velocity[body].z -
                             double(initial) * initial);
+                        EXPECT_NEAR(value(nk::EnergyColumn::RowPhysicalImpulseWork), kinetic, storage_tolerance);
                         EXPECT_NEAR(value(nk::EnergyColumn::Residual), kinetic + stored + loss, storage_tolerance + 1.0e-8 * mass);
                     }
                 }
