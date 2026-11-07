@@ -234,32 +234,58 @@ NUKA_OGC_HD inline OgcTriangleFeature OgcFacetFeature(
     return result;
 }
 
+// Double intermediates preserve the direction of gaps much smaller than either edge.
 NUKA_OGC_HD inline OgcSegmentPair OgcClosestSegments(
     math::Vec3 a0, math::Vec3 a1, math::Vec3 b0, math::Vec3 b1) {
-    const math::Vec3 u = a1 - a0, v = b1 - b0, w = a0 - b0;
-    const float a = u.Dot(u), b = u.Dot(v), c = v.Dot(v);
-    const float d = u.Dot(w), e = v.Dot(w);
-    float s = 0.0f, t = 0.0f;
-    if (a <= 0.0f && c <= 0.0f) return {a0, b0, s, t, w};
-    if (a <= 0.0f) {
-        t = fmaxf(0.0f, fminf(1.0f, e / c));
-    } else if (c <= 0.0f) {
-        s = fmaxf(0.0f, fminf(1.0f, -d / a));
+    const double u[3] = {double(a1.x) - a0.x, double(a1.y) - a0.y, double(a1.z) - a0.z};
+    const double v[3] = {double(b1.x) - b0.x, double(b1.y) - b0.y, double(b1.z) - b0.z};
+    const double w[3] = {double(a0.x) - b0.x, double(a0.y) - b0.y, double(a0.z) - b0.z};
+    double a = 0.0, b = 0.0, c = 0.0, d = 0.0, e = 0.0;
+    for (uint32_t i = 0u; i < 3u; ++i) {
+        a += u[i] * u[i];
+        b += u[i] * v[i];
+        c += v[i] * v[i];
+        d += u[i] * w[i];
+        e += v[i] * w[i];
+    }
+    const double cross[3] = {u[1] * v[2] - u[2] * v[1],
+        u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]};
+    double determinant = 0.0;
+    for (uint32_t i = 0u; i < 3u; ++i) determinant += cross[i] * cross[i];
+    double s = 0.0, t = 0.0;
+    if (a <= 0.0 && c <= 0.0) return {a0, b0, 0.0f, 0.0f, a0 - b0};
+    if (a <= 0.0) {
+        t = fmax(0.0, fmin(1.0, e / c));
+    } else if (c <= 0.0) {
+        s = fmax(0.0, fmin(1.0, -d / a));
     } else {
-        const math::Vec3 cross = u.Cross(v);
-        const float determinant = cross.LengthSq();
-        if (determinant > 0.0f)
-            s = fmaxf(0.0f, fminf(1.0f, v.Cross(w).Dot(cross) / determinant));
+        double numerator = 0.0;
+        for (uint32_t i = 0u; i < 3u; ++i) {
+            numerator += (v[(i + 1u) % 3u] * w[(i + 2u) % 3u] -
+                v[(i + 2u) % 3u] * w[(i + 1u) % 3u]) * cross[i];
+        }
+        if (determinant > 0.0) s = fmax(0.0, fmin(1.0, numerator / determinant));
         t = (b * s + e) / c;
-        if (t < 0.0f) {
-            t = 0.0f;
-            s = fmaxf(0.0f, fminf(1.0f, -d / a));
-        } else if (t > 1.0f) {
-            t = 1.0f;
-            s = fmaxf(0.0f, fminf(1.0f, (b - d) / a));
+        if (t < 0.0) {
+            t = 0.0;
+            s = fmax(0.0, fmin(1.0, -d / a));
+        } else if (t > 1.0) {
+            t = 1.0;
+            s = fmax(0.0, fmin(1.0, (b - d) / a));
         }
     }
-    return {a0 + u * s, b0 + v * t, s, t, w + u * s - v * t};
+    const math::Vec3 first{float(double(a0.x) + u[0] * s), float(double(a0.y) + u[1] * s),
+        float(double(a0.z) + u[2] * s)};
+    const math::Vec3 second{float(double(b0.x) + v[0] * t), float(double(b0.y) + v[1] * t),
+        float(double(b0.z) + v[2] * t)};
+    double gap[3] = {w[0] + u[0] * s - v[0] * t,
+        w[1] + u[1] * s - v[1] * t, w[2] + u[2] * s - v[2] * t};
+    if (s > 0.0 && s < 1.0 && t > 0.0 && t < 1.0 && determinant > 0.0) {
+        const double distance = (w[0] * cross[0] + w[1] * cross[1] + w[2] * cross[2]) / determinant;
+        for (uint32_t i = 0u; i < 3u; ++i) gap[i] = cross[i] * distance;
+    }
+    const math::Vec3 separation{float(gap[0]), float(gap[1]), float(gap[2])};
+    return {first, second, float(s), float(t), separation};
 }
 
 // Pairs farther apart than `reach` return infeasible before the endpoint feasibility tests.

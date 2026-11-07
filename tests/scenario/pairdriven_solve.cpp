@@ -11,6 +11,7 @@
 
 #include "collision/shape_kind.hpp"
 #include "collision/mesh_surface.hpp"
+#include "collision/ogc_geometry.hpp"
 #include "import/cooker/mesh_surface_cooker.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
@@ -415,6 +416,32 @@ TEST(PairDrivenSolve, InteriorSurfaceNormalIsOrthogonalAtFloatSpacing) {
             EXPECT_NEAR(surface.normal.LengthSq(), 1.0f, 2e-7f);
         }
     }
+}
+
+TEST(PairDrivenSolve, EdgeSeparationIsOrthogonalAtFloatSpacing) {
+    const Vec3 a[2] = {{-4.552115440368652f, -7.1476263999938965f, .6000005006790161f},
+                      {-4.551061630249023f, -6.5476274490356445f, .6000005006790161f}};
+    const Vec3 b[2] = {{-4.014209747314453f, -6.514209747314453f, .6000000238418579f},
+                      {-4.721320152282715f, -7.221320152282715f, .6000000238418579f}};
+    for (uint32_t first = 0u; first < 2u; ++first) {
+        for (uint32_t second = 0u; second < 2u; ++second) {
+            const auto pair = nuka::collision::OgcClosestSegments(a[first], a[1u - first],
+                                                                  b[second], b[1u - second]);
+            ASSERT_GT(pair.weight_a, 0.0f);
+            ASSERT_LT(pair.weight_a, 1.0f);
+            ASSERT_GT(pair.weight_b, 0.0f);
+            ASSERT_LT(pair.weight_b, 1.0f);
+            const auto normal = pair.separation / std::sqrt(pair.separation.LengthSq());
+            EXPECT_NEAR(normal.Dot(a[1] - a[0]) / std::sqrt((a[1] - a[0]).LengthSq()), 0.0f, 1e-6f);
+            EXPECT_NEAR(normal.Dot(b[1] - b[0]) / std::sqrt((b[1] - b[0]).LengthSq()), 0.0f, 1e-6f);
+            EXPECT_GT(normal.z, .999999f);
+            EXPECT_NEAR(std::sqrt(pair.separation.LengthSq()), double(a[0].z) - b[0].z, 1e-12);
+        }
+    }
+    Vec3 coplanar[2] = {b[0], b[1]};
+    coplanar[0].z = coplanar[1].z = a[0].z;
+    const auto crossing = nuka::collision::OgcClosestSegments(a[0], a[1], coplanar[0], coplanar[1]);
+    EXPECT_FLOAT_EQ(crossing.separation.LengthSq(), 0.0f);
 }
 
 TEST(PairDrivenSolve, CookedConcaveAndOpenSurfacesSupportBodiesAndParticles) {
