@@ -50,17 +50,33 @@ NUKA_MATERIAL_HD inline bool ValidHenckyJ2(const HenckyJ2Parameters& p) {
            math::IsFinite(3.0f * mu + p.hardening_modulus);
 }
 
-NUKA_MATERIAL_HD inline bool ValidMpmMaterial(const MpmMaterial& m) {
+NUKA_MATERIAL_HD inline bool ValidMpmConstitutiveParameters(const MpmMaterial& m) {
+    if (!math::IsFinite(m.viscosity) || m.viscosity < 0.0f) return false;
     if (m.model_kind == MpmMaterial::kHenckyElastic)
-        return math::IsFinite(m.density) && m.density > 0.0f &&
-               math::IsFinite(m.viscosity) && m.viscosity >= 0.0f &&
-               m.yield_stress == 0.0f && m.hardening_modulus == 0.0f &&
-               ValidHenckyElastic({m.youngs, m.poisson});
+        return ValidHenckyElastic({m.youngs, m.poisson});
     if (m.model_kind == MpmMaterial::kHenckyJ2)
-        return math::IsFinite(m.density) && m.density > 0.0f &&
-               ValidHenckyJ2({m.youngs, m.poisson, m.yield_stress, m.hardening_modulus});
-    return m.model_kind == 0.0f || m.model_kind == 2.0f ||
-           m.model_kind == 3.0f || m.model_kind == 4.0f;
+        return ValidHenckyJ2({m.youngs, m.poisson, m.yield_stress, m.hardening_modulus});
+    if (m.model_kind == 3.0f)
+        return math::IsFinite(m.bulk_modulus) && m.bulk_modulus >= 0.0f &&
+               math::IsFinite(m.tait_gamma) && m.tait_gamma > 0.0f &&
+               math::IsFinite(m.bulk_modulus * m.tait_gamma);
+    if (!(m.model_kind == 0.0f || m.model_kind == 2.0f || m.model_kind == 4.0f) ||
+        !math::IsFinite(m.youngs) || m.youngs < 0.0f || !math::IsFinite(m.poisson) ||
+        !(m.poisson > -1.0f && m.poisson < 0.5f)) return false;
+    const float mu = m.youngs / (2.0f * (1.0f + m.poisson));
+    const float bulk = m.youngs / (3.0f * (1.0f - 2.0f * m.poisson));
+    if (!math::IsFinite(mu) || !math::IsFinite(bulk)) return false;
+    return m.model_kind != 4.0f || (mu > 0.0f && bulk > 0.0f &&
+        math::IsFinite(m.dp_friction) && m.dp_friction >= 0.0f &&
+        m.dp_friction <= 90.0f && math::IsFinite(m.dp_cohesion) && m.dp_cohesion >= 0.0f);
+}
+
+NUKA_MATERIAL_HD inline bool ValidMpmMaterial(const MpmMaterial& m) {
+    if (!ValidMpmConstitutiveParameters(m) || !math::IsFinite(m.density) || m.density < 0.0f)
+        return false;
+    if (m.model_kind == MpmMaterial::kHenckyElastic)
+        return m.density > 0.0f && m.yield_stress == 0.0f && m.hardening_modulus == 0.0f;
+    return m.model_kind != MpmMaterial::kHenckyJ2 || m.density > 0.0f;
 }
 
 namespace detail {

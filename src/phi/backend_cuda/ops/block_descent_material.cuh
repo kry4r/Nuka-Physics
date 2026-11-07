@@ -16,8 +16,8 @@ __device__ nk::augmented::BallTerm<nk::kMpmDeviatorComponents> EvaluateMaterialD
     double dual[nk::kMpmDeviatorComponents], residual[nk::kMpmDeviatorComponents];
     for (uint32_t k = 0u; k < nk::kMpmDeviatorComponents; ++k) {
         dual[k] = data.lambda[slot + 1u + k];
-        residual[k] = state.residual[1u + k] -
-            (jacobians != nullptr ? jacobians[1u + k].Dot(move) : 0.0f);
+        residual[k] = double(state.residual[1u + k]) -
+            (jacobians != nullptr ? double(jacobians[1u + k].Dot(move)) : 0.0);
     }
     const double radius = head.friction_secondary < FLT_MAX
         ? fmax(double(head.mu) * state.pressure_bound + head.friction_secondary, 0.0) : DBL_MAX;
@@ -71,7 +71,7 @@ __global__ void CacheMaterialRowsKernel(DataView data, BlockDescentSolveParams p
         state.pressure_bound = pressure.impulse;
         if (snapshot) {
             const auto deviator = EvaluateMaterialDeviator(data, s, slot, state, nullptr, {});
-            s.row_state[slot].potential = pressure.potential + deviator.potential;
+            s.row_state[slot].potential = deviator.potential;
         }
         valid &= fabsf(state.pressure_bound) <= FLT_MAX;
         if (!valid) {
@@ -83,10 +83,10 @@ __global__ void CacheMaterialRowsKernel(DataView data, BlockDescentSolveParams p
 }
 
 // A grid incidence's potential change along the node move from its cached state; with `impulse`, the
-// move is zero and its response is added too. Point rows run entirely on float scales.
+// move is zero and its response is added too. Impulse products accumulate before rounding to a node force.
 __device__ double EvaluateGridRow(DataView data, BlockDescentSolveParams p, BlockScratch s,
                                   size_t at, Vec3 move,
-                                  Vec3* impulse, SymmetricMat3* curvature) {
+                                  double3* impulse, SymmetricMat3* curvature) {
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
     const uint32_t slot = s.incidence[at];
     const NkRow head = rows[slot];
@@ -100,7 +100,14 @@ __device__ double EvaluateGridRow(DataView data, BlockDescentSolveParams p, Bloc
         SymmetricMat3 c{};
         EvaluateAugmentedResponse(term, nk::augmented::EvaluateScalarImpulse(term.dual.x, term.penalty,
             term.residual.x, term.compliance, term.lower, term.upper, response), {}, &f, &c);
-        AddLocalResponse(term.jacobian, f, c, impulse, curvature);
+        Vec3 unused{};
+        AddLocalResponse(term.jacobian, f, c, &unused, curvature);
+        const float response_impulse[3] = {f.x, f.y, f.z};
+        for (uint32_t axis = 0u; axis < 3u; ++axis) {
+            impulse->x += double(term.jacobian[axis].x) * response_impulse[axis];
+            impulse->y += double(term.jacobian[axis].y) * response_impulse[axis];
+            impulse->z += double(term.jacobian[axis].z) * response_impulse[axis];
+        }
         return 0.0;
     }
     const auto& state = MaterialState(p, s, slot);
@@ -116,11 +123,15 @@ __device__ double EvaluateGridRow(DataView data, BlockDescentSolveParams p, Bloc
         s.scalar_response[slot]);
     const auto deviator = EvaluateMaterialDeviator(data, s, slot, state, jacobian, move);
     if (impulse != nullptr) {
-        *impulse += jacobian[0] * pressure.impulse;
+        impulse->x += double(jacobian[0].x) * pressure.impulse;
+        impulse->y += double(jacobian[0].y) * pressure.impulse;
+        impulse->z += double(jacobian[0].z) * pressure.impulse;
         AddOuter(*curvature, jacobian[0], pressure.curvature);
         for (uint32_t k = 0u; k < nk::kMpmDeviatorComponents; ++k) {
             const Vec3 j = jacobian[1u + k];
-            *impulse += j * deviator.impulse[k];
+            impulse->x += double(j.x) * deviator.impulse[k];
+            impulse->y += double(j.y) * deviator.impulse[k];
+            impulse->z += double(j.z) * deviator.impulse[k];
             AddOuter(*curvature, j, deviator.curvature[k][k]);
             for (uint32_t l = k + 1u; l < nk::kMpmDeviatorComponents; ++l) {
                 const Vec3 other = jacobian[1u + l];
@@ -131,7 +142,10 @@ __device__ double EvaluateGridRow(DataView data, BlockDescentSolveParams p, Bloc
             }
         }
     }
-    return pressure.potential + deviator.potential - s.row_state[slot].potential;
+    const double pressure_change = nk::augmented::ScalarPotentialChange(data.lambda[slot], s.penalty[slot],
+        state.residual[0], jacobian[0].Dot(move), head.compliance_alpha, head.lower, head.upper,
+        s.scalar_response[slot]);
+    return pressure_change + deviator.potential - s.row_state[slot].potential;
 }
 
 __device__ void UpdateMaterialDual(DataView data, BlockDescentSolveParams p, BlockScratch s,

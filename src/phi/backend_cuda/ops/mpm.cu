@@ -19,7 +19,6 @@
 #include <cub/device/device_scan.cuh>
 #include <cub/device/device_radix_sort.cuh>
 #include <thrust/iterator/counting_iterator.h>
-#include <thrust/iterator/transform_iterator.h>
 
 #include "collision/primitive_surface.hpp"
 #include "math/transform.hpp"
@@ -51,7 +50,6 @@ constexpr uint32_t kStencilWidth = nk::kMpmStencilWidth;
 constexpr uint32_t kLatticeNodes = nk::kMpmLatticeStencilNodes;
 constexpr uint32_t kStencilNodes = nk::kMpmStencilNodes;
 constexpr uint32_t kAxisWeights = nk::kMpmLattices * kStencilWidth;
-constexpr uint32_t kCellNodes = nk::kMpmCellStencilNodes;
 constexpr uint32_t kCellLatticeWidth = kStencilWidth + 1u;
 constexpr uint32_t kCudaWarpThreads = 32u;
 constexpr uint32_t kCellGroups = kBlockSize / kCudaWarpThreads;
@@ -187,9 +185,9 @@ inline __host__ int RadixBitsInclusive(uint32_t max_key) {
     return bits;
 }
 
-// Linearized stress a cell's rows solve; pressure, bulk, shear, viscosity and deviator are
-// volume integrals and tension and the yield cone keep the weakest material bound.
-struct MpmCellVolume {
+// Each material point owns its linearized stress and yield bounds.
+// Pressure, bulk, shear, viscosity and deviator are integrated over its reference volume.
+struct MpmPointStress {
     float volume;
     float pressure;
     float bulk;
@@ -201,23 +199,10 @@ struct MpmCellVolume {
     float cone_offset;
 };
 
-__device__ __forceinline__ MpmCellVolume EmptyCellVolume() {
-    MpmCellVolume volume{};
+__device__ __forceinline__ MpmPointStress EmptyPointStress() {
+    MpmPointStress volume{};
     volume.tension = volume.cone_slope = volume.cone_offset = FLT_MAX;
     return volume;
-}
-
-__device__ __forceinline__ void AddCellVolume(MpmCellVolume& total, const MpmCellVolume& part) {
-    total.volume = __fadd_rn(total.volume, part.volume);
-    total.pressure = __fadd_rn(total.pressure, part.pressure);
-    total.bulk = __fadd_rn(total.bulk, part.bulk);
-    total.shear = __fadd_rn(total.shear, part.shear);
-    total.viscosity = __fadd_rn(total.viscosity, part.viscosity);
-    for (uint32_t k = 0u; k < nk::kMpmDeviatorComponents; ++k)
-        total.deviator[k] = __fadd_rn(total.deviator[k], part.deviator[k]);
-    total.tension = fminf(total.tension, part.tension);
-    total.cone_slope = fminf(total.cone_slope, part.cone_slope);
-    total.cone_offset = fminf(total.cone_offset, part.cone_offset);
 }
 
 // The half-cell fixes the particle's cell on both lattices; each axis keeps its kernel weights
@@ -232,14 +217,7 @@ struct MpmTransferInput {
     float inverse_moment[6];
     float affine[9];
     float stress[9];
-    MpmCellVolume rows;
-};
-
-// Stress cells are the lattice-0 cells; their half-cells sort as one contiguous key run.
-struct MpmStressCellKey {
-    __host__ __device__ uint32_t operator()(uint32_t key) const {
-        return key / nk::kMpmHalfCellsPerLatticeNode;
-    }
+    MpmPointStress rows;
 };
 
 struct alignas(float4) MpmCellTransfer {
@@ -263,10 +241,6 @@ struct MpmSortScratchLayout {
     uint64_t active_count_off = 0u;
     uint64_t occupied_cells_off = 0u;
     uint64_t occupied_count_off = 0u;
-    uint64_t stress_cells_off = 0u;
-    uint64_t stress_count_off = 0u;
-    uint64_t cell_gradients_off = 0u;
-    uint64_t cell_volumes_off = 0u;
     uint64_t transfer_input_off = 0u;
     uint64_t cell_transfer_off = 0u;
     uint64_t contact_hit_mask_off = 0u;
@@ -281,7 +255,7 @@ struct MpmSortScratchLayout {
     uint64_t total      = 0u;     // full segment byte size.
     MpmSortScratchLayout(uint32_t particle_count, uint32_t node_count,
                          uint64_t collidables_per_env, uint64_t contact_count,
-                         uint64_t reaction_target_count, uint64_t stress_cell_count) {
+                         uint64_t reaction_target_count) {
         const auto sort_bytes_for = [](uint32_t count) {
             size_t bytes = 0u;
             const auto status = cub::DeviceRadixSort::SortPairs<uint32_t, uint32_t>(
@@ -311,16 +285,6 @@ struct MpmSortScratchLayout {
             static_cast<uint32_t*>(nullptr), static_cast<int>(particle_count));
         if (unique_status != cudaSuccess)
             throw std::runtime_error(cudaGetErrorString(unique_status));
-        size_t stress_bytes = 0u;
-        if (stress_cell_count > 0u) {
-            const auto stress_status = cub::DeviceSelect::Unique(nullptr, stress_bytes,
-                thrust::make_transform_iterator(static_cast<const uint32_t*>(nullptr),
-                                                MpmStressCellKey{}),
-                static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
-                static_cast<int>(particle_count));
-            if (stress_status != cudaSuccess)
-                throw std::runtime_error(cudaGetErrorString(stress_status));
-        }
         size_t scan_bytes = 0u;
         const auto scan_status = cub::DeviceScan::ExclusiveSum(nullptr, scan_bytes,
             static_cast<const uint64_t*>(nullptr), static_cast<uint64_t*>(nullptr),
@@ -328,7 +292,7 @@ struct MpmSortScratchLayout {
         if (scan_status != cudaSuccess)
             throw std::runtime_error(cudaGetErrorString(scan_status));
         temp_bytes = std::max({particle_sort_bytes, node_sort_bytes, select_bytes, unique_bytes,
-                               stress_bytes, scan_bytes});
+                               scan_bytes});
         const uint64_t output_bytes =
             uint64_t{std::max(particle_count, node_count)} * sizeof(uint32_t);
         const uint64_t node_bytes = uint64_t{node_count} * sizeof(uint32_t);
@@ -344,15 +308,7 @@ struct MpmSortScratchLayout {
         occupied_count_off = AlignScratch(occupied_cells_off +
                                           uint64_t{particle_count} * sizeof(uint32_t));
         const uint64_t transfer_slots = std::min(uint64_t{particle_count}, cell_count);
-        const bool stress = stress_cell_count > 0u;
-        stress_cells_off = AlignScratch(occupied_count_off + sizeof(uint32_t));
-        stress_count_off = AlignScratch(stress_cells_off +
-            (stress ? uint64_t{particle_count} * sizeof(uint32_t) : 0u));
-        cell_gradients_off = AlignScratch(stress_count_off + sizeof(uint32_t));
-        cell_volumes_off = AlignScratch(cell_gradients_off +
-            (stress ? transfer_slots * kStencilNodes * sizeof(m::Vec3) : 0u));
-        transfer_input_off = AlignScratch(cell_volumes_off +
-            (stress ? transfer_slots * sizeof(MpmCellVolume) : 0u));
+        transfer_input_off = AlignScratch(occupied_count_off + sizeof(uint32_t));
         cell_transfer_off = AlignScratch(transfer_input_off +
                                         uint64_t{particle_count} * sizeof(MpmTransferInput));
         contact_hit_mask_off = AlignScratch(cell_transfer_off +
@@ -403,8 +359,7 @@ const MpmSortScratchLayout& ScratchLayout(uint32_t particle_count, uint32_t node
     entries.push_back({device, particle_count, node_count, collidables_per_env, contact_count,
                        reaction_target_count, stress_cell_count,
                        MpmSortScratchLayout(particle_count, node_count, collidables_per_env,
-                                            contact_count, reaction_target_count,
-                                            stress_cell_count)});
+                                            contact_count, reaction_target_count)});
     return entries.back().layout;
 }
 
@@ -581,6 +536,7 @@ __global__ void MpmPrepareTransferInputKernel(
     uint32_t particle_count, const uint32_t* __restrict__ sorted_idx,
     const m::Vec3* __restrict__ pos, const float* __restrict__ inv_mass,
     const m::Vec3* __restrict__ velocity, const float* __restrict__ affine,
+    const float* __restrict__ plastic_strain,
     const m::Vec3* __restrict__ target, float dt,
     const float* __restrict__ deformation, const float* __restrict__ volume,
     const uint32_t* __restrict__ material_ids, const nk::MpmMaterial* __restrict__ material_table,
@@ -602,14 +558,19 @@ __global__ void MpmPrepareTransferInputKernel(
         }
         for (int i = 0; i < 9; ++i)
             particle_stress[static_cast<size_t>(p) * 9u + i] = cached.stress[i];
-        cached.rows = EmptyCellVolume();
+        cached.rows = EmptyPointStress();
         if (rows) {
             // The rows carry the whole stress; the transfer moves mass and momentum.
             nk::MpmMaterial material;
             if (material_ids != nullptr && material_ids[p] < material_count)
                 material = material_table[material_ids[p]];
+            const float alpha = plastic_strain != nullptr ? plastic_strain[p] : 0.0f;
             const auto response = nk::material::EvaluateMpmStressRows(
-                material, deformation + static_cast<size_t>(p) * 9u, cached.stress);
+                material, deformation + static_cast<size_t>(p) * 9u, cached.stress, alpha);
+            if (material.model_kind == nk::MpmMaterial::kHenckyJ2 &&
+                (plastic_strain == nullptr || !(alpha >= 0.0f) || !isfinite(alpha) ||
+                 !isfinite(response.cone_offset)))
+                atomicOr(&env_status[p / particles_per_env], kEnvStatusConstitutiveFailure);
             float deviator[nk::kMpmDeviatorComponents];
             nk::material::MpmDeviatorComponents(cached.stress, deviator);
             const float v = volume[p];
@@ -682,8 +643,7 @@ __global__ void MpmP2GCellsKernel(
     const uint32_t* __restrict__ cell_start, const uint32_t* __restrict__ cell_end,
     uint32_t dims_x, uint32_t dims_y, uint32_t dims_z,
     float inv_dx, float dx, float dt, m::Vec3 origin,
-    MpmCellTransfer* __restrict__ cell_transfers, m::Vec3* __restrict__ cell_gradients,
-    MpmCellVolume* __restrict__ cell_volumes) {
+    MpmCellTransfer* __restrict__ cell_transfers) {
     constexpr uint32_t kWords = sizeof(MpmTransferInput) / sizeof(uint32_t);
     __shared__ uint32_t records[kCellGroups][kCudaWarpThreads * kWords];
     const uint32_t group = threadIdx.x / kCudaWarpThreads;
@@ -714,20 +674,17 @@ __global__ void MpmP2GCellsKernel(
         const float shift = nk::MpmLatticeOffset(lattice);
         const m::Vec3 xi{origin.x + (nx + shift) * dx, origin.y + (ny + shift) * dx,
                          origin.z + (nz + shift) * dx};
-        const bool stress = cell_gradients != nullptr;
         float mass = 0.0f;
         m::Vec3 momentum = m::Vec3::Zero();
         float boundary_weight = 0.0f;
         m::Vec3 boundary_velocity = m::Vec3::Zero();
-        m::Vec3 gradient = m::Vec3::Zero();
-        MpmCellVolume volume = EmptyCellVolume();
         for (uint32_t tile = begin; tile < end; tile += kCudaWarpThreads) {
             const uint32_t tile_count = min(kCudaWarpThreads, end - tile);
             const auto* input = reinterpret_cast<const uint32_t*>(transfer_input + tile);
             for (uint32_t word = lane; word < tile_count * kWords; word += kCudaWarpThreads)
                 records[group][word] = input[word];
             __syncwarp(kFullWarpMask);
-            if (valid_node || (stress && lane == 0u)) {
+            if (valid_node) {
                 for (uint32_t source = 0u; source < tile_count; ++source) {
                     uint32_t words[kWords];
                     #pragma unroll
@@ -735,9 +692,6 @@ __global__ void MpmP2GCellsKernel(
                         words[word] = records[group][source * kWords + word];
                     MpmTransferInput cached;
                     memcpy(&cached, words, sizeof(cached));
-                    if (stress && lane == 0u && cached.volume > 0.0f)
-                        AddCellVolume(volume, cached.rows);
-                    if (!valid_node) continue;
                     const int64_t ox = nx - nk::MpmLatticeBase(cached.half_cell[0], lattice);
                     const int64_t oy = ny - nk::MpmLatticeBase(cached.half_cell[1], lattice);
                     const int64_t oz = nz - nk::MpmLatticeBase(cached.half_cell[2], lattice);
@@ -772,9 +726,6 @@ __global__ void MpmP2GCellsKernel(
                         const m::Vec3 g{Dinv[0] * dpos.x + Dinv[3] * dpos.y + Dinv[4] * dpos.z,
                                         Dinv[3] * dpos.x + Dinv[1] * dpos.y + Dinv[5] * dpos.z,
                                         Dinv[4] * dpos.x + Dinv[5] * dpos.y + Dinv[2] * dpos.z};
-                        gradient.x = __fadd_rn(gradient.x, -coef * g.x);
-                        gradient.y = __fadd_rn(gradient.y, -coef * g.y);
-                        gradient.z = __fadd_rn(gradient.z, -coef * g.z);
                         momentum.x = __fadd_rn(momentum.x, dt * coef *
                             (stress[0] * g.x + stress[1] * g.y + stress[2] * g.z));
                         momentum.y = __fadd_rn(momentum.y, dt * coef *
@@ -790,9 +741,6 @@ __global__ void MpmP2GCellsKernel(
         if (lane < kStencilNodes)
             cell_transfers[static_cast<size_t>(transfer_slot) * kStencilNodes + lane] =
                 {mass, momentum, boundary_weight, boundary_velocity};
-        if (stress && lane < kStencilNodes)
-            cell_gradients[static_cast<size_t>(transfer_slot) * kStencilNodes + lane] = gradient;
-        if (stress && lane == 0u) cell_volumes[transfer_slot] = volume;
     }
 }
 
@@ -865,8 +813,8 @@ __global__ void MpmGridFinalizeKernel(
     }
 }
 
-// Stress row blocks occupy the tail of each environment's row span. A cell's rows are written
-// together, so one thread clears a cell and skips a cell whose head row is already clear.
+// Material blocks occupy the tail of each environment's row span.
+// One thread clears a block and skips an already empty head.
 __global__ void MpmClearStressRowsKernel(MpmParams p, DataView data) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= p.env_count * p.stress_cells_per_env) return;
@@ -883,96 +831,60 @@ __global__ void MpmClearStressRowsKernel(MpmParams p, DataView data) {
     }
 }
 
-__device__ __forceinline__ uint32_t LowerBound(const uint32_t* values, uint32_t count,
-                                               uint32_t value) {
-    uint32_t begin = 0u;
-    while (begin < count) {
-        const uint32_t middle = begin + (count - begin) / 2u;
-        if (values[middle] < value) begin = middle + 1u;
-        else count = middle;
-    }
-    return begin;
-}
-
-// One warp per occupied cell merges its half-cell gradients g_n into a stress block: the head has
-// R = V / (h^2 bulk), lambda = h p; deviator k has R = V / (2h (h shear + visc)), lambda = -h s_k.
+// One warp emits a material point's MLS stress block, retaining its constitutive history.
+// Each gradient is V w D^-1 (xi - xp), shared by its pressure and five deviator rows.
 __global__ void MpmEmitStressRowsKernel(
-    MpmParams p, DataView data, uint32_t particle_count, uint32_t total_cells,
-    uint32_t cells_per_env, const uint32_t* __restrict__ cell_start,
-    const uint32_t* __restrict__ stress_cells, const uint32_t* __restrict__ stress_count,
-    const m::Vec3* __restrict__ cell_gradients, const MpmCellVolume* __restrict__ cell_volumes,
+    MpmParams p, DataView data, uint32_t particle_count,
+    const uint32_t* __restrict__ particle_ids,
+    const MpmTransferInput* __restrict__ input,
     uint32_t endpoint_base, uint32_t term_base) {
     const uint32_t lane = threadIdx.x % kCudaWarpThreads;
     const uint32_t warp = (blockIdx.x * blockDim.x + threadIdx.x) / kCudaWarpThreads;
     const uint32_t warps = gridDim.x * blockDim.x / kCudaWarpThreads;
-    const uint32_t lattice_nodes = p.nodes_per_env / nk::kMpmLattices;
-    const uint32_t count = *stress_count;
-    for (uint32_t slot = warp; slot < count; slot += warps) {
-        const uint32_t cell = stress_cells[slot];
-        const uint32_t env = cell / lattice_nodes;
-        const uint32_t local = cell % lattice_nodes;
-        const uint32_t ordinal = slot - LowerBound(stress_cells, count, env * lattice_nodes);
+    for (uint32_t slot = warp; slot < particle_count; slot += warps) {
+        const uint32_t particle = particle_ids[slot];
+        const uint32_t env = particle / p.particles_per_env;
+        const uint32_t ordinal = particle % p.particles_per_env;
         if (ordinal >= p.stress_cells_per_env) {
             if (lane == 0u) atomicOr(&data.env_status[env], kEnvStatusInvalidEndpoint);
             continue;
         }
-        const int64_t base[3] = {local % p.grid_dims[0], (local / p.grid_dims[0]) % p.grid_dims[1],
-                                 local / (p.grid_dims[0] * p.grid_dims[1])};
-        const uint32_t first = env * p.point_endpoint_terms_per_env + term_base + ordinal * kCellNodes;
-        uint32_t terms = 0u;
-        for (uint32_t pass = 0u; pass * kCudaWarpThreads < kCellNodes; ++pass) {
-            const uint32_t j = pass * kCudaWarpThreads + lane;
-            const uint32_t lattice = j < kLatticeNodes ? 0u : 1u;
-            const uint32_t k = lattice == 0u ? j : j - kLatticeNodes;
-            const uint32_t width = lattice == 0u ? kStencilWidth : kCellLatticeWidth;
-            const int64_t node[3] = {base[0] - lattice + k % width, base[1] - lattice + (k / width) % width,
-                                     base[2] - lattice + k / (width * width)};
-            m::Vec3 gradient = m::Vec3::Zero();
-            bool covered = false;
-            for (uint32_t sub = 0u; j < kCellNodes && sub < nk::kMpmHalfCellsPerLatticeNode; ++sub) {
-                const uint32_t key = env * cells_per_env + local * nk::kMpmHalfCellsPerLatticeNode + sub;
-                const uint32_t begin = cell_start[key];
-                if (begin == ~0u) continue;
-                uint32_t corner = 0u;
-                bool inside = true;
-                for (uint32_t axis = 0u; axis < 3u; ++axis) {
-                    const int64_t h = 2 * base[axis] + ((sub >> axis) & 1u);
-                    const int64_t offset = node[axis] - nk::MpmLatticeBase(h, lattice);
-                    inside = inside && offset >= 0 && offset < kStencilWidth;
-                    corner += static_cast<uint32_t>(offset) << axis;
-                }
-                if (!inside) continue;
-                const uint32_t transfer = CellTransferSlot(key, begin, particle_count, total_cells);
-                const m::Vec3 g = cell_gradients[static_cast<size_t>(transfer) * kStencilNodes +
-                                                 lattice * kLatticeNodes + corner];
-                gradient.x = __fadd_rn(gradient.x, g.x);
-                gradient.y = __fadd_rn(gradient.y, g.y);
-                gradient.z = __fadd_rn(gradient.z, g.z);
-                covered = true;
-            }
-            const int64_t index = covered ? nk::MpmNodeIndex(env, lattice, node[0], node[1], node[2],
-                                                             p.grid_dims, p.nodes_per_env) : -1;
-            const uint32_t emit = __ballot_sync(kFullWarpMask, index >= 0);
-            if (index >= 0) {
-                nk::PointEndpointTerm term;
-                term.kind = nk::kNkSideGrid;
-                term.index = static_cast<uint32_t>(index);
-                term.column[0] = {gradient.x, 0.0f, 0.0f};
-                term.column[1] = {gradient.y, 0.0f, 0.0f};
-                term.column[2] = {gradient.z, 0.0f, 0.0f};
-                data.point_endpoint_terms[first + terms + __popc(emit & ((1u << lane) - 1u))] = term;
-            }
-            terms += __popc(emit);
+        const MpmTransferInput& cached = input[slot];
+        const MpmPointStress volume = cached.rows;
+        if (!(volume.volume > 0.0f)) continue;
+        const uint32_t first = env * p.point_endpoint_terms_per_env + term_base + ordinal * kStencilNodes;
+        const uint32_t lattice = min(lane / kLatticeNodes, nk::kMpmLattices - 1u);
+        const uint32_t corner[3] = {lane & 1u, (lane >> 1u) & 1u, (lane >> 2u) & 1u};
+        const int64_t node[3] = {HalfCellNode(cached.half_cell[0], lattice, corner[0]),
+            HalfCellNode(cached.half_cell[1], lattice, corner[1]),
+            HalfCellNode(cached.half_cell[2], lattice, corner[2])};
+        const int64_t index = lane < kStencilNodes ? nk::MpmNodeIndex(env, lattice,
+            node[0], node[1], node[2], p.grid_dims, p.nodes_per_env) : -1;
+        const uint32_t emit = __ballot_sync(kFullWarpMask, index >= 0);
+        const uint32_t terms = __popc(emit);
+        if (index >= 0) {
+            const float shift = nk::MpmLatticeOffset(lattice);
+            const m::Vec3 offset{p.grid_origin[0] + (float(node[0]) + shift) * p.dx - cached.position.x,
+                p.grid_origin[1] + (float(node[1]) + shift) * p.dx - cached.position.y,
+                p.grid_origin[2] + (float(node[2]) + shift) * p.dx - cached.position.z};
+            const uint32_t row = lattice * kStencilWidth;
+            const float weight = nk::kMpmLatticeShare * cached.volume *
+                cached.weight[0][row + corner[0]] * cached.weight[1][row + corner[1]] *
+                cached.weight[2][row + corner[2]];
+            const float* inverse = cached.inverse_moment;
+            const m::Vec3 gradient = weight * m::Vec3{
+                inverse[0] * offset.x + inverse[3] * offset.y + inverse[4] * offset.z,
+                inverse[3] * offset.x + inverse[1] * offset.y + inverse[5] * offset.z,
+                inverse[4] * offset.x + inverse[5] * offset.y + inverse[2] * offset.z};
+            nk::PointEndpointTerm term;
+            term.kind = nk::kNkSideGrid;
+            term.index = static_cast<uint32_t>(index);
+            term.column[0] = {gradient.x, 0.0f, 0.0f};
+            term.column[1] = {gradient.y, 0.0f, 0.0f};
+            term.column[2] = {gradient.z, 0.0f, 0.0f};
+            data.point_endpoint_terms[first + __popc(emit & ((1u << lane) - 1u))] = term;
         }
-        if (lane != 0u) continue;
-        MpmCellVolume volume = EmptyCellVolume();
-        for (uint32_t sub = 0u; sub < nk::kMpmHalfCellsPerLatticeNode; ++sub) {
-            const uint32_t key = env * cells_per_env + local * nk::kMpmHalfCellsPerLatticeNode + sub;
-            const uint32_t begin = cell_start[key];
-            if (begin == ~0u) continue;
-            AddCellVolume(volume, cell_volumes[CellTransferSlot(key, begin, particle_count, total_cells)]);
-        }
-        if (terms == 0u || !(volume.volume > 0.0f)) continue;
+        if (lane != 0u || terms == 0u) continue;
         const uint32_t endpoint = env * p.point_endpoints_per_env + endpoint_base + ordinal;
         data.point_endpoint_ranges[endpoint] = {first, terms};
         const float h = p.dt;
@@ -1009,8 +921,7 @@ __global__ void MpmEmitStressRowsKernel(
         data.lambda[row_slot] = head_impulse;
         // Rows of infinite compliance carry no deviator.
         const float rate = 2.0f * h * (h * volume.shear + volume.viscosity) * inverse_volume;
-        const float deviator_compliance = rate > 0.0f ? volume.volume / (2.0f * h *
-            (h * volume.shear + volume.viscosity)) : FLT_MAX;
+        const float deviator_compliance = rate > 0.0f ? volume.volume / rate : FLT_MAX;
         float impulse[nk::kMpmDeviatorComponents];
         float norm = 0.0f;
         for (uint32_t k = 0u; k < nk::kMpmDeviatorComponents; ++k) {
@@ -1048,6 +959,7 @@ __global__ void MpmG2PGatherKernel(uint32_t mpm_count,
                                    const m::Vec3* __restrict__ grid_velocity,
                                    const m::Vec3* __restrict__ grid_pseudo_velocity,
                                    m::Vec3* __restrict__ part_pos,
+                                   m::Vec3* __restrict__ part_prev_pos,
                                    m::Vec3* __restrict__ part_vel,
                                    float* __restrict__ part_C) {
     const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1055,6 +967,7 @@ __global__ void MpmG2PGatherKernel(uint32_t mpm_count,
     uint32_t env = 0u;
     const uint32_t p = MpmSliceGlobal(t, mpm_per_env, particles_per_env, env);
     const m::Vec3 xp = part_pos[p];
+    part_prev_pos[p] = xp;
     if (inv_mass != nullptr && inv_mass[p] <= 0.0f) {
         if (target != nullptr && dt > 0.0f) {
             part_vel[p] = (target[p] - xp) * (1.0f / dt);
@@ -1149,55 +1062,6 @@ __global__ void MpmUpdateFKernel(uint32_t mpm_count, float dt,
     }
 }
 
-// Stress rows see only a cell's mean volume change, so each particle takes the cell's mean
-// V0-weighted J; its deviatoric deformation is kept.
-__global__ void MpmCellVolumeAverageKernel(
-    uint32_t cells_per_env, const uint32_t* __restrict__ cell_start,
-    const uint32_t* __restrict__ cell_end, const uint32_t* __restrict__ sorted_idx,
-    const uint32_t* __restrict__ stress_cells, const uint32_t* __restrict__ stress_count,
-    uint32_t lattice_nodes, const float* __restrict__ volume,
-    const float* __restrict__ inv_mass, float* __restrict__ part_F) {
-    const uint32_t lane = threadIdx.x % kCudaWarpThreads;
-    const uint32_t warp = (blockIdx.x * blockDim.x + threadIdx.x) / kCudaWarpThreads;
-    const uint32_t warps = gridDim.x * blockDim.x / kCudaWarpThreads;
-    const uint32_t count = *stress_count;
-    for (uint32_t slot = warp; slot < count; slot += warps) {
-        const uint32_t cell = stress_cells[slot];
-        const uint32_t first_key = (cell / lattice_nodes) * cells_per_env +
-                                   (cell % lattice_nodes) * nk::kMpmHalfCellsPerLatticeNode;
-        uint32_t begin = ~0u, end = 0u;
-        for (uint32_t sub = 0u; sub < nk::kMpmHalfCellsPerLatticeNode; ++sub) {
-            if (cell_start[first_key + sub] == ~0u) continue;
-            begin = min(begin, cell_start[first_key + sub]);
-            end = max(end, cell_end[first_key + sub]);
-        }
-        if (begin >= end) continue;
-        float weighted = 0.0f, total = 0.0f;
-        for (uint32_t s = begin + lane; s < end; s += kCudaWarpThreads) {
-            const uint32_t p = sorted_idx[s];
-            if (inv_mass != nullptr && inv_mass[p] <= 0.0f) continue;
-            const float J = nk::material::mpm_detail::Mat3Det(part_F + static_cast<size_t>(p) * 9u);
-            if (!(J > 0.0f) || !(volume[p] > 0.0f)) continue;
-            weighted += volume[p] * J;
-            total += volume[p];
-        }
-        for (uint32_t offset = kCudaWarpThreads / 2u; offset > 0u; offset /= 2u) {
-            weighted += __shfl_xor_sync(kFullWarpMask, weighted, offset);
-            total += __shfl_xor_sync(kFullWarpMask, total, offset);
-        }
-        if (!(total > 0.0f)) continue;
-        const float mean = weighted / total;
-        for (uint32_t s = begin + lane; s < end; s += kCudaWarpThreads) {
-            if (inv_mass != nullptr && inv_mass[sorted_idx[s]] <= 0.0f) continue;
-            float* F = part_F + static_cast<size_t>(sorted_idx[s]) * 9u;
-            const float J = nk::material::mpm_detail::Mat3Det(F);
-            if (!(J > 0.0f)) continue;
-            const float scale = cbrtf(mean / J);
-            for (uint32_t i = 0u; i < 9u; ++i) F[i] *= scale;
-        }
-    }
-}
-
 // Sorting outputs may be reused after P2G; node indexing and transfer inputs remain separate.
 struct MpmScratch {
     void* sort_temp = nullptr;
@@ -1211,10 +1075,6 @@ struct MpmScratch {
     uint32_t* active_count = nullptr;
     uint32_t* occupied_cells = nullptr;
     uint32_t* occupied_count = nullptr;
-    uint32_t* stress_cells = nullptr;
-    uint32_t* stress_count = nullptr;
-    m::Vec3* cell_gradients = nullptr;
-    MpmCellVolume* cell_volumes = nullptr;
     MpmTransferInput* transfer_input = nullptr;
     MpmCellTransfer* cell_transfers = nullptr;
     uint32_t* contact_hit_mask = nullptr;
@@ -1244,12 +1104,6 @@ MpmScratch PartitionScratch(void* base, uint32_t particle_count, uint32_t node_c
     scratch.active_count = reinterpret_cast<uint32_t*>(bytes + layout.active_count_off);
     scratch.occupied_cells = reinterpret_cast<uint32_t*>(bytes + layout.occupied_cells_off);
     scratch.occupied_count = reinterpret_cast<uint32_t*>(bytes + layout.occupied_count_off);
-    if (stress_cell_count > 0u) {
-        scratch.stress_cells = reinterpret_cast<uint32_t*>(bytes + layout.stress_cells_off);
-        scratch.stress_count = reinterpret_cast<uint32_t*>(bytes + layout.stress_count_off);
-        scratch.cell_gradients = reinterpret_cast<m::Vec3*>(bytes + layout.cell_gradients_off);
-        scratch.cell_volumes = reinterpret_cast<MpmCellVolume*>(bytes + layout.cell_volumes_off);
-    }
     scratch.transfer_input = reinterpret_cast<MpmTransferInput*>(bytes + layout.transfer_input_off);
     scratch.cell_transfers = reinterpret_cast<MpmCellTransfer*>(bytes + layout.cell_transfer_off);
     scratch.contact_hit_mask = reinterpret_cast<uint32_t*>(bytes + layout.contact_hit_mask_off);
@@ -1311,13 +1165,6 @@ cudaError_t LaunchMpmStage(const MpmParams& p, const ModelView& model,
             error = cub::DeviceSelect::Unique(scratch.sort_temp, temp_bytes, scratch.keys_out,
                 scratch.occupied_cells, scratch.occupied_count, static_cast<int>(mpm_count), stream);
         }
-        if (error == cudaSuccess && scratch.stress_cells != nullptr) {
-            temp_bytes = scratch.sort_temp_bytes;
-            error = cub::DeviceSelect::Unique(scratch.sort_temp, temp_bytes,
-                thrust::make_transform_iterator(static_cast<const uint32_t*>(scratch.keys_out),
-                                                MpmStressCellKey{}),
-                scratch.stress_cells, scratch.stress_count, static_cast<int>(mpm_count), stream);
-        }
         profiler.Stop(MpmStage::RadixSort, stream);
         if (error != cudaSuccess) return error;
         launch(MpmStage::CellRanges, MpmBuildCellRangesKernel, pblocks,
@@ -1334,18 +1181,18 @@ cudaError_t LaunchMpmStage(const MpmParams& p, const ModelView& model,
         if (error != cudaSuccess) return error;
         launch(MpmStage::TransferInput, MpmPrepareTransferInputKernel, pblocks,
                mpm_count, scratch.idx_out, data.particle_pos, data.particle_inv_mass,
-               data.particle_vel, data.particle_C, data.particle_kinematic_target, dt_sub, data.particle_F,
+               data.particle_vel, data.particle_C, data.particle_plastic, data.particle_kinematic_target, dt_sub, data.particle_F,
                data.particle_vol0, data.particle_material_id,
                reinterpret_cast<const nk::MpmMaterial*>(data.mpm_material_table),
                p.material_count, data.mpm_particle_stress, Ppe, data.env_status,
                origin, inv_dx, p.grid_dims[0], p.grid_dims[1], p.grid_dims[2],
-               scratch.stress_cells != nullptr ? 1u : 0u, scratch.transfer_input);
+               p.stress_cells_per_env > 0u ? 1u : 0u, scratch.transfer_input);
         if (error != cudaSuccess) return error;
         launch(MpmStage::P2GCells, MpmP2GCellsKernel, cell_blocks,
                mpm_count, mpm_pe, total_cells, cpe, scratch.occupied_cells, scratch.occupied_count,
                scratch.transfer_input, scratch.cell_start, scratch.cell_end,
                p.grid_dims[0], p.grid_dims[1], p.grid_dims[2], inv_dx, p.dx, dt_sub, origin,
-               scratch.cell_transfers, scratch.cell_gradients, scratch.cell_volumes);
+               scratch.cell_transfers);
         const m::Vec3 g{p.gravity[0], p.gravity[1], p.gravity[2]};
         launch(MpmStage::GridFinalize, MpmGridFinalizeKernel, finalize_blocks,
                total_nodes, scratch.active_nodes, scratch.active_count,
@@ -1361,18 +1208,15 @@ cudaError_t LaunchMpmStage(const MpmParams& p, const ModelView& model,
         const uint32_t clear_count = p.env_count * std::max(p.contact_capacity, p.point_endpoints_per_env);
         const uint32_t contact_blocks = (clear_count + kBlockSize - 1u) / kBlockSize;
         launch(MpmStage::ContactCount, mpm_contact::ClearSlots, contact_blocks, p, data);
-        if (scratch.stress_cells != nullptr) {
+        if (p.stress_cells_per_env > 0u) {
             const uint32_t stress_cells = p.env_count * p.stress_cells_per_env;
             launch(MpmStage::StressRows, MpmClearStressRowsKernel,
                    (stress_cells + kBlockSize - 1u) / kBlockSize, p, data);
             const uint32_t surfaces = p.particle_surfaces_per_env > 0u ? p.contact_capacity : 0u;
             launch(MpmStage::StressRows, MpmEmitStressRowsKernel,
-                   (std::min(mpm_count, stress_cells) + kCellGroups - 1u) / kCellGroups,
-                   p, data, mpm_count, cpe * p.env_count, cpe, scratch.cell_start,
-                   static_cast<const uint32_t*>(scratch.stress_cells),
-                   static_cast<const uint32_t*>(scratch.stress_count),
-                   static_cast<const m::Vec3*>(scratch.cell_gradients),
-                   static_cast<const MpmCellVolume*>(scratch.cell_volumes),
+                   (mpm_count + kCellGroups - 1u) / kCellGroups,
+                   p, data, mpm_count, static_cast<const uint32_t*>(scratch.idx_out),
+                   static_cast<const MpmTransferInput*>(scratch.transfer_input),
                    static_cast<uint32_t>(nk::MpmPointEndpointCount(Ppe, surfaces, 0u)),
                    static_cast<uint32_t>(nk::MpmPointEndpointTermCount(Ppe, surfaces, 0u)));
             if (error != cudaSuccess) return error;
@@ -1436,22 +1280,13 @@ cudaError_t LaunchMpmStage(const MpmParams& p, const ModelView& model,
         launch(MpmStage::G2P, MpmG2PGatherKernel, pblocks,
                mpm_count, Ppe, mpm_pe, p.nodes_per_env, p.grid_dims[0], p.grid_dims[1],
                p.grid_dims[2], inv_dx, p.dx, dt_sub, origin, data.particle_inv_mass, data.particle_kinematic_target,
-               data.grid_velocity, data.grid_pseudo_vel, data.particle_pos, data.particle_vel, data.particle_C);
+               data.grid_velocity, data.grid_pseudo_vel, data.particle_pos, data.particle_prev_pos,
+               data.particle_vel, data.particle_C);
         launch(MpmStage::UpdateF, MpmUpdateFKernel, pblocks, mpm_count,
                dt_sub, data.particle_C, data.particle_inv_mass, data.particle_material_id,
                reinterpret_cast<const nk::MpmMaterial*>(data.mpm_material_table),
                p.material_count, Ppe, mpm_pe, data.particle_F, data.particle_plastic_F,
                data.particle_plastic, data.env_status);
-        if (scratch.stress_cells != nullptr)
-            launch(MpmStage::UpdateF, MpmCellVolumeAverageKernel,
-                   (std::min(mpm_count, p.env_count * p.stress_cells_per_env) + kCellGroups - 1u) /
-                       kCellGroups,
-                   cpe, static_cast<const uint32_t*>(scratch.cell_start),
-                   static_cast<const uint32_t*>(scratch.cell_end),
-                   static_cast<const uint32_t*>(scratch.idx_out),
-                   static_cast<const uint32_t*>(scratch.stress_cells),
-                   static_cast<const uint32_t*>(scratch.stress_count),
-                   p.nodes_per_env / nk::kMpmLattices, data.particle_vol0, data.particle_inv_mass, data.particle_F);
     }
     return error;
 }
@@ -1512,7 +1347,7 @@ Status OpMpmStage(const ModelView& model, const DataView& data,
         static_cast<uint64_t>(mpm_pe) * p->env_count;
     if (static_cast<uint64_t>(Np) != static_cast<uint64_t>(Ppe) * p->env_count ||
         mpm_count64 > static_cast<uint64_t>(INT_MAX)) return Status::InvalidArgument;
-    if (!data.particle_pos || !data.particle_vel || !data.particle_inv_mass ||
+    if (!data.particle_pos || !data.particle_prev_pos || !data.particle_vel || !data.particle_inv_mass ||
         !data.particle_C || !data.particle_F || !data.particle_vol0 ||
         !data.grid_mass || !data.grid_momentum || !data.grid_velocity || !data.grid_pseudo_vel ||
         !data.grid_inv_mass || !data.grid_contact_count || !data.grid_contact_offset ||

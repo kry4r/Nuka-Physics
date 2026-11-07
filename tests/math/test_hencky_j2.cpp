@@ -7,6 +7,7 @@
 
 #include "nk/material/hencky_j2.hpp"
 #include "nk/material/mpm_constitutive.hpp"
+#include "nk/material/mpm_energy.hpp"
 
 namespace {
 namespace material = nuka::nk::material;
@@ -120,6 +121,16 @@ TEST(HenckyJ2, ClosedFormYieldHardeningAndElasticUnload) {
         const double expected_energy = expected_q * expected_q / (6.0 * mu) + 0.5 * bulk * trace * trace;
         EXPECT_NEAR(response.equivalent_stress, expected_q, expected_q * 2.0e-5);
         EXPECT_NEAR(response.elastic_energy, expected_energy, expected_energy * 2.0e-5);
+        nuka::nk::MpmMaterial parameters;
+        parameters.model_kind = nuka::nk::MpmMaterial::kHenckyJ2;
+        parameters.youngs = kMaterial.youngs;
+        parameters.poisson = kMaterial.poisson;
+        parameters.yield_stress = kMaterial.yield_stress;
+        parameters.hardening_modulus = kMaterial.hardening_modulus;
+        const auto rows = material::EvaluateMpmStressRows(parameters, elastic.data(), response.kirchhoff, alpha);
+        const double yield = kMaterial.yield_stress + kMaterial.hardening_modulus * double(alpha);
+        EXPECT_NEAR(rows.cone_offset, std::sqrt(2.0 / 3.0) * yield, 2e-6 * yield);
+        EXPECT_GE(rows.cone_offset + 2e-5 * yield, std::sqrt(2.0 / 3.0) * response.equivalent_stress);
         ExpectMatrixNear(Multiply(elastic, plastic), trial, 2.0e-4f);
         EXPECT_NEAR(Determinant(plastic.data()), 1.0, 2.0e-4);
         const Matrix held_plastic = plastic;
@@ -254,4 +265,142 @@ TEST(MpmMaterialTrial, FluidPressureAndRejectedVolumeAreTransactional) {
     for (int k = 0; k < 9; ++k) EXPECT_EQ(trial.elastic_f[k], accepted.elastic_f[k]);
     EXPECT_EQ(trial.has_plastic_history, accepted.has_plastic_history);
     EXPECT_EQ(trial.equivalent_plastic_strain, accepted.equivalent_plastic_strain);
+}
+
+TEST(MpmMaterialTrial, NonfiniteGradientsAndOverflowDoNotCommit) {
+    for (float kind : {0.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f}) {
+        SCOPED_TRACE(kind);
+        nuka::nk::MpmMaterial parameters;
+        parameters.model_kind = kind;
+        parameters.youngs = 30000.0f;
+        parameters.poisson = 0.3f;
+        parameters.bulk_modulus = 100000.0f;
+        parameters.tait_gamma = 7.0f;
+        parameters.yield_stress = 100.0f;
+        parameters.density = 1000.0f;
+        if (kind == 6.0f) parameters.yield_stress = 0.0f;
+        EXPECT_TRUE(material::ValidMpmMaterial(parameters));
+        for (int parameter = 0; parameter < (kind == 4.0f ? 6 : 5); ++parameter) {
+            auto invalid = parameters;
+            if (parameter == 0) invalid.viscosity = -1.0f;
+            if (parameter == 1) invalid.viscosity = std::numeric_limits<float>::quiet_NaN();
+            if (parameter == 2) {
+                if (kind == 3.0f) invalid.bulk_modulus = -1.0f;
+                else invalid.youngs = -1.0f;
+            }
+            if (parameter == 3) {
+                if (kind == 3.0f) invalid.tait_gamma = 0.0f;
+                else invalid.poisson = 0.5f;
+            }
+            if (parameter == 4) {
+                if (kind == 3.0f) invalid.tait_gamma = std::numeric_limits<float>::infinity();
+                else invalid.poisson = -1.0f;
+            }
+            if (parameter == 5) invalid.youngs = 0.0f;
+            EXPECT_FALSE(material::ValidMpmMaterial(invalid));
+            Matrix rate{}, stress{};
+            material::MpmMaterialTrial trial;
+            trial.elastic_f[0] = 0.75f;
+            double energy = 12.0;
+            EXPECT_EQ(material::EvaluateMpmMaterialTrial(invalid,
+                {kIdentity.data(), kIdentity.data()}, rate.data(), 0.01f, trial),
+                material::ConstitutiveStatus::InvalidParameters);
+            EXPECT_EQ(trial.elastic_f[0], 0.75f);
+            EXPECT_EQ(material::EvaluateMpmKirchhoff(invalid, kIdentity.data(), rate.data(), stress.data()),
+                material::ConstitutiveStatus::InvalidParameters);
+            EXPECT_EQ(material::EvaluateMpmStoredEnergy(invalid, kIdentity.data(), 0.0f, energy),
+                material::ConstitutiveStatus::InvalidParameters);
+            EXPECT_EQ(energy, 12.0);
+        }
+        for (float stretch : {0.0f, -1.0f}) {
+            Matrix invalid = kIdentity, rate{}, stress{};
+            invalid[0] = stretch;
+            material::MpmMaterialTrial trial;
+            trial.elastic_f[0] = 0.75f;
+            EXPECT_EQ(material::EvaluateMpmMaterialTrial(parameters,
+                {invalid.data(), kIdentity.data()}, rate.data(), 1.0f, trial),
+                material::ConstitutiveStatus::SingularDeformation);
+            EXPECT_EQ(material::EvaluateMpmKirchhoff(parameters, invalid.data(), rate.data(), stress.data()),
+                material::ConstitutiveStatus::SingularDeformation);
+            rate[0] = stretch - 1.0f;
+            EXPECT_EQ(material::EvaluateMpmMaterialTrial(parameters,
+                {kIdentity.data(), kIdentity.data()}, rate.data(), 1.0f, trial),
+                material::ConstitutiveStatus::SingularDeformation);
+            EXPECT_EQ(trial.elastic_f[0], 0.75f);
+        }
+        for (float value : {std::numeric_limits<float>::quiet_NaN(),
+                            std::numeric_limits<float>::infinity(), std::numeric_limits<float>::max()}) {
+            Matrix rate{};
+            rate[1] = value;
+            if (std::isfinite(value)) rate[0] = value;
+            material::MpmMaterialTrial trial;
+            trial.elastic_f[0] = 0.75f;
+            EXPECT_NE(material::EvaluateMpmMaterialTrial(parameters,
+                {kIdentity.data(), kIdentity.data()}, rate.data(), 2.0f, trial), material::ConstitutiveStatus::Ok);
+            EXPECT_EQ(trial.elastic_f[0], 0.75f);
+            for (int k = 1; k < 9; ++k) EXPECT_EQ(trial.elastic_f[k], 0.0f);
+            if (!std::isfinite(value)) {
+                Matrix stress{};
+                EXPECT_EQ(material::EvaluateMpmKirchhoff(parameters, kIdentity.data(), rate.data(), stress.data()),
+                    material::ConstitutiveStatus::InvalidState);
+            }
+        }
+    }
+}
+
+TEST(MpmMaterialTrial, CorotatedCompressionPreservesStressEnergyAndObjectivity) {
+    nuka::nk::MpmMaterial parameters;
+    parameters.youngs = 1000.0f;
+    parameters.poisson = 0.3f;
+    const double mu = parameters.youngs / (2.0 * (1.0 + parameters.poisson));
+    const double lambda = parameters.youngs * parameters.poisson /
+        ((1.0 + parameters.poisson) * (1.0 - 2.0 * parameters.poisson));
+    for (float stretch : {0.001f, 0.01f, 0.04f, 0.1f, 0.8f, 1.2f}) {
+        const Matrix diagonal{stretch, 0, 0, 0, 1, 0, 0, 0, 1};
+        Matrix expected{};
+        expected[0] = 2 * mu * (stretch - 1) * stretch + lambda * (stretch - 1) * stretch;
+        expected[4] = expected[8] = lambda * (stretch - 1) * stretch;
+        for (float angle : {0.0f, 0.71f, 2.31f}) {
+            const Matrix rotation = Rotation(angle), right = Rotation(-0.37f * angle);
+            const Matrix deformation = Multiply(Multiply(rotation, diagonal), right);
+            Matrix stress{}, transpose{};
+            ASSERT_EQ(material::EvaluateMpmKirchhoff(parameters, deformation.data(), nullptr, stress.data()),
+                material::ConstitutiveStatus::Ok);
+            for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c) transpose[r*3+c] = rotation[c*3+r];
+            ExpectMatrixNear(stress, Multiply(Multiply(rotation, expected), transpose), 5e-5f);
+        }
+        Matrix perturbed = diagonal;
+        constexpr float delta = 0.001f;
+        double plus, minus;
+        perturbed[0] = stretch * std::exp(delta);
+        ASSERT_EQ(material::EvaluateMpmStoredEnergy(parameters, perturbed.data(), 0, plus), material::ConstitutiveStatus::Ok);
+        perturbed[0] = stretch * std::exp(-delta);
+        ASSERT_EQ(material::EvaluateMpmStoredEnergy(parameters, perturbed.data(), 0, minus), material::ConstitutiveStatus::Ok);
+        EXPECT_NEAR((plus - minus) / (2 * delta), expected[0], 3e-5 * (1 + std::abs(expected[0])));
+    }
+}
+
+TEST(MpmMaterialTrial, GranularHydrostaticCompressionRetainsElasticVolume) {
+    nuka::nk::MpmMaterial parameters;
+    parameters.model_kind = 4;
+    parameters.youngs = 1000;
+    parameters.poisson = 0.3f;
+    parameters.dp_friction = 30;
+    for (float stretch : {0.99f, 0.98f, 0.95f, 0.9f, 0.75f, 0.5f}) {
+        SCOPED_TRACE(stretch);
+        const float compression = (stretch - 1.0f) / 0.01f;
+        const Matrix rate{compression, 0, 0, 0, compression, 0, 0, 0, compression};
+        material::MpmMaterialTrial trial;
+        ASSERT_EQ(material::EvaluateMpmMaterialTrial(parameters, {kIdentity.data()}, rate.data(), 0.01f, trial),
+            material::ConstitutiveStatus::Ok);
+        for (int k = 0; k < 9; ++k) EXPECT_NEAR(trial.elastic_f[k], k % 4 == 0 ? stretch : 0.0f, 1e-6f);
+        Matrix stress{};
+        ASSERT_EQ(material::EvaluateMpmKirchhoff(parameters, trial.elastic_f, nullptr, stress.data()), material::ConstitutiveStatus::Ok);
+        const double expected = parameters.youngs / (1.0 - 2.0 * parameters.poisson) * std::log(double(stretch));
+        for (int k = 0; k < 9; ++k) EXPECT_NEAR(stress[k], k % 4 == 0 ? expected : 0.0, 1e-3);
+        double energy = 0.0;
+        ASSERT_EQ(material::EvaluateMpmStoredEnergy(parameters, trial.elastic_f, 0.0f, energy),
+            material::ConstitutiveStatus::Ok);
+        EXPECT_NEAR(energy, 1.5 * expected * std::log(double(stretch)), 1e-3);
+    }
 }

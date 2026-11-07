@@ -133,7 +133,7 @@ struct ModelCapacities {
     uint32_t ogc_contacts_per_env = 0u;
     // Mesh contact slots particle surfaces reserve beyond one per vertex and edge, from their pair budgets.
     uint32_t ogc_surface_reserve_per_env = 0u;
-    // Implicit stress cells, one row block per occupied grid cell, at the tail of each env's row span.
+    // Implicit material capacity: one stress block per material point at each environment's row tail.
     uint32_t mpm_stress_cells_per_env = 0;
     // Byte size of the mpm_sort_scratch field (the P2G deterministic-gather cub
     // sort temp + out buffers; sized at World construct; 0 == no MPM particles).

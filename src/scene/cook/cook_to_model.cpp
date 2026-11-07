@@ -2099,9 +2099,8 @@ void CookMpmParticles(nk::Model& model, uint32_t env_count,
     cap.mpm_grid_nodes_per_env = static_cast<uint32_t>(nk::kMpmLattices * nodes64);
     cap.mpm_contact_capacity_per_env = in.contact_capacity != 0u ? in.contact_capacity :
         static_cast<uint32_t>(std::min(nodes64, uint64_t{nk::kMpmStencilNodes} * n));
-    // Every occupied cell holds at least one material point.
-    cap.mpm_stress_cells_per_env = in.implicit_stress
-        ? static_cast<uint32_t>(std::min<uint64_t>(nodes64, n)) : 0u;
+    // Each implicit material point retains its own stress and yield bounds.
+    cap.mpm_stress_cells_per_env = in.implicit_stress ? static_cast<uint32_t>(n) : 0u;
     mp.mpm_grid_min = in.grid_origin;
     mp.mpm_grid_dims[0] = in.grid_dims[0];
     mp.mpm_grid_dims[1] = in.grid_dims[1];

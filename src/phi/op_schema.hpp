@@ -354,11 +354,11 @@ struct MpmParams {
     uint32_t particle_surface_nodes_per_env;
     uint32_t point_endpoints_per_env;
     uint32_t point_endpoint_terms_per_env;
-    // Implicit stress cells per env, row blocks at the env row tail; zero transfers stress explicitly.
+    // Implicit material blocks per env, one per material point; zero transfers stress explicitly.
     uint32_t stress_cells_per_env = 0u;
 };
 
-// Workspace bytes for MPM particles, grid nodes, contacts, reaction targets and stress cells.
+// Workspace bytes for MPM particles, grid nodes, contacts, reaction targets and material blocks.
 // Query before state allocation; zero particles require no workspace.
 uint64_t MpmSortScratchBytes(uint32_t particle_count, uint32_t node_count,
                              uint64_t collidables_per_env, uint64_t contact_count,

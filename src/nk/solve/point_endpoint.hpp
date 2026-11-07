@@ -125,7 +125,7 @@ NUKA_ENDPOINT_HD inline uint32_t CanonicalizePointEndpointTerms(PointEndpointTer
     return retained;
 }
 
-// Per env: material points, then surface contacts, then stress cells.
+// Per env: material points, then surface contacts, then implicit material blocks.
 inline constexpr uint64_t MpmPointEndpointCount(uint32_t particles, uint32_t surface_contacts,
                                                 uint32_t stress_cells) {
     return uint64_t{particles} + surface_contacts + stress_cells;
@@ -134,7 +134,7 @@ inline constexpr uint64_t MpmPointEndpointCount(uint32_t particles, uint32_t sur
 inline constexpr uint64_t MpmPointEndpointTermCount(uint32_t particles, uint32_t surface_contacts,
                                                     uint32_t stress_cells) {
     return uint64_t{particles} * kMpmStencilNodes + uint64_t{surface_contacts} * kTriangleEndpointTerms +
-           uint64_t{stress_cells} * kMpmCellStencilNodes;
+           uint64_t{stress_cells} * kMpmStencilNodes;
 }
 
 // The barycentric point follows the vertices; its offset follows their best-fit angular velocity.

@@ -12,8 +12,11 @@
 #include "math/vec3.hpp"
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/material/mpm_transfer.hpp"
+#include "nk/material/mpm_constitutive.hpp"
 #include "nk/model/model.hpp"
 #include "nk/pipeline/world.hpp"
+#include "nk/readout/energy_ledger.hpp"
+#include "nk/readout/physics_diagnostics.hpp"
 #include "nk/solve/nk_row.hpp"
 #include "phi/backend.hpp"
 #include "phi/op_schema.hpp"
@@ -549,6 +552,16 @@ TEST(MpmTransferRoundtrip, MaterialTableStagesToDevice) {
     if (GetBackend().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
     Backend b = GetBackend();
     nk::Model m = BuildMpmModel(Vec3{0.0f, 0.0f, 0.0f});  // youngs/poisson/density set.
+    const uint32_t count = m.capacities.particles_per_env;
+    m.capacities.mpm_stress_cells_per_env = count;
+    m.capacities.mpm_plastic_state = true;
+    m.mpm_materials.front().model_kind = nk::MpmMaterial::kHenckyJ2;
+    m.mpm_materials.front().yield_stress = 200.0f;
+    m.mpm_materials.front().hardening_modulus = 4000.0f;
+    m.particles.initial_pos.assign(count, {.273f, .312f, .341f});
+    m.particles.initial_plastic_F = m.particles.initial_F;
+    constexpr float alpha = .125f;
+    m.particles.initial_equivalent_plastic_strain.assign(count, alpha);
     const nk::MpmMaterial seed = m.mpm_materials.front();
     nk::World w(std::move(m), 1u, b.dev, b.backend, Cfg());
     ASSERT_TRUE(w.Ready());
@@ -560,4 +573,175 @@ TEST(MpmTransferRoundtrip, MaterialTableStagesToDevice) {
     EXPECT_FLOAT_EQ(table[1], seed.poisson);
     EXPECT_FLOAT_EQ(table[2], seed.density)
         << "the cooked MPM material is all-zero on device if the Model move drops it";
+    auto params = MakeParams(w.GetModel());
+    params.stress_cells_per_env = count;
+    ASSERT_EQ(w.DispatchOp(nphi::NkOp::MpmPredict, &params), nphi::Status::Ok);
+    ASSERT_EQ(w.DispatchOp(nphi::NkOp::MpmExchange, &params), nphi::Status::Ok);
+    std::vector<nk::NkRow> rows(params.rows_per_env);
+    ASSERT_TRUE(w.GetData().DownloadField(nk::FieldId::Urows, rows.data(), rows.size() * sizeof(nk::NkRow)));
+    const auto& head = rows[params.rows_per_env - count * nk::kMpmStressRowsPerCell];
+    ASSERT_NE(head.flags & nk::nk_row_flags::kMaterialBlock, 0u);
+    const double expected = params.dt * std::sqrt(2.0 / 3.0) *
+        (seed.yield_stress + seed.hardening_modulus * double(alpha));
+    EXPECT_NEAR(head.friction_secondary, expected, 2e-6 * expected);
+}
+
+TEST(MpmTransferRoundtrip, ZeroGradientPreservesHeterogeneousMaterialHistory) {
+    if (GetBackend().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
+    const Backend backend = GetBackend();
+    auto model = BuildMpmModel(Vec3::Zero());
+    const uint32_t count = model.capacities.particles_per_env;
+    model.capacities.mpm_stress_cells_per_env = count;
+    model.mpm_materials.push_back(model.mpm_materials.front());
+    model.mpm_materials.back().model_kind = 2.0f;
+    model.capacities.mpm_material_count = 2u;
+    model.particles.initial_pos.assign(count, {.273f, .312f, .341f});
+    for (uint32_t i = 0u; i < count; ++i) {
+        model.particles.initial_material_id[i] = i % 2u;
+        model.particles.initial_vol0[i] *= float(i + 1u);
+        const float stretch = i % 2u == 0u ? .8f : 1.1f;
+        for (uint32_t axis = 0u; axis < 3u; ++axis)
+            model.particles.initial_F[9u * i + 4u * axis] = stretch;
+    }
+    const auto initial = model.particles.initial_F;
+    nk::World world(std::move(model), 1u, backend.dev, backend.backend, Cfg());
+    ASSERT_TRUE(world.Ready()) << world.CreationError();
+    auto params = MakeParams(world.GetModel());
+    params.stress_cells_per_env = world.GetModel().capacities.mpm_stress_cells_per_env;
+    ASSERT_GT(params.stress_cells_per_env, 0u);
+    for (const float dt : {0.0f, 1e-4f}) {
+        SCOPED_TRACE(dt);
+        ASSERT_EQ(world.Reset(), nphi::Status::Ok);
+        params.dt = dt;
+        ASSERT_TRUE(RunTransfer(world, params));
+        uint32_t status = 0u;
+        ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::EnvStatus, &status, sizeof(status)));
+        EXPECT_EQ(status, dt > 0.0f ? 0u : nphi::kEnvStatusConstitutiveFailure);
+        std::vector<float> deformation(9u * count), affine(9u * count);
+        ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::ParticleF,
+            deformation.data(), deformation.size() * sizeof(float)));
+        ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::ParticleC,
+            affine.data(), affine.size() * sizeof(float)));
+        for (uint32_t k = 0u; k < deformation.size(); ++k) {
+            EXPECT_FLOAT_EQ(affine[k], 0.0f);
+            EXPECT_FLOAT_EQ(deformation[k], initial[k]);
+        }
+    }
+}
+
+TEST(MpmTransferRoundtrip, ImplicitStressWorkMatchesGridKineticChange) {
+    const Backend backend = GetBackend();
+    if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    auto model = BuildMpmModel(Vec3::Zero());
+    const uint32_t count = model.capacities.particles_per_env;
+    model.capacities.mpm_stress_cells_per_env = count;
+    model.particles.mpm_floor_d = -10.0f;
+    model.particles.initial_pos.assign(count, {.273f, .312f, .341f});
+    for (uint32_t particle = 0u; particle < count; ++particle)
+        model.particles.initial_F[9u * particle + 1u] = .08f;
+    auto config = Cfg();
+    config.dt = 1e-4f;
+    config.gravity[2] = 0.0f;
+    config.vel_iters = 512u;
+    config.velocity_iterations_override = true;
+    nk::World world(std::move(model), 1u, backend.dev, backend.backend, config);
+    ASSERT_TRUE(world.Ready()) << world.CreationError();
+    ASSERT_NE(world.FieldPtr(nk::FieldId::EnergyLedger), nullptr);
+    ASSERT_NE(world.FieldPtr(nk::FieldId::PhysicsStageMetrics), nullptr);
+    ASSERT_TRUE(world.Step().AllOk());
+    std::vector<nk::NkRow> rows(world.GetModel().capacities.max_rows_per_env);
+    ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::Urows, rows.data(), rows.size() * sizeof(nk::NkRow)));
+    const auto& material = world.GetModel().mpm_materials.front();
+    const double shear = material.youngs / (2.0 * (1.0 + material.poisson));
+    const double volume = double(count) * kDx * kDx * kDx;
+    const double compliance = volume / (2.0 * config.dt * config.dt * shear);
+    uint32_t material_blocks = 0u;
+    double total_compliance = 0.0;
+    for (uint32_t row = 0u; row < rows.size(); ++row) {
+        if (!(rows[row].flags & nk::nk_row_flags::kMaterialBlock)) continue;
+        ASSERT_LT(row + nk::kMpmStressRowsPerCell - 1u, rows.size());
+        total_compliance += rows[row + 1u].compliance_alpha;
+        ++material_blocks;
+    }
+    EXPECT_GT(material_blocks, 0u);
+    EXPECT_NEAR(total_compliance, compliance, 2e-6 * compliance);
+    std::array<float, nk::kEnergyColumnCount> ledger{};
+    ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::EnergyLedger, ledger.data(), sizeof(ledger)));
+    uint32_t coverage = ~0u;
+    ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::EnergyLedgerStatus, &coverage, sizeof(coverage)));
+    EXPECT_EQ(coverage, 0u);
+    const auto value = [&](nk::EnergyColumn column) { return double(ledger[uint32_t(column)]); };
+    const double kinetic_change = value(nk::EnergyColumn::MpmGridSolvedKinetic) -
+        value(nk::EnergyColumn::MpmGridBeginKinetic);
+    ASSERT_GT(kinetic_change, 1e-7);
+    EXPECT_NEAR(value(nk::EnergyColumn::MpmStressWork), kinetic_change, 1e-8 + 1e-4 * kinetic_change);
+    EXPECT_NEAR(value(nk::EnergyColumn::RowPhysicalImpulseWork), kinetic_change, 1e-8 + 1e-4 * kinetic_change);
+    std::array<float, nk::kEnergyStageCount * nk::kPhysicsStageColumnCount> stages{};
+    ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::PhysicsStageMetrics, stages.data(), sizeof(stages)));
+    const uint32_t solved = uint32_t(nk::EnergyStage::Solved) * nk::kPhysicsStageColumnCount;
+    EXPECT_FLOAT_EQ(stages[solved + uint32_t(nk::PhysicsStageColumn::EnergyInjectingPassiveRows)], 0.0f);
+}
+
+TEST(MpmTransferRoundtrip, ImplicitStressPreservesAdmissibleHeterogeneousHistory) {
+    const Backend backend = GetBackend();
+    if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    for (const bool separate_materials : {false, true}) {
+        SCOPED_TRACE(separate_materials);
+        auto model = BuildMpmModel(Vec3::Zero());
+        const uint32_t count = model.capacities.particles_per_env;
+        model.capacities.mpm_stress_cells_per_env = count;
+        model.capacities.mpm_plastic_state = true;
+        auto& material = model.mpm_materials.front();
+        material.model_kind = nk::MpmMaterial::kHenckyJ2;
+        material.yield_stress = 10.0f;
+        material.hardening_modulus = 4000.0f;
+        const double bulk = material.youngs / (3.0 * (1.0 - 2.0 * material.poisson));
+        if (separate_materials) {
+            model.mpm_materials.push_back(model.mpm_materials.front());
+            model.mpm_materials.back().yield_stress = 20.0f;
+            model.capacities.mpm_material_count = 2u;
+        }
+        model.particles.initial_pos.assign(count, {.273f, .312f, .341f});
+        model.particles.initial_plastic_F = model.particles.initial_F;
+        model.particles.initial_equivalent_plastic_strain.assign(count, 0.0f);
+        std::array<double, nk::kMpmDeviatorComponents> expected{}, observed{};
+        for (uint32_t particle = 0u; particle < count; ++particle) {
+            const bool hardened = particle % 2u != 0u;
+            const uint32_t id = separate_materials && hardened ? 1u : 0u;
+            model.particles.initial_material_id[particle] = id;
+            model.particles.initial_equivalent_plastic_strain[particle] = hardened ? .125f : 0.0f;
+            float* deformation = model.particles.initial_F.data() + 9u * particle;
+            deformation[1] = hardened ? .04f : 0.0f;
+            float stress[9], deviator[nk::kMpmDeviatorComponents];
+            ASSERT_EQ(nk::material::EvaluateMpmKirchhoff(model.mpm_materials[id], deformation,
+                nullptr, stress), nk::material::ConstitutiveStatus::Ok);
+            nk::material::MpmDeviatorComponents(stress, deviator);
+            const auto response = nk::material::EvaluateMpmStressRows(model.mpm_materials[id],
+                deformation, stress, model.particles.initial_equivalent_plastic_strain[particle]);
+            double norm = 0.0;
+            for (uint32_t axis = 0u; axis < nk::kMpmDeviatorComponents; ++axis) {
+                expected[axis] += double(model.particles.initial_vol0[particle]) * deviator[axis];
+                norm += double(deviator[axis]) * deviator[axis];
+            }
+            ASSERT_LE(std::sqrt(norm), response.cone_offset);
+        }
+        nk::World world(std::move(model), 1u, backend.dev, backend.backend, Cfg());
+        ASSERT_TRUE(world.Ready()) << world.CreationError();
+        auto params = MakeParams(world.GetModel());
+        params.stress_cells_per_env = count;
+        ASSERT_EQ(world.DispatchOp(nphi::NkOp::MpmPredict, &params), nphi::Status::Ok);
+        ASSERT_EQ(world.DispatchOp(nphi::NkOp::MpmExchange, &params), nphi::Status::Ok);
+        std::vector<nk::NkRow> rows(params.rows_per_env);
+        std::vector<float> impulses(params.rows_per_env);
+        ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::Urows, rows.data(), rows.size() * sizeof(nk::NkRow)));
+        ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::Lambda, impulses.data(), impulses.size() * sizeof(float)));
+        for (uint32_t row = 0u; row < rows.size(); ++row) {
+            if (!(rows[row].flags & nk::nk_row_flags::kMaterialBlock)) continue;
+            const double volume = rows[row].compliance_alpha * double(params.dt) * params.dt * bulk;
+            for (uint32_t axis = 0u; axis < nk::kMpmDeviatorComponents; ++axis)
+                observed[axis] -= volume * impulses[row + 1u + axis] / params.dt;
+        }
+        for (uint32_t axis = 0u; axis < nk::kMpmDeviatorComponents; ++axis)
+            EXPECT_NEAR(observed[axis], expected[axis], 1e-7 + 2e-5 * std::abs(expected[axis]));
+    }
 }

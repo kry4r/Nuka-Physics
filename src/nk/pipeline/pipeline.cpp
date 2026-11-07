@@ -465,7 +465,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
               cap.joint_drive_rows_per_env) +
         uint64_t{cap.ogc_contacts_per_env} * 2u * kTriangleEndpointTerms +
         uint64_t{cap.mpm_contact_capacity_per_env} * (kMpmStencilNodes + kTriangleEndpointTerms) +
-        uint64_t{cap.mpm_stress_cells_per_env} * kMpmCellStencilNodes;
+        uint64_t{cap.mpm_stress_cells_per_env} * kMpmStencilNodes;
     const char* diagnostics = std::getenv("NUKA_CONTACT_SOLVER_DIAGNOSTICS");
     p_block_descent_.measure_vertex_audit = (readout_demand & kReadoutVbdSolveAudit) != 0u;
     const bool telemetry = (readout_demand & kReadoutTelemetry) != 0u;

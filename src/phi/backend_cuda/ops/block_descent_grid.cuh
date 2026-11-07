@@ -85,7 +85,7 @@ __device__ uint32_t DominantGridRow(DataView data, BlockDescentSolveParams p, Bl
     uint32_t dominant_row = ~0u;
     double dominant_trace = -DBL_MAX;
     for (size_t at = size_t{begin} + lane; at < end; at += warpSize) {
-        Vec3 row_impulse{};
+        double3 row_impulse{};
         SymmetricMat3 row_curvature{};
         EvaluateGridRow(data, p, s, at, {}, &row_impulse, &row_curvature);
         const double row_trace = double(row_curvature.xx) + row_curvature.yy + row_curvature.zz;
@@ -119,7 +119,7 @@ __global__ void DescendGridBlocksKernel(
     const uint32_t active_count = s.grid_active_count[color];
     const uint32_t first = s.grid_color_offsets[color];
     const uint32_t nodes_per_env = p.total_grid_count / p.env_count;
-    // A warp holds its nodes' largest Newton step until their env changes.
+    // A warp keeps failed-node residuals until its environment changes.
     uint32_t env = ~0u, residual = 0u;
     const auto raise = [&](uint32_t node_env, float step) {
         if (node_env != env && env != ~0u) {
@@ -138,19 +138,22 @@ __global__ void DescendGridBlocksKernel(
         const uint32_t end = s.offsets[owner + 1u];
         const Vec3 snapshot = s.grid_snapshot[node];
         const Vec3 free_velocity = s.grid_free[node];
-        const float mass = 1.0f / data.grid_inv_mass[node];
-        Vec3 impulse{};
+        const double mass = 1.0 / double(data.grid_inv_mass[node]);
+        double3 impulse{};
         SymmetricMat3 hessian{};
         bool rows_finite = true;
         for (size_t at = size_t{begin} + lane; at < end; at += warpSize) {
-            Vec3 row_impulse{};
+            double3 row_impulse{};
             SymmetricMat3 row_curvature{};
             const double change = EvaluateGridRow(data, p, s, at, {}, &row_impulse, &row_curvature);
-            const bool finite = isfinite(change) && Finite(row_impulse);
+            const bool finite = isfinite(change) && isfinite(row_impulse.x) &&
+                isfinite(row_impulse.y) && isfinite(row_impulse.z);
             rows_finite &= finite;
             if (!finite)
                 RecordBlockFailure(data, p, s, owner, nk::BlockSolveFailure::InvalidRow, s.incidence[at]);
-            impulse += row_impulse;
+            impulse.x += row_impulse.x;
+            impulse.y += row_impulse.y;
+            impulse.z += row_impulse.z;
             nk::vbd::AddTo(hessian, row_curvature);
         }
         impulse = {WarpSum(impulse.x), WarpSum(impulse.y), WarpSum(impulse.z)};
@@ -161,14 +164,14 @@ __global__ void DescendGridBlocksKernel(
             raise(node_env, FLT_MAX);
             continue;
         }
-        // Every lane holds the same warp-uniform node solve, in float apart from the inverse's cofactors.
-        const Vec3 force{fmaf(-mass, snapshot.x - free_velocity.x, impulse.x),
-                         fmaf(-mass, snapshot.y - free_velocity.y, impulse.y),
-                         fmaf(-mass, snapshot.z - free_velocity.z, impulse.z)};
+        // Opposing material impulses cancel in double before the local float solve.
+        const Vec3 force{float(impulse.x - mass * (double(snapshot.x) - free_velocity.x)),
+                         float(impulse.y - mass * (double(snapshot.y) - free_velocity.y)),
+                         float(impulse.z - mass * (double(snapshot.z) - free_velocity.z))};
         Vec3 direction{};
         float slope = 0.0f;
         bool valid = false;
-        nk::vbd::AddIdentity(hessian, mass);
+        nk::vbd::AddIdentity(hessian, float(mass));
         SymmetricMat3 inverse{};
         const bool equation_valid = mass > 0.0f && mass <= FLT_MAX && Finite(force) &&
             Finite({hessian.xx, hessian.yy, hessian.zz}) &&
@@ -181,7 +184,7 @@ __global__ void DescendGridBlocksKernel(
             reason = nk::BlockSolveFailure::InvalidDirection;
             valid = Finite(direction) && fabsf(slope) <= FLT_MAX;
         }
-        raise(node_env, valid ? StepSize(direction) : FLT_MAX);
+        if (!valid) raise(node_env, FLT_MAX);
         if (!valid) {
             double dominant_trace = 0.0;
             const uint32_t dominant_row = DominantGridRow(data, p, s, begin, end, lane, &dominant_trace);
@@ -226,14 +229,18 @@ __global__ void DescendGridBlocksKernel(
             candidate = {fmaf(scale, direction.x, snapshot.x), fmaf(scale, direction.y, snapshot.y),
                          fmaf(scale, direction.z, snapshot.z)};
             const Vec3 move = candidate - snapshot;
-            const float actual_slope = -force.Dot(move);
-            float row_change = 0.0f;
+            const double actual_slope = -(double(force.x) * move.x + double(force.y) * move.y +
+                double(force.z) * move.z);
+            double row_change = 0.0;
             for (size_t at = size_t{begin} + lane; at < end; at += warpSize)
-                row_change += static_cast<float>(EvaluateGridRow(data, p, s, at, move, nullptr, nullptr));
-            const float change = 0.5f * mass * move.Dot((snapshot - free_velocity) * 2.0f + move) +
+                row_change += EvaluateGridRow(data, p, s, at, move, nullptr, nullptr);
+            const double change = 0.5 * mass * (
+                double(move.x) * (2.0 * (double(snapshot.x) - free_velocity.x) + move.x) +
+                double(move.y) * (2.0 * (double(snapshot.y) - free_velocity.y) + move.y) +
+                double(move.z) * (2.0 * (double(snapshot.z) - free_velocity.z) + move.z)) +
                 WarpSum(row_change);
-            if (!__all_sync(0xffffffffu, Finite(candidate) && Finite(move) && fabsf(change) <= FLT_MAX &&
-                                         fabsf(actual_slope) <= FLT_MAX)) {
+            if (!__all_sync(0xffffffffu, Finite(candidate) && Finite(move) && isfinite(change) &&
+                                         isfinite(actual_slope))) {
                 bool base_finite = true;
                 for (size_t at = size_t{begin} + lane; at < end; at += warpSize) {
                     const bool finite = isfinite(EvaluateGridRow(data, p, s, at, {}, nullptr, nullptr));
@@ -280,4 +287,52 @@ __global__ void DescendGridBlocksKernel(
         }
     }
     if (lane == 0u && env != ~0u) RaiseResidual(s, env, kResidualMomentum, residual);
+}
+
+// The accepted node velocity must match the free momentum plus the final physical row impulses.
+__global__ void MeasureGridPrimalsKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
+    bool prune = false;
+    if (!MeasuredSweep(p, s, &prune)) return;
+    const uint32_t lane = threadIdx.x % warpSize;
+    const size_t first = (size_t{blockIdx.x} * blockDim.x + threadIdx.x) / warpSize;
+    const size_t stride = size_t{gridDim.x} * blockDim.x / warpSize;
+    const uint32_t nodes_per_env = p.total_grid_count / p.env_count;
+    const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
+    for (size_t node = first; node < p.total_grid_count; node += stride) {
+        const uint32_t env = node / nodes_per_env;
+        const bool skip = !EnvRunning(data, env) || data.grid_inv_mass[node] == 0.0f ||
+            (prune && Past(p, s, env, kResidualMomentum, 0u));
+        if (__shfl_sync(0xffffffffu, skip ? 1u : 0u, 0u) != 0u) continue;
+        const uint32_t owner = p.total_particle_count + p.total_body_count + p.articulation_count + node;
+        double x = 0.0, y = 0.0, z = 0.0;
+        for (size_t at = size_t{s.offsets[owner]} + lane; at < s.offsets[owner + 1u]; at += warpSize) {
+            const uint32_t slot = s.incidence[at];
+            const NkRow row = rows[slot];
+            const bool material = (row.flags & nk::nk_row_flags::kMaterialBlock) != 0u;
+            const uint32_t axes = material ? nk::kMpmStressRowsPerCell :
+                (row.flags & nk::nk_row_flags::kBlockNormal) ? 3u : 1u;
+            const Vec3 gradient = LoadPointIncidenceJacobian(s, at, 0u);
+            for (uint32_t axis = 0u; axis < axes; ++axis) {
+                Vec3 jacobian = gradient;
+                if (material && axis > 0u) {
+                    float value[3];
+                    nk::material::MpmDeviatorGradient(axis - 1u, gradient.x, gradient.y, gradient.z, value);
+                    jacobian = {value[0], value[1], value[2]};
+                } else if (axis > 0u) jacobian = LoadPointIncidenceJacobian(s, at, axis);
+                const uint32_t index = slot + axis * (material ? 1u : row.group_normal_count);
+                const double impulse = material ? data.lambda[index] : s.dual_base[index];
+                x += double(jacobian.x) * impulse;
+                y += double(jacobian.y) * impulse;
+                z += double(jacobian.z) * impulse;
+            }
+        }
+        x = SumDenseBlockWarp(x); y = SumDenseBlockWarp(y); z = SumDenseBlockWarp(z);
+        if (lane != 0u) continue;
+        const Vec3 velocity = data.grid_velocity[node], free = s.grid_free[node];
+        const double inverse_mass = data.grid_inv_mass[node];
+        const Vec3 residual{float(double(velocity.x) - free.x - inverse_mass * x),
+            float(double(velocity.y) - free.y - inverse_mass * y),
+            float(double(velocity.z) - free.z - inverse_mass * z)};
+        RaiseResidual(s, env, kResidualMomentum, ResidualBits(Finite(residual) ? StepSize(residual) : FLT_MAX));
+    }
 }
