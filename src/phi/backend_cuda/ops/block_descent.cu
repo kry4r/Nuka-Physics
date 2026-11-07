@@ -211,7 +211,8 @@ constexpr uint32_t kTileSlot = 0u, kTileStride = 1u, kTileAxes = 2u, kTileOwner 
                    kTileDualScale = 30u, kTileResidualScale = 31u,
                    kTileRelaxationStep = kTileResidualScale + 1u,
                    kTileRelaxationWeight = kTileRelaxationStep + 3u,
-                   kTileBase = kTileRelaxationWeight + 1u,
+                   kTileRelaxationPoint = kTileRelaxationWeight + 1u,
+                   kTileBase = kTileRelaxationPoint + 3u,
                    kTileElliptic = kTileBase + 3u, kTileTangentCompliance = kTileElliptic + 1u,
                    kTileFields = kTileTangentCompliance + 2u;
 

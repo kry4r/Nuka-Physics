@@ -605,6 +605,7 @@ __device__ void InitializeTileHead(DataView data, BlockDescentSolveParams p, Blo
     c.Store3(kTileStep, h, {});
     c.Store3(kTileRelaxationStep, h, {});
     c.Value(kTileRelaxationWeight, h) = 0.0f;
+    c.Store3(kTileRelaxationPoint, h, {});
 }
 
 // A thread per head incidence finds its support on its block's coordinates, the last nonzero being a single
@@ -2056,7 +2057,7 @@ __device__ void RecordTileMomentumResidual(DataView data, BlockDescentSolveParam
 // The mass-normalized difference between final momentum and physical row impulses bounds velocity error.
 template <uint32_t kN>
 __device__ void MeasureTilePrimal(DataView data, BlockDescentSolveParams p, BlockScratch s, TileContext& c,
-                                  const TileBlock& b) {
+                                  const TileBlock& b, bool reconstruct = false) {
     constexpr uint32_t kSpan = TileSpan<kN>();
     constexpr uint32_t kS = kN + 1u;
     StageTileMass<kN>(c, b);
@@ -2095,60 +2096,90 @@ __device__ void MeasureTilePrimal(DataView data, BlockDescentSolveParams p, Bloc
         if (failure == nk::BlockSolveFailure::None && c.lane + r * kTileLanes < b.dimension)
             residual = fmaxf(residual, isfinite(direction[r]) ? fabsf(direction[r]) : FLT_MAX);
     c.residual = fmaxf(c.residual, TileWarpMax(residual));
-    if ((p.telemetry & nk::kTelemetrySweeps) != 0u && failure == nk::BlockSolveFailure::None)
+    if (reconstruct && failure == nk::BlockSolveFailure::None) {
+        bool finite_candidate = true;
+#pragma unroll
+        for (uint32_t r = 0u; r < kSpan; ++r) {
+            const uint32_t i = c.lane + r * kTileLanes;
+            finite_candidate &= i >= b.dimension || isfinite(b.velocity[i] + direction[r]);
+        }
+        if (!__all_sync(~0u, finite_candidate)) {
+            if (c.lane == 0u) RecordTileFailure(data, p, s, c, b.owner, nk::BlockSolveFailure::InvalidCandidate);
+            c.residual = FLT_MAX;
+            return;
+        }
+#pragma unroll
+        for (uint32_t r = 0u; r < kSpan; ++r) {
+            const uint32_t i = c.lane + r * kTileLanes;
+            if (i < b.dimension) b.velocity[i] += direction[r];
+        }
+        c.momentum = fmaxf(c.momentum, TileWarpMax(residual));
+        __syncwarp();
+    }
+    if (!reconstruct && (p.telemetry & nk::kTelemetrySweeps) != 0u && failure == nk::BlockSolveFailure::None)
         RecordTileMomentumResidual<kN>(data, p, c, b, force, direction);
 }
 
-// Dual update as DualUpdateKernel at the velocities every block reached in this iteration; position pass
-// impulses stay in the tile. Returns the contact normal, contact tangent and other rows' residuals, then the
-// largest multiplier step. A team's warps take alternate warps of heads.
-__device__ float4 UpdateTileDuals(DataView data, const TileContext& c, float beta, bool velocity = true) {
+// Evaluate row residuals and optionally commit the dual update; read-only evaluation uses physical multipliers.
+// Returns normal, tangent, other-row and multiplier-step residuals; position impulses stay in the tile.
+__device__ float4 UpdateTileDuals(DataView data, const TileContext& c, float beta, bool velocity = true,
+                                   bool commit = true) {
     uint32_t steps[kResidualClasses] = {0u, 0u, 0u, 0u};
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
     for (uint32_t h = c.member * kTileLanes + c.lane; h < c.heads; h += c.team * kTileLanes) {
-        const TileHead t = LoadTileHead(c, h);
+        TileHead t = LoadTileHead(c, h);
+        if (!commit) t.dual = c.Load3(kTileBase, h);
         const uint32_t slot = c.Index(kTileSlot, h);
         const uint32_t stride = c.Index(kTileStride, h);
         const bool contact = t.axes == 3u;
         const float normal = nk::augmented::EvaluateScalarImpulse(t.dual.x, t.rho, t.residual.x, t.compliance,
                                                                   t.lower, t.upper, t.response).impulse;
-        nk::augmented::ContactRelaxation relaxation{c.Load3(kTileRelaxationStep, h), c.Value(kTileRelaxationWeight, h)};
+        nk::augmented::ContactRelaxation relaxation{c.Load3(kTileRelaxationStep, h), c.Value(kTileRelaxationWeight, h),
+                                                     c.Load3(kTileRelaxationPoint, h)};
+        if (!commit) relaxation = {};
         const Vec3 dual = t.elliptic
             ? nk::augmented::EvaluateEllipticImpulse(t.dual, t.rho, t.residual, t.cone_compliance, t.mu_first).impulse
             : ProjectRowDual(t.dual, normal, t.rho, t.residual, contact, t.mu_first, t.mu_second, &relaxation);
         float2 step = MultiplierSteps(t.dual, dual, t.response.residual_scale, t.response.dual_scale, t.rho,
                                             contact ? t.mu_first : 0.0f, contact ? t.mu_second : 0.0f);
+        if (!commit && t.response.residual_scale > 0.0f)
+            step.x = fabsf(dual.x - t.dual.x) / t.response.residual_scale;
         if (t.elliptic) {
             const Vec3 delta = nk::augmented::EllipticMultiplierStep(t.dual, dual, t.rho, t.cone_compliance);
             step = {delta.x, fmaxf(delta.y, delta.z)};
         }
         steps[kResidualMomentum] = max(steps[kResidualMomentum], ResidualBits(fmaxf(step.x, step.y)));
+        const Vec3 physical = commit ? dual : t.dual;
         if (!contact) {
             const bool normal_row = (rows[slot].flags & nk::nk_row_flags::kContactNormal) != 0u;
             const uint32_t kind = normal_row ? kResidualNormal : kResidualJoint;
-            const float rate = -t.residual.x + t.compliance * dual.x;
-            const float violation = dual.x > 0.0f ? fabsf(rate) : fmaxf(-rate, 0.0f);
+            const float rate = -t.residual.x + t.compliance * physical.x;
+            const float violation = physical.x > 0.0f ? fabsf(rate) : fmaxf(-rate, 0.0f);
             const float residual = normal_row ? fmaxf(step.x, violation) : step.x;
             steps[kind] = max(steps[kind], ResidualBits(residual));
         }
         if (contact) {
-            c.Store3(kTileRelaxationStep, h, relaxation.step);
-            c.Value(kTileRelaxationWeight, h) = relaxation.weight;
-            data.lambda[slot + stride] = dual.y;
-            data.lambda[slot + 2u * stride] = dual.z;
+            if (commit) {
+                c.Store3(kTileRelaxationStep, h, relaxation.step);
+                c.Value(kTileRelaxationWeight, h) = relaxation.weight;
+                c.Store3(kTileRelaxationPoint, h, relaxation.point);
+                data.lambda[slot + stride] = dual.y;
+                data.lambda[slot + 2u * stride] = dual.z;
+            }
             // Natural velocities without the contact response: a loaded normal must not move, a free one must
             // not approach; friction must not drive its own axis, and inside the cone the slip is the tangent step.
             if (t.elliptic) {
                 steps[kResidualNormal] = max(steps[kResidualNormal], ResidualBits(step.x));
                 steps[kResidualTangent] = max(steps[kResidualTangent], ResidualBits(step.y));
             } else {
-                const Vec3 v{-t.residual.x + t.compliance * dual.x, -t.residual.y, -t.residual.z};
+                const Vec3 v{-t.residual.x + t.compliance * physical.x, -t.residual.y, -t.residual.z};
                 steps[kResidualNormal] = max(steps[kResidualNormal],
-                                             ResidualBits(dual.x > 0.0f ? fabsf(v.x) : fmaxf(-v.x, 0.0f)));
+                                             ResidualBits(physical.x > 0.0f ? fabsf(v.x) : fmaxf(-v.x, 0.0f)));
                 steps[kResidualTangent] = max(steps[kResidualTangent],
-                    ResidualBits(fmaxf(step.y, fmaxf(Along(dual.y, v.y), Along(dual.z, v.z)))));
+                    ResidualBits(fmaxf(step.y, fmaxf(Along(physical.y, v.y), Along(physical.z, v.z)))));
             }
         }
+        if (!commit) continue;
         if (velocity) data.lambda[slot] = dual.x;
         // The blocks descend against the extrapolated multipliers; data.lambda keeps the unextrapolated ones.
         const bool extrapolate = contact || t.response.dual_scale != 0.0f;
@@ -2323,7 +2354,8 @@ __device__ void DescendTileBlocks(DataView data, BlockDescentSolveParams p, Bloc
 }
 
 template <uint32_t kN>
-__device__ void MeasureTilePrimals(DataView data, BlockDescentSolveParams p, BlockScratch s, TileContext& c) {
+__device__ void MeasureTilePrimals(DataView data, BlockDescentSolveParams p, BlockScratch s, TileContext& c,
+                                    bool reconstruct = false) {
     for (uint32_t pending = c.colors; pending != 0u; pending &= pending - 1u) {
         const uint32_t color = __ffs(pending) - 1u;
         const uint32_t before = __shfl_sync(~0u, c.color_stop, (color + kTileColors - 1u) % kTileColors);
@@ -2333,12 +2365,14 @@ __device__ void MeasureTilePrimals(DataView data, BlockDescentSolveParams p, Blo
              k += shared ? c.team : 1u) {
             const uint32_t local = c.order[k];
             const TileBlock b = LoadTileBlock(data, p, s, c, local, false);
-            if (local < c.bodies) MeasureTilePrimal<kRigidBlockDof>(data, p, s, c, b);
-            else MeasureTilePrimal<kN>(data, p, s, c, b);
+            if (local < c.bodies) MeasureTilePrimal<kRigidBlockDof>(data, p, s, c, b, reconstruct);
+            else MeasureTilePrimal<kN>(data, p, s, c, b, reconstruct);
         }
         TeamSync(c);
     }
-    c.residual = __uint_as_float(TeamMax(c, make_uint4(__float_as_uint(c.residual), 0u, 0u, 0u)).x);
+    const uint4 largest = TeamMax(c, make_uint4(__float_as_uint(c.residual), __float_as_uint(c.momentum), 0u, 0u));
+    c.residual = __uint_as_float(largest.x);
+    c.momentum = __uint_as_float(largest.y);
 }
 
 // An environment's velocity sweeps until its residuals pass the tolerance or the budget is spent, as the
@@ -2367,17 +2401,34 @@ __device__ void DescendTile(ArticulationDeviceState state, DataView data, BlockD
             make_uint4(__float_as_uint(c.momentum), __float_as_uint(c.residual), 0u, 0u));
         c.momentum = __uint_as_float(block_residual.x);
         c.residual = __uint_as_float(block_residual.y);
-        if (c.trace_work && c.member == 0u && c.lane == 0u)
-            data.solver_dense_motion_trace[size_t{c.env} * p.trace_sweeps + c.iteration] = c.momentum;
         clock.Stamp(kPhaseDense);
         AdvanceDualMomentum(momentum, step);
         clock.Stamp(kPhaseMomentum);
-        const float4 rows = UpdateTileDuals(data, c, momentum.beta);
+        float4 rows = UpdateTileDuals(data, c, momentum.beta);
         step = rows.w;
         clock.Stamp(kPhaseDual);
         if ((p.telemetry & nk::kTelemetrySweeps) != 0u || sweeps == p.iterations ||
             fmaxf(fmaxf(rows.x, rows.y), fmaxf(rows.z, c.residual)) < p.velocity_tolerance)
             MeasureTilePrimals<kN>(data, p, s, c);
+        // Reconcile nearly converged physical impulses with momentum, then recheck every constitutive row.
+        if (fmaxf(fmaxf(rows.x, rows.y), rows.z) < p.velocity_tolerance &&
+            c.residual >= p.velocity_tolerance && c.residual < FLT_MAX) {
+            MeasureTilePrimals<kN>(data, p, s, c, true);
+            if (c.residual < FLT_MAX) {
+                if (c.member == 0u) {
+                    if constexpr (TileSpan<kN>() == 1u) InitializeTileResiduals<kN>(data, p, s, c);
+                    else RunTileWork<kN>(data, p, s, c, TileWork::Residuals);
+                }
+                TeamSync(c);
+                clock.Stamp(kPhaseDense);
+                rows = UpdateTileDuals(data, c, 0.0f, true, false);
+                clock.Stamp(kPhaseDual);
+                c.residual = 0.0f;
+                MeasureTilePrimals<kN>(data, p, s, c);
+            }
+        }
+        if (c.trace_work && c.member == 0u && c.lane == 0u)
+            data.solver_dense_motion_trace[size_t{c.env} * p.trace_sweeps + c.iteration] = c.momentum;
         if (c.trace_work && c.lane == 0u)
             for (uint32_t kind = 0u; kind < kSolverWorkWords; ++kind)
                 atomicAdd(data.solver_work_trace +
@@ -2391,7 +2442,7 @@ __device__ void DescendTile(ArticulationDeviceState state, DataView data, BlockD
                 residual;
         const float largest = fmaxf(fmaxf(rows.x, rows.y), fmaxf(rows.z, c.residual));
         clock.Stamp(kPhaseCheck);
-        if (largest < p.velocity_tolerance) break;
+        if (largest < p.velocity_tolerance || largest == FLT_MAX) break;
     }
     if (c.member == 0u) {
         if (c.lane < kResidualClasses) data.solver_residual[c.env * kResidualClasses + c.lane] = residual;

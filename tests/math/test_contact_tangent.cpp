@@ -5,6 +5,23 @@
 
 #include "nk/solve/augmented_row.hpp"
 
+TEST(ContactTangent, RelaxationFindsLinearRootAfterExtrapolation) {
+    namespace augmented = nuka::nk::augmented;
+    using nuka::math::Vec3;
+    for (float beta : {0.0f, 0.5f}) {
+        augmented::ContactRelaxation history{};
+        const Vec3 start{10.0f, 1.0f, 0.0f};
+        const auto first = augmented::RelaxContactImpulse(start, {10.0f, -2.0f, 0.0f}, &history);
+        const Vec3 point = first + (first - start) * beta;
+        const auto root = augmented::RelaxContactImpulse(point, {10.0f, -2.0f * point.y, 0.0f}, &history);
+        EXPECT_FLOAT_EQ(root.x, 10.0f);
+        EXPECT_NEAR(root.y, 0.0f, 5.0e-7f);
+        EXPECT_FLOAT_EQ(root.z, 0.0f);
+        EXPECT_NEAR(history.weight, 1.0f / 3.0f, 1.0e-7f);
+        EXPECT_LE(root.y * root.y + root.z * root.z, root.x * root.x);
+    }
+}
+
 TEST(ContactTangent, CollapsedFrictionSetsHaveZeroResponse) {
     namespace augmented = nuka::nk::augmented;
     using nuka::math::Vec3;
