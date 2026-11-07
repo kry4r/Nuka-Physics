@@ -2104,6 +2104,7 @@ __device__ void MeasureTilePrimal(DataView data, BlockDescentSolveParams p, Bloc
 // largest multiplier step. A team's warps take alternate warps of heads.
 __device__ float4 UpdateTileDuals(DataView data, const TileContext& c, float beta, bool velocity = true) {
     uint32_t steps[kResidualClasses] = {0u, 0u, 0u, 0u};
+    const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
     for (uint32_t h = c.member * kTileLanes + c.lane; h < c.heads; h += c.team * kTileLanes) {
         const TileHead t = LoadTileHead(c, h);
         const uint32_t slot = c.Index(kTileSlot, h);
@@ -2122,7 +2123,14 @@ __device__ float4 UpdateTileDuals(DataView data, const TileContext& c, float bet
             step = {delta.x, fmaxf(delta.y, delta.z)};
         }
         steps[kResidualMomentum] = max(steps[kResidualMomentum], ResidualBits(fmaxf(step.x, step.y)));
-        if (!contact) steps[kResidualJoint] = max(steps[kResidualJoint], ResidualBits(step.x));
+        if (!contact) {
+            const bool normal_row = (rows[slot].flags & nk::nk_row_flags::kContactNormal) != 0u;
+            const uint32_t kind = normal_row ? kResidualNormal : kResidualJoint;
+            const float rate = -t.residual.x + t.compliance * dual.x;
+            const float violation = dual.x > 0.0f ? fabsf(rate) : fmaxf(-rate, 0.0f);
+            const float residual = normal_row ? fmaxf(step.x, violation) : step.x;
+            steps[kind] = max(steps[kind], ResidualBits(residual));
+        }
         if (contact) {
             c.Store3(kTileRelaxationStep, h, relaxation.step);
             c.Value(kTileRelaxationWeight, h) = relaxation.weight;
