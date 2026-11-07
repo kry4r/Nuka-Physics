@@ -19,6 +19,7 @@
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/prims_types.cuh"  // LoadPrimShape (PairDriven side resolve)
 #include "phi/backend_cuda/ops/registry.cuh"
+#include "phi/backend_cuda/ops/row_coupling.cuh"
 #include "phi/backend_cuda/ops/rigid_types.cuh"
 #include "phi/backend_cuda/ops/union_types.cuh"
 #include "phi/backend_cuda/ops/vertex_blocks.cuh"
@@ -388,6 +389,13 @@ __global__ void ClearPairDrivenRowsKernel(
     }
 }
 
+// Compliant rows record their reference stiffness and deflection for the energy ledger.
+__device__ inline void StoreCompliantSpring(float* storage, uint32_t rs, float spring, float pos) {
+    if (storage == nullptr) return;
+    storage[size_t{rs} * 4u] = spring;
+    storage[size_t{rs} * 4u + 1u] = pos;
+}
+
 // Each candidate slot emits its manifold rows using ComputeCompliantRow.
 // The tangent basis and collidable sides are shared with warm-start persistence.
 __global__ void EmitPairDrivenRowsKernel(
@@ -435,6 +443,7 @@ __global__ void EmitPairDrivenRowsKernel(
     uint32_t* __restrict__ row_count,
     float* __restrict__ row_penetration,
     float* __restrict__ row_reference_velocity_gain, float* __restrict__ row_invweight,
+    float* __restrict__ row_compliant_storage,
     uint32_t* __restrict__ env_status,
     uint32_t* __restrict__ contact_row_extent) {
     BeginProgrammaticKernel();
@@ -668,6 +677,7 @@ __global__ void EmitPairDrivenRowsKernel(
                     if (kind_b == kNkSideArtic) { row_cj_link_b[rs] = link_b; row_cj_point_b[rs] = point; }
                     row_reference_velocity_gain[rs] = 1.0f / dt - compliant.damping;
                     row_invweight[rs] = edge_invweight;
+                    StoreCompliantSpring(row_compliant_storage, rs, compliant.spring, pos);
                     ++active_rows;
                 }
                 urows[rs] = row;
@@ -714,6 +724,7 @@ __global__ void EmitPairDrivenRowsKernel(
                                                 overlap_recovery_velocity * dt))) / (dt * dt);
                 row_reference_velocity_gain[rs] = 1.0f / dt - compliant.damping;
                 row_invweight[rs] = invweight;
+                StoreCompliantSpring(row_compliant_storage, rs, speculative ? 0.0f : compliant.spring, pos);
                 row.compliance_alpha = compliant.R;
                 row.lower = 0.0f;
                 row.upper = kFltMaxLocal;
@@ -759,6 +770,7 @@ __global__ void EmitPairDrivenRowsKernel(
                     row.compliance_alpha = compliant.R;
                     row_reference_velocity_gain[rs] = 1.0f / dt - compliant.damping;
                     row_invweight[rs] = tangent_invweight;
+                    StoreCompliantSpring(row_compliant_storage, rs, 0.0f, 0.0f);
                 }
                 row.lower = -kFltMaxLocal;
                 row.upper = kFltMaxLocal;
@@ -851,6 +863,7 @@ __device__ void EmitJointLimitRow(
             row.compliance_alpha = compliant.R;
             data.row_reference_velocity_gain[rs] = 1.0f / dt - compliant.damping;
             data.row_invweight[rs] = invweight;
+            StoreCompliantSpring(data.row_compliant_storage, rs, compliant.spring, pos);
         }
         if (row.flags & nk::nk_row_flags::kActive) atomicAdd(&row_count[env], 1u);
     } else {
@@ -903,6 +916,7 @@ __device__ void EmitJointFrictionRows(
             row.compliance_alpha = compliant.R;
             data.row_reference_velocity_gain[rs] = 1.0f / dt - compliant.damping;
             data.row_invweight[rs] = invweight;
+            StoreCompliantSpring(data.row_compliant_storage, rs, 0.0f, 0.0f);
         }
         atomicAdd(&row_count[env], 1u);
     }
@@ -1002,80 +1016,6 @@ __global__ void EmitJointRowsKernel(
 }
 
 // L^-1 J of a row's articulated sides; side 0 reads chain_jacobian, side 1 chain_jacobian_b.
-struct RowForward {
-    const float* side[2] = {nullptr, nullptr};
-};
-
-__device__ RowForward ForwardRowSides(const NkRow& row, uint32_t row_index,
-    const float* __restrict__ chain_jacobian, const float* __restrict__ chain_jacobian_b,
-    const float* __restrict__ mass_factor, uint32_t dof_stride, float* storage) {
-    RowForward forward;
-    const NkRowSide sides[2] = {row.a, row.b};
-    for (uint32_t s = 0u; s < 2u; ++s) {
-        if (sides[s].kind != kNkSideArtic) continue;
-        float* const y = storage + size_t{s} * dof_stride;
-        ForwardMass(mass_factor + size_t{sides[s].index} * dof_stride * dof_stride, dof_stride,
-                    (s == 0u ? chain_jacobian : chain_jacobian_b) + size_t{row_index} * dof_stride, nullptr, y);
-        forward.side[s] = y;
-    }
-    return forward;
-}
-
-__device__ float PairDrivenSideCoupling(
-    const NkRowSide& lhs, const float* lhs_forward,
-    const NkRowSide& rhs, const float* rhs_forward,
-    const float* __restrict__ mass_factor,
-    const float* __restrict__ body_inv_mass,
-    const math::SymmetricMat3* __restrict__ body_world_inv_inertia,
-    PointMassView point_masses, uint32_t dof_stride) {
-    if (PointMassView::IsPointSide(lhs.kind) && PointMassView::IsPointSide(rhs.kind))
-        return point_masses.Coupling(lhs, rhs);
-    if (lhs.kind != rhs.kind || lhs.index != rhs.index) return 0.0f;
-    switch (lhs.kind) {
-        case kNkSideRigid: {
-            const float im = body_inv_mass[lhs.index];
-            return im * Dot3(lhs.jlin, rhs.jlin) +
-                   Dot3(lhs.jang, body_world_inv_inertia[lhs.index].Multiply(rhs.jang));
-        }
-        case kNkSideArtic: {
-            const float* const factor = mass_factor + size_t{lhs.index} * dof_stride * dof_stride;
-            return MassDot(factor, dof_stride, lhs_forward, rhs_forward);
-        }
-        case kNkSideParticle:
-        case kNkSideGrid: {
-            return point_masses.Quad(lhs.kind, lhs.index, lhs.jlin, rhs.jlin);
-        }
-        default:
-            return 0.0f;
-    }
-}
-
-// Same-side couplings a caller already summed (bit s for side s) replace their merge.
-struct SharedSideCoupling {
-    uint32_t known = 0u;
-    float value[2] = {0.0f, 0.0f};
-};
-
-__device__ float PairDrivenRowCoupling(
-    const NkRow& lhs, const RowForward& lhs_forward, const NkRow& rhs, const RowForward& rhs_forward,
-    const float* __restrict__ mass_factor,
-    const float* __restrict__ body_inv_mass,
-    const math::SymmetricMat3* __restrict__ body_world_inv_inertia,
-    PointMassView point_masses, uint32_t dof_stride, SharedSideCoupling shared = {}) {
-    const NkRowSide lhs_sides[2] = {lhs.a, lhs.b};
-    const NkRowSide rhs_sides[2] = {rhs.a, rhs.b};
-    float coupling = 0.0f;
-    for (uint32_t i = 0u; i < 2u; ++i) {
-        for (uint32_t j = 0u; j < 2u; ++j) {
-            coupling += i == j && ((shared.known >> i) & 1u) != 0u ? shared.value[i]
-                : PairDrivenSideCoupling(
-                      lhs_sides[i], lhs_forward.side[i], rhs_sides[j], rhs_forward.side[j],
-                      mass_factor, body_inv_mass, body_world_inv_inertia, point_masses, dof_stride);
-        }
-    }
-    return coupling;
-}
-
 // Point couplings of a block's rows on the endpoint all three share, in one pass over its terms;
 // each sum adds terms in the order a pairwise merge does. Order: 11, 22, 01, 02, 12.
 __device__ void SharedPointCouplings(const PointMassView& points, const NkRowSide& side,
@@ -1164,6 +1104,7 @@ __global__ void PrepareContactRowsKernel(
     const math::Vec3* __restrict__ step_body_linear,
     const math::Vec3* __restrict__ step_body_angular,
     const math::Vec3* __restrict__ step_particle,
+    float* __restrict__ row_compliant_storage,
     uint32_t total_rows, uint32_t dof_stride, float dt, VertexBlockLayout vertex_blocks,
     uint32_t rows_per_env, uint32_t contact_rows_per_env, uint32_t measure,
     const uint32_t* __restrict__ contact_row_extent) {
@@ -1180,15 +1121,17 @@ __global__ void PrepareContactRowsKernel(
     if (TouchesVertexBlock(row.a, point_masses, vertex_blocks) ||
         TouchesVertexBlock(row.b, point_masses, vertex_blocks))
         row.flags |= nk::nk_row_flags::kVertexBlock;
+    float initial_velocity = 0.0f;
     if (row.flags & nk::nk_row_flags::kMuJoCo) {
-        const float initial_velocity = ContactReferenceVelocity(
+        initial_velocity = ContactReferenceVelocity(
             row, rs, dof_stride, chain_jacobian, chain_jacobian_b,
             step_qdot, step_body_linear, step_body_angular, step_particle, point_masses);
         row.rhs += row_reference_velocity_gain[rs] * initial_velocity;
     }
     const bool respond = measure != 0u &&
         (row.flags & (nk::nk_row_flags::kBlockNormal | nk::nk_row_flags::kContactNormal));
-    if (!respond) return;
+    const bool book = row_compliant_storage != nullptr && (row.flags & nk::nk_row_flags::kMuJoCo);
+    if (!respond && !book) return;
     uint32_t tangent_rows[2] = {0u, 0u};
     const bool block = respond && BlockTangentRows(urows, rs, row, tangent_rows);
     const uint32_t tangent1_row = tangent_rows[0], tangent2_row = tangent_rows[1];
@@ -1219,6 +1162,12 @@ __global__ void PrepareContactRowsKernel(
     float diagonal = PairDrivenRowCoupling(
         row, forward, row, forward, mass_factor, body_inv_mass, body_world_inv_inertia, point_masses,
         dof_stride);
+    if (book) {
+        // Damping excitation -b v0 of the reference acceleration and the row's diagonal response.
+        row_compliant_storage[size_t{rs} * 4u + 2u] = -(1.0f / dt - row_reference_velocity_gain[rs]) * initial_velocity;
+        row_compliant_storage[size_t{rs} * 4u + 3u] = diagonal;
+    }
+    if (!respond) return;
     diagonal += row.compliance_alpha;
     if (!block) {
         contact_response[rs] = {diagonal, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
@@ -1599,7 +1548,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    data.row_cj_link, data.row_cj_point,
                    data.row_cj_link_b, data.row_cj_point_b,
                    data.row_count, data.row_penetration, data.row_reference_velocity_gain,
-                   data.row_invweight, data.env_status,
+                   data.row_invweight, data.row_compliant_storage, data.env_status,
                    data.contact_row_extent);
     }
 
@@ -1672,6 +1621,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    PointMasses(data),
                    data.row_reference_velocity_gain, data.step_qdot_flat, data.step_body_linear_velocity,
                    data.step_body_angular_velocity, data.step_particle_velocity,
+                   data.row_compliant_storage,
                    total_rows, p->max_dof, p->dt, p->vertex_blocks, p->rows_per_env,
                    p->contact_rows_per_env, p->measure_contact_response, data.contact_row_extent);
     }

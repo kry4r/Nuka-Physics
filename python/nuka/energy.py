@@ -52,6 +52,31 @@ class EnergyColumn(IntEnum):
     MPM_GRID_BEGIN_KINETIC = 41
     MPM_GRID_SOLVED_KINETIC = 42
     POSITION_KINETIC_WORK = 43
+    CONSTRAINT_STORAGE = 44
+
+
+
+class EnergyRowTerm(IntEnum):
+    """Columns of Field.ENERGY_ROW_TERMS, one record per row slot from the last solved stage."""
+    KIND = 0
+    IMPULSE = 1
+    WORK = 2
+    STORAGE = 3
+    RATE = 4
+    CONSERVATIVE = 5
+    RESPONSE = 6
+    COMPLIANCE = 7
+
+
+class EnergyRowKind(IntEnum):
+    NONE = 0
+    LIMIT = 1
+    NORMAL = 2
+    PYRAMID_EDGE = 3
+    FRICTION = 4
+    DRIVE = 5
+    MATERIAL = 6
+    OTHER = 7
 
 
 class EnergyStatus(IntFlag):
@@ -64,6 +89,7 @@ class EnergyStatus(IntFlag):
     RIGID_ANGULAR_POSITION_WORK = 1 << 6
     ARMATURE_ENERGY = 1 << 7
     PHYSICS_FAILURE = 1 << 8
+    STORAGE_CAPACITY = 1 << 9
 
 
 class EnergyLedgerSampler:

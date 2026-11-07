@@ -352,12 +352,17 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
     {NUKA_FIELD_BODY_GRAVITY_COMPENSATION, kStrideF32, kWireDtypeF32, nk::FieldId::BodyGravityCompensation},
     {NUKA_FIELD_JOINT_ACTUATOR_GRAVITY_COMPENSATION, kStrideU32, kWireDtypeU32, nk::FieldId::JointActuatorGravityCompensation},
     {NUKA_FIELD_JOINT_GRAVITY_FORCE, kStrideF32, kWireDtypeF32, nk::FieldId::JointGravityForce},
+    {NUKA_FIELD_ENERGY_ROW_TERMS, nk::LayoutOf(nk::FieldId::EnergyRowTerms).elem_size,
+        kWireDtypeF32, nk::FieldId::EnergyRowTerms},
 };
 
 inline constexpr size_t kDlpackFieldCount =
     sizeof(kDlpackFieldTable) / sizeof(kDlpackFieldTable[0]);
 static_assert(NUKA_ENERGY_COLUMN_COUNT == nk::kEnergyColumnCount,
               "public energy record columns must match the physics readout");
+static_assert(nk::LayoutOf(nk::FieldId::EnergySplitMatrix).elem_size == nk::kEnergySplitCapacity * sizeof(double));
+static_assert(NUKA_ENERGY_ROW_TERM_COUNT == nk::kEnergyRowTermCount &&
+              nk::LayoutOf(nk::FieldId::EnergyRowTerms).elem_size == nk::kEnergyRowTermCount * sizeof(float));
 static_assert(nk::LayoutOf(nk::FieldId::PhysicsStageMetrics).elem_size ==
               nk::kEnergyStageCount * nk::kPhysicsStageColumnCount * sizeof(float));
 static_assert(nk::LayoutOf(nk::FieldId::VbdSolveAudit).elem_size ==

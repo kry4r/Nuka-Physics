@@ -167,6 +167,13 @@ fields:
   - {name: chain_jacobian,  dtype: f32,  per: row_dof,  arena: scratch,    owner: data}
   - {name: row_reference_velocity_gain, dtype: f32, per: row_slot, arena: scratch, owner: data}
   - {name: row_invweight, dtype: f32, per: row_slot, arena: scratch, owner: data}
+  # Compliant rows for the energy ledger: reference stiffness, deflection, damping excitation, diagonal response.
+  - {name: row_compliant_storage, dtype: f32, per: row_slot, elem: 4, arena: scratch, owner: data}
+  # Energy ledger damping split: per-row forward solves and each env's dense active-set response.
+  - {name: energy_split_forward, dtype: f32, per: row_dof, elem: 2, arena: scratch, owner: data}
+  - {name: energy_split_matrix, dtype: f64, per: row_slot, elem: 128, arena: scratch, owner: data}
+  # Solved-stage energy terms per row: kind, impulse, work, storage, rate, conservative impulse, response, compliance.
+  - {name: energy_row_terms, dtype: f32, per: row_slot, elem: 8, arena: scratch, owner: data, flags: [readout]}
   - {name: row_cj_link,     dtype: u32,  per: row_slot, arena: scratch,    owner: data}
   - {name: row_cj_point,    dtype: vec3, per: row_slot, arena: scratch,    owner: data}
   - {name: qdot_flat,       dtype: f32,  per: articulation_dof, arena: scratch, owner: data}
@@ -799,9 +806,9 @@ fields:
   # acceleration, dual, check.
   - {name: solver_phase_time, dtype: u64, per: env, elem: 13, arena: scratch, owner: data}
   - {name: dat_surface_motion, dtype: f32, per: scalar, count: "particle_surfaces_per_env*env_count", arena: scratch, owner: data}
-  - {name: energy_ledger, dtype: f32, per: scalar, count: "integration_substeps*env_count", elem: 44, arena: scratch, owner: data, flags: [readout]}
+  - {name: energy_ledger, dtype: f32, per: scalar, count: "integration_substeps*env_count", elem: 45, arena: scratch, owner: data, flags: [readout]}
   # The ledger record in double; residuals difference stage energies far larger than their change.
-  - {name: energy_ledger_sum, dtype: f64, per: scalar, count: "integration_substeps*env_count", elem: 44, arena: scratch, owner: data}
+  - {name: energy_ledger_sum, dtype: f64, per: scalar, count: "integration_substeps*env_count", elem: 45, arena: scratch, owner: data}
   - {name: energy_ledger_status, dtype: u32, per: scalar, count: "integration_substeps*env_count", arena: scratch, owner: data, flags: [readout]}
   - {name: physics_stage_metrics, dtype: f32, per: scalar, count: "integration_substeps*env_count", elem: 220, arena: scratch, owner: data, flags: [readout]}
   - {name: contact_audit_counts, dtype: u32, per: scalar, count: "integration_substeps*env_count", elem: 8, arena: scratch, owner: data, flags: [readout]}

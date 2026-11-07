@@ -20,10 +20,15 @@ enum class EnergyColumn : uint32_t {
     MpmBeginAffineKinetic, MpmEndAffineKinetic, MpmP2gLoss, MpmG2pLoss,
     MpmAffineTransport, MpmPlasticLoss, MpmVolumeAverageWork, MpmStressWork,
     MpmBoundaryWork, MpmViscousLoss, MpmGridBeginKinetic, MpmGridSolvedKinetic,
-    PositionKineticWork, Count
+    PositionKineticWork, ConstraintStorage, Count
 };
 
+// Per-row ledger terms of the solved stage, one record per row slot.
+enum class EnergyRowTerm : uint32_t { Kind, Impulse, Work, Storage, Rate, Conservative, Response, Compliance, Count };
+enum class EnergyRowKind : uint32_t { None, Limit, Normal, PyramidEdge, Friction, Drive, Material, Other };
+
 inline constexpr uint32_t kEnergyColumnCount = static_cast<uint32_t>(EnergyColumn::Count);
+inline constexpr uint32_t kEnergyRowTermCount = static_cast<uint32_t>(EnergyRowTerm::Count);
 inline constexpr uint32_t kEnergyStageCount = static_cast<uint32_t>(EnergyStage::Count);
 
 inline constexpr std::array<FieldId, 3> kEnergyMpmParticleFields = {
@@ -38,6 +43,10 @@ inline constexpr std::array<FieldId, 4> kEnergyArticulationFields = {
 inline constexpr std::array<FieldId, 4> kEnergyLoadFields = {
     FieldId::EnergyBodyWrench, FieldId::EnergyBodyStartVelocity,
     FieldId::EnergyLinkWrench, FieldId::EnergyLinkStartVelocity};
+inline constexpr std::array<FieldId, 4> kEnergyRowFields = {FieldId::RowCompliantStorage, FieldId::EnergyRowTerms,
+    FieldId::EnergySplitForward, FieldId::EnergySplitMatrix};
+// Rows an env's damping split solves densely; a larger active set leaves storage unbooked.
+inline constexpr uint32_t kEnergySplitCapacity = 128u;
 
 namespace energy_status {
 inline constexpr uint32_t kNonfinite = 1u << 0;
@@ -49,6 +58,7 @@ inline constexpr uint32_t kFloatingPositionWork = 1u << 5;
 inline constexpr uint32_t kRigidAngularPositionWork = 1u << 6;
 inline constexpr uint32_t kArmatureEnergy = 1u << 7;
 inline constexpr uint32_t kPhysicsFailure = 1u << 8;
+inline constexpr uint32_t kStorageCapacity = 1u << 9;
 }
 
 }  // namespace nuka::nk

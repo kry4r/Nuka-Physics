@@ -25,6 +25,7 @@ struct CompliantContactRow {
     float R = 0.0f;
     float aref_bias = 0.0f;
     float damping = 0.0f;
+    float spring = 0.0f;  // k * imp, the reference stiffness on the constraint coordinate
 };
 
 struct CompliantRowTerms {
@@ -71,7 +72,7 @@ NUKA_SRSI_HD inline CompliantContactRow ComputeCompliantRow(
     bool refsafe = true) {
     const auto terms = ComputeCompliantRowTerms(
         solref, solimp, pos_imp, pos_aref, vel, invweight, dt, refsafe);
-    return {terms.R, terms.aref, terms.b};
+    return {terms.R, terms.aref, terms.b, terms.k * terms.imp};
 }
 
 }  // namespace nuka::constraint

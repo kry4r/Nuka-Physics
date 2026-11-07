@@ -117,7 +117,22 @@ private pose advanced by physical velocity alone, including articulated inertia
 and conserved rigid angular momentum. `POSITION_POTENTIAL` records the associated
 potential change. These numerical contributions are separate from physical loads
 and require convergence checks; joint load work excludes pseudo displacement.
-Older captures with 31 or 43 energy columns remain readable; missing appended terms
+`CONSTRAINT_STORAGE` is the stored-energy change of MuJoCo-law compliant normal,
+pyramid-edge and limit rows. Each env's solved active set (rows strictly inside their
+bounds and friction cones) is solved once more, densely, for its response
+`f_d = (A + R)^-1 (-B v0)` to the reference damping alone; the conservative share
+`f - f_d` carries the springs and every coupled load, and its work over each row's own
+displacement, with the spring's change on the diagonal response, is the storage change.
+It moves out of `NORMAL_LOSS` and `LIMIT_LOSS`; a pyramid edge books the tangential part
+of its displacement against `FRICTION_LOSS`. The losses keep only the remaining
+dissipation, while the residual and throughput are unchanged. An active set larger than
+128 rows leaves storage unbooked and raises `STORAGE_CAPACITY`, so its records are not
+covered. Discretization of the explicit reference spring remains in the losses and must
+shrink under timestep refinement.
+`Field.ENERGY_ROW_TERMS` keeps the last solved stage per row slot as `EnergyRowTerm`
+columns (kind, impulse, work, storage, rate, conservative impulse, response, compliance), so a
+negative loss or storage step can be traced to its rows.
+Older captures with 31, 43 or 44 energy columns remain readable; missing appended terms
 are represented by NaN and keep energy coverage incomplete.
 
 `SOLVED` retains all four solver residual classes in m/s for every physical

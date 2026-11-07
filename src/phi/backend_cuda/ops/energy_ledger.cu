@@ -19,6 +19,7 @@
 #include "phi/backend_cuda/ops/kinematics.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
+#include "phi/backend_cuda/ops/row_coupling.cuh"
 #include "phi/backend_cuda/ops/surface_query.cuh"
 #include "phi/backend_cuda/ops/union_types.cuh"
 #include "phi/backend_cuda/ops/vertex_blocks.cuh"
@@ -35,7 +36,7 @@ constexpr uint32_t kThreads = 128u;
 constexpr uint32_t kColumns = nk::kEnergyColumnCount;
 constexpr uint32_t kForceWorkColumn = kColumns;
 constexpr uint32_t kReductionColumns = kColumns + 1u;
-static_assert(kColumns == 44u, "energy field record must match its named columns");
+static_assert(kColumns == 45u, "energy field record must match its named columns");
 
 __device__ uint32_t Column(EnergyColumn value) { return static_cast<uint32_t>(value); }
 __device__ double Dot(Vec3 a, Vec3 b) {
@@ -402,6 +403,177 @@ __device__ RowPower SidePower(const NkRowSide& side, bool second, uint32_t row,
         }
     }
     return out;
+}
+
+struct CompliantShare {
+    double force = 0.0;
+    double conservative = 0.0;
+    double response = 0.0;
+};
+
+__device__ bool CompliantSpringRow(const NkRow& r, const DataView& d, uint32_t row) {
+    constexpr uint32_t excluded = nk::nk_row_flags::kSpeculative | nk::nk_row_flags::kVelocityOnly |
+        nk::nk_row_flags::kBlockTangent | nk::nk_row_flags::kMaterialBlock;
+    return d.row_compliant_storage != nullptr && (r.flags & nk::nk_row_flags::kMuJoCo) && !(r.flags & excluded) &&
+           d.row_compliant_storage[size_t{row} * 4u] > 0.0f;
+}
+
+// Negated conservative force of a compliant row at the midpoint of its own displacement: the solved impulse less
+// the active set's response to the damping excitation alone, with the spring's change on the diagonal response.
+__device__ CompliantShare CompliantStorageForce(const NkRow& r, uint32_t row, double impulse, double displacement,
+                                                const DataView& d, const ReadoutEnergyLedgerParams& p) {
+    CompliantShare out;
+    if (!CompliantSpringRow(r, d, row) || !(p.dt > 0.0f)) return out;
+    const float* stored = d.row_compliant_storage + size_t{row} * 4u;
+    const double spring = stored[0], damping_impulse = stored[2];
+    out.response = stored[3];
+    const double inverse_mass = out.response + double(r.compliance_alpha);
+    if (!(impulse > 0.0) || !(inverse_mass > 0.0)) return out;
+    out.conservative = impulse - damping_impulse;
+    out.force = -out.conservative / double(p.dt) + 0.5 * spring * displacement / inverse_mass;
+    return out;
+}
+
+// Rows of an env's damping split: solved rows strictly inside their bounds and friction cones.
+__device__ bool DampingSplitMember(const NkRow* rows, const float* lambda, uint32_t row) {
+    const NkRow& r = rows[row];
+    if (!(r.flags & nk::nk_row_flags::kActive) || (r.flags & nk::nk_row_flags::kMaterialBlock)) return false;
+    const float impulse = lambda[row];
+    const float tolerance = 1e-6f * fmaxf(1.0f, fabsf(impulse));
+    if (impulse == 0.0f || !(impulse > r.lower + tolerance) || !(impulse < r.upper - tolerance)) return false;
+    if (!(r.flags & nk::nk_row_flags::kBlockTangent)) return true;
+    const uint32_t count = r.group_normal_count;
+    const float primary = r.mu, secondary = r.friction_secondary > 0.0f ? r.friction_secondary : r.mu;
+    if (count == 0u || !(primary > 0.0f) || !(secondary > 0.0f)) return false;
+    const uint32_t normal = r.group_first + (row - r.group_first) % count;
+    return hypotf(lambda[normal + count] / primary, lambda[normal + 2u * count] / secondary) <
+           (1.0f - 1e-4f) * lambda[normal];
+}
+
+__device__ RowForward StoredForward(const NkRow& r, const float* base, uint32_t dofs) {
+    RowForward forward;
+    if (r.a.kind == nk::kNkSideArtic) forward.side[0] = base;
+    if (r.b.kind == nk::kNkSideArtic) forward.side[1] = base + dofs;
+    return forward;
+}
+
+// Solves (A + R) f_d = -B v0 on each env's active set with a semidefinite Cholesky that drops dependent rows,
+// and leaves the damping impulse f_d dt in each member's storage record for the ledger.
+__global__ void EnergyDampingSplitKernel(DataView d, ReadoutEnergyLedgerParams p) {
+    constexpr uint32_t capacity = nk::kEnergySplitCapacity;
+    __shared__ uint32_t members[capacity];
+    __shared__ double rhs[capacity];
+    __shared__ double original[capacity];
+    __shared__ uint32_t dropped[capacity];
+    __shared__ uint32_t warp_counts[kThreads / 32u];
+    __shared__ uint32_t total;
+    const uint32_t env = blockIdx.x;
+    if (env >= p.env_count) return;
+    const auto* rows = reinterpret_cast<const NkRow*>(d.urows);
+    float* const storage = d.row_compliant_storage;
+    const uint32_t first = env * p.rows_per_env, dofs = p.dofs_per_artic;
+    const uint32_t bound = ContactRowBound(d.contact_row_extent, env, p.contact_rows);
+    const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5u;
+    if (threadIdx.x == 0u) total = 0u;
+    __syncthreads();
+    bool spring = false;
+    for (uint32_t base = 0u; base < p.rows_per_env; base += blockDim.x) {
+        const uint32_t local = base + threadIdx.x, row = first + local;
+        const bool scanned = local < p.rows_per_env && (local >= p.contact_rows || local < bound);
+        const bool member = scanned && DampingSplitMember(rows, d.lambda, row);
+        if (scanned && !member) storage[size_t{row} * 4u + 2u] = 0.0f;
+        spring |= member && CompliantSpringRow(rows[row], d, row) && d.lambda[row] > 0.0f;
+        const uint32_t ballot = __ballot_sync(0xffffffffu, member);
+        if (lane == 0u) warp_counts[warp] = __popc(ballot);
+        __syncthreads();
+        uint32_t offset = total + __popc(ballot & ((1u << lane) - 1u));
+        for (uint32_t w = 0u; w < warp; ++w) offset += warp_counts[w];
+        if (member && offset < capacity) members[offset] = row;
+        __syncthreads();
+        if (threadIdx.x == 0u)
+            for (uint32_t w = 0u; w < blockDim.x / 32u; ++w) total += warp_counts[w];
+        __syncthreads();
+    }
+    if (!__syncthreads_or(spring)) return;
+    const uint32_t n = total;
+    if (n > capacity) {
+        for (uint32_t local = threadIdx.x; local < p.rows_per_env; local += blockDim.x)
+            storage[size_t{first + local} * 4u] = 0.0f;
+        if (threadIdx.x == 0u)
+            atomicOr(d.energy_ledger_status + size_t{env} * p.substeps + p.slot, nk::energy_status::kStorageCapacity);
+        return;
+    }
+    const auto* mass_factor = static_cast<const float*>(d.m_factor);
+    const auto* inv_mass = static_cast<const float*>(d.body_inv_mass);
+    const auto* inv_inertia = static_cast<const math::SymmetricMat3*>(d.body_world_inv_inertia);
+    const auto points = PointMasses(d);
+    for (uint32_t k = threadIdx.x; k < n; k += blockDim.x) {
+        const uint32_t row = members[k];
+        if (dofs > 0u)
+            ForwardRowSides(rows[row], row, d.chain_jacobian, d.chain_jacobian_b, mass_factor, dofs,
+                            d.energy_split_forward + size_t{row} * 2u * dofs);
+        rhs[k] = (rows[row].flags & nk::nk_row_flags::kMuJoCo) ? double(storage[size_t{row} * 4u + 2u]) : 0.0;
+    }
+    __syncthreads();
+    // The env's n <= min(capacity, rows) members pack their n x n response into its row slots.
+    double* const a = d.energy_split_matrix + size_t{first} * capacity;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        const uint32_t ri = members[i];
+        const RowForward fi = StoredForward(rows[ri], d.energy_split_forward + size_t{ri} * 2u * dofs, dofs);
+        for (uint32_t j = 0u; j <= i; ++j) {
+            const uint32_t rj = members[j];
+            const RowForward fj = StoredForward(rows[rj], d.energy_split_forward + size_t{rj} * 2u * dofs, dofs);
+            double coupling = PairDrivenRowCoupling(rows[ri], fi, rows[rj], fj, mass_factor, inv_mass, inv_inertia,
+                                                    points, dofs);
+            if (i == j) coupling += rows[ri].compliance_alpha;
+            a[size_t{i} * n + j] = coupling;
+        }
+        original[i] = a[size_t{i} * n + i];
+    }
+    __syncthreads();
+    for (uint32_t k = 0u; k < n; ++k) {
+        if (threadIdx.x == 0u) {
+            const double pivot = a[size_t{k} * n + k];
+            dropped[k] = pivot > 1e-9 * original[k] && pivot > 0.0 ? 0u : 1u;
+            a[size_t{k} * n + k] = dropped[k] ? 1.0 : sqrt(pivot);
+        }
+        __syncthreads();
+        const double diagonal = a[size_t{k} * n + k];
+        for (uint32_t i = k + 1u + threadIdx.x; i < n; i += blockDim.x)
+            a[size_t{i} * n + k] = dropped[k] ? 0.0 : a[size_t{i} * n + k] / diagonal;
+        __syncthreads();
+        for (uint32_t i = k + 1u + threadIdx.x; i < n; i += blockDim.x) {
+            const double lik = a[size_t{i} * n + k];
+            for (uint32_t j = k + 1u; j <= i; ++j) a[size_t{i} * n + j] -= lik * a[size_t{j} * n + k];
+        }
+        __syncthreads();
+    }
+    for (uint32_t k = 0u; k < n; ++k) {
+        if (threadIdx.x == 0u) rhs[k] = dropped[k] ? 0.0 : rhs[k] / a[size_t{k} * n + k];
+        __syncthreads();
+        for (uint32_t i = k + 1u + threadIdx.x; i < n; i += blockDim.x) rhs[i] -= a[size_t{i} * n + k] * rhs[k];
+        __syncthreads();
+    }
+    for (uint32_t k = n; k > 0u; --k) {
+        const uint32_t c = k - 1u;
+        if (threadIdx.x == 0u) rhs[c] = dropped[c] ? 0.0 : rhs[c] / a[size_t{c} * n + c];
+        __syncthreads();
+        for (uint32_t i = threadIdx.x; i < c; i += blockDim.x) rhs[i] -= a[size_t{c} * n + i] * rhs[c];
+        __syncthreads();
+    }
+    for (uint32_t k = threadIdx.x; k < n; k += blockDim.x)
+        storage[size_t{members[k]} * 4u + 2u] = float(rhs[k] * double(p.dt));
+}
+
+// Writes one row's solved-stage ledger terms when the per-row readout is allocated.
+__device__ void RecordRowTerms(const DataView& d, uint32_t row, nk::EnergyRowKind kind, double impulse,
+                               double work, double storage, double rate, const CompliantShare& share,
+                               float compliance) {
+    if (d.energy_row_terms == nullptr) return;
+    float* terms = d.energy_row_terms + size_t{row} * nk::kEnergyRowTermCount;
+    const float values[nk::kEnergyRowTermCount] = {float(static_cast<uint32_t>(kind)), float(impulse),
+        float(work), float(storage), float(rate), float(share.conservative), float(share.response), compliance};
+    for (uint32_t k = 0u; k < nk::kEnergyRowTermCount; ++k) terms[k] = values[k];
 }
 
 // Row rate at the solved displacement; contact and friction laws keep it nonpositive along the impulse.
@@ -869,6 +1041,7 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
                     add(EnergyColumn::RowPhysicalImpulseWork, impulse * power.applied);
                     add(EnergyColumn::MpmBoundaryWork, -impulse * power.grid_boundary);
                 }
+                RecordRowTerms(d, row, nk::EnergyRowKind::Material, d.lambda[row], 0.0, 0.0, 0.0, {}, 0.0f);
                 continue;
             }
             const double impulse = d.lambda[row];
@@ -879,7 +1052,24 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
             add(EnergyColumn::RowRateWork, impulse * (a.rate + b.rate));
             add(EnergyColumn::RowPhysicalImpulseWork, impulse * (a.applied + b.applied));
             add(EnergyColumn::MpmBoundaryWork, -impulse * (a.grid_boundary + b.grid_boundary));
-            if (local >= first_drive && local < first_drive + p.drive_rows) continue;
+            const auto record = [&](nk::EnergyRowKind kind, double storage, const CompliantShare& share) {
+                RecordRowTerms(d, row, kind, impulse, work, storage, a.rate + b.rate, share, r.compliance_alpha);
+            };
+            if (local >= first_drive && local < first_drive + p.drive_rows) {
+                record(nk::EnergyRowKind::Drive, 0.0, {});
+                continue;
+            }
+            // Storage follows the row's own displacement; a pyramid edge splits it into normal and friction parts.
+            const auto store = [&](nk::EnergyRowKind kind, double normal_rate, EnergyColumn loss,
+                                   EnergyColumn tangent_loss) {
+                const double displacement = double(p.dt) * (a.physical + b.physical);
+                const auto share = CompliantStorageForce(r, row, impulse, displacement, d, p);
+                const double normal = share.force * double(p.dt) * normal_rate;
+                values[Column(loss)] -= normal;
+                values[Column(tangent_loss)] -= share.force * displacement - normal;
+                values[Column(EnergyColumn::ConstraintStorage)] += share.force * displacement;
+                record(kind, share.force * displacement, share);
+            };
             if (r.flags & nk::nk_row_flags::kPyramidal) {
                 const uint32_t contact = nkops::ContactSlotForRow(d.ucontact_row_range,
                     env * p.contact_slots_per_env, p.contact_slots_per_env, row);
@@ -893,18 +1083,32 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
                 const double normal_work = impulse * 0.5 * (n0a.physical + n0b.physical + n1a.physical + n1b.physical);
                 add(EnergyColumn::NormalLoss, -normal_work);
                 add(EnergyColumn::FrictionLoss, normal_work - work);
+                store(nk::EnergyRowKind::PyramidEdge, 0.5 * (n0a.physical + n0b.physical + n1a.physical + n1b.physical),
+                      EnergyColumn::NormalLoss, EnergyColumn::FrictionLoss);
             } else if ((r.flags & nk::nk_row_flags::kBlockTangent) ||
-                (local >= first_friction && local < first_drive)) add(EnergyColumn::FrictionLoss, -work);
-            else if (r.flags & (nk::nk_row_flags::kContactNormal | nk::nk_row_flags::kBlockNormal))
+                (local >= first_friction && local < first_drive)) {
+                add(EnergyColumn::FrictionLoss, -work);
+                record(nk::EnergyRowKind::Friction, 0.0, {});
+            } else if (r.flags & (nk::nk_row_flags::kContactNormal | nk::nk_row_flags::kBlockNormal)) {
                 add(EnergyColumn::NormalLoss, -work);
-            else if (r.flags & nk::nk_row_flags::kJointLimit) add(EnergyColumn::LimitLoss, -work);
+                store(nk::EnergyRowKind::Normal, a.physical + b.physical, EnergyColumn::NormalLoss,
+                      EnergyColumn::NormalLoss);
+            } else if (r.flags & nk::nk_row_flags::kJointLimit) {
+                add(EnergyColumn::LimitLoss, -work);
+                store(nk::EnergyRowKind::Limit, a.physical + b.physical, EnergyColumn::LimitLoss,
+                      EnergyColumn::LimitLoss);
+            }
             else {
                 add(EnergyColumn::UnclassifiedRowWork, work);
                 atomicOr(coverage, nk::energy_status::kUnclassifiedRows);
+                record(nk::EnergyRowKind::Other, 0.0, {});
             }
         }
         add(EnergyColumn::SolvedKinetic, kinetic);
     } else if (p.stage == EnergyStage::Begin) {
+        if (d.energy_row_terms != nullptr)
+            for (uint32_t local = threadIdx.x; local < p.rows_per_env * nk::kEnergyRowTermCount; local += blockDim.x)
+                d.energy_row_terms[size_t{env} * p.rows_per_env * nk::kEnergyRowTermCount + local] = 0.0f;
         add(EnergyColumn::BeginKinetic, kinetic);
         add(EnergyColumn::BeginGravity, gravity);
         add(EnergyColumn::BeginElastic, elastic);
@@ -959,7 +1163,8 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
     set(EnergyColumn::Throughput, get(EnergyColumn::Throughput) + fabs(get(EnergyColumn::MpmBoundaryWork)) +
         fabs(get(EnergyColumn::MpmP2gLoss)) + fabs(get(EnergyColumn::MpmG2pLoss)) +
         fabs(get(EnergyColumn::MpmPlasticLoss)) + fabs(get(EnergyColumn::MpmViscousLoss)));
-    const double residual = change - work + losses + get(EnergyColumn::DatKineticLoss) -
+    const double residual = change + get(EnergyColumn::ConstraintStorage) - work + losses +
+        get(EnergyColumn::DatKineticLoss) -
         get(EnergyColumn::PositionPotential) - get(EnergyColumn::MpmAffineTransport) -
         get(EnergyColumn::MpmVolumeAverageWork) - get(EnergyColumn::PositionKineticWork);
     output[Column(EnergyColumn::Dt)] = p.dt;
@@ -1624,6 +1829,9 @@ Status OpReadoutEnergyLedger(const ModelView& m, const DataView& d, const void* 
         if (blocks > std::numeric_limits<uint32_t>::max()) return Status::InvalidArgument;
         LaunchCuda(EnergyKinematicImpulseKernel, dim3(static_cast<uint32_t>(blocks)), dim3(kThreads), 0u, stream, d, *p);
     }
+    if (p->stage == EnergyStage::Solved && p->rows_per_env > 0u && d.row_compliant_storage &&
+        d.energy_split_matrix && (p->dofs_per_artic == 0u || d.energy_split_forward))
+        LaunchCuda(EnergyDampingSplitKernel, dim3(p->env_count), dim3(kThreads), 0u, stream, d, *p);
     if (p->physics_diagnostics)
         LaunchCuda(PhysicsStageMetricsKernel, dim3(p->env_count), dim3(kThreads), 0u, stream, m, d, *p);
     LaunchCuda(EnergyLedgerKernel, dim3(p->env_count), dim3(kThreads), 0u, stream, m, d, *p);

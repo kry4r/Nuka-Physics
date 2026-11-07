@@ -205,6 +205,10 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::ChainJacobian:       v.chain_jacobian = static_cast<float*>(p); break;
         case FieldId::RowReferenceVelocityGain: v.row_reference_velocity_gain = static_cast<float*>(p); break;
         case FieldId::RowInvweight:        v.row_invweight = static_cast<float*>(p); break;
+        case FieldId::RowCompliantStorage: v.row_compliant_storage = static_cast<float*>(p); break;
+        case FieldId::EnergyRowTerms: v.energy_row_terms = static_cast<float*>(p); break;
+        case FieldId::EnergySplitForward: v.energy_split_forward = static_cast<float*>(p); break;
+        case FieldId::EnergySplitMatrix: v.energy_split_matrix = static_cast<double*>(p); break;
         case FieldId::RowCjLink:           v.row_cj_link = static_cast<uint32_t*>(p); break;
         case FieldId::RowCjPoint:          v.row_cj_point = static_cast<math::Vec3*>(p); break;
         // S2 (general contact pipeline Phase 1B): the second per-side arm fields.

@@ -950,7 +950,9 @@ typedef enum nuka_state_field_t {
     // Per-link u32 flag: include scalar-joint gravity compensation in the total actuator force limit.
     NUKA_FIELD_JOINT_ACTUATOR_GRAVITY_COMPENSATION = 156,
     // Requested gravity compensation routed through each scalar joint's actuator, in N or N*m.
-    NUKA_FIELD_JOINT_GRAVITY_FORCE = 157
+    NUKA_FIELD_JOINT_GRAVITY_FORCE = 157,
+    // Per-row energy terms of the last solved stage, laid out as nuka_energy_row_term_t.
+    NUKA_FIELD_ENERGY_ROW_TERMS = 158
 } nuka_state_field_t;
 
 // Collider and boundary IDs are environment-local; particle, grid and point-endpoint IDs are global.
@@ -1005,8 +1007,14 @@ typedef enum nuka_energy_column_t {
     NUKA_ENERGY_MPM_VOLUME_AVERAGE_WORK, NUKA_ENERGY_MPM_STRESS_WORK,
     NUKA_ENERGY_MPM_BOUNDARY_WORK, NUKA_ENERGY_MPM_VISCOUS_LOSS,
     NUKA_ENERGY_MPM_GRID_BEGIN_KINETIC, NUKA_ENERGY_MPM_GRID_SOLVED_KINETIC,
-    NUKA_ENERGY_POSITION_KINETIC_WORK, NUKA_ENERGY_COLUMN_COUNT
+    NUKA_ENERGY_POSITION_KINETIC_WORK, NUKA_ENERGY_CONSTRAINT_STORAGE, NUKA_ENERGY_COLUMN_COUNT
 } nuka_energy_column_t;
+
+typedef enum nuka_energy_row_term_t {
+    NUKA_ENERGY_ROW_KIND, NUKA_ENERGY_ROW_IMPULSE, NUKA_ENERGY_ROW_WORK, NUKA_ENERGY_ROW_STORAGE,
+    NUKA_ENERGY_ROW_RATE, NUKA_ENERGY_ROW_CONSERVATIVE, NUKA_ENERGY_ROW_RESPONSE, NUKA_ENERGY_ROW_COMPLIANCE,
+    NUKA_ENERGY_ROW_TERM_COUNT
+} nuka_energy_row_term_t;
 
 typedef enum nuka_energy_status_t {
     NUKA_ENERGY_STATUS_NONFINITE = 1u << 0,
@@ -1017,7 +1025,9 @@ typedef enum nuka_energy_status_t {
     NUKA_ENERGY_STATUS_FLOATING_POSITION_WORK = 1u << 5,
     NUKA_ENERGY_STATUS_RIGID_ANGULAR_POSITION_WORK = 1u << 6,
     NUKA_ENERGY_STATUS_ARMATURE_ENERGY = 1u << 7,
-    NUKA_ENERGY_STATUS_PHYSICS_FAILURE = 1u << 8
+    NUKA_ENERGY_STATUS_PHYSICS_FAILURE = 1u << 8,
+    // The active row set exceeded the damping split capacity, so constraint storage is unbooked.
+    NUKA_ENERGY_STATUS_STORAGE_CAPACITY = 1u << 9
 } nuka_energy_status_t;
 
 typedef enum nuka_env_status_t {

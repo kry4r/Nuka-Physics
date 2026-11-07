@@ -126,6 +126,8 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         if (id == field && !energy_readout) return 0u;
     for (FieldId field : kEnergyLoadFields)
         if (id == field && !energy_readout) return 0u;
+    for (FieldId field : kEnergyRowFields)
+        if (id == field && !energy_readout) return 0u;
     if (id == FieldId::IntervalStateDt)
         return interval_state_readout ? CheckedProduct({integration_substeps, env_count}) : 0u;
     for (FieldId field : kIntervalParticleFields)

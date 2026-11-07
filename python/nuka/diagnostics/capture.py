@@ -284,7 +284,7 @@ def iter_record_blocks(root, *, states=False):
         if manifest.get(name) != [column.name for column in enum]:
             raise ValueError(f"diagnostic column order mismatch: {name}")
     energy_columns = manifest.get("energy_columns", [c.name for c in EnergyColumn][:31])
-    if (not isinstance(energy_columns, list) or len(energy_columns) not in (31, 43, len(EnergyColumn)) or
+    if (not isinstance(energy_columns, list) or len(energy_columns) not in (31, 43, 44, len(EnergyColumn)) or
             energy_columns != [c.name for c in EnergyColumn][:len(energy_columns)]):
         raise ValueError("diagnostic energy column order mismatch")
     for name in ("env_count", "substeps", "steps"):

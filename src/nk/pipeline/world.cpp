@@ -1017,6 +1017,10 @@ phi::Status World::BuildDemanded(uint32_t demand, std::unique_ptr<Pipeline>* out
             const auto status = allocate(field);
             if (status != phi::Status::Ok) return status;
         }
+        for (FieldId field : kEnergyRowFields) {
+            const auto status = allocate(field);
+            if (status != phi::Status::Ok) return status;
+        }
         cap.energy_readout = true;
     }
     auto candidate = std::make_unique<Pipeline>();
