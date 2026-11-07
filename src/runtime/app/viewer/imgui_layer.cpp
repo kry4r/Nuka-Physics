@@ -1015,8 +1015,8 @@ void ImGuiLayer::BuildProperties(nui::VStack& root) {
     };
     auto& mobility = head.Add<nui::Badge>();
     mobility.text_fn = [this] {
-        const InspectorState& ins = frame_.ui->inspector;
-        return std::string(Tr(ins.deformable ? "deformable" : ins.movable ? "movable" : "fixed"));
+        const InspectorState& inspector = frame_.ui->inspector;
+        return std::string(Tr(inspector.deformable ? "deformable" : inspector.movable ? "movable" : "fixed"));
     };
     mobility.tone_fn = [this] {
         return frame_.ui->inspector.movable || frame_.ui->inspector.deformable ? Tone::Accent : Tone::Dim;
@@ -1352,7 +1352,8 @@ void ImGuiLayer::DrawScriptTabs() {
     std::string answer;
     if (active.completion != 0u && ui.take_completion(active.completion, &answer)) {
         std::vector<std::string> names;
-        for (const json::Value& c : json::Value::Parse(answer).Elements()) names.push_back(c.At("name").AsString());
+        const auto candidates = json::Value::Parse(answer);
+        for (const json::Value& c : candidates.Elements()) names.push_back(c.At("name").AsString());
         active.editor->SetAutoCompleteSuggestions(names);
         active.completion = 0u;
     }
@@ -1473,7 +1474,8 @@ void ImGuiLayer::DrawRepl() {
     if (repl_ticket_ != 0u && ui.take_completion(repl_ticket_, &answer)) {
         repl_ticket_ = 0u;
         repl_options_.clear();
-        for (const json::Value& c : json::Value::Parse(answer).Elements()) repl_options_.push_back(c.At("name").AsString());
+        const auto candidates = json::Value::Parse(answer);
+        for (const json::Value& c : candidates.Elements()) repl_options_.push_back(c.At("name").AsString());
         // One option, or the longest prefix they share, goes straight into the line.
         if (!repl_options_.empty()) {
             std::string common = repl_options_.front();

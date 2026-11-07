@@ -38,8 +38,8 @@ struct Action {
     std::function<ActionResult(const scene::json::Value& args)> run;
     std::string icon;     // a UTF-8 icon glyph for menus, toolbars and the palette
     bool hidden = false;  // takes arguments or backs a widget, so menus and the palette skip it
-    std::string owner;    // the extension that registered it; empty for the editor's own
-    scene::json::Value doc;  // {summary, kind, args, returns, example}; null: the catalog's entry
+    std::string owner{};    // the extension that registered it; empty for the editor's own
+    scene::json::Value doc{};  // {summary, kind, args, returns, example}; null: the catalog's entry
 };
 
 // A run queued for the next frame top, where the UI's own calls execute.
