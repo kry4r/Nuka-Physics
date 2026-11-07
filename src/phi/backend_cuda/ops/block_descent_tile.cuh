@@ -614,15 +614,18 @@ __device__ void FindWideTileSupport(DataView data, BlockDescentSolveParams p, Bl
         const TileBlock b = LoadTileBlock(data, p, s, c, block);
         uint32_t supported = 0u, unit = 0u;
         float unit_value = 0.0f;
+        bool finite = true;
 #pragma unroll 8
         for (uint32_t i = 0u; i < b.dimension; ++i) {
             const float value = b.Jacobian(data, p, head, slot, i);
+            finite &= isfinite(value);
             if (value != 0.0f) {
                 ++supported;
                 unit = i;
                 unit_value = value;
             }
         }
+        if (!finite) RecordTileFailure(data, p, s, c, b.owner, nk::BlockSolveFailure::InvalidRow);
         const bool single = axes == 1u && supported <= 1u;
         c.Index(kTileRow + incidence, h) = single ? 0u : axes;
         c.Index(kTileUnit + incidence, h) = single ? unit : ~0u;
@@ -643,13 +646,18 @@ __device__ void CopyWideTileRows(DataView data, BlockDescentSolveParams p, Block
             if (block == kNoTileBlock || c.Index(kTileRow + incidence, h) == ~0u) continue;
             const TileBlock b = LoadTileBlock(data, p, s, c, block);
             const uint32_t row = c.Index(kTileRow + incidence, h);
+            bool finite = true;
             for (uint32_t axis = 0u; axis < axes; ++axis) {
                 const uint32_t row_slot = slot + axis * stride;
                 const NkRow axis_row = row_data[row_slot];
                 float* const out = c.jacobian + size_t{row + axis} * c.width;
-                for (uint32_t i = lane; i < c.width; i += kTileLanes)
+                for (uint32_t i = lane; i < c.width; i += kTileLanes) {
                     out[i] = i < b.dimension ? b.Jacobian(data, p, axis_row, row_slot, i) : 0.0f;
+                    finite &= isfinite(out[i]);
+                }
             }
+            if (!__all_sync(~0u, finite) && lane == 0u)
+                RecordTileFailure(data, p, s, c, b.owner, nk::BlockSolveFailure::InvalidRow);
         }
     }
 }
@@ -909,6 +917,7 @@ __device__ void InitializeTileRows(DataView data, BlockDescentSolveParams p, Blo
             if (block != kNoTileBlock) b = LoadTileBlock(data, p, s, c, block);
             // A side off the tile's blocks keeps the empty block, whose dimension is zero.
             float value[3][kSpan]{};
+            bool finite = true;
 #pragma unroll
             for (uint32_t axis = 0u; axis < 3u; ++axis) {
                 if (axis >= axes) continue;
@@ -918,9 +927,12 @@ __device__ void InitializeTileRows(DataView data, BlockDescentSolveParams p, Blo
                 for (uint32_t r = 0u; r < kSpan; ++r) {
                     const uint32_t i = c.lane + r * kTileLanes;
                     if (i < b.dimension) value[axis][r] = b.Jacobian(data, p, row, row_slot, i);
+                    finite &= isfinite(value[axis][r]);
                 }
             }
             if (block == kNoTileBlock) continue;
+            if (!__all_sync(~0u, finite) && c.lane == 0u)
+                RecordTileFailure(data, p, s, c, b.owner, nk::BlockSolveFailure::InvalidRow);
             uint32_t support[kSpan], supported = 0u;
 #pragma unroll
             for (uint32_t r = 0u; r < kSpan; ++r) {
@@ -1958,38 +1970,21 @@ __device__ void DescendTileBlock(DataView data, BlockDescentSolveParams p, Block
 // The block's worst velocity residual with the float terms forming its momentum balance, laid out as
 // nk::MomentumResidualColumn; a relative residual near FLT_EPSILON is the rounding of those terms.
 template <uint32_t kN>
-__device__ void RecordTileMomentumResidual(DataView data, BlockDescentSolveParams p, TileContext& c,
-                                           const TileBlock& b, const float* force, const float* direction) {
+__device__ void RecordTileMomentumResidual(DataView data, TileContext& c, const TileBlock& b,
+    const float* force, const float* direction, const double* scales, const double* dominant_terms,
+    const uint32_t* dominant_rows) {
     using Column = nk::MomentumResidualColumn;
     constexpr uint32_t kSpan = TileSpan<kN>();
-    constexpr uint32_t kS = kN + 1u;
     float* const target = b.roots == nullptr ? data.body_momentum_residual : data.articulation_momentum_residual;
     if (target == nullptr) return;
-    const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
     float values[nk::kMomentumResidualColumnCount] = {};
     float best = -1.0f, relative = 0.0f;
 #pragma unroll
     for (uint32_t r = 0u; r < kSpan; ++r) {
         const uint32_t i = c.lane + r * kTileLanes;
         if (i >= b.dimension) continue;
-        double scale = 0.0, dominant = 0.0;
-        uint32_t dominant_row = ~0u;
-        for (uint32_t j = 0u; j < b.dimension; ++j)
-            scale += fabs(double(c.mass[i * kS + j]) * (double(b.velocity[j]) - b.free[j]));
-        for (uint32_t at = c.IncidentBegin(b.local); at < c.incident_end[b.local]; ++at) {
-            const uint32_t slot = c.Index(kTileSlot, c.incident[at]);
-            const NkRow row = rows[slot];
-            const uint32_t axes = row.flags & nk::nk_row_flags::kBlockNormal ? 3u : 1u;
-            for (uint32_t axis = 0u; axis < axes; ++axis) {
-                const uint32_t index = slot + axis * row.group_normal_count;
-                const double term = double(b.Jacobian(data, p, rows[index], index, i)) * data.lambda[index];
-                scale += fabs(term);
-                if (fabs(term) > fabs(dominant)) {
-                    dominant = term;
-                    dominant_row = index;
-                }
-            }
-        }
+        const double scale = scales[r], dominant = dominant_terms[r];
+        const uint32_t dominant_row = dominant_rows[r];
         relative = fmaxf(relative, scale > 0.0 ? static_cast<float>(fabs(double(force[r])) / scale) : 0.0f);
         const float velocity = isfinite(direction[r]) ? fabsf(direction[r]) : FLT_MAX;
         if (velocity > best) {
@@ -2021,28 +2016,69 @@ __device__ void MeasureTilePrimal(DataView data, BlockDescentSolveParams p, Bloc
     constexpr uint32_t kSpan = TileSpan<kN>();
     constexpr uint32_t kS = kN + 1u;
     StageTileMass<kN>(c, b);
-    const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
     float force[kSpan]{}, direction[kSpan]{};
+    double scales[kSpan]{}, dominant_terms[kSpan]{};
+    uint32_t dominant_rows[kSpan];
+    const bool record = !reconstruct && (p.telemetry & nk::kTelemetrySweeps) != 0u;
     bool finite = true;
+    double balance[kSpan]{};
 #pragma unroll
     for (uint32_t r = 0u; r < kSpan; ++r) {
         const uint32_t i = c.lane + r * kTileLanes;
+        dominant_rows[r] = ~0u;
         if (i >= b.dimension) continue;
-        double balance = 0.0;
+        if (record)
+            for (uint32_t j = 0u; j < b.dimension; ++j)
+                scales[r] += fabs(double(c.mass[i * kS + j]) * (double(b.velocity[j]) - b.free[j]));
         for (uint32_t j = 0u; j < b.dimension; ++j)
-            balance -= double(c.mass[i * kS + j]) * (double(b.velocity[j]) - b.free[j]);
-        for (uint32_t at = c.IncidentBegin(b.local); at < c.incident_end[b.local]; ++at) {
-            const uint32_t head = c.incident[at];
-            const uint32_t slot = c.Index(kTileSlot, head);
-            const NkRow row = rows[slot];
-            const uint32_t axes = row.flags & nk::nk_row_flags::kBlockNormal ? 3u : 1u;
-            for (uint32_t axis = 0u; axis < axes; ++axis) {
-                const uint32_t index = slot + axis * row.group_normal_count;
-                balance += double(b.Jacobian(data, p, rows[index], index, i)) * data.lambda[index];
+            balance[r] -= double(c.mass[i * kS + j]) * (double(b.velocity[j]) - b.free[j]);
+    }
+    // Jacobians are checked while staging; exact zero impulses contribute no momentum.
+    const uint32_t end = c.incident_end[b.local];
+    for (uint32_t chunk = c.IncidentBegin(b.local); chunk < end; chunk += kTileLanes) {
+        const bool listed = chunk + c.lane < end;
+        const uint32_t head = listed ? c.incident[chunk + c.lane] : 0u;
+        const uint32_t slot = listed ? c.Index(kTileSlot, head) : 0u;
+        const uint32_t stride = listed ? c.Index(kTileStride, head) : 0u;
+        const uint32_t axes = listed ? c.Index(kTileAxes, head) : 0u;
+        const Vec3 impulse{listed ? data.lambda[slot] : 0.0f,
+            axes == 3u ? data.lambda[slot + stride] : 0.0f,
+            axes == 3u ? data.lambda[slot + 2u * stride] : 0.0f};
+        for (uint32_t pending = __ballot_sync(~0u, impulse.x != 0.0f || impulse.y != 0.0f || impulse.z != 0.0f);
+             pending != 0u; pending &= pending - 1u) {
+            const uint32_t source = __ffs(pending) - 1u;
+            const uint32_t own = __shfl_sync(~0u, head, source);
+            const uint32_t incidence = c.Incidence(own, b.local);
+            const uint32_t unit = c.Index(kTileUnit + incidence, own), first = c.Index(kTileRow + incidence, own);
+            const uint32_t row = __shfl_sync(~0u, slot, source), spacing = __shfl_sync(~0u, stride, source);
+            const uint32_t count = __shfl_sync(~0u, axes, source);
+            const Vec3 applied{__shfl_sync(~0u, impulse.x, source), __shfl_sync(~0u, impulse.y, source),
+                __shfl_sync(~0u, impulse.z, source)};
+            for (uint32_t axis = 0u; axis < count; ++axis) {
+                const uint32_t index = row + axis * spacing;
+#pragma unroll
+                for (uint32_t r = 0u; r < kSpan; ++r) {
+                    const uint32_t i = c.lane + r * kTileLanes;
+                    if (i >= b.dimension) continue;
+                    const float jacobian = unit != ~0u ? (i == unit ? c.Value(kTileUnitValue + incidence, own) : 0.0f)
+                        : c.jacobian[size_t{first + axis} * c.width + i];
+                    const double term = double(jacobian) * AxisComponent(applied, axis);
+                    balance[r] += term;
+                    if (record) {
+                        scales[r] += fabs(term);
+                        if (fabs(term) > fabs(dominant_terms[r])) {
+                            dominant_terms[r] = term;
+                            dominant_rows[r] = index;
+                        }
+                    }
+                }
             }
         }
-        force[r] = float(balance);
-        finite &= fabs(balance) <= FLT_MAX;
+    }
+#pragma unroll
+    for (uint32_t r = 0u; r < kSpan; ++r) {
+        force[r] = float(balance[r]);
+        finite &= fabs(balance[r]) <= FLT_MAX;
     }
     auto failure = __all_sync(~0u, finite) ? nk::BlockSolveFailure::None
                                          : nk::BlockSolveFailure::InvalidEquation;
@@ -2076,8 +2112,8 @@ __device__ void MeasureTilePrimal(DataView data, BlockDescentSolveParams p, Bloc
         c.momentum = fmaxf(c.momentum, TileWarpMax(residual));
         __syncwarp();
     }
-    if (!reconstruct && (p.telemetry & nk::kTelemetrySweeps) != 0u && failure == nk::BlockSolveFailure::None)
-        RecordTileMomentumResidual<kN>(data, p, c, b, force, direction);
+    if (record && failure == nk::BlockSolveFailure::None)
+        RecordTileMomentumResidual<kN>(data, c, b, force, direction, scales, dominant_terms, dominant_rows);
 }
 
 // Evaluate row residuals and optionally commit the dual update; read-only evaluation uses physical multipliers.
