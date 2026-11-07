@@ -952,7 +952,10 @@ typedef enum nuka_state_field_t {
     // Requested gravity compensation routed through each scalar joint's actuator, in N or N*m.
     NUKA_FIELD_JOINT_GRAVITY_FORCE = 157,
     // Per-row energy terms of the last solved stage, laid out as nuka_energy_row_term_t.
-    NUKA_FIELD_ENERGY_ROW_TERMS = 158
+    NUKA_FIELD_ENERGY_ROW_TERMS = 158,
+    // Per-body and per-articulation momentum balance under sweep tracing, laid out as nuka_momentum_residual_t.
+    NUKA_FIELD_BODY_MOMENTUM_RESIDUAL = 159,
+    NUKA_FIELD_ARTICULATION_MOMENTUM_RESIDUAL = 160
 } nuka_state_field_t;
 
 // Collider and boundary IDs are environment-local; particle, grid and point-endpoint IDs are global.
@@ -1015,6 +1018,14 @@ typedef enum nuka_energy_row_term_t {
     NUKA_ENERGY_ROW_RATE, NUKA_ENERGY_ROW_CONSERVATIVE, NUKA_ENERGY_ROW_RESPONSE, NUKA_ENERGY_ROW_COMPLIANCE,
     NUKA_ENERGY_ROW_TERM_COUNT
 } nuka_energy_row_term_t;
+
+// Velocity residual M^-1 r (m/s) at the worst DOF, the force residual and the sum of |terms| forming it there,
+// the largest |r_i| / sum_i over DOFs, the largest incident row term at the worst DOF (slot bits) and the sweep.
+typedef enum nuka_momentum_residual_t {
+    NUKA_MOMENTUM_RESIDUAL_VELOCITY, NUKA_MOMENTUM_RESIDUAL_DOF, NUKA_MOMENTUM_RESIDUAL_FORCE,
+    NUKA_MOMENTUM_RESIDUAL_SCALE, NUKA_MOMENTUM_RESIDUAL_RELATIVE, NUKA_MOMENTUM_RESIDUAL_ROW,
+    NUKA_MOMENTUM_RESIDUAL_ROW_TERM, NUKA_MOMENTUM_RESIDUAL_SWEEP, NUKA_MOMENTUM_RESIDUAL_COUNT
+} nuka_momentum_residual_t;
 
 typedef enum nuka_energy_status_t {
     NUKA_ENERGY_STATUS_NONFINITE = 1u << 0,

@@ -14,6 +14,7 @@
 #include "constraint/coulomb_contact.hpp"
 #include "nk/material/mpm_constitutive.hpp"
 #include "nk/readout/energy_ledger.hpp"
+#include "nk/readout/physics_diagnostics.hpp"
 #include "nk/readout/telemetry.hpp"
 #include "nk/solve/augmented_row.hpp"
 #include "nk/solve/block_row_schedule.hpp"

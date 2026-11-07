@@ -111,6 +111,18 @@ class SolverResidual(IntEnum):
     PRIMAL_COUPLING = 3
 
 
+# Columns of Field.BODY_MOMENTUM_RESIDUAL and Field.ARTICULATION_MOMENTUM_RESIDUAL under sweep tracing.
+class MomentumResidual(IntEnum):
+    VELOCITY = 0
+    DOF = 1
+    FORCE = 2
+    SCALE = 3
+    RELATIVE = 4
+    ROW = 5
+    ROW_TERM = 6
+    SWEEP = 7
+
+
 # Phases of SOLVER_PHASE_TIME in nanoseconds.
 class SolverPhase(IntEnum):
     SETUP = 0

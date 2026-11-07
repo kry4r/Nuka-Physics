@@ -138,6 +138,12 @@ are represented by NaN and keep energy coverage incomplete.
 `SOLVED` retains all four solver residual classes in m/s for every physical
 interval. `SOLVER_RESIDUAL_MEASURED` is one when those residuals were written.
 The separate `SOLVER_RESIDUAL` field and sweep traces describe the latest solve.
+Under sweep tracing, `Field.BODY_MOMENTUM_RESIDUAL` and `Field.ARTICULATION_MOMENTUM_RESIDUAL`
+keep each dense block's last momentum balance as `MomentumResidual` columns: the velocity
+residual at the worst DOF, its force residual and the sum of the absolute terms forming it,
+the largest force residual relative to that sum over all DOFs, and the largest incident row
+term. A relative residual near float epsilon is rounding of the balance terms; a larger one
+is a balance the multipliers do not meet.
 Capture schema 2 includes the retained interval residuals; schema 1 records
 remain readable and keep their missing residual coverage unmeasured.
 

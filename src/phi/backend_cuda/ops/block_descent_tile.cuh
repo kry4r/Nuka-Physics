@@ -1934,6 +1934,65 @@ __device__ void DescendTileBlock(DataView data, BlockDescentSolveParams p, Block
     __syncwarp();
 }
 
+// The block's worst velocity residual with the float terms forming its momentum balance, laid out as
+// nk::MomentumResidualColumn; a relative residual near FLT_EPSILON is the rounding of those terms.
+template <uint32_t kN>
+__device__ void RecordTileMomentumResidual(DataView data, BlockDescentSolveParams p, TileContext& c,
+                                           const TileBlock& b, const float* force, const float* direction) {
+    using Column = nk::MomentumResidualColumn;
+    constexpr uint32_t kSpan = TileSpan<kN>();
+    constexpr uint32_t kS = kN + 1u;
+    float* const target = b.roots == nullptr ? data.body_momentum_residual : data.articulation_momentum_residual;
+    if (target == nullptr) return;
+    const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
+    float values[nk::kMomentumResidualColumnCount] = {};
+    float best = -1.0f, relative = 0.0f;
+#pragma unroll
+    for (uint32_t r = 0u; r < kSpan; ++r) {
+        const uint32_t i = c.lane + r * kTileLanes;
+        if (i >= b.dimension) continue;
+        double scale = 0.0, dominant = 0.0;
+        uint32_t dominant_row = ~0u;
+        for (uint32_t j = 0u; j < b.dimension; ++j)
+            scale += fabs(double(c.mass[i * kS + j]) * (double(b.velocity[j]) - b.free[j]));
+        for (uint32_t at = c.IncidentBegin(b.local); at < c.incident_end[b.local]; ++at) {
+            const uint32_t slot = c.Index(kTileSlot, c.incident[at]);
+            const NkRow row = rows[slot];
+            const uint32_t axes = row.flags & nk::nk_row_flags::kBlockNormal ? 3u : 1u;
+            for (uint32_t axis = 0u; axis < axes; ++axis) {
+                const uint32_t index = slot + axis * row.group_normal_count;
+                const double term = double(b.Jacobian(data, p, rows[index], index, i)) * data.lambda[index];
+                scale += fabs(term);
+                if (fabs(term) > fabs(dominant)) {
+                    dominant = term;
+                    dominant_row = index;
+                }
+            }
+        }
+        relative = fmaxf(relative, scale > 0.0 ? static_cast<float>(fabs(double(force[r])) / scale) : 0.0f);
+        const float velocity = isfinite(direction[r]) ? fabsf(direction[r]) : FLT_MAX;
+        if (velocity > best) {
+            best = velocity;
+            values[static_cast<uint32_t>(Column::Velocity)] = velocity;
+            values[static_cast<uint32_t>(Column::Dof)] = static_cast<float>(i);
+            values[static_cast<uint32_t>(Column::Force)] = force[r];
+            values[static_cast<uint32_t>(Column::Scale)] = static_cast<float>(scale);
+            values[static_cast<uint32_t>(Column::Row)] = __uint_as_float(dominant_row);
+            values[static_cast<uint32_t>(Column::RowTerm)] = static_cast<float>(dominant);
+        }
+    }
+    const bool held = best >= 0.0f;
+    const uint32_t bits = held ? __float_as_uint(best) : 0u;
+    const uint32_t top = __reduce_max_sync(~0u, bits);
+    const uint32_t winners = __ballot_sync(~0u, held && bits == top);
+    relative = TileWarpMax(relative);
+    if (winners == 0u || c.lane != __ffs(winners) - 1u) return;
+    values[static_cast<uint32_t>(Column::Relative)] = relative;
+    values[static_cast<uint32_t>(Column::Sweep)] = static_cast<float>(c.iteration + 1u);
+    for (uint32_t column = 0u; column < nk::kMomentumResidualColumnCount; ++column)
+        target[size_t{b.index} * nk::kMomentumResidualColumnCount + column] = values[column];
+}
+
 // The mass-normalized difference between final momentum and physical row impulses bounds velocity error.
 template <uint32_t kN>
 __device__ void MeasureTilePrimal(DataView data, BlockDescentSolveParams p, BlockScratch s, TileContext& c,
@@ -2003,6 +2062,8 @@ __device__ void MeasureTilePrimal(DataView data, BlockDescentSolveParams p, Bloc
         if (failure == nk::BlockSolveFailure::None && c.lane + r * kTileLanes < b.dimension)
             residual = fmaxf(residual, isfinite(direction[r]) ? fabsf(direction[r]) : FLT_MAX);
     c.residual = fmaxf(c.residual, TileWarpMax(residual));
+    if ((p.telemetry & nk::kTelemetrySweeps) != 0u && failure == nk::BlockSolveFailure::None)
+        RecordTileMomentumResidual<kN>(data, p, c, b, force, direction);
 }
 
 // Dual update as DualUpdateKernel at the velocities every block reached in this iteration; position pass

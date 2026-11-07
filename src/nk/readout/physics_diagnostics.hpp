@@ -47,6 +47,13 @@ enum class VbdSolveAuditColumn : uint32_t {
     LastPrimalForceX, LastPrimalForceY, LastPrimalForceZ, Count
 };
 
+// Dense block momentum balance columns, as nuka_momentum_residual_t.
+enum class MomentumResidualColumn : uint32_t {
+    Velocity, Dof, Force, Scale, Relative, Row, RowTerm, Sweep, Count
+};
+
+inline constexpr uint32_t kMomentumResidualColumnCount = static_cast<uint32_t>(MomentumResidualColumn::Count);
+
 inline constexpr uint32_t kVbdSolveAuditColumnCount =
     static_cast<uint32_t>(VbdSolveAuditColumn::Count);
 

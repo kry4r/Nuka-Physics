@@ -354,6 +354,10 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
     {NUKA_FIELD_JOINT_GRAVITY_FORCE, kStrideF32, kWireDtypeF32, nk::FieldId::JointGravityForce},
     {NUKA_FIELD_ENERGY_ROW_TERMS, nk::LayoutOf(nk::FieldId::EnergyRowTerms).elem_size,
         kWireDtypeF32, nk::FieldId::EnergyRowTerms},
+    {NUKA_FIELD_BODY_MOMENTUM_RESIDUAL, nk::LayoutOf(nk::FieldId::BodyMomentumResidual).elem_size,
+        kWireDtypeF32, nk::FieldId::BodyMomentumResidual},
+    {NUKA_FIELD_ARTICULATION_MOMENTUM_RESIDUAL, nk::LayoutOf(nk::FieldId::ArticulationMomentumResidual).elem_size,
+        kWireDtypeF32, nk::FieldId::ArticulationMomentumResidual},
 };
 
 inline constexpr size_t kDlpackFieldCount =
@@ -365,6 +369,11 @@ static_assert(NUKA_ENERGY_ROW_TERM_COUNT == nk::kEnergyRowTermCount &&
               nk::LayoutOf(nk::FieldId::EnergyRowTerms).elem_size == nk::kEnergyRowTermCount * sizeof(float));
 static_assert(nk::LayoutOf(nk::FieldId::PhysicsStageMetrics).elem_size ==
               nk::kEnergyStageCount * nk::kPhysicsStageColumnCount * sizeof(float));
+static_assert(NUKA_MOMENTUM_RESIDUAL_COUNT == nk::kMomentumResidualColumnCount &&
+              nk::LayoutOf(nk::FieldId::BodyMomentumResidual).elem_size ==
+                  nk::kMomentumResidualColumnCount * sizeof(float) &&
+              nk::LayoutOf(nk::FieldId::ArticulationMomentumResidual).elem_size ==
+                  nk::kMomentumResidualColumnCount * sizeof(float));
 static_assert(nk::LayoutOf(nk::FieldId::VbdSolveAudit).elem_size ==
               nk::kVbdSolveAuditColumnCount * sizeof(float));
 

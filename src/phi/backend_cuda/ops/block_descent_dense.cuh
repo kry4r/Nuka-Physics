@@ -656,6 +656,56 @@ __device__ nk::BlockSolveFailure NewtonDenseBlock(const Block& b, DataView data,
     return failure;
 }
 
+// One thread's record of the block's worst velocity residual and the float terms forming its momentum
+// balance, laid out as nk::MomentumResidualColumn, from the stored force and direction.
+template <typename Block>
+__device__ void RecordDenseMomentumResidual(const Block& b, DataView data, BlockDescentSolveParams p,
+                                            BlockScratch s, uint32_t owner) {
+    using Column = nk::MomentumResidualColumn;
+    const bool rigid = owner < p.total_particle_count + p.total_body_count;
+    float* const target = rigid ? data.body_momentum_residual : data.articulation_momentum_residual;
+    if (target == nullptr) return;
+    const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
+    float values[nk::kMomentumResidualColumnCount] = {};
+    float best = -1.0f, relative = 0.0f;
+    for (uint32_t i = 0u; i < b.dimension; ++i) {
+        double scale = 0.0, dominant = 0.0;
+        uint32_t dominant_row = ~0u;
+        for (uint32_t j = 0u; j < b.dimension; ++j)
+            scale += fabs(double(b.Mass(i, j)) * (double(b.velocity[j]) - b.Free(j)));
+        for (size_t at = b.begin; at < b.end; ++at) {
+            const uint32_t slot = s.incidence[at];
+            const NkRow row = rows[slot];
+            const uint32_t axes = row.flags & nk::nk_row_flags::kBlockNormal ? 3u : 1u;
+            for (uint32_t axis = 0u; axis < axes; ++axis) {
+                const uint32_t index = slot + axis * row.group_normal_count;
+                const double term = double(b.Jacobian(data, p, index, i)) * data.lambda[index];
+                scale += fabs(term);
+                if (fabs(term) > fabs(dominant)) {
+                    dominant = term;
+                    dominant_row = index;
+                }
+            }
+        }
+        relative = fmaxf(relative, scale > 0.0 ? static_cast<float>(fabs(double(b.force[i])) / scale) : 0.0f);
+        const float velocity = isfinite(b.direction[i]) ? fabsf(b.direction[i]) : FLT_MAX;
+        if (velocity > best) {
+            best = velocity;
+            values[static_cast<uint32_t>(Column::Velocity)] = velocity;
+            values[static_cast<uint32_t>(Column::Dof)] = static_cast<float>(i);
+            values[static_cast<uint32_t>(Column::Force)] = b.force[i];
+            values[static_cast<uint32_t>(Column::Scale)] = static_cast<float>(scale);
+            values[static_cast<uint32_t>(Column::Row)] = __uint_as_float(dominant_row);
+            values[static_cast<uint32_t>(Column::RowTerm)] = static_cast<float>(dominant);
+        }
+    }
+    if (best < 0.0f) return;
+    values[static_cast<uint32_t>(Column::Relative)] = relative;
+    values[static_cast<uint32_t>(Column::Sweep)] = static_cast<float>(s.sweep_state[kSweepCount] + 1u);
+    for (uint32_t column = 0u; column < nk::kMomentumResidualColumnCount; ++column)
+        target[size_t{b.index} * nk::kMomentumResidualColumnCount + column] = values[column];
+}
+
 template <typename Block>
 __device__ void MeasureDensePrimal(const Block& b, DataView data, BlockDescentSolveParams p, BlockScratch s,
                                    uint32_t owner) {
@@ -694,6 +744,8 @@ __device__ void MeasureDensePrimal(const Block& b, DataView data, BlockDescentSo
     if (threadIdx.x == 0u) {
         if (failure != nk::BlockSolveFailure::None) RecordBlockFailure(data, p, s, owner, failure);
         RaiseResidual(s, b.env, kResidualMomentum, ResidualBits(primal));
+        if ((p.telemetry & nk::kTelemetrySweeps) != 0u && failure == nk::BlockSolveFailure::None)
+            RecordDenseMomentumResidual(b, data, p, s, owner);
     }
 }
 
