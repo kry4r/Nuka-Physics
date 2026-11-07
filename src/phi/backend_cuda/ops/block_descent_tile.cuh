@@ -1567,10 +1567,46 @@ __device__ void SolveWideTileBlock(const TileContext& c, const float (&inverse)[
     for (uint32_t s = 0u; s < kSpan; ++s) d[s] = r[s];
 }
 
+// Apply the block's inverse inertial mass to a force in compact coordinates.
+template <uint32_t kN, uint32_t kSpan = TileSpan<kN>()>
+__device__ nk::BlockSolveFailure SolveTileMass(TileContext& c, const TileBlock& b,
+    const float (&force)[kSpan], float (&direction)[kSpan]) {
+    constexpr uint32_t kS = kN + 1u;
+    if (c.trace_work) ++c.work[kWorkFactor];
+    if constexpr (kSpan == 1u) {
+        float mass[kN], inverse = 0.0f;
+#pragma unroll
+        for (uint32_t j = 0u; j < kN; ++j)
+            mass[j] = c.lane < kN ? c.mass[c.lane * kS + j] : 0.0f;
+        if (!FactorTileBlock<kN>(mass, &inverse, c.lane, b.dimension))
+            return nk::BlockSolveFailure::Factorization;
+        else direction[0] = SolveTileBlock<kN>(mass, inverse, force[0], c, b.dimension);
+    } else {
+        for (uint32_t at = c.lane; at < kN * kS; at += kTileLanes)
+            c.factor[at] = at % kS < kN ? c.mass[at] : 0.0f;
+        __syncwarp();
+        if (c.lane == 0u) *c.chunk_work = {false, TileWork::Factor, b.dimension};
+        TileWorkSync();
+        FactorTileColumns<kN>(*c.chunk_work, {c.factor, c.chunk_terms, c.chunk_rows, c.stage});
+        TileWorkSync();
+        if (c.stage[kStageValid] == 0.0f) return nk::BlockSolveFailure::Factorization;
+        else {
+            float inverse[kSpan];
+#pragma unroll
+            for (uint32_t r = 0u; r < kSpan; ++r) {
+                const uint32_t i = c.lane + r * kTileLanes;
+                inverse[r] = i < b.dimension ? c.stage[kStageInverse + i] : 0.0f;
+            }
+            SolveWideTileBlock<kN>(c, inverse, force, b.dimension, direction);
+        }
+    }
+    return nk::BlockSolveFailure::None;
+}
+
 // The Newton direction d = H^-1 g at u and the forces g: H in registers within a warp of coordinates, in the
 // factor buffer past it.
 template <uint32_t kN, uint32_t kSpan = TileSpan<kN>()>
-__device__ nk::BlockSolveFailure TileNewtonDirection(TileContext& c, const TileBlock& b, const float (&u)[kSpan],
+__device__ nk::BlockSolveFailure TileNewtonDirection(TileContext& c, const TileBlock& b, float tolerance, const float (&u)[kSpan],
                                                      const float (&free)[kSpan], float (&force)[kSpan],
                                                      float (&inertia)[kSpan], float (&d)[kSpan], bool* converged) {
     if constexpr (kSpan == 1u) {
@@ -1578,6 +1614,16 @@ __device__ nk::BlockSolveFailure TileNewtonDirection(TileContext& c, const TileB
         float inverse = 0.0f;
         if (!AssembleTileBlock<kN>(c, b, u[0], free[0], h, &force[0], &inertia[0], converged))
             return nk::BlockSolveFailure::InvalidEquation;
+        // Curvature-based rounding cannot waive the requested inertial momentum accuracy.
+        if (*converged && tolerance > 0.0f) {
+            const auto failure = SolveTileMass<kN>(c, b, force, d);
+            if (failure != nk::BlockSolveFailure::None) return failure;
+            bool stationary = true;
+#pragma unroll
+            for (uint32_t r = 0u; r < kSpan; ++r)
+                stationary &= c.lane + r * kTileLanes >= b.dimension || fabsf(d[r]) < tolerance;
+            *converged = __all_sync(~0u, stationary);
+        }
         if (*converged) return nk::BlockSolveFailure::None;
         if (c.trace_work) ++c.work[kWorkFactor];
         if (!FactorTileBlock<kN>(h, &inverse, c.lane, b.dimension)) return nk::BlockSolveFailure::Factorization;
@@ -1586,6 +1632,21 @@ __device__ nk::BlockSolveFailure TileNewtonDirection(TileContext& c, const TileB
         float inverse[kSpan];
         if (!AssembleWideTileBlock<kN>(c, b, u, free, force, inertia, converged))
             return nk::BlockSolveFailure::InvalidEquation;
+        // Curvature-based rounding cannot waive the requested inertial momentum accuracy.
+        if (*converged && tolerance > 0.0f) {
+            const auto failure = SolveTileMass<kN>(c, b, force, d);
+            if (failure != nk::BlockSolveFailure::None) return failure;
+            bool stationary = true;
+#pragma unroll
+            for (uint32_t r = 0u; r < kSpan; ++r)
+                stationary &= c.lane + r * kTileLanes >= b.dimension || fabsf(d[r]) < tolerance;
+            *converged = __all_sync(~0u, stationary);
+            if (!*converged) {
+                bool rounded = false;
+                if (!AssembleWideTileBlock<kN>(c, b, u, free, force, inertia, &rounded))
+                    return nk::BlockSolveFailure::InvalidEquation;
+            }
+        }
         if (*converged) return nk::BlockSolveFailure::None;
         if (c.trace_work) ++c.work[kWorkFactor];
         if (c.lane == 0u) *c.chunk_work = {false, TileWork::Factor, b.dimension};
@@ -1846,7 +1907,7 @@ __device__ void DescendTileBlock(DataView data, BlockDescentSolveParams p, Block
         if (c.trace_work) ++c.work[kWorkNewton];
         float force[kSpan], inertia[kSpan], d[kSpan], mass_step[kSpan];
         bool converged = false;
-        failure = TileNewtonDirection<kN>(c, b, u, free, force, inertia, d, &converged);
+        failure = TileNewtonDirection<kN>(c, b, p.velocity_tolerance, u, free, force, inertia, d, &converged);
         if (converged) primal = 0.0f;
         if (failure != nk::BlockSolveFailure::None || converged) break;
 #pragma unroll
@@ -1894,8 +1955,7 @@ __device__ void DescendTileBlock(DataView data, BlockDescentSolveParams p, Block
         for (uint32_t r = 0u; r < kSpan; ++r) {
             after[r] = fmaf(alpha, d[r], u[r]);
             finite &= !coordinate[r] || isfinite(after[r]);
-            rounded &= !coordinate[r] || fabsf(after[r] - u[r]) <=
-                kDenseRoundings * FLT_EPSILON * fmaxf(fabsf(after[r]), fabsf(u[r]));
+            rounded &= !coordinate[r] || after[r] == u[r];
         }
         rounded = __all_sync(~0u, rounded);
         if (!__all_sync(~0u, finite)) {
@@ -2026,34 +2086,7 @@ __device__ void MeasureTilePrimal(DataView data, BlockDescentSolveParams p, Bloc
     auto failure = __all_sync(~0u, finite) ? nk::BlockSolveFailure::None
                                          : nk::BlockSolveFailure::InvalidEquation;
     if (failure == nk::BlockSolveFailure::None) {
-        if (c.trace_work) ++c.work[kWorkFactor];
-        if constexpr (kSpan == 1u) {
-            float mass[kN], inverse = 0.0f;
-#pragma unroll
-            for (uint32_t j = 0u; j < kN; ++j)
-                mass[j] = c.lane < kN ? c.mass[c.lane * kS + j] : 0.0f;
-            if (!FactorTileBlock<kN>(mass, &inverse, c.lane, b.dimension))
-                failure = nk::BlockSolveFailure::Factorization;
-            else direction[0] = SolveTileBlock<kN>(mass, inverse, force[0], c, b.dimension);
-        } else {
-            for (uint32_t at = c.lane; at < kN * kS; at += kTileLanes)
-                c.factor[at] = at % kS < kN ? c.mass[at] : 0.0f;
-            __syncwarp();
-            if (c.lane == 0u) *c.chunk_work = {false, TileWork::Factor, b.dimension};
-            TileWorkSync();
-            FactorTileColumns<kN>(*c.chunk_work, {c.factor, c.chunk_terms, c.chunk_rows, c.stage});
-            TileWorkSync();
-            if (c.stage[kStageValid] == 0.0f) failure = nk::BlockSolveFailure::Factorization;
-            else {
-                float inverse[kSpan];
-#pragma unroll
-                for (uint32_t r = 0u; r < kSpan; ++r) {
-                    const uint32_t i = c.lane + r * kTileLanes;
-                    inverse[r] = i < b.dimension ? c.stage[kStageInverse + i] : 0.0f;
-                }
-                SolveWideTileBlock<kN>(c, inverse, force, b.dimension, direction);
-            }
-        }
+        failure = SolveTileMass<kN>(c, b, force, direction);
     }
     float residual = failure == nk::BlockSolveFailure::None ? 0.0f : FLT_MAX;
     if (failure != nk::BlockSolveFailure::None && c.lane == 0u) RecordTileFailure(data, p, s, c, b.owner, failure);
