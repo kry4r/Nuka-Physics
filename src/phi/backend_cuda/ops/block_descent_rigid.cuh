@@ -66,6 +66,7 @@ struct RigidBlock {
     float* force;
     float* direction;
     __device__ float Mass(uint32_t i, uint32_t j) const { return mass[i * kRigidBlockDof + j]; }
+    __device__ const uint32_t* MassCoordinates() const { return nullptr; }
     __device__ float Snapshot(uint32_t i) const { return snapshot[i]; }
     __device__ float Free(uint32_t i) const { return free[i]; }
     __device__ float Jacobian(DataView data, BlockDescentSolveParams, uint32_t row_slot, uint32_t i) const {

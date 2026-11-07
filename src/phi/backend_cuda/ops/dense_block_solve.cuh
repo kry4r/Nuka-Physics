@@ -52,7 +52,8 @@ __device__ inline bool InFloatRange(double value) {
 // float factors in increasing column order; all CTA threads call with the same arguments.
 template <uint32_t kMaxDof>
 __device__ inline bool SolveDensePositiveBlock(const float* matrix, const float* rhs, float* direction,
-                                               uint32_t dimension, uint32_t stride) {
+                                               uint32_t dimension, uint32_t stride,
+                                               const uint32_t* coordinates = nullptr) {
     // Packed lower rows, (r, c) at r(r+1)/2 + c: the trailing block's sums, then L and the pivots.
     __shared__ double lower[kMaxDof * (kMaxDof + 1u) / 2u];
     __shared__ double sums[kMaxDof];
@@ -64,7 +65,9 @@ __device__ inline bool SolveDensePositiveBlock(const float* matrix, const float*
     const uint32_t lane = threadIdx.x % warpSize;
     for (uint32_t r = threadIdx.x / warpSize; r < n; r += blockDim.x / warpSize)
         for (uint32_t c = lane; c <= r; c += warpSize)
-            lower[r * (r + 1u) / 2u + c] = static_cast<double>(matrix[size_t{r} * stride + c]);
+            lower[r * (r + 1u) / 2u + c] = static_cast<double>(matrix[
+                size_t{coordinates != nullptr ? coordinates[r] : r} * stride +
+                (coordinates != nullptr ? coordinates[c] : c)]);
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) sums[i] = static_cast<double>(rhs[i]);
     __syncthreads();
     for (uint32_t k = 0u; k < n; ++k) {

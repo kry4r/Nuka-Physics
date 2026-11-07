@@ -32,6 +32,7 @@ struct ArticulationBlock {
     float* force;
     float* direction;
     __device__ float Mass(uint32_t i, uint32_t j) const { return mass[size_t{roots[i]} * stride + roots[j]]; }
+    __device__ const uint32_t* MassCoordinates() const { return roots; }
     __device__ float Snapshot(uint32_t i) const { return snapshot[roots[i]]; }
     __device__ float Free(uint32_t i) const { return free[roots[i]]; }
     __device__ float Jacobian(DataView data, BlockDescentSolveParams p, uint32_t row_slot, uint32_t i) const {

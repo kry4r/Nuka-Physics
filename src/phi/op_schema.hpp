@@ -596,6 +596,7 @@ struct BlockDescentSolveParams {
     uint32_t max_dof = 0u;
     uint32_t base_link_count = 0u;
     uint32_t contact_rows_per_env = 0u;
+    uint32_t contact_slots_per_env = 0u;
     uint32_t distinct_owner_rows_per_env = 0u;
     uint32_t joint_limit_rows_per_env = 0u;
     uint64_t incidence_per_env = 0u;

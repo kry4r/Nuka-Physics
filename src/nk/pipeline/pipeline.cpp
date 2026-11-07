@@ -440,6 +440,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     std::copy(mp.mpm_grid_dims, mp.mpm_grid_dims + 3u, p_block_descent_.grid_dims);
     p_block_descent_.base_link_count = base_link_count;
     p_block_descent_.contact_rows_per_env = contact_rows_per_env;
+    p_block_descent_.contact_slots_per_env = cap.max_contacts_per_env;
     p_block_descent_.distinct_owner_rows_per_env = cap.distinct_owner_rows_per_env;
     p_block_descent_.joint_limit_rows_per_env = cap.joint_limit_rows_per_env;
     p_block_descent_.workspace_words = cap.block_descent_scratch_words;

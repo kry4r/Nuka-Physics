@@ -38,21 +38,32 @@ struct TangentTerm {
     double potential = 0.0;
 };
 
-NUKA_AUGMENTED_HD inline float EllipticFraction(float cap, math::Vec3 compliance) {
-    return fminf(1.0f, cap * fminf(compliance.x, fminf(compliance.y, compliance.z)));
+struct EllipticResponse {
+    math::Vec3 residual_scale;
+    math::Vec3 dual_scale;
+};
+
+// The tangential metric preserves the friction ellipse; the normal uses its own compliance.
+// Adding a positive proximal metric keeps the same cone KKT conditions and bounds curvature by cap.
+NUKA_AUGMENTED_HD inline EllipticResponse ComputeEllipticResponse(float cap, math::Vec3 compliance) {
+    const double tangent = fmin(double(compliance.y), double(compliance.z));
+    const double normal_scale = 1.0 / (1.0 + double(cap) * compliance.x);
+    const double tangent_scale = 1.0 / (1.0 + double(cap) * tangent);
+    return {{float(cap * normal_scale), float(cap * tangent_scale * tangent / compliance.y),
+             float(cap * tangent_scale * tangent / compliance.z)},
+            {float(normal_scale), float(tangent_scale), float(tangent_scale)}};
 }
 
 // The compliance metric preserves the cone's circular cross section after scaling.
 NUKA_AUGMENTED_HD inline TangentTerm EvaluateEllipticImpulse(
     math::Vec3 dual, float cap, math::Vec3 residual, math::Vec3 compliance, float mu_first) {
-    const float gamma = EllipticFraction(cap, compliance);
-    const float s = 1.0f - gamma;
-    const math::Vec3 k{gamma / compliance.x, gamma / compliance.y, gamma / compliance.z};
-    const math::Vec3 x{fmaf(k.x, residual.x, s * dual.x), fmaf(k.y, residual.y, s * dual.y),
-                       fmaf(k.z, residual.z, s * dual.z)};
-    const math::Vec3 root{sqrtf(compliance.x), sqrtf(compliance.y), sqrtf(compliance.z)};
-    const float m = mu_first * root.y / root.x;
-    const float p = root.x * x.x, q1 = root.y * x.y, q2 = root.z * x.z;
+    const auto response = ComputeEllipticResponse(cap, compliance);
+    const math::Vec3 k = response.residual_scale, s = response.dual_scale;
+    const math::Vec3 x{fmaf(k.x, residual.x, s.x * dual.x), fmaf(k.y, residual.y, s.y * dual.y),
+                       fmaf(k.z, residual.z, s.z * dual.z)};
+    const math::Vec3 root{sqrtf(k.x), sqrtf(k.y), sqrtf(k.z)};
+    const float m = mu_first * root.x / root.y;
+    const float p = x.x / root.x, q1 = x.y / root.y, q2 = x.z / root.z;
     const float t = hypotf(q1, q2);
     if (t <= m * p) return {x, {k.x, k.y, k.z, 0.0f, 0.0f, 0.0f}, 0.0};
     if (m * t + p <= 0.0f) return {};
@@ -60,12 +71,12 @@ NUKA_AUGMENTED_HD inline TangentTerm EvaluateEllipticImpulse(
     const float projected = (p + m * t) * a;
     const float u1 = q1 / t, u2 = q2 / t;
     const float b = m * projected / t, along = m * m * a;
-    return {{projected / root.x, m * projected * u1 / root.y, m * projected * u2 / root.z},
+    return {{projected * root.x, m * projected * u1 * root.y, m * projected * u2 * root.z},
             {k.x * a, k.y * (along * u1 * u1 + b * u2 * u2),
              k.z * (along * u2 * u2 + b * u1 * u1),
-             gamma * m * a * u1 / (root.x * root.y),
-             gamma * m * a * u2 / (root.x * root.z),
-             gamma * (along - b) * u1 * u2 / (root.y * root.z)}, 0.0};
+             root.x * root.y * m * a * u1,
+             root.x * root.z * m * a * u2,
+             root.y * root.z * (along - b) * u1 * u2}, 0.0};
 }
 
 NUKA_AUGMENTED_HD inline double EllipticPotential(double p, double q1, double q2, double m, double gamma) {
@@ -79,22 +90,21 @@ NUKA_AUGMENTED_HD inline double EllipticPotential(double p, double q1, double q2
 // Both cone potentials and their difference use double precision during line search.
 NUKA_AUGMENTED_HD inline float EllipticPotentialChange(
     math::Vec3 dual, float cap, math::Vec3 residual, math::Vec3 drop, math::Vec3 compliance, float mu_first) {
-    const double gamma = EllipticFraction(cap, compliance), s = 1.0 - gamma;
-    const double rx = sqrt(double(compliance.x)), ry = sqrt(double(compliance.y)), rz = sqrt(double(compliance.z));
-    const double p = rx * (s * dual.x + gamma / compliance.x * residual.x);
-    const double q1 = ry * (s * dual.y + gamma / compliance.y * residual.y);
-    const double q2 = rz * (s * dual.z + gamma / compliance.z * residual.z);
-    const double m = double(mu_first) * ry / rx;
-    return float(EllipticPotential(p - gamma / rx * drop.x, q1 - gamma / ry * drop.y,
-                                  q2 - gamma / rz * drop.z, m, gamma) - EllipticPotential(p, q1, q2, m, gamma));
+    const auto response = ComputeEllipticResponse(cap, compliance);
+    const math::Vec3 k = response.residual_scale, s = response.dual_scale;
+    const double rx = sqrt(double(k.x)), ry = sqrt(double(k.y)), rz = sqrt(double(k.z));
+    const double p = (double(s.x) * dual.x + double(k.x) * residual.x) / rx;
+    const double q1 = (double(s.y) * dual.y + double(k.y) * residual.y) / ry;
+    const double q2 = (double(s.z) * dual.z + double(k.z) * residual.z) / rz;
+    const double m = double(mu_first) * rx / ry;
+    return float(EllipticPotential(p - rx * drop.x, q1 - ry * drop.y,
+                                  q2 - rz * drop.z, m, 1.0) - EllipticPotential(p, q1, q2, m, 1.0));
 }
 
 NUKA_AUGMENTED_HD inline math::Vec3 EllipticMultiplierStep(
     math::Vec3 dual, math::Vec3 next, float cap, math::Vec3 compliance) {
-    const float gamma = EllipticFraction(cap, compliance);
-    if (gamma == 1.0f) return {};
-    return {fabsf(next.x - dual.x) * compliance.x / gamma,
-            fabsf(next.y - dual.y) * compliance.y / gamma, fabsf(next.z - dual.z) * compliance.z / gamma};
+    const auto k = ComputeEllipticResponse(cap, compliance).residual_scale;
+    return {fabsf(next.x - dual.x) / k.x, fabsf(next.y - dual.y) / k.y, fabsf(next.z - dual.z) / k.z};
 }
 
 // A contact multiplier's last unrelaxed step and the weight it took; weight 0 marks no last step.
@@ -144,23 +154,26 @@ NUKA_AUGMENTED_HD inline ScalarTerm EvaluateScalar(
     return EvaluateScalar(dual, rho, residual, compliance, lower, upper, ComputeScalarResponse(rho, compliance));
 }
 
+// Normalized cone axes keep the largest tangent curvature at rho, independent of friction magnitude.
 // The caller holds normal_impulse fixed throughout each local Newton solve and line search.
 NUKA_AUGMENTED_HD inline TangentTerm EvaluateTangent(
     math::Vec3 dual, float rho, math::Vec3 residual, float normal_impulse,
     float mu_first, float mu_second) {
     if (rho <= 0.0f) return {};
-    const double mu_y = mu_first <= 0.0f ? 0.0 : double(mu_first);
-    const double mu_z = mu_second <= 0.0f ? 0.0 : double(mu_second);
+    const double scale = fmaxf(mu_first, mu_second);
+    const double mu_y = mu_first <= 0.0f ? 0.0 : double(mu_first) / scale;
+    const double mu_z = mu_second <= 0.0f ? 0.0 : double(mu_second) / scale;
     const double q_y = mu_y == 0.0 ? 0.0
         : math::Quotient(double(dual.y), mu_y) + double(rho) * mu_y * residual.y;
     const double q_z = mu_z == 0.0 ? 0.0
         : math::Quotient(double(dual.z), mu_z) + double(rho) * mu_z * residual.z;
-    const double radius = normal_impulse < 0.0f ? 0.0 : double(normal_impulse);
+    const double radius = (normal_impulse < 0.0f ? 0.0 : double(normal_impulse)) * fmax(scale, 0.0);
     if (q_y != q_y || q_z != q_z || radius != radius || rho != rho) {
         const float invalid = float(q_y + q_z + radius + rho);
         return {{0.0f, invalid, invalid},
                 {0.0f, invalid, invalid, 0.0f, 0.0f, invalid}, double(invalid)};
     }
+    if (radius == 0.0) return {};
     const double norm_sq = q_y * q_y + q_z * q_z;
     const double norm = sqrt(norm_sq);
     if (norm <= radius) {
@@ -228,7 +241,7 @@ NUKA_AUGMENTED_HD inline ScalarTerm EvaluateScalarImpulse(
 
 // Change of EvaluateScalar's potential when the residual drops by `drop`: (1/k) times the
 // integral of the clamped impulse argument along the drop, so no two potentials are subtracted.
-NUKA_AUGMENTED_HD inline float ScalarPotentialChange(
+NUKA_AUGMENTED_HD inline double ScalarPotentialChange(
     float dual, float rho, float residual, float drop, float compliance, float lower, float upper,
     const ScalarResponse& response) {
     if (rho <= 0.0f) return 0.0f;
@@ -244,19 +257,19 @@ NUKA_AUGMENTED_HD inline float ScalarPotentialChange(
     if (lower > upper) {
         const double fx = x < lower ? double(lower) : (x > upper ? double(upper) : x);
         const double fy = y < lower ? double(lower) : (y > upper ? double(upper) : y);
-        return float(fy * (y - 0.5 * fy) / k - fx * (x - 0.5 * fx) / k);
+        return fy * (y - 0.5 * fy) / k - fx * (x - 0.5 * fx) / k;
     }
     if (x >= lower && x <= upper && y >= lower && y <= upper)
-        return float(-double(drop) * (x - 0.5 * k * drop));
-    if (x <= lower && y <= lower) return float(-double(lower) * drop);
-    if (x >= upper && y >= upper) return float(-double(upper) * drop);
+        return -double(drop) * (x - 0.5 * k * drop);
+    if (x <= lower && y <= lower) return -double(lower) * drop;
+    if (x >= upper && y >= upper) return -double(upper) * drop;
     const double a = fmin(x, y), b = fmax(x, y);
     double integral = 0.0;
     if (a < lower) integral += double(lower) * (fmin(b, double(lower)) - a);
     const double low = fmax(a, double(lower)), high = fmin(b, double(upper));
     if (low < high) integral += 0.5 * (high - low) * (high + low);
     if (b > upper) integral += double(upper) * (b - fmax(a, double(upper)));
-    return float((y >= x ? integral : -integral) / k);
+    return (y >= x ? integral : -integral) / k;
 }
 
 // ScalarPotentialChange on float scales, for searches whose impulses run in float.
@@ -314,15 +327,17 @@ NUKA_AUGMENTED_HD inline TangentTerm EvaluateTangentImpulse(
     math::Vec3 dual, float rho, math::Vec3 residual, float normal_impulse,
     float mu_first, float mu_second) {
     if (rho <= 0.0f) return {};
-    const float mu_y = mu_first <= 0.0f ? 0.0f : mu_first;
-    const float mu_z = mu_second <= 0.0f ? 0.0f : mu_second;
+    const float scale = fmaxf(mu_first, mu_second);
+    const float mu_y = mu_first <= 0.0f ? 0.0f : mu_first / scale;
+    const float mu_z = mu_second <= 0.0f ? 0.0f : mu_second / scale;
     const float q_y = mu_y == 0.0f ? 0.0f : ConeArgument(dual.y, rho, mu_y, residual.y);
     const float q_z = mu_z == 0.0f ? 0.0f : ConeArgument(dual.z, rho, mu_z, residual.z);
-    const float radius = normal_impulse < 0.0f ? 0.0f : normal_impulse;
+    const float radius = (normal_impulse < 0.0f ? 0.0f : normal_impulse) * fmaxf(scale, 0.0f);
     if (q_y != q_y || q_z != q_z || radius != radius || rho != rho) {
         const float invalid = q_y + q_z + radius + rho;
         return {{0.0f, invalid, invalid}, {0.0f, invalid, invalid, 0.0f, 0.0f, invalid}, double(invalid)};
     }
+    if (radius == 0.0f) return {};
     const float norm = hypotf(q_y, q_z);
     if (norm <= radius)
         return {{0.0f, mu_y * q_y, mu_z * q_z},
@@ -342,16 +357,18 @@ NUKA_AUGMENTED_HD inline float TangentPotentialChange(
     math::Vec3 dual, float rho, math::Vec3 residual, math::Vec3 drop, float normal_impulse,
     float mu_first, float mu_second) {
     if (rho <= 0.0f) return 0.0f;
-    const float mu_y = mu_first <= 0.0f ? 0.0f : mu_first;
-    const float mu_z = mu_second <= 0.0f ? 0.0f : mu_second;
+    const float scale = fmaxf(mu_first, mu_second);
+    const float mu_y = mu_first <= 0.0f ? 0.0f : mu_first / scale;
+    const float mu_z = mu_second <= 0.0f ? 0.0f : mu_second / scale;
     const float q_y = mu_y == 0.0f ? 0.0f : ConeArgument(dual.y, rho, mu_y, residual.y);
     const float q_z = mu_z == 0.0f ? 0.0f : ConeArgument(dual.z, rho, mu_z, residual.z);
     const float slide_y = mu_y == 0.0f ? 0.0f : mu_y * drop.y;
     const float slide_z = mu_z == 0.0f ? 0.0f : mu_z * drop.z;
     const float step_y = -rho * slide_y, step_z = -rho * slide_z;
-    const float radius = normal_impulse < 0.0f ? 0.0f : normal_impulse;
+    const float radius = (normal_impulse < 0.0f ? 0.0f : normal_impulse) * fmaxf(scale, 0.0f);
     if (!(fabsf(q_y) <= FLT_MAX && fabsf(q_z) <= FLT_MAX && fabsf(step_y) <= FLT_MAX &&
           fabsf(step_z) <= FLT_MAX) || radius != radius || rho != rho) return NAN;
+    if (radius == 0.0f) return 0.0f;
     const float before = hypotf(q_y, q_z);
     const float after = hypotf(q_y + step_y, q_z + step_z);
     const float stick = -(slide_y * fmaf(0.5f, step_y, q_y) + slide_z * fmaf(0.5f, step_z, q_z));
@@ -413,6 +430,7 @@ NUKA_AUGMENTED_HD inline BallTerm<N> EvaluateBall(
         }
         return term;
     }
+    if (radius == 0.0) return term;
     double norm_sq_scaled = 0.0;
     if (scale > 0.0) {
         for (uint32_t i = 0u; i < N; ++i) {

@@ -351,10 +351,10 @@ __device__ bool AssembleSmallDenseBlock(const Block& b, DataView data, BlockDesc
     return __syncthreads_or(!finite) == 0;
 }
 
-// w_j = J_j d for every incidence; a row group of lanes sums each row.
+// Store J d or J (u - snapshot) for each incidence; a row group of lanes sums each row.
 template <typename Block>
 __device__ void StoreDenseRowSteps(const Block& b, DataView data, BlockDescentSolveParams p,
-                                   BlockScratch s, uint32_t working) {
+                                   BlockScratch s, uint32_t working, bool displacement = false) {
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
     const uint32_t lane = threadIdx.x % warpSize;
     const uint32_t warp = threadIdx.x / warpSize;
@@ -377,14 +377,16 @@ __device__ void StoreDenseRowSteps(const Block& b, DataView data, BlockDescentSo
         }
         double dot[3] = {};
         if (valid) {
-            for (uint32_t i = group_lane; i < b.dimension; i += width)
+            for (uint32_t i = group_lane; i < b.dimension; i += width) {
+                const double value = displacement ? double(b.velocity[i]) - b.Snapshot(i) : b.direction[i];
                 for (uint32_t axis = 0u; axis < axes; ++axis)
-                    dot[axis] += static_cast<double>(b.Jacobian(data, p, slot + axis * stride, i)) * b.direction[i];
+                    dot[axis] += static_cast<double>(b.Jacobian(data, p, slot + axis * stride, i)) * value;
+            }
         }
         for (uint32_t axis = 0u; axis < 3u; ++axis) dot[axis] = SumDenseRowGroup(dot[axis], width);
         if (valid && group_lane == 0u)
-            StoreIncidenceVec3(s, at, kDenseStepColumn, {static_cast<float>(dot[0]), static_cast<float>(dot[1]),
-                                                         static_cast<float>(dot[2])});
+            StoreIncidenceVec3(s, at, displacement ? kDenseMoveColumn : kDenseStepColumn,
+                {static_cast<float>(dot[0]), static_cast<float>(dot[1]), static_cast<float>(dot[2])});
     }
 }
 
@@ -569,6 +571,15 @@ __device__ nk::BlockSolveFailure DenseNewtonDirection(const Block& b, DataView d
     else
         assembled = AssembleDenseBlock(b, data, p, s, working, gradient, inertia, converged);
     if (!assembled) return nk::BlockSolveFailure::InvalidEquation;
+    // A curvature-based rounding bound cannot waive momentum accuracy for a small inertial mass.
+    if (*converged && p.velocity_tolerance > 0.0f) {
+        if (!SolveDensePositiveBlock<Block::kMaxDof>(b.mass, b.force, b.direction, b.dimension, b.stride,
+                b.MassCoordinates())) return nk::BlockSolveFailure::Factorization;
+        bool stationary = true;
+        for (uint32_t i = threadIdx.x; i < b.dimension; i += blockDim.x)
+            stationary &= fabsf(b.direction[i]) < p.velocity_tolerance;
+        *converged = __syncthreads_and(stationary) != 0;
+    }
     if (!*converged) {
         CountDenseWork(data, p, s, b.env, kWorkFactor);
         if (!SolveDensePositiveBlock<Block::kMaxDof>(b.matrix, b.force, b.direction, b.dimension, b.stride))
@@ -620,8 +631,7 @@ __device__ nk::BlockSolveFailure NewtonDenseBlock(const Block& b, DataView data,
             const float before = b.velocity[i];
             const float after = static_cast<float>(static_cast<double>(before) + alpha * b.direction[i]);
             finite &= isfinite(after);
-            rounded &= fabsf(after - before) <=
-                kDenseRoundings * FLT_EPSILON * fmaxf(fabsf(after), fabsf(before));
+            rounded &= after == before;
         }
         rounded = __syncthreads_and(rounded) != 0;
         if (__syncthreads_or(!finite)) {
@@ -634,14 +644,9 @@ __device__ nk::BlockSolveFailure NewtonDenseBlock(const Block& b, DataView data,
         if (!(alpha > 0.0)) break;
         for (uint32_t i = threadIdx.x; i < n; i += blockDim.x)
             b.velocity[i] = static_cast<float>(static_cast<double>(b.velocity[i]) + alpha * b.direction[i]);
-        for (uint32_t item = threadIdx.x; item < working; item += blockDim.x) {
-            const size_t at = DenseRows(s)[size_t{b.begin} + item];
-            const Vec3 move = LoadIncidenceVec3(s, at, kDenseMoveColumn);
-            const Vec3 row_step = LoadIncidenceVec3(s, at, kDenseStepColumn);
-            StoreIncidenceVec3(s, at, kDenseMoveColumn, {static_cast<float>(move.x + alpha * row_step.x),
-                                                        static_cast<float>(move.y + alpha * row_step.y),
-                                                        static_cast<float>(move.z + alpha * row_step.z)});
-        }
+        __syncthreads();
+        // Row moves follow the stored float velocity, including the rounding of each accepted step.
+        StoreDenseRowSteps(b, data, p, s, working, true);
         __syncthreads();
         if (rounded) break;
     }
@@ -654,13 +659,34 @@ __device__ nk::BlockSolveFailure NewtonDenseBlock(const Block& b, DataView data,
 template <typename Block>
 __device__ void MeasureDensePrimal(const Block& b, DataView data, BlockDescentSolveParams p, BlockScratch s,
                                    uint32_t owner) {
-    __shared__ double gradient[Block::kMaxDof];
-    __shared__ double inertia[Block::kMaxDof];
-    const uint32_t working = ParkDenseRows(b, data, p, s);
-    bool converged = false;
-    const auto failure = DenseNewtonDirection(b, data, p, s, working, gradient, inertia, &converged);
+    const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
+    bool finite = true;
+    for (uint32_t i = threadIdx.x; i < b.dimension; i += blockDim.x) {
+        double force = 0.0;
+        for (uint32_t j = 0u; j < b.dimension; ++j) {
+            const float mass = b.Mass(i, j);
+            b.matrix[size_t{i} * b.stride + j] = mass;
+            force -= double(mass) * (double(b.velocity[j]) - b.Free(j));
+        }
+        for (size_t at = b.begin; at < b.end; ++at) {
+            const uint32_t slot = s.incidence[at];
+            const NkRow row = rows[slot];
+            const uint32_t axes = row.flags & nk::nk_row_flags::kBlockNormal ? 3u : 1u;
+            for (uint32_t axis = 0u; axis < axes; ++axis) {
+                const uint32_t index = slot + axis * row.group_normal_count;
+                force += double(b.Jacobian(data, p, index, i)) * data.lambda[index];
+            }
+        }
+        b.force[i] = float(force);
+        finite &= fabs(force) <= FLT_MAX;
+    }
+    auto failure = __syncthreads_and(finite) ? nk::BlockSolveFailure::None
+                                            : nk::BlockSolveFailure::InvalidEquation;
+    if (failure == nk::BlockSolveFailure::None &&
+        !SolveDensePositiveBlock<Block::kMaxDof>(b.matrix, b.force, b.direction, b.dimension, b.stride))
+        failure = nk::BlockSolveFailure::Factorization;
     float primal = failure == nk::BlockSolveFailure::None ? 0.0f : FLT_MAX;
-    if (failure == nk::BlockSolveFailure::None && !converged)
+    if (failure == nk::BlockSolveFailure::None)
         for (uint32_t i = threadIdx.x; i < b.dimension; i += blockDim.x)
             primal = fmaxf(primal, fabsf(b.direction[i]));
     float unused = 0.0f;

@@ -30,6 +30,12 @@ __device__ __forceinline__ float WarpSum(float value) {
     return __shfl_sync(0xffffffffu, value, 0u);
 }
 
+__device__ __forceinline__ double WarpSum(double value) {
+    for (uint32_t offset = warpSize / 2u; offset > 0u; offset /= 2u)
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    return __shfl_sync(0xffffffffu, value, 0u);
+}
+
 // Material particles and background nodes share scalar mass response with separate state.
 // A world with vertex blocks gives every particle a frozen 3x3 response instead.
 struct PointMassView {
@@ -104,12 +110,15 @@ struct PointMassView {
         const float* inv_mass = InverseMass(kind);
         return inv_mass != nullptr ? inv_mass[index] * u.Dot(v) : 0.0f;
     }
-    // Terms load independently before their ordered sum, so unrolled terms keep their loads in flight.
-    __device__ float RowVelocity(const NkRowSide& side) const {
-        float result = 0.0f;
+    // Projected velocities accumulate before rounding, including cancellation between endpoint terms.
+    __device__ double RowVelocity(const NkRowSide& side) const {
+        double result = 0.0;
         if (side.kind != nk::kNkSidePointEndpoint) {
             const auto* velocity = Velocity(side.kind);
-            if (velocity != nullptr) result += side.jlin.Dot(velocity[side.index]);
+            if (velocity != nullptr) {
+                const auto v = velocity[side.index];
+                result = double(side.jlin.x) * v.x + double(side.jlin.y) * v.y + double(side.jlin.z) * v.z;
+            }
             return result;
         }
         const nk::PointEndpointRange range = ranges[side.index];
@@ -119,8 +128,11 @@ struct PointMassView {
         for (uint32_t i = 0u; i < range.count; ++i) {
             const auto& entry = entries[i];
             const auto* velocity = Velocity(entry.kind);
-            if (velocity != nullptr)
-                result += projection.At(entries, i, side.jlin).Dot(velocity[entry.index]);
+            if (velocity != nullptr) {
+                const auto j = projection.At(entries, i, side.jlin);
+                const auto v = velocity[entry.index];
+                result += double(j.x) * v.x + double(j.y) * v.y + double(j.z) * v.z;
+            }
         }
         return result;
     }

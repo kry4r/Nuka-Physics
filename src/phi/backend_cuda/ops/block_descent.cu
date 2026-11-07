@@ -22,6 +22,7 @@
 #include "phi/backend_cuda/launch.cuh"
 #include "phi/backend_cuda/launch_grid.cuh"
 #include "phi/backend_cuda/ops/articulation_mass.cuh"
+#include "phi/backend_cuda/ops/contact_row_layout.cuh"
 #include "phi/backend_cuda/ops/dense_block_solve.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
@@ -58,14 +59,13 @@ constexpr uint32_t kPhaseSetup = 0u, kPhaseVertices = 1u, kPhaseDense = 2u, kPha
                    kPhaseSetupJacobian = 11u, kPhaseSetupResidual = 12u, kPhaseEnd = kSolverPhaseWords;
 constexpr uint32_t kPointJacobianAxes = 3u;
 constexpr uint32_t kPointJacobianComponents = 3u;
-constexpr uint32_t kPointJacobianWords = kPointJacobianAxes * kPointJacobianComponents;
+constexpr uint32_t kPointJacobianValues = kPointJacobianAxes * kPointJacobianComponents;
+constexpr uint32_t kPointJacobianWords = kPointJacobianValues + 1u;
 // Penalty scale of rows with grid owners: they tie light nodes to each other and to heavier blocks, where a
 // stiffer penalty pins each block to its neighbours' stale velocities and stalls block Gauss-Seidel.
 constexpr double kGridRowPenaltyScale = 1.0;
 // Largest penalty times a row's most compliant owner share, the condition float block solves keep exact enough.
 constexpr double kPenaltyConditionCap = 1.0e2;
-// MuJoCo-law rows cap curvature at this over their invweight, above every corpus contact's 1/R.
-constexpr double kCompliantConditionCap = 3.0e4;
 
 struct AugmentedRowState {
     Vec3 residual;
@@ -699,10 +699,13 @@ __device__ void RaiseWarpResidual(BlockScratch s, uint32_t env, uint32_t kind, u
 }
 
 // A row's multiplier steps at its dual update in velocity units: the normal (or scalar) step over its residual
-// scale, the tangent steps over their cone penalties rho mu^2, which is the slip velocity inside the cone.
+// scale, the tangent steps over their normalized cone penalties, which is the slip velocity inside the cone.
 __device__ float2 MultiplierSteps(Vec3 dual, Vec3 next, float scale, float dual_scale, float rho,
                                   float mu_first, float mu_second) {
     const float normal = scale > 0.0f && dual_scale != 0.0f ? fabsf(next.x - dual.x) / scale : 0.0f;
+    const float friction_scale = fmaxf(mu_first, mu_second);
+    mu_first = mu_first <= 0.0f ? 0.0f : mu_first / friction_scale;
+    mu_second = mu_second <= 0.0f ? 0.0f : mu_second / friction_scale;
     const float first = mu_first > 0.0f && rho > 0.0f ? (next.y - dual.y) / (rho * mu_first * mu_first) : 0.0f;
     const float second = mu_second > 0.0f && rho > 0.0f ? (next.z - dual.z) / (rho * mu_second * mu_second) : 0.0f;
     return {normal, hypotf(first, second)};
@@ -981,10 +984,10 @@ __device__ float SideResponse(const NkRowSide& side, const DataView& data,
     return 0.0f;
 }
 
-__device__ float RowVelocity(const NkRow& row, uint32_t slot, const DataView& data,
+__device__ double RowVelocity(const NkRow& row, uint32_t slot, const DataView& data,
                              BlockDescentSolveParams p, PointMassView points,
                              const float* articulation_velocity, const float* rigid_velocity) {
-    float velocity = 0.0f;
+    double velocity = 0.0;
     const NkRowSide sides[2] = {row.a, row.b};
     for (uint32_t endpoint = 0u; endpoint < 2u; ++endpoint) {
         const NkRowSide side = sides[endpoint];
@@ -997,7 +1000,9 @@ __device__ float RowVelocity(const NkRow& row, uint32_t slot, const DataView& da
             const Vec3 angular = rigid_velocity != nullptr
                 ? Vec3{rigid_velocity[base + 3u], rigid_velocity[base + 4u], rigid_velocity[base + 5u]}
                 : data.body_angular_velocity[side.index];
-            velocity += side.jlin.Dot(linear) + side.jang.Dot(angular);
+            velocity += double(side.jlin.x) * linear.x + double(side.jlin.y) * linear.y +
+                double(side.jlin.z) * linear.z + double(side.jang.x) * angular.x +
+                double(side.jang.y) * angular.y + double(side.jang.z) * angular.z;
         }
         else if (side.kind == kNkSideArtic) {
             const auto* jacobian = static_cast<const float*>(endpoint == 0u
@@ -1006,7 +1011,7 @@ __device__ float RowVelocity(const NkRow& row, uint32_t slot, const DataView& da
             double value = 0.0;
             for (uint32_t dof = 0u; dof < p.max_dof; ++dof)
                 value += double(jacobian[dof]) * u[dof];
-            velocity += static_cast<float>(value);
+            velocity += value;
         }
     }
     return velocity;
@@ -1130,6 +1135,15 @@ __global__ void CachePointIncidenceJacobiansKernel(
                 s.point_jacobian[first + s.incidence_capacity] = jacobian[axis].y;
                 s.point_jacobian[first + 2u * s.incidence_capacity] = jacobian[axis].z;
             }
+            uint32_t concurrent = 1u;
+            if (kind == kNkSideParticle) {
+                concurrent = 0u;
+                VisitOwners(head, points, p, [&](uint32_t other) {
+                    if (s.owner_cache_color[other] == s.owner_cache_color[owner]) ++concurrent;
+                });
+            }
+            s.point_jacobian[uint64_t{kPointJacobianValues} * s.incidence_capacity + at] =
+                static_cast<float>(concurrent);
         }
     }
 }
@@ -1243,9 +1257,7 @@ __global__ void CountIncidenceKernel(DataView data, BlockDescentSolveParams p, B
         // rho^2 P / (1 + rho W + rho^2 P), P = max w_i (W - w_i); the root below keeps it at most 1/4.
         const double coupled = coupling > 0.0
             ? (response + sqrt(response * response + 12.0 * coupling)) / (6.0 * coupling) : HUGE_VAL;
-        const double cap = (row.flags & nk::nk_row_flags::kMuJoCo) != 0u
-            ? kCompliantConditionCap / data.row_invweight[slot]
-            : grid ? kGridRowPenaltyScale / response : kPenaltyConditionCap / largest;
+        const double cap = grid ? kGridRowPenaltyScale / response : kPenaltyConditionCap / largest;
         const double penalty = response > 0.0 ? fmin(cap, coupled) : 0.0;
         const bool valid_penalty = response == 0.0 ||
             (penalty > 0.0 && penalty <= double(FLT_MAX) && static_cast<float>(penalty) > 0.0f);
@@ -1371,6 +1383,7 @@ __device__ VertexBlockView Vertices(ModelView model, DataView data, BlockDescent
     b.color_segments = model.vbd_color_segments;
     b.start = data.particle_prev_pos;
     b.free_rate = data.vbd_free_rate;
+    b.free_velocity = data.vbd_free_velocity;
     b.inertia = data.vbd_inertia;
     b.effective_step = data.vbd_step;
     b.solver_audit = p.measure_vertex_audit != 0u ? data.vbd_solve_audit : nullptr;
@@ -1417,15 +1430,14 @@ __device__ PointMassView RowPointMasses(DataView data, BlockScratch s, bool snap
     return points;
 }
 
-// Residual and dual of one axis of the row group headed by `slot`. Explicit roundings keep the
-// residual identical in every kernel that inlines it.
+// Residual and dual of one axis; both endpoints cancel before the cached residual is rounded.
 __device__ void AugmentedRowAxis(DataView data, BlockDescentSolveParams p, BlockScratch s,
                                  const NkRow& normal, uint32_t slot, uint32_t axis,
                                  bool snapshot, float* residual, float* dual) {
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
     const uint32_t row_slot = slot + axis * normal.group_normal_count;
     const NkRow row = rows[row_slot];
-    *residual = __fsub_rn(__fmul_rn(row.rhs, p.dt),
+    *residual = float(double(__fmul_rn(row.rhs, p.dt)) -
                 RowVelocity(row, row_slot, data, p, RowPointMasses(data, s, snapshot),
                     snapshot ? s.articulation_snapshot : data.qdot_flat,
                     snapshot ? s.rigid_snapshot : nullptr));
@@ -1607,7 +1619,10 @@ __device__ void AddPointRowSample(BlockScratch s, size_t at, const PointRowSampl
         jacobian[axis] = LoadPointIncidenceJacobian(s, at, axis);
     const SymmetricMat3 c{sample.curvature[0], sample.curvature[1], sample.curvature[2],
                           sample.curvature[4], sample.curvature[5], sample.curvature[3]};
-    AddLocalResponse(jacobian, sample.impulse, c, impulse, curvature);
+    // A row with n simultaneous owners has curvature bounded by n times its block diagonal.
+    // This includes position rows, whose particle owners all share one update color.
+    const float concurrent = s.point_jacobian[uint64_t{kPointJacobianValues} * s.incidence_capacity + at];
+    AddLocalResponse(jacobian, sample.impulse, nk::vbd::Scaled(c, concurrent), impulse, curvature);
 }
 
 __device__ bool Finite(Vec3 value) {
@@ -1618,9 +1633,11 @@ __device__ bool Finite(Vec3 value) {
 #include "phi/backend_cuda/ops/block_descent_articulation.cuh"
 #include "phi/backend_cuda/ops/block_descent_rigid.cuh"
 
-// Dense stationarity is checked at the updated duals only when the sweep could otherwise stop.
+// Final physical impulses must balance each block's momentum before the solve can stop.
 template <uint32_t capacity, bool rigid>
 __global__ void MeasureDensePrimalsKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
+    bool prune = false;
+    if (!MeasuredSweep(p, s, &prune)) return;
     const uint32_t index = blockIdx.x;
     const uint32_t owner = p.total_particle_count + (rigid ? 0u : p.total_body_count) + index;
     const uint32_t env = rigid ? index / (p.total_body_count / p.env_count)
@@ -1630,7 +1647,7 @@ __global__ void MeasureDensePrimalsKernel(DataView data, BlockDescentSolveParams
         largest = max(largest, s.env_residual[size_t{env} * kResidualClasses + kind]);
     const uint32_t dimension = rigid ? s.rigid_dimensions[index] : s.articulation_dimensions[index];
     const bool candidate = __syncthreads_and(EnvRunning(data, env) && dimension != 0u &&
-        __uint_as_float(largest) < p.velocity_tolerance) != 0;
+        (!prune || __uint_as_float(largest) < p.velocity_tolerance)) != 0;
     if (candidate) {
         if constexpr (rigid) MeasureDensePrimal(LoadRigidBlock(data, p, s, index), data, p, s, owner);
         else MeasureDensePrimal(LoadArticulationBlock<capacity>(data, p, s, index), data, p, s, owner);
@@ -1640,6 +1657,29 @@ __global__ void MeasureDensePrimalsKernel(DataView data, BlockDescentSolveParams
 #include "phi/backend_cuda/ops/block_descent_grid.cuh"
 #include "phi/backend_cuda/ops/block_descent_coarse.cuh"
 #include "phi/backend_cuda/ops/block_descent_multilevel.cuh"
+// Position rows retain the gap left by physical motion, bounded by the geometric recovery.
+// A velocity-solve residual alone must not generate a split position impulse.
+__device__ float PositionRowBias(DataView data, BlockDescentSolveParams p, const NkRow& row,
+                                  uint32_t slot, float slop) {
+    const float penetration = fmaxf(data.row_penetration[slot] - slop, 0.0f);
+    float physical = penetration;
+    if ((row.flags & nk::nk_row_flags::kSpeculative) != 0u && p.contact_slots_per_env > 0u) {
+        const uint32_t contact = ContactSlotForRow(data.ucontact_row_range,
+            row.env * p.contact_slots_per_env, p.contact_slots_per_env, slot);
+        const auto range = ContactRowRangeFor(data.ucontact_row_range, contact);
+        const size_t point = size_t{contact} * nk::kPairDrivenPtsPerSlot + (slot - range.first) % range.points;
+        const double depth = double(data.ucontact_depth[point]) - slop;
+        const double reserve = double(data.row_penetration[slot]) - data.ucontact_depth[point];
+        const double correction = p.position_beta * fmax(depth, 0.0) + reserve;
+        const double target = fmin(depth, 0.0) + correction;
+        const double velocity = RowVelocity(row, slot, data, p, PointMasses(data), data.qdot_flat, nullptr);
+        const double limit = fmin(correction / p.dt, double(p.position_max_velocity));
+        return float(fmin(target / p.dt - velocity, limit));
+    }
+    const float correction = p.position_beta * physical + fmaxf(penetration - physical, 0.0f);
+    return fminf(correction / p.dt, p.position_max_velocity);
+}
+
 #include "phi/backend_cuda/ops/block_descent_tile.cuh"
 
 __global__ void PackBlockRigidSnapshotKernel(DataView data, BlockDescentSolveParams p,
@@ -1917,13 +1957,15 @@ __global__ void DescendParticlesKernel(ModelView model, DataView data, BlockDesc
             const float inertia = elastic ? b.inertia[b.Slot(env, vertex)]
                                           : 1.0f / (data.particle_inv_mass[particle] * p.dt * p.dt);
             const Vec3 free_rate = elastic ? b.free_rate[b.Slot(env, vertex)] : s.particle_free[particle];
-            Vec3 gradient{};
+            double3 gradient{};
             SymmetricMat3 hessian{};
             if constexpr (elastic) {
                 if (dense_elements) {
                     for (uint32_t i = lane; i < v.element_count; i += warpSize) {
                         const float* sample = element_samples[v.element_first + i];
-                        gradient = gradient + TileVec3(sample);
+                        gradient.x += sample[0];
+                        gradient.y += sample[1];
+                        gradient.z += sample[2];
                         nk::vbd::AddTo(hessian, SymmetricMat3{sample[3], sample[4], sample[5],
                                                               sample[6], sample[7], sample[8]});
                     }
@@ -1952,9 +1994,11 @@ __global__ void DescendParticlesKernel(ModelView model, DataView data, BlockDesc
             nk::vbd::AddTo(hessian, nk::vbd::Scaled(contact_hessian, 1.0f / (p.dt * p.dt)));
             hessian = {WarpSum(hessian.xx), WarpSum(hessian.yy), WarpSum(hessian.zz),
                        WarpSum(hessian.xy), WarpSum(hessian.xz), WarpSum(hessian.yz)};
+            const Vec3 force = VertexAssembledForce(gradient,
+                nk::vbd::InertialGradient(u, free_rate, inertia, p.dt), impulse / p.dt);
             if (lane == 0u) {
                 float* sums = row_changes + j * kDescendSolveWords;
-                SetTileVec3(sums, gradient);
+                SetTileVec3(sums, force);
                 SetTileVec3(sums + 3, impulse);
                 sums[6] = hessian.xx;
                 sums[7] = hessian.yy;
@@ -1976,16 +2020,13 @@ __global__ void DescendParticlesKernel(ModelView model, DataView data, BlockDesc
             const Vec3 u = TileVec3(v.u);
             const Vec3 free_rate = TileVec3(v.free_rate);
             const float inertia = v.inertia;
-            const Vec3 gradient = TileVec3(sums);
-            const Vec3 impulse = TileVec3(sums + 3);
+            const Vec3 force = TileVec3(sums);
             SymmetricMat3 hessian{sums[6], sums[7], sums[8], sums[9], sums[10], sums[11]};
             Vec3 direction{};
             Vec3 primal_force{};
             float slope = 0.0f;
             uint32_t valid = 0u;
             nk::vbd::AddIdentity(hessian, inertia);
-            const Vec3 force = -nk::vbd::InertialGradient(u, free_rate, inertia, p.dt) -
-                               gradient + impulse / p.dt;
             primal_force = force;
             SymmetricMat3 inverse{};
             if (Finite(force) && nk::vbd::Invert(hessian, 0.0f, &inverse)) {
@@ -2143,8 +2184,8 @@ __global__ void DescendParticlesKernel(ModelView model, DataView data, BlockDesc
     }
 }
 
-// A seeded row's endpoints keep their velocities until its lowest color's next cache, which would compute
-// the state stored here; grid-only rows read the residuals grid descents keep current instead of recomputing.
+// Seed the next sweep from the committed velocities; incremental grid residuals accumulate rounding
+// within a sweep and must not carry that error into later multiplier updates.
 __global__ void DualUpdateKernel(DataView data, BlockDescentSolveParams p, BlockScratch s, bool seed) {
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
     uint32_t env = ~0u, joint = 0u, step = 0u;
@@ -2158,9 +2199,7 @@ __global__ void DualUpdateKernel(DataView data, BlockDescentSolveParams p, Block
             continue;
         }
         const bool grid_only = p.total_grid_count != 0u && GridOnlyRow(s, p.vertex_blocks.colors, slot);
-        AugmentedRowState current = grid_only ? s.row_state[slot] : ComputeAugmentedRowState(data, p, s, slot, false);
-        if (grid_only)
-            current.normal_bound = AugmentedRowBound(s, rows[slot], slot, current);
+        const AugmentedRowState current = ComputeAugmentedRowState(data, p, s, slot, false);
         const LocalTerm t = LoadLocalTerm(data, p, s, slot, ~0u, false, &current);
         const uint32_t stride = rows[slot].group_normal_count;
         const Vec3 next = t.elliptic
@@ -2181,13 +2220,13 @@ __global__ void DualUpdateKernel(DataView data, BlockDescentSolveParams p, Block
             const Vec3 delta = nk::augmented::EllipticMultiplierStep(t.dual, next, t.penalty, t.cone_compliance);
             change = {delta.x, fmaxf(delta.y, delta.z)};
         }
-        if (!t.contact) joint = max(joint, ResidualBits(change.x));
+        if (!t.contact && !(rows[slot].flags & nk::nk_row_flags::kContactNormal))
+            joint = max(joint, ResidualBits(change.x));
         step = max(step, ResidualBits(fmaxf(change.x, change.y)));
         // The primal reads the extrapolated multipliers; the unextrapolated ones stay in dual_base.
         const Vec3 base{s.dual_base[slot], t.contact ? s.dual_base[slot + stride] : 0.0f,
                         t.contact ? s.dual_base[slot + 2u * stride] : 0.0f};
-        const bool extrapolate = t.elliptic ? nk::augmented::EllipticFraction(t.penalty, t.cone_compliance) < 1.0f
-                                            : t.contact || t.response.dual_scale != 0.0;
+        const bool extrapolate = t.contact || t.response.dual_scale != 0.0;
         const Vec3 y = ExtrapolateDual(base, next, extrapolate ? s.dual_momentum[row_env].beta : 0.0f, t.lower, t.upper, t.contact,
                                        t.mu_first, t.mu_second);
         s.dual_base[slot] = next.x;
@@ -2356,7 +2395,8 @@ __global__ void ContactResidualsKernel(DataView data, BlockDescentSolveParams p,
         const uint32_t slot = s.active_rows[item];
         const NkRow row = rows[slot];
         const uint32_t row_env = slot / p.rows_per_env;
-        if (!(row.flags & nk::nk_row_flags::kBlockNormal) || !EnvRunning(data, row_env)) continue;
+        if (!(row.flags & (nk::nk_row_flags::kBlockNormal | nk::nk_row_flags::kContactNormal)) ||
+            !EnvRunning(data, row_env)) continue;
         if (row_env != env && env != ~0u) {
             RaiseResidual(s, env, kResidualNormal, normal);
             RaiseResidual(s, env, kResidualTangent, tangent);
@@ -2364,7 +2404,7 @@ __global__ void ContactResidualsKernel(DataView data, BlockDescentSolveParams p,
         }
         env = row_env;
         if (prune && Past(p, s, env, kResidualNormal, normal) && Past(p, s, env, kResidualTangent, tangent)) continue;
-        if (row.flags & nk::nk_row_flags::kMuJoCo) {
+        if ((row.flags & nk::nk_row_flags::kMuJoCo) && (row.flags & nk::nk_row_flags::kBlockNormal)) {
             const LocalTerm t = LoadLocalTerm(data, p, s, slot, ~0u, false);
             const auto f = nk::augmented::EvaluateEllipticImpulse(t.dual, t.penalty, t.residual,
                                                                   t.cone_compliance, t.mu_first);
@@ -2411,7 +2451,7 @@ __global__ void MeasureRowsKernel(DataView data, BlockDescentSolveParams p, Bloc
          item += gridDim.x * blockDim.x) {
         const uint32_t slot = s.active_rows[item];
         const NkRow row = rows[slot];
-        if (!(row.flags & nk::nk_row_flags::kBlockNormal)) continue;
+        if (!(row.flags & (nk::nk_row_flags::kBlockNormal | nk::nk_row_flags::kContactNormal))) continue;
         const auto residual = ContactRowResidual(data, p, s, slot, row);
         const uint32_t env = slot / p.rows_per_env;
         atomicAdd(data.contact_solve_counts + env * constraint::kContactSolveCountSize, 1u);
@@ -3120,17 +3160,20 @@ Status SolveBlockDescent(const ModelView& model, const DataView& data,
              LaunchWork(VertexResidualsKernel, p->vertex_blocks.dynamic_vertices * p->env_count, kThreads / 32u,
                  stream, model, measured, *p, s) != cudaSuccess))
             return Status::Failed;
-        if (p->velocity_tolerance > 0.0f && (p->total_body_count > 0u || p->articulation_count > 0u)) {
+        if (p->total_grid_count > 0u &&
+            LaunchWork(MeasureGridPrimalsKernel, p->total_grid_count, kThreads / 32u,
+                stream, data, *p, s) != cudaSuccess) return Status::Failed;
+        if (p->total_body_count > 0u || p->articulation_count > 0u) {
             if (!stamp(kPhaseDense, stream)) return Status::Failed;
             if (p->articulation_count > 0u) {
                 const auto kernel = p->max_independent_dof <= 32u ? MeasureDensePrimalsKernel<32u, false>
                     : MeasureDensePrimalsKernel<kMaxArticulationDof, false>;
-                LaunchCuda(kernel, dim3(p->articulation_count), dim3(kThreads), 0u, stream, data, *p, s);
+                LaunchCuda(kernel, dim3(p->articulation_count), dim3(kThreads), 0u, stream, measured, *p, s);
                 if (cudaGetLastError() != cudaSuccess) return Status::Failed;
             }
             if (p->total_body_count > 0u)
                 LaunchCuda(MeasureDensePrimalsKernel<kRigidBlockDof, true>, dim3(p->total_body_count),
-                           dim3(kRigidThreads), 0u, stream, data, *p, s);
+                           dim3(kRigidThreads), 0u, stream, measured, *p, s);
             if (cudaGetLastError() != cudaSuccess || !stamp(kPhaseCheck, stream)) return Status::Failed;
         }
         LaunchCuda(FinishSweepKernel, dim3(1u), dim3(kThreads), 0u, stream, data, *p, s, loop, graph);
@@ -3207,13 +3250,13 @@ __global__ void InitializePositionRowsKernel(DataView data, BlockDescentSolvePar
             (row.flags & kinds) != 0u) {
             const float slop = (row.flags & nk::nk_row_flags::kSpeculative) != 0u ? 0.0f : p.position_slop;
             const float penetration = data.row_penetration[slot];
-            if (penetration > slop || data.lambda[slot] != 0.0f) {
+            if ((row.flags & nk::nk_row_flags::kSpeculative) != 0u ||
+                penetration > slop || data.lambda[slot] != 0.0f) {
                 position = row;
                 position.flags = nk::nk_row_flags::kActive | (row.flags & kinds);
                 position.group_first = slot;
                 position.group_normal_count = 1u;
-                const float bias = fminf(p.position_beta * fmaxf(penetration - slop, 0.0f) / p.dt,
-                                         p.position_max_velocity);
+                const float bias = PositionRowBias(data, p, row, slot, slop);
                 position.rhs = bias / p.dt;
                 position.compliance_alpha = 0.0f;
                 position.lower = 0.0f;

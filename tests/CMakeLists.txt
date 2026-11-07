@@ -22,6 +22,7 @@ gtest_discover_tests(nuka_smoke_test
 add_executable(nuka_math_test
     math/test_spatial_math.cpp
     math/test_hencky_j2.cpp
+    math/test_contact_tangent.cpp
 )
 
 target_link_libraries(nuka_math_test
