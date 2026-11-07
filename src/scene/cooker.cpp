@@ -624,6 +624,7 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
     blob.bodies.inv_masses.reserve(bodies.size());
     blob.bodies.inv_inertias.reserve(bodies.size());
     blob.bodies.is_static.reserve(bodies.size());
+    blob.bodies.gravity_compensation.reserve(bodies.size());
 
     for (const auto& b : bodies) {
         blob.bodies.poses.push_back(ResolveWorldTransform(scene, b.id));
@@ -645,6 +646,7 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
         }
 
         blob.bodies.is_static.push_back(b.is_static ? uint8_t(1) : uint8_t(0));
+        blob.bodies.gravity_compensation.push_back(b.gravity_compensation);
     }
 
     const auto& joints = scene.Joints();
@@ -663,6 +665,7 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
     blob.joints.initial_positions.reserve(joints.size());
     blob.joints.frictionlosses.reserve(joints.size());
     blob.joints.actuator_force_limits.reserve(joints.size());
+    blob.joints.actuator_gravity_compensation.reserve(joints.size());
     blob.joints.stiffnesses.reserve(joints.size());
     blob.joints.spring_references.reserve(joints.size());
     blob.joints.mimic_sources.reserve(joints.size());
@@ -687,6 +690,7 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
         blob.joints.initial_positions.push_back(j.initial_position);
         blob.joints.frictionlosses.push_back(j.frictionloss);
         blob.joints.actuator_force_limits.push_back(j.actuator_force_limit);
+        blob.joints.actuator_gravity_compensation.push_back(j.actuator_gravity_compensation ? 1u : 0u);
         blob.joints.stiffnesses.push_back(j.stiffness);
         blob.joints.spring_references.push_back(j.spring_reference);
         blob.joints.law_sources.push_back(j.law_source);

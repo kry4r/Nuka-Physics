@@ -560,6 +560,9 @@ void Model::StageModelField(FieldId id, const Segment& seg,
         case FieldId::JointArmature:
             StampPerLink(dst, a.joint_armature, L, E, sizeof(float));
             break;
+        case FieldId::JointActuatorGravityCompensation:
+            StampPerLink(dst, a.joint_actuator_gravity_compensation, L, E, sizeof(uint32_t));
+            break;
         case FieldId::JointFrictionloss:
             StampPerLink(dst, a.joint_frictionloss, L, E, sizeof(float));
             break;
@@ -1184,6 +1187,7 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::Heights:               v.heights = static_cast<float*>(p); break;
         case FieldId::JointDamping:          v.joint_damping = static_cast<float*>(p); break;
         case FieldId::JointArmature:         v.joint_armature = static_cast<float*>(p); break;
+        case FieldId::JointActuatorGravityCompensation: v.joint_actuator_gravity_compensation = static_cast<uint32_t*>(p); break;
         case FieldId::JointFrictionloss:     v.joint_frictionloss = static_cast<float*>(p); break;
         case FieldId::JointStiffness:        v.joint_stiffness = static_cast<float*>(p); break;
         case FieldId::JointSpringReference:  v.joint_spring_reference = static_cast<float*>(p); break;
@@ -1609,6 +1613,11 @@ phi::Status Model::ValidateTopology(std::string* reason) const {
     }
     if (body_init.size() > cap.bodies_per_env)
         return reject(Status::InvalidArgument, "body state exceeds the declared topology");
+    if (body_gravity_compensation.size() > cap.bodies_per_env)
+        return reject(Status::InvalidArgument, "gravity compensation exceeds the body topology");
+    for (float compensation : body_gravity_compensation)
+        if (!std::isfinite(compensation))
+            return reject(Status::InvalidArgument, "body gravity compensation must be finite");
     for (const auto& body : body_init) {
         if (!std::isfinite(body.inv_mass) || body.inv_mass < 0.0f)
             return reject(Status::InvalidArgument, "body inverse mass must be finite and nonnegative");
@@ -2041,6 +2050,7 @@ void MoveModelMembers(Model& dst, Model&& src) {
     for (int k = 0; k < 2; ++k) dst.contact_solref[k] = src.contact_solref[k];
     for (int k = 0; k < 5; ++k) dst.contact_solimp[k] = src.contact_solimp[k];
     dst.body_init = std::move(src.body_init);
+    dst.body_gravity_compensation = std::move(src.body_gravity_compensation);
     dst.dof_to_link = std::move(src.dof_to_link);
     dst.dof_to_component = std::move(src.dof_to_component);
     // M5 pair-driven / SDF tables (review fix: these were MISSING — a moved

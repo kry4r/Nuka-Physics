@@ -82,6 +82,9 @@ struct ApplyDrivesParams {
     uint32_t defer_velocity_damping;
     uint32_t mode;
     uint32_t links_per_env;
+    uint32_t bodies_per_env = 0u;
+    uint32_t articulation_count = 0u;
+    float gravity[3] = {};
 };
 
 struct ApplyDynamicsDrivesParams {
@@ -113,6 +116,8 @@ struct ArticulationDynamicsParams {
     uint32_t total_link_count;
     uint32_t apply_link_wrench = 0u;
     uint32_t max_links = 0u;   // links of the largest articulation
+    uint32_t links_per_env = 0u;
+    uint32_t bodies_per_env = 0u;
 };
 
 struct ReferenceWeightsParams {
@@ -132,6 +137,7 @@ struct ArticulationDampingParams {
     uint32_t total_link_count;
     uint32_t actuator_derivative;
     uint32_t mode;
+    uint32_t readout_drives = 0u;
 };
 
 struct IntegrateVelocityParams {

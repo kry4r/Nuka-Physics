@@ -10,7 +10,9 @@
 #include "import/mjcf_importer.hpp"
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/pipeline/world.hpp"
+#include "nk/readout/energy_ledger.hpp"
 #include "scene/cook/cook_to_model.hpp"
+#include "scene/format/nks.hpp"
 
 namespace {
 namespace nk = nuka::nk;
@@ -25,7 +27,7 @@ Backend& Device() {
     return backend;
 }
 
-void CheckDryFrictionResponse(bool coupled) {
+void CheckDryFrictionResponse(bool coupled, bool compliant) {
     auto& backend = Device();
     if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
     const auto fixture = std::filesystem::path(NUKA_SOURCE_DIR) /
@@ -33,13 +35,16 @@ void CheckDryFrictionResponse(bool coupled) {
     for (uint32_t drive_mode : {1u, 4u}) {
         for (uint32_t fold_damping : {0u, 1u}) {
             for (float speed : {0.05f, 0.0001f}) {
-                SCOPED_TRACE(::testing::Message() << "coupled=" << coupled
+                SCOPED_TRACE(::testing::Message() << "coupled=" << coupled << " compliant=" << compliant
                     << " mode=" << drive_mode
                     << " fold=" << fold_damping << " speed=" << speed);
                 auto scene = nuka::import::LoadMjcf(fixture.string());
                 auto& joint = scene.GetJointMut(scene.Joints().back().id);
                 joint.damping = 0.0f;
                 joint.frictionloss = 1.0f;
+                joint.law_source = compliant ? nuka::constraint::LawSource::MuJoCo
+                                            : nuka::constraint::LawSource::None;
+                joint.friction_reference = {};
                 if (coupled) joint.axis = {1.0f, 0.0f, 0.0f};
                 nuka::scene::cook::CookToModelOptions options;
                 options.enable_contacts = false;
@@ -69,8 +74,11 @@ void CheckDryFrictionResponse(bool coupled) {
                 for (uint32_t env = 0; env < 2u; ++env) {
                     const uint32_t hand = env * 3u + 1u;
                     const uint32_t finger = hand + 1u;
-                    const float impulse = -std::copysign(
-                        std::min(config.dt, speed / inverse_diagonal), velocity[finger]);
+                    // The imported law uses a damped acceleration reference and positive impedance compliance.
+                    const float stopping_impulse = compliant
+                        ? config.dt * (2.0f / (0.95f * 0.02f)) * speed / (inverse_diagonal / 0.9f)
+                        : speed / inverse_diagonal;
+                    const float impulse = -std::copysign(std::min(config.dt, stopping_impulse), velocity[finger]);
                     EXPECT_NEAR(after[finger], velocity[finger] + inverse_diagonal * impulse, 2.0e-6f);
                     EXPECT_NEAR(after[hand], inverse_cross * impulse, 2.0e-6f);
                 }
@@ -81,7 +89,7 @@ void CheckDryFrictionResponse(bool coupled) {
 }
 
 // OSC compensation must preserve passive damping on an unpowered child joint.
-// Orthogonal sliders give diagonal inertia and an analytic one-step decay.
+// Orthogonal sliders give diagonal inertia and an analytic implicit damping step.
 TEST(OscPassiveDamping, CompensationPreservesUnpoweredGripperDamping) {
     auto& backend = Device();
     if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
@@ -114,18 +122,94 @@ TEST(OscPassiveDamping, CompensationPreservesUnpoweredGripperDamping) {
     ASSERT_TRUE(data.DownloadField(nk::FieldId::ActuatorEffort, effort.data(), effort.size() * sizeof(float)));
     for (uint32_t env = 0; env < 2u; ++env) {
         const auto finger = env * 3u + 2u;
-        const float expected = velocity[finger] * (1.0f - config.dt * 100.0f / 1.1f);
+        const float expected = velocity[finger] / (1.0f + config.dt * 100.0f / 1.1f);
         EXPECT_NEAR(effort[finger], 0.0f, 2.0e-5f);
         EXPECT_NEAR(after[finger], expected, 2.0e-6f);
     }
 }
 
+TEST(OscPassiveDamping, GravityCompensationPreservesBodyWeightsAndJointForceLimits) {
+    auto& backend = Device();
+    if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    const auto fixture = std::filesystem::path(NUKA_SOURCE_DIR) / "tests/data/gravity_compensation.xml";
+    const auto imported = nuka::import::LoadMjcf(fixture.string());
+    ASSERT_EQ(imported.Joints().size(), 2u);
+    EXPECT_TRUE(imported.Joints().front().actuator_gravity_compensation);
+    const auto saved = std::filesystem::temp_directory_path() / "nuka_gravity_compensation.nks";
+    nuka::scene::nks::Save(imported, saved.string());
+    const auto restored = nuka::scene::nks::Load(saved.string());
+    for (uint32_t body = 0u; body < imported.Bodies().size(); ++body)
+        EXPECT_FLOAT_EQ(imported.GetBody(body).gravity_compensation, restored.GetBody(body).gravity_compensation);
+    EXPECT_TRUE(restored.Joints().front().actuator_gravity_compensation);
+    std::filesystem::remove(saved);
+    std::filesystem::remove(saved.parent_path() / (saved.stem().string() + ".nka"));
+    for (bool actuated : {false, true}) {
+      for (float joint_limit : {0.0f, 10.0f}) {
+        SCOPED_TRACE(::testing::Message() << "actuated=" << actuated << " joint_limit=" << joint_limit);
+        auto source = restored;
+        source.GetJointMut(source.Joints().front().id).actuator_gravity_compensation = actuated;
+        nuka::scene::cook::CookToModelOptions options;
+        options.enable_contacts = false;
+        auto model = nuka::scene::cook::CookToModel(source, 1u, options).model;
+        const uint32_t links = model.capacities.links_per_env;
+        ASSERT_EQ(links, 3u);
+        model.drive_mode = 1u;
+        model.hold_drives.targets.assign(links, 0.0f);
+        model.hold_drives.targets[1] = 4.0f;
+        model.hold_drives.stiffness.assign(links, 0.0f);
+        model.hold_drives.damping.assign(links, 0.0f);
+        model.hold_drives.force_limits.assign(links, 3.0f);
+        model.hold_drives.joint_force_limits.assign(links, joint_limit);
+        model.articulation.initial_qdot.assign(links, 0.0f);
+        model.articulation.initial_qdot[1] = 0.1f;
+        nk::Pipeline::SolverConfig config;
+        config.dt = 0.001f;
+        config.pos_iters = 0u;
+        config.gravity[0] = config.gravity[1] = 0.0f;
+        config.gravity[2] = -9.81f;
+        nk::World world(std::move(model), 2u, backend.device, backend.backend, config);
+        ASSERT_TRUE(world.Ready());
+        ASSERT_NE(world.FieldPtr(nk::FieldId::EnergyLedger), nullptr);
+        const float compensation = 19.62f;
+        const float requested = 3.0f + (actuated ? compensation : 0.0f);
+        const float effort = joint_limit > 0.0f ? std::min(requested, joint_limit) : requested;
+        const float speed = 0.1f + config.dt *
+            (-29.43f + effort + (actuated ? 0.0f : compensation)) / 3.0f;
+        for (bool planned : {false, true}) {
+            if (planned) ASSERT_EQ(world.Reset({0u, 1u}), phi::Status::Ok);
+            std::vector<float> command(links * 2u, 0.0f);
+            command[1] = command[links + 1u] = 4.0f;
+            ASSERT_TRUE(world.GetData().UploadField(nk::FieldId::DriveTarget, command.data(), command.size() * sizeof(float)));
+            ASSERT_EQ(planned ? world.StepPlanned() : world.Step().result, phi::Status::Ok);
+            std::vector<float> velocity(links * 2u), applied(links * 2u), projected(links * 2u);
+            auto& data = world.GetData();
+            ASSERT_TRUE(data.DownloadField(nk::FieldId::Qdot, velocity.data(), velocity.size() * sizeof(float)));
+            ASSERT_TRUE(data.DownloadField(nk::FieldId::ActuatorEffort, applied.data(), applied.size() * sizeof(float)));
+            ASSERT_TRUE(data.DownloadField(nk::FieldId::JointGravityForce, projected.data(), projected.size() * sizeof(float)));
+            std::vector<float> ledger(2u * nk::kEnergyColumnCount);
+            ASSERT_TRUE(data.DownloadField(nk::FieldId::EnergyLedger, ledger.data(), ledger.size() * sizeof(float)));
+            for (uint32_t env = 0u; env < 2u; ++env) {
+                EXPECT_NEAR(velocity[env * links + 1u], speed, 2.0e-6f);
+                EXPECT_NEAR(applied[env * links + 1u], effort, 2.0e-5f);
+                EXPECT_NEAR(projected[env * links + 1u], actuated ? compensation : 0.0f, 2.0e-5f);
+                const auto value = [&](nk::EnergyColumn c) { return ledger[env * nk::kEnergyColumnCount + uint32_t(c)]; };
+                EXPECT_NEAR(value(nk::EnergyColumn::ExternalWork),
+                    actuated ? 0.0f : 0.5f * compensation * (0.1f + speed) * config.dt, 2.0e-7f);
+                EXPECT_NEAR(value(nk::EnergyColumn::DriveWork), effort * speed * config.dt, 2.0e-7f);
+            }
+        }
+      }
+    }
+}
+
 TEST(JointDryFriction, DecayAndStickingWithoutContactsInBothControlModes) {
-    CheckDryFrictionResponse(false);
+    CheckDryFrictionResponse(false, false);
+    CheckDryFrictionResponse(false, true);
 }
 
 TEST(JointDryFriction, ImpulsePropagatesThroughTheCoupledMassMatrix) {
-    CheckDryFrictionResponse(true);
+    CheckDryFrictionResponse(true, false);
+    CheckDryFrictionResponse(true, true);
 }
 
 namespace {
@@ -260,6 +344,66 @@ TEST(ControlModes, BoundedEffortMatchesAnalyticFixedAndFloatingMassResponse) {
                 }
             }
         }
+    }
+}
+
+TEST(ControlModes, ImplicitDampingEffortAndWorkMatchAnalyticImpulse) {
+    auto& backend = Device();
+    if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    nuka::scene::cook::CookToModelOptions options;
+    options.enable_contacts = false;
+    for (bool derivative : {false, true}) for (float limit : {0.0f, 0.25f}) {
+      for (float joint_limit : {0.0f, 0.15f}) {
+        SCOPED_TRACE(::testing::Message() << "derivative=" << derivative << " limit=" << limit
+                     << " joint_limit=" << joint_limit);
+        auto source = SliderControlScene(false, 1u, 1u, false);
+        source.SolverOptionsMut().law_source = nuka::constraint::LawSource::MuJoCo;
+        source.SolverOptionsMut().integrator = derivative ? nuka::constraint::Integrator::ImplicitFast
+                                                         : nuka::constraint::Integrator::Euler;
+        auto model = nuka::scene::cook::CookToModel(source, 1u, options).model;
+        model.drive_mode = 0u;
+        model.hold_drives.joint_force_limits = {0.0f, joint_limit};
+        nk::Pipeline::SolverConfig cfg;
+        cfg.dt = 0.01f;
+        cfg.gravity[0] = cfg.gravity[1] = cfg.gravity[2] = 0.0f;
+        nk::World world(std::move(model), 2u, backend.device, backend.backend, cfg);
+        ASSERT_TRUE(world.Ready()) << world.CreationError();
+        ASSERT_NE(world.FieldPtr(nk::FieldId::EnergyLedger), nullptr);
+        for (bool planned : {false, true}) {
+            if (planned) ASSERT_EQ(world.Reset({0u, 1u}), phi::Status::Ok);
+            WriteControl(world, nk::FieldId::Q, {0, 0.1f, 0, 0.1f});
+            WriteControl(world, nk::FieldId::Qdot, {0, 0.2f, 0, -0.2f});
+            WriteControl(world, nk::FieldId::DriveTarget, {0, 0.3f, 0, 0.3f});
+            WriteControl(world, nk::FieldId::VelocityTarget, {0, -0.1f, 0, -0.1f});
+            WriteControl(world, nk::FieldId::DriveStiffness, {0, 20, 0, 20});
+            WriteControl(world, nk::FieldId::DriveDamping, {0, 4, 0, 4});
+            WriteControl(world, nk::FieldId::DriveForceLimit, {0, limit, 0, limit});
+            WriteControl(world, nk::FieldId::JointF, {0, 0.25f, 0, 0.25f});
+            ASSERT_EQ(planned ? world.StepPlanned() : world.Step().result, phi::Status::Ok);
+            const auto speed = ControlField<float>(world, nk::FieldId::Qdot);
+            const auto effort = ControlField<float>(world, nk::FieldId::ActuatorEffort);
+            const auto requested = ControlField<float>(world, nk::FieldId::ActuatorEffortRequested);
+            const auto ledger = ControlField<float>(world, nk::FieldId::EnergyLedger);
+            for (uint32_t env = 0u; env < 2u; ++env) {
+                const uint32_t link = env * 2u + 1u;
+                const double initial = env == 0u ? 0.2 : -0.2;
+                const double command = 4.0 + 4.0 * (-0.1 - initial);
+                const double gain = derivative && (limit == 0.0f || std::abs(command) <= limit) ? 4.0 : 0.0;
+                double applied = limit > 0.0f ? std::clamp(command, -double(limit), double(limit)) : command;
+                if (joint_limit > 0.0f) applied = std::clamp(applied, -double(joint_limit), double(joint_limit));
+                const double end = (2.4 * initial + cfg.dt * (0.25 + applied + gain * initial)) /
+                                   (2.4 + cfg.dt * (0.7 + gain));
+                const double correction = gain * (end - initial);
+                EXPECT_NEAR(speed[link], end, 2.0e-6);
+                EXPECT_NEAR(effort[link], applied - correction, 3.0e-5);
+                EXPECT_NEAR(requested[link], command - correction, 3.0e-5);
+                const auto value = [&](nk::EnergyColumn column) { return ledger[env * nk::kEnergyColumnCount + uint32_t(column)]; };
+                EXPECT_NEAR(value(nk::EnergyColumn::DriveWork), (applied - correction) * end * cfg.dt, 2.0e-7);
+                EXPECT_NEAR(value(nk::EnergyColumn::ExternalWork), 0.25 * end * cfg.dt, 2.0e-7);
+                EXPECT_NEAR(value(nk::EnergyColumn::PassiveLoss), 0.7 * end * end * cfg.dt, 2.0e-7);
+            }
+        }
+      }
     }
 }
 

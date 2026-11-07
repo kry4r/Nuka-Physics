@@ -352,6 +352,9 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
             !mujoco_damping && cfg.defer_velocity_damping && cfg.fold_drive_damping;
         p_apply_drives_.links_per_env = base_link_count;
         p_apply_drives_.mode = model.drive_mode;
+        p_apply_drives_.bodies_per_env = cap.bodies_per_env;
+        p_apply_drives_.articulation_count = articulation_cnt;
+        std::copy(std::begin(cfg.gravity), std::end(cfg.gravity), p_apply_drives_.gravity);
 
         p_dynamics_.gravity[0] = cfg.gravity[0];
         p_dynamics_.gravity[1] = cfg.gravity[1];
@@ -359,6 +362,8 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_dynamics_.articulation_count = articulation_cnt;
         p_dynamics_.total_link_count = total_link_count;
         p_dynamics_.max_links = base_link_count;
+        p_dynamics_.links_per_env = base_link_count;
+        p_dynamics_.bodies_per_env = cap.bodies_per_env;
         p_dynamics_.apply_link_wrench = 1u;
         p_dynamics_.dt = cfg.dt;
         p_dynamics_.max_dof = max_dof;
@@ -877,18 +882,6 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         add(phi::NkOp::BlockDescentSolve, &p_block_descent_);
     }
 
-    if (mujoco_damping) {
-        p_damping_.dt = cfg.dt;
-        p_damping_.max_dof = max_dof;
-        p_damping_.articulation_count = articulation_cnt;
-        p_damping_.total_link_count = total_link_count;
-        p_damping_.mode = model.drive_mode;
-        p_damping_.actuator_derivative =
-            model.solver_options.integrator == constraint::Integrator::ImplicitFast ||
-            model.solver_options.integrator == constraint::Integrator::Implicit;
-        add(phi::NkOp::ArticulationDamping, &p_damping_);
-    }
-
     if (cap.joint_drive_rows_per_env > 0u) {
         p_readout_drives_.dt = cfg.dt;
         p_readout_drives_.total_link_count = total_link_count;
@@ -897,6 +890,19 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_readout_drives_.first_drive_row = contact_rows_per_env +
             cap.joint_limit_rows_per_env + cap.joint_friction_rows_per_env;
         add(phi::NkOp::ReadoutDrives, &p_readout_drives_);
+    }
+
+    if (mujoco_damping) {
+        p_damping_.dt = cfg.dt;
+        p_damping_.max_dof = max_dof;
+        p_damping_.articulation_count = articulation_cnt;
+        p_damping_.total_link_count = total_link_count;
+        p_damping_.mode = model.drive_mode;
+        p_damping_.readout_drives = cap.joint_drive_rows_per_env > 0u ? 1u : 0u;
+        p_damping_.actuator_derivative =
+            model.solver_options.integrator == constraint::Integrator::ImplicitFast ||
+            model.solver_options.integrator == constraint::Integrator::Implicit;
+        add(phi::NkOp::ArticulationDamping, &p_damping_);
     }
 
     energy(EnergyStage::Solved);

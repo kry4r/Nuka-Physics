@@ -1,0 +1,16 @@
+<mujoco model="gravity_compensation">
+  <default>
+    <joint actuatorgravcomp="true"/>
+  </default>
+  <worldbody>
+    <body name="base">
+      <body name="slider" gravcomp="0.5">
+        <joint name="vertical" type="slide" axis="0 0 1"/>
+        <inertial pos="0.2 0.1 0" mass="2" diaginertia="1 1 1"/>
+        <body name="payload" pos="0.3 0 0" gravcomp="1">
+          <inertial pos="0 0.1 0" mass="1" diaginertia="0.1 0.1 0.1"/>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>

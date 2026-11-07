@@ -184,6 +184,7 @@ struct ModelArticulation {
     std::vector<float>            link_inertia_spatial;  // 36 floats / link (flat)
     std::vector<float>            joint_damping;
     std::vector<float>            joint_armature;
+    std::vector<uint32_t>         joint_actuator_gravity_compensation;
     std::vector<float>            joint_frictionloss;    // MuJoCo joint dry friction bound
     std::vector<float>            joint_stiffness;
     std::vector<float>            joint_spring_reference;
@@ -493,6 +494,7 @@ public:
         math::Transform inertial_frame = math::Transform::Identity();
     };
     std::vector<BodyInit> body_init;
+    std::vector<float> body_gravity_compensation;
     // The flat-DOF -> (template-local link, base component) maps (the legacy
     // DofIndexOf prefix-sum inverse; component == ~0u for scalar joints). Cooked
     // by the union cook; staged into the dof_to_link/dof_to_component fields.

@@ -113,6 +113,7 @@ struct MjcfJointDefaults {
     float armature = 0.0f;
     float frictionloss = 0.0f;
     float actuator_force_limit = 0.0f;
+    bool actuator_gravity_compensation = false;
     float stiffness = 0.0f;
     float spring_reference = 0.0f;
     constraint::SolverReference limit_reference;
@@ -327,6 +328,7 @@ void ApplyJointDefault(tinyxml2::XMLElement* joint_elem, MjcfDefaultClass* defau
     joint_elem->QueryFloatAttribute("armature", &defaults->joint.armature);
     joint_elem->QueryFloatAttribute("frictionloss", &defaults->joint.frictionloss);
     ParseActuatorForceRange(joint_elem, defaults->joint.actuator_force_limit);
+    joint_elem->QueryBoolAttribute("actuatorgravcomp", &defaults->joint.actuator_gravity_compensation);
     joint_elem->QueryFloatAttribute("stiffness", &defaults->joint.stiffness);
     joint_elem->QueryFloatAttribute("springref", &defaults->joint.spring_reference);
     joint_elem->QueryFloatAttribute("margin", &defaults->joint.limit_margin);
@@ -1059,6 +1061,7 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
     // construction placeholder into imported physics.
     rec.mass = 0.0f;
     rec.inertia = math::Vec3::Zero();
+    body_elem->QueryFloatAttribute("gravcomp", &rec.gravity_compensation);
     if (const char* pos_attr = body_elem->Attribute("pos")) {
         rec.local_transform.position = ParseVec3(pos_attr);
     }
@@ -1184,6 +1187,7 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         jrec.armature = defaults.joint.armature;
         jrec.frictionloss = defaults.joint.frictionloss;
         jrec.actuator_force_limit = defaults.joint.actuator_force_limit;
+        jrec.actuator_gravity_compensation = defaults.joint.actuator_gravity_compensation;
         jrec.stiffness = defaults.joint.stiffness;
         jrec.spring_reference = defaults.joint.spring_reference;
         jrec.law_source = constraint::LawSource::MuJoCo;
@@ -1199,6 +1203,7 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         joint->QueryFloatAttribute("armature", &jrec.armature);
         joint->QueryFloatAttribute("frictionloss", &jrec.frictionloss);
         ParseActuatorForceRange(joint, jrec.actuator_force_limit);
+        joint->QueryBoolAttribute("actuatorgravcomp", &jrec.actuator_gravity_compensation);
         joint->QueryFloatAttribute("stiffness", &jrec.stiffness);
         joint->QueryFloatAttribute("springref", &jrec.spring_reference);
         joint->QueryFloatAttribute("margin", &jrec.limit_margin);

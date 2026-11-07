@@ -26,6 +26,7 @@ struct CookedBodyTable {
     std::vector<float>           inv_masses;   // 1/mass, 0 for static
     std::vector<math::Vec3>      inv_inertias; // diagonal inverse inertia
     std::vector<uint8_t>         is_static;    // flags
+    std::vector<float>           gravity_compensation;
 };
 
 struct CookedJointTable {
@@ -43,6 +44,7 @@ struct CookedJointTable {
     std::vector<float>      initial_positions;
     std::vector<float>      frictionlosses;
     std::vector<float>      actuator_force_limits;
+    std::vector<uint8_t>    actuator_gravity_compensation;
     std::vector<float>      stiffnesses;
     std::vector<float>      spring_references;
     std::vector<constraint::LawSource> law_sources;

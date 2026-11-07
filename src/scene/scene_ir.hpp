@@ -52,6 +52,7 @@ struct RigidBodyRecord {
     float mass                             = 1.0f;
     math::Vec3 inertia                     = {1.0f, 1.0f, 1.0f};
     bool is_static                         = false;
+    float gravity_compensation             = 0.0f;
 };
 
 struct CollisionShapeRecord {
@@ -140,6 +141,7 @@ struct JointRecord {
     float initial_position                 = 0.0f;
     float frictionloss                     = 0.0f;   // MuJoCo joint dry friction
     float actuator_force_limit             = 0.0f;   // MuJoCo actfrcrange on the summed drive; 0 is unlimited
+    bool actuator_gravity_compensation     = false;
     constraint::LawSource law_source       = constraint::LawSource::None;
     constraint::SolverReference limit_reference;
     constraint::SolverReference friction_reference;

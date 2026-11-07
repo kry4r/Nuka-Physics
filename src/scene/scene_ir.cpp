@@ -1060,6 +1060,7 @@ void SceneIR::ProjectBody(const RigidBodyRecord& rec) {
     rb.inertia_diag   = rec.inertia;
     rb.inertial_frame = rec.inertial_transform;
     rb.kinematic      = rec.is_static;
+    rb.gravity_compensation = rec.gravity_compensation;
     ecs_.Add(entity, std::move(rb));
 
     // Articulated routing is decided at cook (M3); keep Rigid for all for now.
@@ -1198,6 +1199,7 @@ void SceneIR::ProjectJoint(const JointRecord& rec) {
     jc.limit_hi   = rec.upper_limit;
     jc.damping    = rec.damping;
     jc.armature   = rec.armature;
+    jc.actuator_gravity_compensation = rec.actuator_gravity_compensation;
     ecs_.Add(target, std::move(jc));
 
     joint_entity_[rec.id] = target;

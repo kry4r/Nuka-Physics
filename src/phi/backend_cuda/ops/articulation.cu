@@ -375,6 +375,53 @@ __device__ void PrepareArticulationKinematics(ArticulationDeviceState state,
     __syncthreads();
 }
 
+__device__ void LinkGravityCompensation(const ArticulationDeviceState& state, const DataView& data,
+    uint32_t link, uint32_t links_per_env, uint32_t bodies_per_env, math::Vec3 gravity, float* force) {
+    Zero6(force);
+    if (links_per_env == 0u || bodies_per_env == 0u) return;
+    const uint32_t local_body = state.link_body[link];
+    if (local_body >= bodies_per_env) return;
+    const uint32_t body = (link / links_per_env) * bodies_per_env + local_body;
+    const float compensation = data.body_gravity_compensation[body];
+    if (compensation == 0.0f) return;
+    const auto local = RotateByQuatInverse(state.link_pose[link].rotation, gravity);
+    const float acceleration[6] = {0.0f, 0.0f, 0.0f,
+        -compensation * local.x, -compensation * local.y, -compensation * local.z};
+    Mat66MulVec6(state.link_inertia[link].I, acceleration, force);
+}
+
+__global__ void ProjectGravityCompensationKernel(ArticulationDeviceState state, ModelView model,
+    DataView data, ArticulationTreeView tree, ApplyDrivesParams p) {
+    const uint32_t articulation = blockIdx.x;
+    const uint32_t offset = state.articulation_link_offset[articulation];
+    const uint32_t count = state.articulation_link_count[articulation];
+    PrepareArticulationKinematics(state, data.link_wrench, 0u, tree);
+    for (uint32_t local = threadIdx.x; local < count; local += blockDim.x) {
+        const uint32_t link = offset + local;
+        LinkGravityCompensation(state, data, link, p.links_per_env, p.bodies_per_env,
+            {p.gravity[0], p.gravity[1], p.gravity[2]}, state.link_bias_force[link].p);
+        data.joint_gravity_force[link] = 0.0f;
+    }
+    __syncthreads();
+    for (uint32_t remaining = tree.max_depth[articulation] + 1u; remaining > 0u; --remaining) {
+        for (uint32_t local = threadIdx.x; local < count; local += blockDim.x) {
+            const uint32_t link = offset + local;
+            if (tree.depth[link] != remaining - 1u) continue;
+            for (uint32_t i = tree.child_range[2u * link]; i < tree.child_range[2u * link + 1u]; ++i) {
+                const uint32_t child = tree.children[i];
+                float force[6];
+                TransformForceTranspose(state.link_xup[child], state.link_bias_force[child].p, force);
+                Add6InPlace(state.link_bias_force[link].p, force);
+            }
+            if (JointDofCountDevice(state.joint_type[link]) == 1u &&
+                model.joint_actuator_gravity_compensation[link] != 0u)
+                data.joint_gravity_force[link] =
+                    Dot6(state.joint_motion_subspace[link].s, state.link_bias_force[link].p);
+        }
+        __syncthreads();
+    }
+}
+
 __global__ void BodyReferenceWeightsKernel(ModelView model, DataView data, uint32_t count) {
     for (uint32_t body = blockIdx.x * blockDim.x + threadIdx.x; body < count;
          body += blockDim.x * gridDim.x) {
@@ -503,6 +550,8 @@ __global__ void ArticulationDynamicsKernel(ArticulationDeviceState state, DataVi
         float force[6];
         Mat66MulVec6(state.link_inertia[link].I, state.link_acceleration[link].a, force);
         Add6InPlace(state.link_bias_force[link].p, force);
+        LinkGravityCompensation(state, data, link, p.links_per_env, p.bodies_per_env, gravity, force);
+        for (uint32_t c = 0u; c < 6u; ++c) state.link_bias_force[link].p[c] -= force[c];
     }
     __syncthreads();
     for (uint32_t remaining = tree.max_depth[articulation] + 1u; remaining > 0u; --remaining) {
@@ -525,6 +574,7 @@ __global__ void ArticulationDynamicsKernel(ArticulationDeviceState state, DataVi
         velocity[d] = DofVelocity(state, link, component);
         bias[d] = scalar ? Dot6(state.joint_motion_subspace[link].s, state.link_bias_force[link].p)
                          : state.link_bias_force[link].p[component];
+        if (scalar) bias[d] += data.joint_gravity_force[link];
         const bool spherical = state.joint_type[link] == ArticulationJointType::Spherical;
         const float damping = scalar ? state.joint_damping[link] +
             (p.fold_drive_damping != 0u ? data.drive_dissipation[link] : 0.0f)
@@ -785,7 +835,8 @@ DriveControlView MakeDriveControlView(const DataView& data) {
 // Passive joint damping stays in ABA; feedforward is an independent generalized load.
 __global__ void ApplyAffineDriveKernel(ArticulationDeviceState state,
                                        DriveControlView drive, uint32_t mode,
-                                       uint32_t links_per_env, bool implicit, float dt) {
+                                       uint32_t links_per_env, bool implicit, float dt,
+                                       const float* joint_gravity_force) {
     const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
     if (link >= state.total_link_count) return;
     drive.command[link] = drive.dissipation[link] = 0.0f;
@@ -842,26 +893,38 @@ __global__ void ApplyAffineDriveKernel(ArticulationDeviceState state,
     // The force limit bounds the whole effort; as in MuJoCo, a drive clamped at the step
     // start applies its clamped effort without the implicit damping derivative.
     const float effort = bias - damping * velocity;
+    const float gravity_force = joint_gravity_force[link];
     const bool saturated = effort < lower || effort > upper;
     const float joint_limit = drive.joint_force_limit[link];
     if (implicit && joint_limit > 0.0f) {
         // A joint range clamps the step-start effort and, as in MuJoCo, keeps the implicit damping unclamped.
-        bias = fminf(fmaxf(fminf(fmaxf(effort, lower), upper), -joint_limit), joint_limit);
+        bias = fminf(fmaxf(fminf(fmaxf(effort, lower), upper) + gravity_force, -joint_limit), joint_limit);
         damping = saturated ? 0.0f : damping;
         bias += damping * velocity;
         lower = -FLT_MAX;
         upper = FLT_MAX;
     } else if (!implicit || saturated) {
-        bias = effort;
+        bias = effort + gravity_force;
         damping = 0.0f;
+        lower += gravity_force;
+        upper += gravity_force;
         if (joint_limit > 0.0f) {
-            lower = fmaxf(lower, -joint_limit);
-            upper = fminf(upper, joint_limit);
+            lower = fminf(fmaxf(lower, -joint_limit), joint_limit);
+            upper = fminf(fmaxf(upper, -joint_limit), joint_limit);
         }
     } else {
         // The row clamps the command bias = effort + damping * velocity.
-        lower += damping * velocity;
-        upper += damping * velocity;
+        bias += gravity_force;
+        lower += gravity_force + damping * velocity;
+        upper += gravity_force + damping * velocity;
+    }
+    if (inverse_dynamics) {
+        lower = (limit > 0.0f ? -limit : -FLT_MAX) + gravity_force;
+        upper = (limit > 0.0f ? limit : FLT_MAX) + gravity_force;
+        if (joint_limit > 0.0f) {
+            lower = fminf(fmaxf(lower, -joint_limit), joint_limit);
+            upper = fminf(fmaxf(upper, -joint_limit), joint_limit);
+        }
     }
     const float feedforward = drive.feedforward[link];
     if (!isfinite(bias) || !isfinite(damping) || damping < 0.0f ||
@@ -874,6 +937,14 @@ __global__ void ApplyAffineDriveKernel(ArticulationDeviceState state,
     drive.lower[link] = lower;
     drive.upper[link] = upper;
     state.tau[link] = inverse_dynamics ? 0.0f : feedforward;
+}
+
+__device__ float ActuatorVelocityDerivative(const DriveControlView& drive, ArticulationControlMode mode,
+                                           uint32_t link, float gravity_force) {
+    if (drive.force_limit[link] > 0.0f && fabsf(drive.command[link] - gravity_force) > drive.force_limit[link])
+        return 0.0f;
+    return mode == ArticulationControlMode::PDPosition ? drive.damping[link] :
+           mode == ArticulationControlMode::Velocity ? drive.stiffness[link] : 0.0f;
 }
 
 // A MuJoCo integrator solves contacts with the plain mass, then maps the step's velocity change through
@@ -900,10 +971,8 @@ __global__ void ArticulationDampingKernel(ArticulationDeviceState state, DataVie
         const bool spherical = state.joint_type[link] == ArticulationJointType::Spherical;
         float value = scalar || spherical ? state.joint_damping[link] : 0.0f;
         // Only the actuator's own range drops the derivative; a joint range keeps it, as in MuJoCo.
-        if (scalar && p.actuator_derivative != 0u &&
-            !(drive.force_limit[link] > 0.0f && fabsf(drive.command[link]) > drive.force_limit[link]))
-            value += control == ArticulationControlMode::PDPosition ? drive.damping[link]
-                   : control == ArticulationControlMode::Velocity ? drive.stiffness[link] : 0.0f;
+        if (scalar && p.actuator_derivative != 0u)
+            value += ActuatorVelocityDerivative(drive, control, link, data.joint_gravity_force[link]);
         const float velocity = DofVelocity(state, link, component);
         damping[d] = p.dt * value;
         change[d] = damping[d] * (velocity - data.step_qdot_flat[base + d]);
@@ -917,6 +986,13 @@ __global__ void ArticulationDampingKernel(ArticulationDeviceState state, DataVie
         float& velocity = DofVelocity(state, link, component);
         velocity -= change[d];
         data.qdot_flat[base + d] = velocity;
+        if (component == kInvalidLink && p.actuator_derivative != 0u && p.readout_drives != 0u) {
+            const float derivative = ActuatorVelocityDerivative(drive, control, link, data.joint_gravity_force[link]);
+            const float correction = derivative * (velocity - data.step_qdot_flat[base + d]);
+            data.actuator_effort_requested[link] -= correction;
+            data.actuator_effort[link] -= correction;
+            state.tau[link] -= correction;
+        }
     }
 }
 
@@ -945,6 +1021,7 @@ __global__ void BodyIntegrateVelocityKernel(math::Vec3* body_linear_velocity,
                                       math::Vec3* body_force,
                                       math::Vec3* body_torque,
                                       const float* body_inv_mass,
+                                      const float* body_gravity_compensation,
                                       const math::Transform* body_pose,
                                       const math::Transform* body_inertial_frame,
                                       const math::Vec3* body_inv_inertia,
@@ -968,7 +1045,8 @@ __global__ void BodyIntegrateVelocityKernel(math::Vec3* body_linear_velocity,
     }
     body_world_inv_inertia[body] = BodyWorldInverseInertia(
         body_pose[body], body_inertial_frame[body], body_inv_inertia[body]);
-    body_linear_velocity[body] += (gravity + force * body_inv_mass[body]) * dt;
+    body_linear_velocity[body] +=
+        (gravity * (1.0f - body_gravity_compensation[body]) + force * body_inv_mass[body]) * dt;
     body_angular_velocity[body] += body_world_inv_inertia[body].Multiply(torque) * dt;
 }
 
@@ -1530,11 +1608,14 @@ Status OpApplyDrives(const ModelView& model, const DataView& data,
         return Status::InvalidArgument;
     if (p->total_link_count == 0u) return Status::Ok;
     if (p->links_per_env == 0u) return Status::InvalidArgument;
-    const auto state = MakeArticulationDeviceState(model, data, p->total_link_count, 0u);
+    const auto state = MakeArticulationDeviceState(model, data, p->total_link_count, p->articulation_count);
+    if (p->articulation_count != 0u)
+        LaunchCuda(ProjectGravityCompensationKernel, dim3(p->articulation_count), dim3(kAbaBlockSize),
+            0u, stream, state, model, data, MakeArticulationTreeView(model), *p);
     const uint32_t blocks = (p->total_link_count + kAbaBlockSize - 1u) / kAbaBlockSize;
     LaunchCuda(ApplyAffineDriveKernel, dim3(blocks), dim3(kAbaBlockSize), 0u, stream,
                state, MakeDriveControlView(data), p->mode, p->links_per_env,
-               p->defer_velocity_damping != 0u, p->dt);
+               p->defer_velocity_damping != 0u, p->dt, data.joint_gravity_force);
     return LaunchOk(stream);
 }
 
@@ -1641,6 +1722,7 @@ Status OpIntegrateVelocity(const ModelView& model, const DataView& data,
                    stream, data.body_linear_velocity, data.body_angular_velocity,
                    data.body_force, data.body_torque,
                    static_cast<const float*>(data.body_inv_mass),
+                   static_cast<const float*>(data.body_gravity_compensation),
                    data.body_pose, data.body_inertial_frame, data.body_inv_inertia,
                    data.body_world_inv_inertia,
                    p->total_body_count, gravity, p->dt, p->clear_body_forces);
@@ -1778,7 +1860,6 @@ void RegisterNkArticulationPipelineOps() {
     RegisterNkParticleOps();
     RegisterNkVertexBlockOps();
     RegisterNkOgcDetectOps();
-    RegisterNkDatTruncateOps();
     RegisterNkMpmOps();              // MLS-MPM transfers (inert round-trip scaffold)
     RegisterNkReadoutOps();
     RegisterNkEnergyLedgerOps();

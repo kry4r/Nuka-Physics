@@ -636,6 +636,10 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
     // so the staged Model bytes are byte-for-byte unchanged (the K==1 D1
     // invariant). dofs_per_env stays the MAX single-dog DOF (NEVER summed): the
     // CRBA M-tile is per-articulation (one max_dof^2 block per dog).
+    model.body_gravity_compensation = blob.bodies.gravity_compensation;
+    for (float compensation : model.body_gravity_compensation)
+        if (!std::isfinite(compensation))
+            throw std::runtime_error("CookToModel: non-finite body gravity compensation");
     if (!arts.empty()) {
         namespace articulation = runtime::articulation;
         const articulation::ArticulationHostState host =
@@ -651,6 +655,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         m.link_inertial_frame = host.link_inertial_frame;
         m.joint_damping = host.joint_damping;
         m.joint_armature = host.joint_armature;
+        m.joint_actuator_gravity_compensation.assign(m.link_count, 0u);
         m.joint_frictionloss = host.joint_frictionloss;
         m.joint_stiffness = host.joint_stiffness;
         m.joint_spring_reference = host.joint_spring_reference;
@@ -680,6 +685,8 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
                     m.joint_limit_flags[link] = blob.joints.limit_flags[joint];
                 }
                 joint_link[joint] = link;
+                if (joint < blob.joints.actuator_gravity_compensation.size())
+                    m.joint_actuator_gravity_compensation[link] = blob.joints.actuator_gravity_compensation[joint];
                 m.joint_law_source[link] = blob.joints.law_sources[joint];
                 m.joint_limit_reference[link] = blob.joints.limit_references[joint];
                 m.joint_friction_reference[link] = blob.joints.friction_references[joint];

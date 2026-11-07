@@ -147,6 +147,7 @@ struct RigidBodyComponent {
     bool            kinematic        = false;
     float           linear_damping   = 0.0f;
     float           angular_damping  = 0.0f;
+    float           gravity_compensation = 0.0f;
 };
 
 struct JointComponent {
@@ -160,6 +161,7 @@ struct JointComponent {
     float      damping  = 0.0f;
     float      armature = 0.0f;
     float      friction = 0.0f;
+    bool       actuator_gravity_compensation = false;
 };
 
 struct ActuatorComponent {

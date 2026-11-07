@@ -471,6 +471,7 @@ Value SaveRigidBody(const RigidBodyRecord& b) {
     o.Set("mass", Value::Float(b.mass));
     o.Set("inertia", Vec3Json(b.inertia));
     o.Set("is_static", Value::Bool(b.is_static));
+    o.Set("gravity_compensation", Value::Float(b.gravity_compensation));
     return o;
 }
 
@@ -497,6 +498,7 @@ Value SaveJoint(const JointRecord& j) {
     o.Set("initial_position", Value::Float(j.initial_position));
     o.Set("frictionloss", Value::Float(j.frictionloss));
     o.Set("actuator_force_limit", Value::Float(j.actuator_force_limit));
+    o.Set("actuator_gravity_compensation", Value::Bool(j.actuator_gravity_compensation));
     o.Set("law_source", Value::Int(static_cast<uint32_t>(j.law_source)));
     o.Set("solreflimit", FloatArray(j.limit_reference.solref, 2));
     o.Set("solimplimit", FloatArray(j.limit_reference.solimp, 5));
@@ -1504,6 +1506,7 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                     if (const Value* v = rb->Find("mass")) rec.mass = v->AsFloat();
                     if (const Value* v = rb->Find("inertia")) rec.inertia = Vec3FromJson(*v);
                     if (const Value* v = rb->Find("is_static")) rec.is_static = v->AsBool();
+                    if (const Value* v = rb->Find("gravity_compensation")) rec.gravity_compensation = v->AsFloat();
                     const BodyId id = scene.AddRigidBody(std::move(rec));
                     body_nodes.push_back(BodyNode{&node, id});
                     // A body resets the group prefix for ITS subtree (its node is
@@ -1670,6 +1673,7 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             // Backward-compatible: a pre-frictionloss .nks lacks the key -> 0.
             if (const Value* fl = j->Find("frictionloss")) rec.frictionloss = fl->AsFloat();
             if (const Value* v = j->Find("actuator_force_limit")) rec.actuator_force_limit = v->AsFloat();
+            if (const Value* v = j->Find("actuator_gravity_compensation")) rec.actuator_gravity_compensation = v->AsBool();
             if (const Value* v = j->Find("law_source"))
                 rec.law_source = static_cast<constraint::LawSource>(v->AsInt());
             if (const Value* v = j->Find("solreflimit"))
@@ -2372,6 +2376,7 @@ void ApplyOverrides(SceneIR& scene, const Value& overlay) {
                 if (const Value* mass = rb->Find("mass")) b.mass = mass->AsFloat();
                 if (const Value* inertia = rb->Find("inertia")) b.inertia = Vec3FromJson(*inertia);
                 if (const Value* st = rb->Find("is_static")) b.is_static = st->AsBool();
+                if (const Value* v = rb->Find("gravity_compensation")) b.gravity_compensation = v->AsFloat();
             }
         }
 

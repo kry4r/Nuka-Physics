@@ -332,6 +332,14 @@ bool World::SeedInitialState() {
 
     // -- M4: movable rigid-body template seeding (env-major replication) -----
     const uint32_t B = cap.bodies_per_env;
+    if (B > 0u && !model_.body_gravity_compensation.empty()) {
+        std::vector<float> compensation(size_t{B} * E, 0.0f);
+        for (uint32_t e = 0u; e < E; ++e)
+            for (uint32_t b = 0u; b < B && b < model_.body_gravity_compensation.size(); ++b)
+                compensation[size_t{e} * B + b] = model_.body_gravity_compensation[b];
+        if (!data_.UploadField(FieldId::BodyGravityCompensation, compensation.data(),
+                               compensation.size() * sizeof(float))) return false;
+    }
     if (B > 0 && !model_.body_init.empty()) {
         std::vector<math::Transform> poses(static_cast<size_t>(B) * E);
         std::vector<math::Vec3> lin(static_cast<size_t>(B) * E);

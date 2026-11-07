@@ -10,8 +10,10 @@
 #include <vector>
 
 #include "import/usd_importer.hpp"
+#include "constraint/coulomb_contact.hpp"
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/pipeline/world.hpp"
+#include "nk/readout/energy_ledger.hpp"
 #include "nk/solve/nk_row.hpp"
 #include "scene/cook/cook_to_model.hpp"
 #include "scene/scene_compose.hpp"
@@ -36,7 +38,7 @@ Backend& Device() {
     return backend;
 }
 
-nk::Model CookFreeBody(const scene::RigidBodyRecord& body, bool with_floor) {
+nk::Model CookFreeBody(const scene::RigidBodyRecord& body, bool with_floor, bool surface_contact = false) {
     scene::SceneIR source;
     if (with_floor) {
         scene::RigidBodyRecord floor;
@@ -53,9 +55,18 @@ nk::Model CookFreeBody(const scene::RigidBodyRecord& body, bool with_floor) {
     shape.body_id = source.AddRigidBody(body);
     shape.type = scene::ShapeType::Sphere;
     shape.radius = 0.1f;
+    if (surface_contact) {
+        shape.type = scene::ShapeType::TriMesh;
+        shape.decompose_mode = scene::DecomposeMode::Skip;
+        shape.mesh_vertices = {-.1f,-.1f,-.1f, .1f,-.1f,-.1f, .1f,.1f,-.1f, -.1f,.1f,-.1f,
+            -.1f,-.1f,.1f, .1f,-.1f,.1f, .1f,.1f,.1f, -.1f,.1f,.1f};
+        shape.mesh_indices = {0,2,1,0,3,2,4,5,6,4,6,7,0,1,5,0,5,4,
+            1,2,6,1,6,5,2,3,7,2,7,6,3,0,4,3,4,7};
+    }
     source.AddCollisionShape(shape);
     scene::cook::CookToModelOptions options;
     options.enable_contacts = with_floor;
+    if (surface_contact) return scene::cook::CookSceneToModel(source, 1, options).model;
     return scene::cook::CookToModel(source, 1, options).model;
 }
 
@@ -147,8 +158,16 @@ TEST(FreeRigidDynamics, MountedImuIncludesFreeFallAndCentripetalAcceleration) {
         nuka::sensor::StateSensorStamp stamp;
         ASSERT_EQ(world.StateSensors().ReadStamp(center_id, 0u, &stamp), phi::Status::Ok);
         EXPECT_EQ(stamp.acquisitions, 0u);
+        uint32_t completed_steps = 0u;
         for (uint32_t step = 0u; step < 40u; ++step) {
-            ASSERT_EQ(world.StepConfigured(), phi::Status::Ok);
+            const uint32_t batches[] = {1u, 2u, 7u, 0u};
+            uint32_t submitted = ~0u;
+            ASSERT_EQ(world.StepConfigured(batches[step % 4u], &submitted), phi::Status::Ok);
+            ASSERT_EQ(submitted, batches[step % 4u]);
+            completed_steps += submitted;
+            EXPECT_EQ(world.GraphReplays(), completed_steps);
+            ASSERT_EQ(world.StateSensors().ReadStamp(center_id, 0u, &stamp), phi::Status::Ok);
+            EXPECT_EQ(stamp.acquisitions, completed_steps);
             std::vector<float> center(18u), offset(18u);
             ASSERT_EQ(world.StateSensors().Download(center_id, center.data(), center.size() * sizeof(float)), phi::Status::Ok);
             ASSERT_EQ(world.StateSensors().Download(offset_id, offset.data(), offset.size() * sizeof(float)), phi::Status::Ok);
@@ -160,6 +179,14 @@ TEST(FreeRigidDynamics, MountedImuIncludesFreeFallAndCentripetalAcceleration) {
                 EXPECT_NEAR(offset[env * 6u + 2u], 0.0f, 5.0e-4f);
                 EXPECT_NEAR(offset[env * 6u + 4u], 3.0f, 1.0e-5f);
             }
+        }
+        ASSERT_EQ(world.Reset({0u}), phi::Status::Ok);
+        uint32_t submitted = 0u;
+        ASSERT_EQ(world.StepConfigured(5u, &submitted), phi::Status::Ok);
+        ASSERT_EQ(submitted, 5u);
+        for (uint32_t env = 0u; env < 3u; ++env) {
+            ASSERT_EQ(world.StateSensors().ReadStamp(center_id, env, &stamp), phi::Status::Ok);
+            EXPECT_EQ(stamp.acquisitions, env == 0u ? 5u : completed_steps + 5u);
         }
     }
 }
@@ -619,6 +646,42 @@ TEST(FreeRigidDynamics, WorldAngularVelocityRotatesAboutTheAuthoredCenterOfMass)
     }
 }
 
+TEST(FreeRigidDynamics, GravityCompensationAccountsForWorkAndPreservesOtherBodies) {
+    auto& backend = Device();
+    if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    for (float compensation : {0.0f, 0.5f, 1.0f, 1.5f}) {
+        scene::RigidBodyRecord body;
+        body.name = "weighted_body";
+        body.mass = 2.0f;
+        body.gravity_compensation = compensation;
+        auto model = CookFreeBody(body, false);
+        model.body_init[0].linear_velocity = {0.0f, 0.0f, 0.25f};
+        auto config = Config();
+        config.dt = 0.001f;
+        config.gravity[2] = -9.81f;
+        nk::World world(std::move(model), 2u, backend.device, backend.backend, config);
+        ASSERT_TRUE(world.Ready());
+        ASSERT_NE(world.FieldPtr(nk::FieldId::EnergyLedger), nullptr);
+        const float fractions[2] = {compensation, 0.0f};
+        EXPECT_EQ(Read<float>(world, nk::FieldId::BodyGravityCompensation, 2u),
+            std::vector<float>(2u, compensation));
+        ASSERT_TRUE(world.GetData().UploadField(nk::FieldId::BodyGravityCompensation, fractions, sizeof(fractions)));
+        for (uint32_t step = 0u; step < 100u; ++step) {
+            const auto before = Read<Vec3>(world, nk::FieldId::BodyLinearVelocity, 2u);
+            ASSERT_EQ(world.StepPlanned(), phi::Status::Ok);
+            const auto after = Read<Vec3>(world, nk::FieldId::BodyLinearVelocity, 2u);
+            const auto ledger = Read<float>(world, nk::FieldId::EnergyLedger, 2u * nk::kEnergyColumnCount);
+            for (uint32_t env = 0u; env < 2u; ++env) {
+                const float expected = before[env].z - 9.81f * (1.0f - fractions[env]) * config.dt;
+                EXPECT_NEAR(after[env].z, expected, 1.0e-7f);
+                const double work = 0.5 * body.mass * 9.81 * fractions[env] *
+                    (double(before[env].z) + after[env].z) * config.dt;
+                EXPECT_NEAR(ledger[env * nk::kEnergyColumnCount + uint32_t(nk::EnergyColumn::ExternalWork)], work, 2.0e-8);
+            }
+        }
+    }
+}
+
 TEST(FreeRigidDynamics, WorldWrenchesAndGravityAreCovariantAndConsumedOnce) {
     auto& backend = Device();
     if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
@@ -645,6 +708,7 @@ TEST(FreeRigidDynamics, WorldWrenchesAndGravityAreCovariantAndConsumedOnce) {
         const Vec3 torque = rotation.Rotate(Vec3{0.2f, -0.3f, 0.1f}.Cross({0.7f, -0.9f, 1.1f}));
         nk::World world(CookFreeBody(body, false), 2u, backend.device, backend.backend, config);
         ASSERT_TRUE(world.Ready());
+        ASSERT_NE(world.FieldPtr(nk::FieldId::EnergyLedger), nullptr);
         const auto advance = [&]() { return planned ? world.StepPlanned() : world.Step().result; };
         const std::vector<Vec3> forces{force, Vec3{}}, torques{torque, Vec3{}};
         ASSERT_TRUE(world.GetData().UploadField(nk::FieldId::BodyForce, forces.data(), forces.size() * sizeof(Vec3)));
@@ -662,6 +726,16 @@ TEST(FreeRigidDynamics, WorldWrenchesAndGravityAreCovariantAndConsumedOnce) {
         principal_torque.z /= body.inertia.z;
         ExpectVectorNear(omega[0], principal.Rotate(principal_torque) * config.dt, 1.0e-6f);
         ExpectVectorNear(omega[1], Vec3{}, 1.0e-7f);
+        const auto ledger = Read<float>(world, nk::FieldId::EnergyLedger, 2u * substeps * nk::kEnergyColumnCount);
+        const auto coverage = Read<uint32_t>(world, nk::FieldId::EnergyLedgerStatus, 2u * substeps);
+        double work = 0.0;
+        for (uint32_t step = 0u; step < substeps; ++step) {
+            work += ledger[step * nk::kEnergyColumnCount + static_cast<uint32_t>(nk::EnergyColumn::ExternalWork)];
+            EXPECT_FLOAT_EQ(ledger[(substeps + step) * nk::kEnergyColumnCount +
+                static_cast<uint32_t>(nk::EnergyColumn::ExternalWork)], 0.0f);
+        }
+        EXPECT_NEAR(work, 0.5 * config.dt * (force.Dot(velocity[0]) + torque.Dot(omega[0])), 1.0e-9);
+        EXPECT_EQ(coverage, std::vector<uint32_t>(2u * substeps));
         const Vec3 initial_com = body.local_transform.TransformPoint(body.inertial_transform.position);
         for (uint32_t env = 0; env < 2u; ++env)
             ExpectVectorNear(pose[env].TransformPoint(body.inertial_transform.position),
@@ -673,6 +747,10 @@ TEST(FreeRigidDynamics, WorldWrenchesAndGravityAreCovariantAndConsumedOnce) {
         velocity = Read<Vec3>(world, nk::FieldId::BodyLinearVelocity, 2u);
         ExpectVectorNear(velocity[0], gravity * (2.0f * config.dt) + force * (config.dt / body.mass), 1.0e-6f);
         ExpectVectorNear(velocity[1], gravity * (2.0f * config.dt), 1.0e-6f);
+        const auto unloaded = Read<float>(world, nk::FieldId::EnergyLedger, 2u * substeps * nk::kEnergyColumnCount);
+        for (uint32_t record = 0u; record < 2u * substeps; ++record)
+            EXPECT_FLOAT_EQ(unloaded[record * nk::kEnergyColumnCount +
+                static_cast<uint32_t>(nk::EnergyColumn::ExternalWork)], 0.0f);
         ASSERT_TRUE(world.GetData().UploadField(nk::FieldId::BodyForce, forces.data(), forces.size() * sizeof(Vec3)));
         ASSERT_EQ(world.Reset({1u}), phi::Status::Ok);
         EXPECT_EQ(Read<Vec3>(world, nk::FieldId::BodyForce, 2u), forces);
@@ -711,15 +789,47 @@ TEST(FreeRigidDynamics, FixedAndFloatingArticulationsRespectRotatedGravity) {
                               2u, backend.device, backend.backend, config);
         ASSERT_TRUE(original.Ready());
         ASSERT_TRUE(transformed.Ready());
+        ASSERT_NE(original.FieldPtr(nk::FieldId::EnergyLedger), nullptr);
+        ASSERT_NE(transformed.FieldPtr(nk::FieldId::EnergyLedger), nullptr);
+        const uint32_t links = original.GetModel().capacities.links_per_env * 2u;
+        std::vector<nk::Spatial6> loads(links), rotated_loads(links);
+        const Vec3 force{0.7f, -0.4f, 1.3f}, torque{-0.1f, 0.3f, 0.2f};
+        const Vec3 rotated_force = rotation.Rotate(force), rotated_torque = rotation.Rotate(torque);
+        for (uint32_t link = 0u; link < links / 2u; ++link) {
+            loads[link] = {{force.x, force.y, force.z, torque.x, torque.y, torque.z}};
+            rotated_loads[link] = {{rotated_force.x, rotated_force.y, rotated_force.z,
+                rotated_torque.x, rotated_torque.y, rotated_torque.z}};
+        }
+        ASSERT_TRUE(original.GetData().UploadField(nk::FieldId::LinkWrench, loads.data(), loads.size() * sizeof(nk::Spatial6)));
+        ASSERT_TRUE(transformed.GetData().UploadField(nk::FieldId::LinkWrench, rotated_loads.data(), rotated_loads.size() * sizeof(nk::Spatial6)));
         ASSERT_TRUE(original.Step().AllOk());
         ASSERT_TRUE(transformed.Step().AllOk());
-        const uint32_t links = original.GetModel().capacities.links_per_env * 2u;
         const auto qdot = Read<float>(original, nk::FieldId::Qdot, links);
         const auto rotated_qdot = Read<float>(transformed, nk::FieldId::Qdot, links);
         for (uint32_t link = 0; link < links; ++link)
             EXPECT_NEAR(rotated_qdot[link], qdot[link], 2.0e-6f) << "link=" << link;
         const auto velocity = Read<nk::Spatial6>(original, nk::FieldId::LinkVelocity, links);
         const auto rotated_velocity = Read<nk::Spatial6>(transformed, nk::FieldId::LinkVelocity, links);
+        const auto pose = Read<Transform>(original, nk::FieldId::LinkPose, links);
+        std::vector<Transform> inertial_frames(links);
+        ASSERT_EQ(original.GetModel().DownloadFieldStatus(nk::FieldId::LinkInertialFrame,
+            inertial_frames.data(), inertial_frames.size() * sizeof(Transform)), phi::Status::Ok);
+        double external_work = 0.0;
+        for (uint32_t link = 0u; link < links / 2u; ++link) {
+            const auto& v = velocity[link];
+            const Vec3 angular = pose[link].rotation.Rotate({v.v[0], v.v[1], v.v[2]});
+            const Vec3 offset = pose[link].rotation.Rotate(inertial_frames[link].position);
+            const Vec3 linear = pose[link].rotation.Rotate({v.v[3], v.v[4], v.v[5]}) + angular.Cross(offset);
+            external_work += 0.5 * config.dt * (force.Dot(linear) + torque.Dot(angular));
+        }
+        const auto ledger = Read<float>(original, nk::FieldId::EnergyLedger, 2u * nk::kEnergyColumnCount);
+        const auto rotated_ledger = Read<float>(transformed, nk::FieldId::EnergyLedger, 2u * nk::kEnergyColumnCount);
+        const uint32_t work_column = static_cast<uint32_t>(nk::EnergyColumn::ExternalWork);
+        EXPECT_NEAR(ledger[work_column], external_work, 1.0e-8);
+        EXPECT_NEAR(rotated_ledger[work_column], ledger[work_column], 1.0e-8);
+        EXPECT_FLOAT_EQ(ledger[nk::kEnergyColumnCount + work_column], 0.0f);
+        EXPECT_EQ(Read<uint32_t>(original, nk::FieldId::EnergyLedgerStatus, 2u), std::vector<uint32_t>(2u));
+        EXPECT_EQ(Read<uint32_t>(transformed, nk::FieldId::EnergyLedgerStatus, 2u), std::vector<uint32_t>(2u));
         for (uint32_t link = 0; link < links; ++link)
             for (uint32_t axis = 0; axis < 6u; ++axis)
                 EXPECT_NEAR(rotated_velocity[link].v[axis], velocity[link].v[axis], 2.0e-6f)
@@ -727,21 +837,90 @@ TEST(FreeRigidDynamics, FixedAndFloatingArticulationsRespectRotatedGravity) {
     }
 }
 
+TEST(FreeRigidDynamics, FrictionMixingAppliesToPrimitiveAndMeshContacts) {
+    auto& backend = Device();
+    if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    for (bool surface : {false, true}) {
+        for (bool geometric : {false, true}) {
+            scene::RigidBodyRecord body;
+            body.mass = 1.0f;
+            body.inertia = {0.01f, 0.01f, 0.01f};
+            body.local_transform.position = {0, 0, surface ? 0.1001f : 0.099f};
+            auto model = CookFreeBody(body, true, surface);
+            model.body_init[1].linear_velocity = {1, 0, -1};
+            for (uint32_t shape = 0u; shape < model.shape_table_rows.size(); ++shape) {
+                const auto profile_index = model.shape_table_rows[shape].contact_profile_index;
+                auto profile = model.material_buckets[profile_index].Profile();
+                profile.mu1 = profile.mu2 = shape == 0u ? 0.0f : 0.5f;
+                if (geometric) profile.flags |= nk::kContactProfileFlagGeometricFriction;
+                model.material_buckets[profile_index] = nk::ModelMaterialBucket(profile);
+            }
+            auto config = Config();
+            config.vel_iters = 64u;
+            config.velocity_iterations_override = true;
+            config.measure_contact_residual = true;
+            nk::World world(std::move(model), 2u, backend.device, backend.backend, config);
+            ASSERT_TRUE(world.Ready()) << world.CreationError();
+            ASSERT_EQ(world.SetExecutionMode(nk::World::ExecutionMode::Graph), phi::Status::Ok);
+            ASSERT_NE(world.FieldPtr(nk::FieldId::ContactSolveCounts), nullptr);
+            ASSERT_TRUE(world.Step().AllOk());
+            const auto velocity = Read<Vec3>(world, nk::FieldId::BodyLinearVelocity, 4u);
+            const auto counts = Read<uint32_t>(world, nk::FieldId::ContactSolveCounts,
+                2u * nuka::constraint::kContactSolveCountSize);
+            for (uint32_t env = 0u; env < 2u; ++env) {
+                EXPECT_GT(counts[env * nuka::constraint::kContactSolveCountSize], 0u);
+                EXPECT_GT(velocity[2u * env + 1u].z, -0.9f);
+                if (geometric) EXPECT_NEAR(velocity[2u * env + 1u].x, 1.0f, 2.0e-5f);
+                else EXPECT_LT(velocity[2u * env + 1u].x, 0.99f);
+            }
+            ASSERT_EQ(world.Reset(), phi::Status::Ok);
+            ASSERT_TRUE(world.Step().AllOk());
+            const auto repeated = Read<Vec3>(world, nk::FieldId::BodyLinearVelocity, 4u);
+            for (uint32_t body_index = 0u; body_index < 4u; ++body_index)
+                ExpectVectorNear(repeated[body_index], velocity[body_index], 2.0e-5f);
+        }
+    }
+}
+
+TEST(FreeRigidDynamics, SeparatedMeshStaysStillInsideTheQueryBand) {
+    auto& backend = Device();
+    if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    for (float gap : {0.0001f, 0.0008f}) {
+        scene::RigidBodyRecord body;
+        body.name = "free_mesh";
+        body.mass = 0.5f;
+        body.inertia = {0.003f, 0.007f, 0.011f};
+        body.local_transform.position = {0, 0, 0.1f + gap};
+        auto config = Config();
+        config.pos_iters = 8u;
+        nk::World world(CookFreeBody(body, true, true), 2u, backend.device, backend.backend, config);
+        ASSERT_TRUE(world.Ready());
+        for (uint32_t step = 0u; step < 4u; ++step) ASSERT_TRUE(world.Step().AllOk());
+        const auto poses = Read<Transform>(world, nk::FieldId::BodyPose, 4u);
+        const auto velocity = Read<Vec3>(world, nk::FieldId::BodyLinearVelocity, 4u);
+        for (uint32_t env = 0u; env < 2u; ++env) {
+            ExpectVectorNear(poses[env * 2u + 1u].position, body.local_transform.position, 1.0e-6f);
+            ExpectVectorNear(velocity[env * 2u + 1u], {}, 1.0e-6f);
+        }
+    }
+}
+
 TEST(FreeRigidDynamics, ContactImpulseUsesTheCenterOfMassAndWorldInertia) {
     auto& backend = Device();
     if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
-    for (bool offset_center : {false, true}) {
+    for (bool surface_contact : {false, true}) {
+     for (bool offset_center : {false, true}) {
       for (uint16_t position_iterations : {0u, 4u}) {
-        SCOPED_TRACE(::testing::Message() << "offset=" << offset_center);
+        SCOPED_TRACE(::testing::Message() << "offset=" << offset_center << " surface=" << surface_contact);
         scene::RigidBodyRecord body;
         body.name = "free_body";
         body.mass = 0.5f;
         body.inertia = {0.003f, 0.007f, 0.011f};
-        body.local_transform.position = {0, 0, 0.097f};
-        body.local_transform.rotation = Quat::FromAxisAngle({1, 2, 3}, 1.05f);
+        body.local_transform.position = {0, 0, surface_contact ? 0.1001f : 0.097f};
+        body.local_transform.rotation = Quat::FromAxisAngle(surface_contact ? Vec3{0, 0, 1} : Vec3{1, 2, 3}, 1.05f);
         body.inertial_transform.rotation = Quat::FromAxisAngle({3, 1, 2}, 0.66f);
         if (offset_center) body.inertial_transform.position = {0.025f, -0.01f, 0.015f};
-        auto model = CookFreeBody(body, true);
+        auto model = CookFreeBody(body, true, surface_contact);
         ASSERT_EQ(model.body_init.size(), 2u);
         const auto capacity = model.capacities;
         const Vec3 incoming{0.2f, -0.1f, -0.2f};
@@ -777,25 +956,35 @@ TEST(FreeRigidDynamics, ContactImpulseUsesTheCenterOfMassAndWorldInertia) {
         ASSERT_EQ(world.StateSensors().Download(body_sensor, body_load.data(), body_load.size() * sizeof(float)), phi::Status::Ok);
         ASSERT_EQ(world.StateSensors().Download(plate_sensor, plate_load.data(), plate_load.size() * sizeof(float)), phi::Status::Ok);
         for (uint32_t env = 0; env < 2u; ++env) {
-            Vec3 impulse{}, torque{};
+            Vec3 impulse{}, torque{}, ground_torque{};
+            uint32_t surface_contacts = 0u;
+            const auto plate = poses[env * 2u] * contact.local_offset;
+            const uint32_t rigid_slots = capacity.max_contacts_per_env - capacity.ogc_contacts_per_env;
             for (uint32_t slot = 0; slot < capacity.max_contacts_per_env; ++slot) {
                 const uint32_t contact = env * capacity.max_contacts_per_env + slot;
                 for (uint32_t point = 0; point < counts[contact]; ++point) {
-                    const Vec3 lever = points[4u * contact + point] - center;
+                    const bool surface = slot >= rigid_slots && slot - rigid_slots < capacity.ogc_contacts_per_env;
+                    surface_contacts += surface;
                     for (uint32_t axis = 0; axis < 3u; ++axis) {
                         const uint32_t row_index = ranges[2u * contact] +
                             axis * ranges[2u * contact + 1u] + point;
                         const auto& row = rows[row_index];
-                        for (const auto& side : {row.a, row.b}) {
+                        for (uint32_t which = 0u; which < 2u; ++which) {
+                            const auto& side = which == 0u ? row.a : row.b;
+                            const Vec3 point_world = points[4u * contact + point];
+                            if (side.kind == nk::kNkSideStatic ||
+                                (side.kind == nk::kNkSideRigid && side.index == env * 2u))
+                                ground_torque += (point_world - plate.position).Cross(side.jlin * impulses[row_index]);
                             if (side.kind != nk::kNkSideRigid || side.index != env * 2u + 1u) continue;
                             const Vec3 applied = side.jlin * impulses[row_index];
                             impulse += applied;
-                            torque += lever.Cross(applied);
+                            torque += (point_world - center).Cross(applied);
                         }
                     }
                 }
             }
             ASSERT_GT(impulse.LengthSq(), 1.0e-6f);
+            if (surface_contact) EXPECT_GT(surface_contacts, 0u);
             ExpectVectorNear(linear[env * 2u + 1u], incoming + impulse / body.mass, 2.0e-5f);
             ExpectVectorNear(AngularMomentum(poses[env * 2u + 1u], body.inertial_transform,
                 body.inertia, angular[env * 2u + 1u]), torque, 3.0e-6f);
@@ -812,13 +1001,111 @@ TEST(FreeRigidDynamics, ContactImpulseUsesTheCenterOfMassAndWorldInertia) {
                 ((start.position + end.position) * 0.5f - center).Cross(observed);
             ExpectVectorNear(observed, impulse, 2.0e-6f);
             ExpectVectorNear(moment, torque, 2.0e-6f);
-            const auto plate = poses[env * 2u] * contact.local_offset;
             const auto plate_impulse = plate.rotation.Rotate(measured(plate_load, 0u));
             const auto plate_moment = plate.rotation.Rotate(measured(plate_load, 3u));
             ExpectVectorNear(plate_impulse, -impulse, 2.0e-6f);
-            ExpectVectorNear(plate_moment, -torque - (center - plate.position).Cross(impulse), 2.0e-6f);
+            ExpectVectorNear(plate_moment, ground_torque, 2.0e-6f);
+            const Vec3 body_momentum = AngularMomentum(poses[env * 2u + 1u], body.inertial_transform,
+                body.inertia, angular[env * 2u + 1u]);
+            ExpectVectorNear(body_momentum + center.Cross(impulse) + plate_moment +
+                plate.position.Cross(plate_impulse), Vec3{}, 3.0e-6f);
         }
       }
+     }
+    }
+}
+
+TEST(FreeRigidDynamics, JointSpringAndArmatureEnergyMatchesStoredState) {
+    auto& backend = Device();
+    if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    for (bool implicit : {false, true}) {
+     for (auto type : {scene::JointType::Revolute, scene::JointType::Prismatic, scene::JointType::Spherical}) {
+        SCOPED_TRACE(::testing::Message() << "implicit=" << implicit << " type=" << uint32_t(type));
+        const bool spherical = type == scene::JointType::Spherical;
+        scene::SceneIR source;
+        source.SolverOptionsMut().law_source = implicit ? nuka::constraint::LawSource::MuJoCo : nuka::constraint::LawSource::None;
+        scene::RigidBodyRecord root, body;
+        root.name = "support";
+        root.is_static = true;
+        body.name = "mass";
+        body.mass = 2.0f;
+        body.inertia = {0.5f, 0.5f, 0.5f};
+        scene::JointRecord joint;
+        joint.name = "spring";
+        joint.parent_body = source.AddRigidBody(root);
+        joint.child_body = source.AddRigidBody(body);
+        joint.type = type;
+        joint.stiffness = spherical ? 0.0f : 8.0f;
+        joint.armature = 0.35f;
+        joint.damping = 2.0f;
+        joint.spring_reference = -0.1f;
+        joint.initial_position = 0.2f;
+        source.AddJoint(joint);
+        scene::cook::CookToModelOptions options;
+        options.enable_contacts = false;
+        auto model = scene::cook::CookToModel(source, 1, options).model;
+        const auto stiffness = model.articulation.joint_stiffness;
+        const auto reference = model.articulation.joint_spring_reference;
+        const auto armature = model.articulation.joint_armature;
+        const uint32_t links = model.capacities.links_per_env;
+        nk::World world(std::move(model), 2u, backend.device, backend.backend, Config());
+        ASSERT_TRUE(world.Ready()) << world.CreationError();
+        ASSERT_NE(world.FieldPtr(nk::FieldId::EnergyLedger), nullptr);
+        std::vector<float> speed(2u * links, 0.0f);
+        std::vector<Vec3> angular(2u * links);
+        for (uint32_t env = 0u; env < 2u; ++env) {
+            for (uint32_t link = 0u; link < links; ++link) {
+                if (armature[link] == 0.0f) continue;
+                const float scale = env == 0u ? 1.0f : 2.0f;
+                speed[env * links + link] = spherical ? 0.0f : -0.2f * scale;
+                if (spherical) angular[env * links + link] = Vec3{0.2f, 0.3f, -0.4f} * scale;
+            }
+        }
+        ASSERT_TRUE(world.GetData().UploadField(nk::FieldId::Qdot, speed.data(), speed.size() * sizeof(float)));
+        ASSERT_TRUE(world.GetData().UploadField(nk::FieldId::JointAngularVelocity, angular.data(), angular.size() * sizeof(Vec3)));
+        const auto before = Read<float>(world, nk::FieldId::Q, 2u * links);
+        ASSERT_TRUE(world.Step().AllOk());
+        const auto after = Read<float>(world, nk::FieldId::Q, 2u * links);
+        const auto end_speed = Read<float>(world, nk::FieldId::Qdot, 2u * links);
+        const auto end_angular = Read<Vec3>(world, nk::FieldId::JointAngularVelocity, 2u * links);
+        const auto ledger = Read<float>(world, nk::FieldId::EnergyLedger, 2u * nk::kEnergyColumnCount);
+        const auto status = Read<uint32_t>(world, nk::FieldId::EnergyLedgerStatus, 2u);
+        for (uint32_t env = 0u; env < 2u; ++env) {
+            double begin = 0.0, end = 0.0, kinetic_begin = 0.0, kinetic_end = 0.0, passive = 0.0;
+            for (uint32_t link = 0u; link < links; ++link) {
+                const double x0 = double(before[env * links + link]) - reference[link];
+                const double x1 = double(after[env * links + link]) - reference[link];
+                begin += 0.5 * stiffness[link] * x0 * x0;
+                end += 0.5 * stiffness[link] * x1 * x1;
+                if (armature[link] == 0.0f) continue;
+                const uint32_t index = env * links + link;
+                const double inertia = (type == scene::JointType::Prismatic ? 2.0 : 0.5) + armature[link];
+                const double denominator = implicit ? inertia + Config().dt * 2.0 : inertia;
+                if (spherical) {
+                    const float scale = float((inertia - (implicit ? 0.0 : Config().dt * 2.0)) / denominator);
+                    ExpectVectorNear(end_angular[index], angular[index] * scale, 2.0e-6f);
+                } else {
+                    const double impulse = Config().dt * (stiffness[link] * x0 + (implicit ? 0.0 : 2.0 * speed[index]));
+                    EXPECT_NEAR(end_speed[index], (inertia * speed[index] - impulse) / denominator, 2.0e-6);
+                }
+                kinetic_begin += 0.5 * inertia * (spherical ? angular[index].LengthSq() : double(speed[index]) * speed[index]);
+                kinetic_end += 0.5 * inertia * (spherical ? end_angular[index].LengthSq() : double(end_speed[index]) * end_speed[index]);
+                passive += 2.0 * (spherical ? Config().dt *
+                    (implicit ? end_angular[index] : angular[index]).Dot(end_angular[index]) :
+                    (implicit ? double(end_speed[index]) : double(speed[index])) * (double(after[index]) - before[index]));
+            }
+            if (!spherical) {
+                ASSERT_GT(begin, 0.1);
+                EXPECT_LT(end, begin);
+            }
+            EXPECT_EQ(status[env], 0u);
+            EXPECT_NEAR(ledger[env * nk::kEnergyColumnCount + uint32_t(nk::EnergyColumn::BeginKinetic)], kinetic_begin, 2e-7);
+            EXPECT_NEAR(ledger[env * nk::kEnergyColumnCount + uint32_t(nk::EnergyColumn::EndKinetic)], kinetic_end, 2e-7);
+            EXPECT_NEAR(ledger[env * nk::kEnergyColumnCount + uint32_t(nk::EnergyColumn::BeginElastic)], begin, 1e-7);
+            EXPECT_NEAR(ledger[env * nk::kEnergyColumnCount + uint32_t(nk::EnergyColumn::EndElastic)], end, 1e-7);
+            EXPECT_NEAR(ledger[env * nk::kEnergyColumnCount + uint32_t(nk::EnergyColumn::PassiveLoss)], passive, 1e-7);
+        }
+     }
     }
 }
 
