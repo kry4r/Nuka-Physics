@@ -774,7 +774,7 @@ fields:
   - {name: dat_body_truncation_count, dtype: u32, per: env, arena: scratch, owner: data}
   - {name: dat_body_truncation_energy, dtype: f32, per: env, arena: scratch, owner: data}
   # Step of each vertex's inertial target, and whether its next target restarts at backward Euler
-  # because a row pushed it or its displacement was truncated.
+  # because a row applied an impulse or position correction.
   - {name: vbd_step, dtype: f32, per: scalar, count: "vbd_vertices_per_env*env_count", arena: scratch, owner: data}
   - {name: vbd_restart, dtype: u32, per: scalar, count: "vbd_vertices_per_env*env_count", arena: persistent, owner: data}
   - {name: dat_failure_count, dtype: u32, per: env, arena: scratch, owner: data}

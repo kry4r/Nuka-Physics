@@ -175,7 +175,7 @@ __global__ void ClothPredictKernel(DataView data, ClothStepParams p) {
         data.vbd_step[item] = p.dt;
         return;
     }
-    // A vertex a row pushed or truncation clipped last step restarts at backward Euler.
+    // A vertex pushed by a row restarts at backward Euler.
     const bool second_order = p.integrator == 0u && has_history &&
                               (data.vbd_history_ready[env] & nk::kVbdHistoryRestart) == 0u;
     const float h = p.dt;
@@ -235,9 +235,13 @@ __global__ void ClothResponseKernel(ModelView model, DataView data, ClothStepPar
         b.offsets = model.vbd_incidence_offsets;
         b.incidence = model.vbd_incidence;
         b.start = data.particle_prev_pos;
+        b.free_rate = data.vbd_free_rate;
+        b.free_velocity = data.vbd_free_velocity;
+        b.inertia = data.vbd_inertia;
+        b.effective_step = data.vbd_step;
         b.layout = l;
         b.dt = p.dt;
-        math::Vec3 gradient;
+        double3 gradient;
         math::SymmetricMat3 hessian;
         nkops::GatherVertexBlock(b, data.particle_vel, env, vertex, 0u, 1u, gradient, hessian);
         nk::vbd::AddIdentity(hessian, data.vbd_inertia[env * l.vertices + vertex]);
@@ -253,7 +257,7 @@ __global__ void ClothResponseKernel(ModelView model, DataView data, ClothStepPar
 }
 
 // Position rows added pseudo displacement to x; it stays out of the velocity. The velocity uses
-// the step its target was built with; impulses, position recovery and truncation restart the next target.
+// the step its target was built with; impulses and position recovery restart the next target.
 __global__ void ClothFinalizeKernel(DataView data, ClothStepParams p) {
     const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
     const VertexBlockLayout& l = p.layout;
@@ -266,11 +270,9 @@ __global__ void ClothFinalizeKernel(DataView data, ClothStepParams p) {
     }
     const math::Vec3 u = data.particle_vel[particle];
     const math::Vec3 impulse = data.particle_row_impulse[particle];
-    const bool truncated = p.truncation != 0u &&
-                           data.dat_particle_beta[particle] < 1.0f;
     const bool corrected = p.position_pass != 0u && data.particle_pseudo_vel[particle].LengthSq() > 0.0f;
     data.vbd_restart[item] =
-        truncated || corrected || impulse.x != 0.0f || impulse.y != 0.0f || impulse.z != 0.0f ? 1u : 0u;
+        corrected || impulse.x != 0.0f || impulse.y != 0.0f || impulse.z != 0.0f ? 1u : 0u;
     data.particle_vel[particle] = nk::vbd::PhysicalVelocity(
         u, data.vbd_free_rate[item], data.vbd_free_velocity[item], p.dt, data.vbd_step[item]);
 }
@@ -328,8 +330,7 @@ Status OpClothFinalize(const ModelView&, const DataView& data, const void* param
     if (data.vbd_free_rate == nullptr || data.vbd_free_velocity == nullptr ||
         data.particle_row_impulse == nullptr ||
         data.vbd_history_ready == nullptr ||
-        data.vbd_step == nullptr || data.vbd_restart == nullptr ||
-        (p->truncation != 0u && data.dat_particle_beta == nullptr))
+        data.vbd_step == nullptr || data.vbd_restart == nullptr)
         return Status::InvalidArgument;
     const uint32_t items = p->layout.vertices * p->layout.env_count;
     LaunchCuda(ClothFinalizeKernel, dim3((items + kBlockSize - 1u) / kBlockSize),

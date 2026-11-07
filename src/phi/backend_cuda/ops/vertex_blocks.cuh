@@ -22,6 +22,7 @@ struct VertexBlockView {
     const uint32_t* color_segments = nullptr;
     const math::Vec3* start = nullptr;  // interval-start positions
     const math::Vec3* free_rate = nullptr;
+    const math::Vec3* free_velocity = nullptr;
     const float* inertia = nullptr;
     const float* effective_step = nullptr;
     const uint32_t* row_first = nullptr;
@@ -110,7 +111,24 @@ __device__ inline nk::vbd::ElementGeometry ElementStepGeometry(const VertexBlock
     return geometry;
 }
 
-// Element damping uses all nodal rates and a material metric frozen at the interval start.
+__device__ inline math::Vec3 VertexPhysicalVelocity(const VertexBlockView& b, uint32_t env,
+                                                    uint32_t vertex, math::Vec3 rate) {
+    const uint32_t slot = b.Slot(env, vertex);
+    return nk::vbd::PhysicalVelocity(rate, b.free_rate[slot], b.free_velocity[slot],
+                                    b.dt, b.effective_step[slot]);
+}
+
+// Dynamic vertices share an integration history; prescribed vertices have no variable in the potential.
+__device__ inline float ElementEffectiveStep(const VertexBlockView& b, const nk::VbdElement& element,
+                                             uint32_t env) {
+    for (uint32_t j = 0u; j < nk::VbdElementVertexCount(element.kind); ++j) {
+        const uint32_t slot = b.Slot(env, element.vertex[j]);
+        if (b.inertia[slot] > 0.0f) return b.effective_step[slot];
+    }
+    return b.dt;
+}
+
+// Element damping uses physical velocities and a material metric frozen at the interval start.
 __device__ inline void VertexElementRayleigh(const VertexBlockView& b, const math::Vec3* velocity,
                                             const nk::VbdElement& element, uint32_t env,
                                             uint32_t local, math::Vec3 own,
@@ -121,7 +139,7 @@ __device__ inline void VertexElementRayleigh(const VertexBlockView& b, const mat
     for (uint32_t j = 0u; j < nk::VbdElementVertexCount(element.kind); ++j) {
         const uint32_t particle = b.Particle(env, element.vertex[j]);
         start.start[j] = b.start[particle];
-        rates[j] = j == local ? own : velocity[particle];
+        rates[j] = VertexPhysicalVelocity(b, env, element.vertex[j], j == local ? own : velocity[particle]);
     }
     nk::vbd::ElementRayleighBlock(element, local, start, rates, &applied, &diagonal, membrane);
 }
@@ -143,14 +161,15 @@ __device__ inline void VertexElementBlock(const VertexBlockView& b, const math::
         VertexElementRayleigh(b, velocity, element, env, local, own,
                               damping_force, damping_diagonal, start);
         g = g + damping_force * element.damping;
-        nk::vbd::AddTo(h, nk::vbd::Scaled(damping_diagonal, element.damping / b.dt));
+        const float step = b.effective_step[b.Slot(env, element.vertex[local])];
+        nk::vbd::AddTo(h, nk::vbd::Scaled(damping_diagonal, element.damping / step));
     }
 }
 
 __device__ inline void GatherVertexBlock(const VertexBlockView& b, const math::Vec3* velocity,
                                          uint32_t env, uint32_t vertex, uint32_t lane,
-                                         uint32_t width, math::Vec3& gradient,
-                                         math::SymmetricMat3& hessian, math::Vec3* magnitude = nullptr) {
+                                          uint32_t width, double3& gradient,
+                                          math::SymmetricMat3& hessian) {
     gradient = {};
     hessian = {};
     const math::Vec3 own = velocity[b.Particle(env, vertex)];
@@ -158,10 +177,19 @@ __device__ inline void GatherVertexBlock(const VertexBlockView& b, const math::V
         math::Vec3 g;
         math::SymmetricMat3 h;
         VertexElementBlock(b, velocity, env, own, b.incidence[i], g, h);
-        gradient = gradient + g;
+        gradient.x += g.x;
+        gradient.y += g.y;
+        gradient.z += g.z;
         nk::vbd::AddTo(hessian, h);
-        if (magnitude != nullptr) *magnitude = *magnitude + math::Vec3{fabsf(g.x), fabsf(g.y), fabsf(g.z)};
     }
+}
+
+// Keep cancellation between inertia, elastic forces and row impulses in the reduction's precision.
+__device__ inline math::Vec3 VertexAssembledForce(double3 gradient, math::Vec3 inertial,
+                                                 math::Vec3 impulse) {
+    return {static_cast<float>(double(impulse.x) - inertial.x - gradient.x),
+            static_cast<float>(double(impulse.y) - inertial.y - gradient.y),
+            static_cast<float>(double(impulse.z) - inertial.z - gradient.z)};
 }
 
 // The vertex force with its terms summed in double, one rounding from their exact sum in any order.
@@ -190,9 +218,8 @@ constexpr float kVertexStepDecrease = 1.0e-4f;
 // Armijo backtracking still enforces descent. Row-coupled blocks start at their dominating-metric step.
 constexpr float kVertexStepRelaxation = 1.9f;
 
-// Change of the elastic and Rayleigh energy at a vertex whose rate moves from `from` by `move`.
-// The Rayleigh change is d h (move^T K u + move^T K_ii move / 2) with a frozen element K.
-// One element's share: the elastic change, the Rayleigh power factor and its damping coefficient.
+// One element's elastic change, Rayleigh work factor, and damping coefficient.
+// A displacement-rate move changes physical velocity by h / ht times that move.
 struct VertexElementChangeTerms {
     float elastic;
     float rayleigh;
@@ -217,7 +244,8 @@ __device__ inline VertexElementChangeTerms VertexElementChange(
         math::SymmetricMat3 damping_diagonal;
         VertexElementRayleigh(b, velocity, element, env, local, from,
                               damping_force, damping_diagonal, start);
-        terms.rayleigh = move.Dot(damping_force + damping_diagonal.Multiply(move) * 0.5f);
+        const float ratio = b.dt / b.effective_step[b.Slot(env, element.vertex[local])];
+        terms.rayleigh = move.Dot(damping_force + damping_diagonal.Multiply(move) * (0.5f * ratio));
     }
     return terms;
 }
@@ -267,7 +295,7 @@ __device__ inline bool VertexEnergyStateValid(const VertexBlockView& b, const ma
             for (uint32_t j = 0u; j < count; ++j) {
                 const uint32_t particle = b.Particle(env, element.vertex[j]);
                 frozen.start[j] = b.start[particle];
-                rates[j] = j == local ? from : velocity[particle];
+                rates[j] = VertexPhysicalVelocity(b, env, element.vertex[j], j == local ? from : velocity[particle]);
             }
             float power = 0.0f;
             for (uint32_t j = 0u; j < count; ++j) {
@@ -276,7 +304,7 @@ __device__ inline bool VertexEnergyStateValid(const VertexBlockView& b, const ma
                 nk::vbd::ElementRayleighBlock(element, j, frozen, rates, &applied, &diagonal);
                 power += rates[j].Dot(applied);
             }
-            valid &= fabsf(0.5f * element.damping * b.dt * power) <= FLT_MAX;
+            valid &= fabsf(0.5f * element.damping * ElementEffectiveStep(b, element, env) * power) <= FLT_MAX;
         }
     }
     return valid;
@@ -287,7 +315,7 @@ __device__ inline void VertexBlockEquationWarp(const VertexBlockView& b, PointMa
                                                uint32_t vertex, uint32_t lane, math::Vec3& u,
                                                math::Vec3& force, math::SymmetricMat3& hessian) {
     const uint32_t particle = b.Particle(env, vertex);
-    math::Vec3 gradient;
+    double3 gradient;
     GatherVertexBlock(b, points.particle_velocity, env, vertex, lane, warpSize, gradient, hessian);
     // The sums reach every lane, so every lane forms the same step and search.
     gradient = {WarpSum(gradient.x), WarpSum(gradient.y), WarpSum(gradient.z)};
@@ -299,45 +327,30 @@ __device__ inline void VertexBlockEquationWarp(const VertexBlockView& b, PointMa
     const math::Vec3 impulse = points.particle_row_impulse[particle];
     const float inertia = b.inertia[slot];
     const float h = b.dt;
-    force = -nk::vbd::InertialGradient(u, b.free_rate[slot], inertia, h) - gradient + impulse / h;
+    force = VertexAssembledForce(gradient, nk::vbd::InertialGradient(u, b.free_rate[slot], inertia, h),
+                                 impulse / h);
     nk::vbd::AddIdentity(hessian, inertia);
 }
 
 // The vertex equation's residual after all neighboring row updates: the larger of the Newton correction and
-// the momentum defect in m/s. The defect carries this warp sum's rounding bound, as the ledger sums in double.
+// the momentum defect in m/s. Force accumulation uses the ledger's double-precision term sum.
 __device__ inline float VertexBlockStationaryResidualWarp(const VertexBlockView& b, PointMassView points,
                                                           uint32_t env, uint32_t vertex, uint32_t lane) {
     const uint32_t particle = b.Particle(env, vertex);
     if (!(points.particle_inv_mass[particle] > 0.0f)) return 0.0f;
     const uint32_t slot = b.Slot(env, vertex);
-    math::Vec3 gradient, magnitude{};
+    math::Vec3 u, force;
     math::SymmetricMat3 hessian, inverse;
-    GatherVertexBlock(b, points.particle_velocity, env, vertex, lane, warpSize, gradient, hessian, &magnitude);
-    gradient = {WarpSum(gradient.x), WarpSum(gradient.y), WarpSum(gradient.z)};
-    magnitude = {WarpSum(magnitude.x), WarpSum(magnitude.y), WarpSum(magnitude.z)};
-    hessian = {WarpSum(hessian.xx), WarpSum(hessian.yy), WarpSum(hessian.zz),
-               WarpSum(hessian.xy), WarpSum(hessian.xz), WarpSum(hessian.yz)};
+    VertexBlockEquationWarp(b, points, nullptr, env, vertex, lane, u, force, hessian);
     const float inertia = b.inertia[slot];
-    const math::Vec3 inertial =
-        nk::vbd::InertialGradient(points.particle_velocity[particle], b.free_rate[slot], inertia, b.dt);
-    const math::Vec3 impulse = points.particle_row_impulse[particle] / b.dt;
-    const math::Vec3 force = -inertial - gradient + impulse;
-    nk::vbd::AddIdentity(hessian, inertia);
     if (!(fabsf(force.x) <= FLT_MAX && fabsf(force.y) <= FLT_MAX && fabsf(force.z) <= FLT_MAX)) {
         if (lane == 0u) atomicOr(b.env_status + env, kEnvStatusSolverFailure);
         return FLT_MAX;
     }
     if (!nk::vbd::Invert(hessian, 1.0e-6f * inertia * inertia * inertia, &inverse)) return FLT_MAX;
     const math::Vec3 correction = inverse.Multiply(force) / b.dt;
-    // Each term passes at most ceil(n/32) + 6 roundings here (lane sum, five shuffle levels, assembly); with the
-    // ledger's own roundings its readout exceeds this force by at most (ceil(n/32) + 10) u per term magnitude.
-    const uint32_t lane_terms = (b.offsets[vertex + 1u] - b.offsets[vertex] + warpSize - 1u) / warpSize;
-    const float rounding = 0.5f * static_cast<float>(lane_terms + 10u) * FLT_EPSILON;
-    const math::Vec3 bound = (magnitude + math::Vec3{fabsf(inertial.x), fabsf(inertial.y), fabsf(inertial.z)} +
-                              math::Vec3{fabsf(impulse.x), fabsf(impulse.y), fabsf(impulse.z)}) * rounding;
     const math::Vec3 momentum_error = nk::vbd::MomentumResidualVelocity(
-        math::Vec3{fabsf(force.x), fabsf(force.y), fabsf(force.z)} + bound, points.particle_inv_mass[particle],
-        b.effective_step[slot]);
+        force, points.particle_inv_mass[particle], b.effective_step[slot]);
     return fmaxf(fmaxf(fabsf(correction.x), fmaxf(fabsf(correction.y), fabsf(correction.z))),
                  fmaxf(fabsf(momentum_error.x), fmaxf(fabsf(momentum_error.y), fabsf(momentum_error.z))));
 }

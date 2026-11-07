@@ -403,20 +403,33 @@ NUKA_VBD_HD inline float AreaBarrierChange(float d, float s) {
 // whose rest linearization keeps the Lame pair; per rest area it is mu (tr G - d) + l/2 d^2 for d = J - 1.
 NUKA_VBD_HD inline bool NeoHookean(const VbdElement& e) { return e.law == kVbdMembraneNeoHookean; }
 
-NUKA_VBD_HD inline float NeoHookeanEnergy(const VbdElement& e, float trace, float d) {
-    return e.rest[5] * (trace - d) + 0.5f * (e.rest[6] + e.rest[5]) * d * d;
+NUKA_VBD_HD inline float NeoHookeanShear(const TriangleStrain& t) {
+    const float difference = t.g00 - t.g11;
+    const float denominator = 2.0f + t.g00 + t.g11 + t.area_change;
+    return denominator > 0.0f
+        ? (difference * difference + 4.0f * t.g01 * t.g01) / denominator : 0.0f;
 }
 
-// Energy change per rest area as tr G moves by c and the area change d moves by s.
-NUKA_VBD_HD inline float NeoHookeanEnergyChange(const VbdElement& e, float d, float c, float s) {
-    return e.rest[5] * (c - s) + 0.5f * (e.rest[6] + e.rest[5]) * s * (s + 2.0f * d);
+NUKA_VBD_HD inline float NeoHookeanEnergy(const VbdElement& e, const TriangleStrain& t) {
+    return e.rest[5] * NeoHookeanShear(t) +
+        0.5f * (e.rest[6] + e.rest[5]) * t.area_change * t.area_change;
 }
 
-// Unsigned area change J' - J for the area normal n moved by `turn`, at the area change d = J - 1.
-NUKA_VBD_HD inline float NeoHookeanAreaStep(Vec3 n, Vec3 turn, float d) {
-    const float J = 1.0f + d, growth = 2.0f * n.Dot(turn) + turn.LengthSq();
+// The shear energy is ((G00-G11)^2 + 4 G01^2) / (tr G + 1 + J), avoiding tr G - (J-1).
+NUKA_VBD_HD inline float NeoHookeanEnergyChange(const VbdElement& e, const TriangleStrain& t,
+                                                float c00, float c11, float c01) {
+    const float J = 1.0f + t.area_change;
+    const float growth = 2.0f * (c00 + c11) + 4.0f *
+        (t.g00 * c11 + c00 * t.g11 + c00 * c11 - c01 * (2.0f * t.g01 + c01));
     const float moved = sqrtf(fmaxf(J * J + growth, 0.0f));
-    return moved + J > 0.0f ? growth / (moved + J) : 0.0f;
+    const float s = moved + J > 0.0f ? growth / (moved + J) : 0.0f;
+    const float difference = c00 - c11;
+    const float numerator = difference * (2.0f * (t.g00 - t.g11) + difference) +
+        4.0f * c01 * (2.0f * t.g01 + c01);
+    const float denominator = 1.0f + t.g00 + t.g11 + c00 + c11 + moved;
+    const float shear = denominator > 0.0f
+        ? (numerator - NeoHookeanShear(t) * (c00 + c11 + s)) / denominator : -NeoHookeanShear(t);
+    return e.rest[5] * shear + 0.5f * (e.rest[6] + e.rest[5]) * s * (s + 2.0f * t.area_change);
 }
 
 // Woven fabric buckles under a small share of its tensile stiffness (tension-field theory; Choi and Ko
@@ -535,7 +548,10 @@ NUKA_VBD_HD inline void NeoHookeanTriangleBlock(const VbdElement& e, uint32_t lo
     if (normal_length > 0.0f && J > 0.0f) {
         const Vec3 q = w.Cross(n / normal_length);
         const float s = volume * t.area_change - mu, r = s > 0.0f ? s / J : 0.0f;
-        g = g + q * s;
+        // Express F - cof(F) through the small strain, retaining forces near a rigid rotation.
+        const float a = (t.area_change - 2.0f * t.g11) * bx + 2.0f * t.g01 * by;
+        const float b = (t.area_change - 2.0f * t.g00) * by + 2.0f * t.g01 * bx;
+        g = (t.f0 * a + t.f1 * b) * (mu / J) + q * (volume * t.area_change);
         AddTo(h, Outer(q, volume - r));
         AddIdentity(h, r * w.LengthSq());
         AddTo(h, Outer(w, -r));
@@ -922,8 +938,7 @@ NUKA_VBD_HD inline float ElementEnergyChange(const VbdElement& e, uint32_t local
         // counts as collapsing the triangle.
         const Vec3 n = t.f0.Cross(t.f1), turn = move.Cross(t.f1 * bx - t.f0 * by);
         if (NeoHookean(e))
-            return e.rest[4] * NeoHookeanEnergyChange(e, t.area_change, change,
-                                                      NeoHookeanAreaStep(n, turn, t.area_change));
+            return e.rest[4] * NeoHookeanEnergyChange(e, t, c00, c11, c01);
         const float J = 1.0f + t.area_change, growth = 2.0f * n.Dot(turn) + turn.LengthSq();
         const float moved_sq = J * J + growth;
         const float area_step = n.Dot(n + turn) > 0.0f && moved_sq > 0.0f
@@ -963,7 +978,7 @@ NUKA_VBD_HD inline float ElementEnergy(const VbdElement& e, const ElementGeometr
     if (e.kind == kVbdTriangle) {
         const TriangleStrain t = MembraneStrain(e, g);
         const float trace = t.g00 + t.g11;
-        if (NeoHookean(e)) return e.rest[4] * NeoHookeanEnergy(e, trace, t.area_change);
+        if (NeoHookean(e)) return e.rest[4] * NeoHookeanEnergy(e, t);
         if (e.rest[7] > 0.0f) {
             const MembraneTangent m = SoftenedTangent(e.rest[7], t.g00, t.g11, t.g01);
             return e.rest[4] * (e.rest[5] * (m.high * m.e_high * m.e_high + m.low * m.e_low * m.e_low +

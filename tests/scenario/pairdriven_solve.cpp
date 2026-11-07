@@ -271,6 +271,62 @@ TEST(PairDrivenSolve, ParticleImpactPreservesPhysicalMomentumAcrossIntegrators) 
     }
 }
 
+TEST(PairDrivenSolve, DampedSpringConvergesToPhysicalVelocityLaw) {
+    const auto backend = GetBackend();
+    if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    namespace scene = nuka::scene;
+    namespace cook = nuka::scene::cook;
+    constexpr float initial = 1.05f;
+    constexpr double duration = 0.1, stiffness = 1000.0, alpha = 10.0, frequency = 30.0;
+    const double amplitude = double(initial) - 1.0;
+    const double exact_position = 1.0 + amplitude * std::exp(-alpha * duration) *
+        (std::cos(frequency * duration) + alpha / frequency * std::sin(frequency * duration));
+    const double exact_velocity = -amplitude * std::exp(-alpha * duration) *
+        stiffness / frequency * std::sin(frequency * duration);
+    for (uint32_t integrator : {0u, 1u}) {
+        double previous_error = 0.0;
+        for (uint32_t steps : {20u, 40u, 80u}) {
+            SCOPED_TRACE(::testing::Message() << "integrator=" << integrator << " steps=" << steps);
+            auto model = std::move(cook::CookSceneToModel(scene::SceneIR{}, 1u, {}).model);
+            cook::VbdCookInput input;
+            input.positions = {{0, 0, 0}, {initial, 0, 0}};
+            input.velocities.resize(2u);
+            input.inv_mass = {0.0f, 1.0f};
+            input.half_thickness = {0.0f, 0.0f};
+            input.friction = {0.0f, 0.0f};
+            input.vbd_count = 2u;
+            nk::VbdElement spring;
+            spring.vertex[0] = 0u;
+            spring.vertex[1] = 1u;
+            spring.rest[0] = 1.0f;
+            spring.rest[1] = static_cast<float>(stiffness);
+            spring.damping = 0.02f;
+            input.vbd_elements.push_back(spring);
+            cook::CookVbdParticles(model, 1u, input);
+            auto cfg = Cfg(0.0f);
+            cfg.dt = static_cast<float>(duration / steps);
+            cfg.vel_iters = 128u;
+            cfg.cloth_integrator = integrator;
+            nk::World world(std::move(model), 1u, backend.dev, backend.backend, cfg);
+            ASSERT_TRUE(world.Ready()) << world.CreationError();
+            ASSERT_EQ(world.SetExecutionMode(nk::World::ExecutionMode::Graph), nphi::Status::Ok);
+            for (uint32_t step = 0u; step < steps; ++step) ASSERT_TRUE(world.Step().AllOk()) << step;
+            Vec3 position[2], velocity[2];
+            ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::ParticlePos, position, sizeof(position)));
+            ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::ParticleVel, velocity, sizeof(velocity)));
+            const double error = std::hypot(double(position[1].x) - exact_position,
+                                           (double(velocity[1].x) - exact_velocity) / std::sqrt(stiffness));
+            std::fprintf(stderr, "[damped spring] integrator=%u steps=%u x=%.9g v=%.9g error=%.9g\n",
+                         integrator, steps, position[1].x, velocity[1].x, error);
+            EXPECT_NEAR(position[0].LengthSq(), 0.0f, 1e-12f);
+            EXPECT_NEAR(velocity[0].LengthSq(), 0.0f, 1e-12f);
+            if (previous_error > 0.0) EXPECT_LT(error, previous_error * (integrator == 0u ? 0.35 : 0.6));
+            if (steps == 80u) EXPECT_LT(error, integrator == 0u ? 5e-5 : 2e-3);
+            previous_error = error;
+        }
+    }
+}
+
 TEST(PairDrivenSolve, FreeBoxRestsOnStaticGround) {
     if (GetBackend().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
     Backend b = GetBackend();
@@ -333,6 +389,31 @@ TEST(PairDrivenSolve, FreeBoxRestsOnStaticGround) {
         EXPECT_NEAR(snap.lin[ground].x, 0.0f, 1.0e-5f);
         EXPECT_NEAR(snap.lin[ground].z, 0.0f, 1.0e-5f);
         EXPECT_LT(std::abs(snap.lin[box].z), 0.2f) << "box must come to rest on the ground";
+    }
+}
+
+TEST(PairDrivenSolve, InteriorSurfaceNormalIsOrthogonalAtFloatSpacing) {
+    const float vertices[] = {1, 1, 1, 2, 1, 1.5f, 1, 2, 1.25f};
+    const uint32_t triangles[] = {0u, 1u, 2u};
+    const auto mesh = nuka::import::cooker::CookMeshSurface(vertices, 3u, triangles, 1u);
+    const nuka::collision::MeshSurfaceView view{vertices, triangles, mesh.nodes.data(),
+        {3u, 1u, mesh.info.node_count}};
+    const float plane_z = 1.1875f;
+    for (bool oriented : {false, true}) {
+        auto info = mesh.info;
+        if (oriented) info.flags |= nuka::collision::kMeshSurfaceOriented;
+        for (float direction : {-1.0f, 1.0f}) {
+            const Vec3 point{1.25f, 1.25f, std::nextafter(plane_z, plane_z + direction)};
+            const auto surface = nuka::collision::QueryMeshSurface(view, info, point);
+            ASSERT_TRUE(surface.valid);
+            ASSERT_EQ(surface.feature, 6u);
+            const double height = (double(point.z) - plane_z) / std::sqrt(1.3125);
+            EXPECT_NEAR(surface.distance, oriented ? height : std::abs(height), 1e-13);
+            EXPECT_NEAR(surface.normal.Dot({1, 0, 0.5f}), 0.0f, 1e-7f);
+            EXPECT_NEAR(surface.normal.Dot({0, 1, 0.25f}), 0.0f, 1e-7f);
+            EXPECT_GT(surface.normal.z * (oriented ? 1.0f : direction), 0.0f);
+            EXPECT_NEAR(surface.normal.LengthSq(), 1.0f, 2e-7f);
+        }
     }
 }
 

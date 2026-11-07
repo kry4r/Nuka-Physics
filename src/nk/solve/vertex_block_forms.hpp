@@ -398,8 +398,7 @@ NUKA_VBD_HD inline float ElementMovesEnergyChange(const VbdElement& e, const Ele
         // The area normal moves by f0 x d1 + d0 x f1'; a move turning it past 90 degrees collapses it.
         const Vec3 n = t.f0.Cross(t.f1), turn = t.f0.Cross(d1) + d0.Cross(f1);
         if (NeoHookean(e))
-            return e.rest[4] * NeoHookeanEnergyChange(e, t.area_change, change,
-                                                      NeoHookeanAreaStep(n, turn, t.area_change));
+            return e.rest[4] * NeoHookeanEnergyChange(e, t, c00, c11, c01);
         const float J = 1.0f + t.area_change, growth = 2.0f * n.Dot(turn) + turn.LengthSq();
         const float moved_sq = J * J + growth;
         const float area_step = n.Dot(n + turn) > 0.0f && moved_sq > 0.0f

@@ -334,7 +334,7 @@ __device__ inline float StoreElementHessian(const VertexBlockView& b, const Data
     const auto rayleigh = damped
         ? nk::vbd::RayleighCurvature(element, ElementStartGeometry(b, element, env), start)
         : nk::vbd::ElementCurvature{};
-    const float damping = element.damping / b.dt;
+    const float damping = element.damping / ElementEffectiveStep(b, element, env);
     float* out = s.multilevel_element_hessian + size_t{env} * b.layout.elements + index;
     const size_t stride = size_t{envs} * b.layout.elements;
     switch (element.kind) {
@@ -373,7 +373,7 @@ __device__ inline void AddElementForms(const VertexBlockView& b, const DataView&
     if (!(element.damping > 0.0f)) return;
     const auto rayleigh = nk::vbd::RayleighCurvature(element, ElementStartGeometry(b, element, env), start);
     const auto rd = nk::vbd::Vary(element, rayleigh, d), rq = nk::vbd::Vary(element, rayleigh, q);
-    const double damping = double(element.damping) * b.dt;
+    const double damping = double(element.damping) * step / ElementEffectiveStep(b, element, env);
     sums[2] += damping * nk::vbd::ElementForm(element, rayleigh, rd, rd);
     sums[3] += damping * nk::vbd::ElementForm(element, rayleigh, rd, rq);
     sums[4] += damping * nk::vbd::ElementForm(element, rayleigh, rq, rq);
@@ -389,7 +389,7 @@ __device__ inline float MultilevelElementChange(const VertexBlockView& b, const 
     Vec3 rate[4], move[4], shift[4];
     for (uint32_t j = 0u; j < nk::VbdElementVertexCount(element.kind); ++j) {
         const uint32_t particle = b.Particle(env, element.vertex[j]);
-        rate[j] = data.particle_vel[particle];
+        rate[j] = VertexPhysicalVelocity(b, env, element.vertex[j], data.particle_vel[particle]);
         move[j] = MultilevelMove<kUnit>(data, s, state, particle, b.Slot(env, element.vertex[j]), scale);
         shift[j] = move[j] * b.dt;
     }
@@ -398,8 +398,9 @@ __device__ inline float MultilevelElementChange(const VertexBlockView& b, const 
     if (element.damping > 0.0f) {
         const auto rayleigh = nk::vbd::RayleighCurvature(element, ElementStartGeometry(b, element, env), start);
         const auto vm = nk::vbd::Vary(element, rayleigh, move), vu = nk::vbd::Vary(element, rayleigh, rate);
+        const float ratio = b.dt / ElementEffectiveStep(b, element, env);
         change += element.damping * b.dt * (nk::vbd::ElementForm(element, rayleigh, vm, vu) +
-                                             0.5f * nk::vbd::ElementForm(element, rayleigh, vm, vm));
+                                    0.5f * ratio * nk::vbd::ElementForm(element, rayleigh, vm, vm));
     }
     return change;
 }
