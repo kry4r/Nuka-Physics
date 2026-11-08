@@ -198,7 +198,7 @@ static_assert(sizeof(MultilevelRowTerm) % sizeof(double) == 0u);
 constexpr uint32_t kTileLanes = 32u;
 constexpr uint32_t kTileWarps = 4u;
 // Warps that may descend one environment together, and the block colors that order them, one per lane.
-constexpr uint32_t kTileTeamWarps = 8u;
+constexpr uint32_t kTileTeamWarps = 16u;
 constexpr uint32_t kTileColors = kTileLanes;
 constexpr uint32_t kNoTileColor = ~0u;
 constexpr uint32_t kTileHeadGroup = 8u;
