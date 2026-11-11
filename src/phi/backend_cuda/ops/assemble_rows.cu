@@ -321,17 +321,16 @@ __device__ uint32_t ResolvePairSide(uint32_t side_kind,
 // model defaults with only their authored per-system isotropic friction replaced.
 
 // Each environment prefixes rigid contact ranges and advances its occupied row extent.
-__global__ void InitializePairDrivenRangesKernel(
+template <uint32_t kThreads, uint32_t kItems>
+__global__ void __launch_bounds__(kThreads) InitializePairDrivenRangesKernel(
     const uint32_t* counts, uint32_t slot_count, uint32_t rigid_slots,
     uint32_t rows_per_env, uint32_t contact_rows, uint32_t* ranges,
     uint32_t* row_count, uint32_t* extent, uint64_t* contact_material) {
-    using Scan = cub::BlockScan<uint32_t, kContactRowsBlock>;
+    using Scan = cub::BlockScan<uint32_t, kThreads>;
     __shared__ typename Scan::TempStorage scratch;
-    __shared__ uint32_t carry;
     const uint32_t env = blockIdx.x;
     BeginProgrammaticKernel();
     if (threadIdx.x == 0u) {
-        carry = 0u;
         row_count[env] = 0u;
         if (extent != nullptr) {
             extent[2u * env] = extent[2u * env + 1u];
@@ -340,20 +339,25 @@ __global__ void InitializePairDrivenRangesKernel(
     }
     __syncthreads();
     const uint32_t bound = ContactRowBound(extent, env, contact_rows);
-    for (uint32_t tile = 0u; tile < rigid_slots; tile += blockDim.x) {
-        const uint32_t slot = tile + threadIdx.x;
-        const uint32_t points = slot < rigid_slots ? counts[env * slot_count + slot] : 0u;
-        uint32_t prefix;
-        Scan(scratch).ExclusiveSum(points, prefix);
-        const uint32_t first = env * rows_per_env + (carry + prefix) * nk::kRigidContactRowsPerPt;
-        if (slot < rigid_slots) {
+    uint32_t carry = 0u;
+    for (uint32_t tile = 0u; tile < rigid_slots; tile += kThreads * kItems) {
+        const uint32_t base = tile + threadIdx.x * kItems;
+        uint32_t points[kItems], prefix[kItems], total;
+#pragma unroll
+        for (uint32_t i = 0u; i < kItems; ++i)
+            points[i] = base + i < rigid_slots ? counts[env * slot_count + base + i] : 0u;
+        Scan(scratch).ExclusiveSum(points, prefix, total);
+#pragma unroll
+        for (uint32_t i = 0u; i < kItems; ++i) {
+            const uint32_t slot = base + i;
+            if (slot >= rigid_slots) break;
+            const uint32_t first = env * rows_per_env + (carry + prefix[i]) * nk::kRigidContactRowsPerPt;
             const size_t index = size_t{env * slot_count + slot} * 2u;
             ranges[index] = first;
-            ranges[index + 1u] = points;
+            ranges[index + 1u] = points[i];
             if (first - env * rows_per_env < bound) contact_material[env * slot_count + slot] = 0u;
         }
-        __syncthreads();
-        if (threadIdx.x + 1u == blockDim.x) carry += prefix + points;
+        carry += total;
         __syncthreads();
     }
 }
@@ -1482,7 +1486,9 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
     const uint32_t full_slots = std::min(p->full_row_slot_count, p->union_slot_count);
     const uint32_t rigid_rows = p->contact_rows_per_env -
         (p->union_slot_count - full_slots) * nk::kPairDrivenParticleRowsPerSlot;
-    LaunchCuda(InitializePairDrivenRangesKernel, dim3(p->env_count), dim3(kBlockSize), 0u, stream,
+    constexpr uint32_t kRangeThreads = 1024u, kRangeItems = 8u;
+    LaunchCuda(InitializePairDrivenRangesKernel<kRangeThreads, kRangeItems>, dim3(p->env_count),
+               dim3(kRangeThreads), 0u, stream,
                data.ucontact_count, p->union_slot_count, full_slots,
                p->rows_per_env, p->contact_rows_per_env, data.ucontact_row_range,
                data.row_count, data.contact_row_extent, data.contact_material);
