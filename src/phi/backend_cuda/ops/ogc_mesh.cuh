@@ -447,6 +447,14 @@ __device__ float OgcSurfaceQuery(const OgcDetectParams& p, const OgcSurfacePair&
 
 struct OgcMixedCandidate { uint32_t source, target; };
 
+// A surface's vertex or edge count; a block whose feature chunk starts past it has no work.
+__device__ uint32_t OgcSourceFeatures(const OgcDetectParams& p, const ModelView& model, uint32_t source, bool edges) {
+    const bool particle = source < p.surfaces_per_env;
+    const uint32_t owner = particle ? source : source - p.surfaces_per_env;
+    if (edges) return particle ? model.particle_surface_edge_info[owner].edge_count : model.mesh_edge_info[owner].edge_count;
+    return particle ? model.particle_surface_info[owner].vertex_count : model.mesh_surface_info[owner].vertex_count;
+}
+
 __global__ void OgcMixedVertexFaceKernel(OgcDetectParams p, ModelView model, DataView data) {
     constexpr uint32_t kWarps = 4u;
     __shared__ OgcMixedCandidate queue[kWarps][2u * kWarpLanes];
@@ -460,6 +468,7 @@ __global__ void OgcMixedVertexFaceKernel(OgcDetectParams p, ModelView model, Dat
     const uint32_t env = item / surfaces, source = item % surfaces;
     const uint32_t first_target = (blockIdx.x % groups) * kWarpLanes;
     const uint32_t share = warp;
+    if (blockIdx.y * blockDim.x >= OgcSourceFeatures(p, model, source, false)) return;
     if (warp == 0u) {
         const uint32_t target = first_target + lane;
         const bool allowed = target < surfaces && OgcPairPotential(p, model, data, env, source, target, false);
@@ -477,14 +486,14 @@ __global__ void OgcMixedVertexFaceKernel(OgcDetectParams p, ModelView model, Dat
         if (!pair.active) continue;
         const auto& a = pair.source;
         const auto& b = pair.target;
-        uint32_t vertex = share * kWarpLanes + lane, cursor = b.info.node_count;
+        uint32_t vertex = blockIdx.y * blockDim.x + share * kWarpLanes + lane, cursor = b.info.node_count;
         bool entered = false;
         math::Vec3 point{}, local{};
         float query = 0.0f;
         const auto next = [&](OgcMixedCandidate* candidate) {
             while (vertex < a.info.vertex_count) {
                 if (cursor >= b.info.node_count) {
-                    if (entered) vertex += blockDim.x;
+                    if (entered) vertex += blockDim.x * gridDim.y;
                     if (vertex >= a.info.vertex_count) break;
                     entered = true;
                     point = collision::MeshSurfaceVertex(a.view, a.info, vertex);
@@ -518,10 +527,25 @@ __global__ void OgcMixedVertexFaceKernel(OgcDetectParams p, ModelView model, Dat
             const float source_radius = a.particle ? model.particle_half_thickness[particle] : 0.0f;
             const float radius = source_radius + b.radius;
             const float reach = OgcSurfaceQuery(p, pair, radius);
-            const auto feature = collision::OgcFacetFeature(b.view, b.info, b.edge_array, b.triangle_edges,
-                b.edges, b.vertex_faces, c.target, source, reach);
+            // Rigid pairs touch at zero radius, so a closed target signs them: a contained point penetrates
+            // along the outward normal, bounded by the rigid band; any other point keeps the unsigned side.
+            const bool solid = !a.particle && !b.particle && (b.info.flags & collision::kMeshSurfaceClosed) != 0u;
+            const float floor = solid ? -fminf(reach, collision::kRigidContactQueryMargin + p.margin) : 0.0f;
+            auto feature = collision::OgcFacetFeature(b.view, b.info, b.edge_array, b.triangle_edges,
+                b.edges, b.vertex_faces, c.target, source, reach, solid);
+            if (feature.distance < 0.0f) {
+                auto body_frame = b.view;
+                body_frame.transformed = false;
+                bool valid = true;
+                const bool inside = collision::MeshSurfaceContains(
+                    body_frame, b.info, collision::MeshSurfaceLocalPoint(b.view, source), valid);
+                if (!inside || !valid) {
+                    feature.distance = -feature.distance;
+                    feature.normal = feature.normal * -1.0f;
+                }
+            }
             if (!feature.feasible || feature.owner_triangle != c.target ||
-                !(feature.distance >= 0.0f && feature.distance <= reach)) return;
+                !(feature.distance >= floor && feature.distance <= reach)) return;
             const uint32_t ordinal = OgcClaimSlot(p, data, env);
             if (ordinal >= p.slot_capacity) return;
             const auto face = b.particle
@@ -614,6 +638,7 @@ __global__ void OgcMixedEdgeEdgeKernel(OgcDetectParams p, ModelView model, DataV
     const uint32_t env = item / surfaces, source = item % surfaces;
     const uint32_t first_target = (blockIdx.x % groups) * kWarpLanes;
     const uint32_t share = warp;
+    if (blockIdx.y * blockDim.x >= OgcSourceFeatures(p, model, source, true)) return;
     if (warp == 0u) {
         const uint32_t target = first_target + lane;
         const bool allowed = target < surfaces && OgcPairPotential(p, model, data, env, source, target, true);
@@ -634,14 +659,14 @@ __global__ void OgcMixedEdgeEdgeKernel(OgcDetectParams p, ModelView model, DataV
         const float radius = a.radius;
         const float query = OgcSurfaceQuery(p, pair, radius), within = query + 1.0e-6f;
         if (!(query > 0.0f)) continue;
-        uint32_t edge = share * kWarpLanes + lane, cursor = b.edges.node_count;
+        uint32_t edge = blockIdx.y * blockDim.x + share * kWarpLanes + lane, cursor = b.edges.node_count;
         bool entered = false;
         math::Vec3 local_a0{}, local_a1{}, midpoint{};
         float broad = 0.0f;
         const auto next = [&](OgcMixedCandidate* candidate) {
             while (edge < a.edges.edge_count) {
                 if (cursor >= b.edges.node_count) {
-                    if (entered) edge += blockDim.x;
+                    if (entered) edge += blockDim.x * gridDim.y;
                     if (edge >= a.edges.edge_count) break;
                     entered = true;
                     const auto feature = a.edge_array[a.edges.edge_offset + edge];

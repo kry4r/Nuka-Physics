@@ -355,6 +355,9 @@ nuka_result_t BuildWorld(CookedWorld& cooked, const WorldRecipe& recipe, DeviceR
     if (recipe.solver_pos_iters != 0u) cfg.pos_iters = static_cast<uint16_t>(recipe.solver_pos_iters);
     if (recipe.solver_contact_margin > 0.0f) cfg.contact_margin = recipe.solver_contact_margin;
     if (recipe.solver_max_pairs != 0u) cfg.max_pairs = recipe.solver_max_pairs;
+    if (recipe.desc.solver_substeps != 0u) cfg.substeps = recipe.desc.solver_substeps;
+    if (recipe.desc.contact_detection_substeps != 0u)
+        cfg.contact_detection_substeps = recipe.desc.contact_detection_substeps;
     cfg.cloth_integrator = recipe.cloth_integrator;
 
     auto world = std::make_unique<nuka::nk::World>(std::move(cooked.model), recipe.desc.env_count,

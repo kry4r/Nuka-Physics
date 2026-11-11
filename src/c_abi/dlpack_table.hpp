@@ -358,6 +358,10 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
         kWireDtypeF32, nk::FieldId::BodyMomentumResidual},
     {NUKA_FIELD_ARTICULATION_MOMENTUM_RESIDUAL, nk::LayoutOf(nk::FieldId::ArticulationMomentumResidual).elem_size,
         kWireDtypeF32, nk::FieldId::ArticulationMomentumResidual},
+    {NUKA_FIELD_ROW_PENETRATION, nk::LayoutOf(nk::FieldId::RowPenetration).elem_size,
+        kWireDtypeF32, nk::FieldId::RowPenetration},
+    {NUKA_FIELD_ROW_LAMBDA, nk::LayoutOf(nk::FieldId::Lambda).elem_size,
+        kWireDtypeF32, nk::FieldId::Lambda},
 };
 
 inline constexpr size_t kDlpackFieldCount =

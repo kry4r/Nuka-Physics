@@ -48,6 +48,9 @@ public:
         uint32_t defer_velocity_damping = 1;  // solve affine velocity feedback implicitly
         uint32_t fold_drive_damping = 1;      // enable implicit feedback in the shared rows
         uint32_t substeps = 1u;
+        // Substeps of a step that share one contact detection; the later ones move the detected contacts with
+        // their bodies, so a detection's reach covers all of them.
+        uint32_t contact_detection_substeps = 1u;
         uint32_t cloth_integrator = 0u;  // 0 = BDF2, 1 = backward Euler.
     };
 
@@ -107,6 +110,9 @@ private:
     phi::ArticulationDampingParams    p_damping_{};
     phi::ParticleSurfacesParams       p_particle_surfaces_{};
     phi::OgcDetectParams              p_ogc_detect_{};
+    // The detection substep anchors its contacts; the substeps sharing that detection move them.
+    phi::ContactRefreshParams         p_contact_anchor_{};
+    phi::ContactRefreshParams         p_contact_refresh_{};
     phi::ArticulationDynamicsParams             p_dynamics_{};
     phi::ArticulationDynamicsParams             p_dynamics_prepare_{};
     phi::IntegrateVelocityParams      p_int_vel_{};

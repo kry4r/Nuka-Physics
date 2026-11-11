@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 
@@ -8,6 +9,7 @@
 #include "nk/model/generated/views.hpp"
 #include "nk/solve/point_endpoint.hpp"
 #include "phi/backend_cuda/launch.cuh"
+#include "phi/backend_cuda/launch_grid.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
 #include "phi/op_schema.hpp"
@@ -19,6 +21,8 @@ namespace nuka::phi {
 namespace {
 
 constexpr uint32_t kBlockSize = 128u;
+constexpr uint32_t kMaxFeatureChunks = 65535u;
+constexpr uint32_t kFeatureChunkWaves = 256u;
 
 __device__ bool VertexInTriangle(const collision::MeshSurfaceView& view,
                                  const collision::MeshSurfaceInfo& info,
@@ -600,13 +604,27 @@ Status OpOgcDetect(const ModelView& model, const DataView& data,
         LaunchCuda(OgcSphereFaceKernel,
                    dim3((static_cast<uint32_t>(body_surface_pairs) * kTreeShares + kBlockSize - 1u) / kBlockSize),
                    dim3(kBlockSize), 0u, stream, *p, model, data);
+    // Each pair's source features split into block-sized chunks; a pair block without nearby targets exits
+    // after its screen, so the chunks may take up to kFeatureChunkWaves resident waves.
+    const uint32_t pair_blocks = p->env_count * static_cast<uint32_t>(surfaces) *
+        ((static_cast<uint32_t>(surfaces) + kWarpLanes - 1u) / kWarpLanes);
+    const auto chunks = [&](auto kernel, uint32_t features, uint32_t* count) {
+        uint32_t resident = 0u;
+        const cudaError_t status = ResidentGridSize(kernel, kBlockSize, 0u, UINT32_MAX, &resident);
+        const uint32_t wanted = (features + kBlockSize - 1u) / kBlockSize;
+        const uint64_t budget = uint64_t{resident} * kFeatureChunkWaves / std::max(pair_blocks, 1u);
+        *count = static_cast<uint32_t>(std::max<uint64_t>(1u, std::min<uint64_t>({wanted, budget, kMaxFeatureChunks})));
+        return status;
+    };
+    uint32_t vertex_chunks = 1u, edge_chunks = 1u;
+    if (chunks(OgcMixedVertexFaceKernel, p->surface_vertex_max, &vertex_chunks) != cudaSuccess ||
+        chunks(OgcMixedEdgeEdgeKernel, p->surface_edge_max, &edge_chunks) != cudaSuccess)
+        return Status::Failed;
     if (mixed && vertices > 0u)
-        LaunchCuda(OgcMixedVertexFaceKernel,
-                   dim3(p->env_count * surfaces * ((surfaces + kWarpLanes - 1u) / kWarpLanes)),
+        LaunchCuda(OgcMixedVertexFaceKernel, dim3(pair_blocks, vertex_chunks),
                    dim3(kBlockSize), 0u, stream, *p, model, data);
     if (mixed && mixed_edges > 0u)
-        LaunchCuda(OgcMixedEdgeEdgeKernel,
-                   dim3(p->env_count * surfaces * ((surfaces + kWarpLanes - 1u) / kWarpLanes)),
+        LaunchCuda(OgcMixedEdgeEdgeKernel, dim3(pair_blocks, edge_chunks),
                    dim3(kBlockSize), 0u, stream, *p, model, data);
     LaunchCuda(FinalizeOgcCountKernel,
                dim3((p->env_count - 1u) / kBlockSize + 1u),

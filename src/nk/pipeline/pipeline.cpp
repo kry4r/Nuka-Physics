@@ -37,6 +37,23 @@ void Pipeline::AddOp(phi::NkOp op, const void* params, phi::Device* device) {
     calls_.push_back(phi::OpCall{op, params});
 }
 
+// Ops that detect contacts from the current poses; a substep sharing an earlier detection skips them.
+static bool DetectsContacts(phi::NkOp op) {
+    switch (op) {
+        case phi::NkOp::BuildAabbs:
+        case phi::NkOp::LbvhBuild:
+        case phi::NkOp::LbvhQueryPairs:
+        case phi::NkOp::NarrowphasePrimitives:
+        case phi::NkOp::NarrowphaseHeightfield:
+        case phi::NkOp::NarrowphaseSdf:
+        case phi::NkOp::NarrowphaseBodyParticle:
+        case phi::NkOp::OgcDetect:
+            return true;
+        default:
+            return false;
+    }
+}
+
 uint32_t Pipeline::SubstepCount(const Model& model, const SolverConfig& cfg) {
     uint32_t count = std::max(1u, cfg.substeps);
     if (model.MpmParticlesPerEnv() > 0u && model.capacities.mpm_grid_nodes_per_env > 0u)
@@ -50,6 +67,10 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
     const uint32_t substeps = SubstepCount(model, cfg);
     SolverConfig interval = cfg;
     interval.dt /= static_cast<float>(substeps);
+    interval.contact_detection_substeps = std::min(std::max(1u, cfg.contact_detection_substeps), substeps);
+    // Carried contacts move with body poses, which particle and grid sides do not have.
+    if (interval.contact_detection_substeps > 1u && model.capacities.particles_per_env > 0u)
+        return phi::Status::InvalidArgument;
     calls_.clear();
     missing_ops_.clear();
     p_accumulate_step_.clear();
@@ -129,8 +150,13 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
             outputs.flags |= phi::kAccumulateLinkWrench;
         if (substeps > 1u && cap.joint_limit_rows_per_env != 0u)
             outputs.flags |= phi::kAccumulateJointLimit;
+        // Substeps between detections skip detection and carry the detected contacts with their bodies.
+        const bool detects = step % interval.contact_detection_substeps == 0u;
         for (const auto& call : interval_calls) {
-            if (call.op == phi::NkOp::ReadoutEnergyLedger || call.op == phi::NkOp::ReadoutContactAudit ||
+            if (!detects && DetectsContacts(call.op)) continue;
+            if (call.op == phi::NkOp::ContactRefresh) {
+                AddOp(call.op, detects ? &p_contact_anchor_ : &p_contact_refresh_, device);
+            } else if (call.op == phi::NkOp::ReadoutEnergyLedger || call.op == phi::NkOp::ReadoutContactAudit ||
                 call.op == phi::NkOp::ReadoutIntervalState) {
                 const auto& source = *static_cast<const phi::ReadoutEnergyLedgerParams*>(call.params);
                 auto& energy = p_energy_[size_t{step} * kEnergyStageCount + static_cast<uint32_t>(source.stage)];
@@ -193,6 +219,9 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     // deleted the FUSED runtime path; deleted the UnionCsr path. There
     // is now ONE general contact path: PairDriven. Every cooked model uses it.
     const uint32_t family = phi::kContactFamilyPairDriven;
+    // A detection serves cfg.contact_detection_substeps substeps, so its motion reach spans all of them.
+    const uint32_t detection_substeps = std::max(1u, cfg.contact_detection_substeps);
+    const float detection_dt = cfg.dt * static_cast<float>(detection_substeps);
 
     // launch-geometry counts (the views are pure pointer aggregates, so
     // every op carries its counts in the params POD).
@@ -461,6 +490,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     p_block_descent_.workspace_words = cap.block_descent_scratch_words;
     p_block_descent_.vertex_blocks = vertex_blocks;
     p_block_descent_.position_iterations = has_contacts ? cfg.pos_iters : 0u;
+    p_block_descent_.contact_anchors = has_contacts && detection_substeps > 1u ? 1u : 0u;
     p_block_descent_.position_beta = cfg.pos_beta;
     p_block_descent_.position_slop = cfg.pos_slop;
     p_block_descent_.position_max_velocity = model.baumgarte_max_velocity;
@@ -581,7 +611,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         // geometry travel in the params (the views are pure pointer aggregates).
         const uint32_t bodies_per_env = cap.bodies_per_env;
         p_aabbs_.margin = std::max(contact_margin, collision::kRigidContactQueryMargin);
-        p_aabbs_.dt = cfg.dt;
+        p_aabbs_.dt = detection_dt;
         p_aabbs_.query_reach = query_reach;
         p_aabbs_.family = family;
         p_aabbs_.env_count = env_count;
@@ -637,7 +667,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_np_prim_.query_reach = query_reach;
         p_np_prim_.num_material_buckets = cap.num_material_buckets;
         p_np_prim_.contact_pairs = cap.max_contact_pairs;
-        p_np_prim_.dt = cfg.dt;
+        p_np_prim_.dt = detection_dt;
         p_np_prim_.max_contacts_per_pair = kMaxContactsPerPair;
         p_np_prim_.ground_height = model.ground_height;
         p_np_prim_.foot_count = static_cast<uint32_t>(model.feet.size());
@@ -749,7 +779,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     mpm_coupling_provider_.Couple(coupling_ctx);
     if (cap.ogc_contacts_per_env > 0u &&
         (cap.particle_surfaces_per_env > 0u || cap.mesh_vertex_source_count > 0u)) {
-        p_ogc_detect_.dt = cfg.dt;
+        p_ogc_detect_.dt = detection_dt;
         p_ogc_detect_.num_material_buckets = cap.num_material_buckets;
         p_ogc_detect_.ogc_body_pairs = HasMeshContactPairs(model, collision::MeshContactRoute::Ogc);
         p_ogc_detect_.margin = contact_margin;
@@ -772,6 +802,13 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_ogc_detect_.mesh_nodes = cap.max_mesh_bvh_nodes;
         p_ogc_detect_.mesh_edges = cap.max_mesh_edges;
         p_ogc_detect_.mesh_edge_nodes = cap.max_mesh_edge_nodes;
+        uint32_t vertex_max = 0u, edge_max = 0u;
+        for (const auto& info : model.mesh_surface_info) vertex_max = std::max(vertex_max, info.vertex_count);
+        for (const auto& info : model.particles.surface_info) vertex_max = std::max(vertex_max, info.vertex_count);
+        for (const auto& info : model.mesh_edge_info) edge_max = std::max(edge_max, info.edge_count);
+        for (const auto& info : model.particles.surface_edge_info) edge_max = std::max(edge_max, info.edge_count);
+        p_ogc_detect_.surface_vertex_max = vertex_max;
+        p_ogc_detect_.surface_edge_max = edge_max;
         p_ogc_detect_.excluded_pairs = cap.max_excluded_pairs;
         p_ogc_detect_.contact_pairs = cap.max_contact_pairs;
         p_ogc_detect_.slot_stride = cap.max_contacts_per_env;
@@ -788,6 +825,13 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
             cap.particles_per_env, mpm_surfaces, cap.mpm_stress_cells_per_env)) : 0u;
         p_ogc_detect_.workspace_bytes = cap.contact_cache_scratch_bytes;
         add(phi::NkOp::OgcDetect, &p_ogc_detect_);
+    }
+
+    // The detection substep anchors its contacts on their bodies; Build carries them through later substeps.
+    if (has_contacts && detection_substeps > 1u) {
+        p_contact_anchor_ = {1u, cap.bodies_per_env, &p_block_descent_};
+        p_contact_refresh_ = {0u, cap.bodies_per_env, &p_block_descent_};
+        add(phi::NkOp::ContactRefresh, &p_contact_anchor_);
     }
 
     if (has_contacts && vertex_blocks.vertices > 0u && cfg.cloth_integrator == 0u) {

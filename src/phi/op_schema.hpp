@@ -301,6 +301,9 @@ struct OgcDetectParams {
     uint32_t mesh_nodes = 0u;
     uint32_t mesh_edges = 0u;
     uint32_t mesh_edge_nodes = 0u;
+    // Largest vertex and edge count of any one surface; a pair's source features split into chunks of it.
+    uint32_t surface_vertex_max = 0u;
+    uint32_t surface_edge_max = 0u;
     uint32_t excluded_pairs = 0u;
     uint32_t contact_pairs = 0u;
     uint32_t slot_stride = 0u;
@@ -628,6 +631,17 @@ struct BlockDescentSolveParams {
     uint32_t trace_sweeps = 0u;
     // nk::kTelemetry* bits: the solve opens, samples and fills the ring's current record.
     uint32_t telemetry = 0u;
+    // Nonzero keeps each contact point's anchors on its bodies in the scratch, for ContactRefresh.
+    uint32_t contact_anchors = 0u;
+};
+
+// Contacts carried between detections retain body-local points, witnesses and detected depth.
+// Refresh moves them with their bodies and updates depth along the fixed detected normal.
+struct ContactRefreshParams {
+    uint32_t anchor = 0u;
+    uint32_t bodies_per_env = 0u;
+    // The solve whose scratch holds the anchors.
+    const BlockDescentSolveParams* solve = nullptr;
 };
 
 // Completes the substep's telemetry record from the measured solve and the energy ledger, then commits it.

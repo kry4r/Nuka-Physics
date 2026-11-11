@@ -168,6 +168,8 @@ typedef struct nuka_world_desc_t {
     uint32_t cloth_integrator;              // 0 = BDF2, 1 = backward Euler.
     uint32_t ogc_contact_capacity;          // Per-environment contact slots; 0 uses the cook estimate.
     float    solver_overlap_recovery_velocity; // Speculative overlap push-out bound, m/s; 0 => none.
+    uint32_t solver_substeps;               // Substeps of dt / substeps each step runs; 0 => 1.
+    uint32_t contact_detection_substeps;    // Substeps sharing one contact detection; 0 => 1.
 } nuka_world_desc_t;
 
 nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
@@ -955,7 +957,10 @@ typedef enum nuka_state_field_t {
     NUKA_FIELD_ENERGY_ROW_TERMS = 158,
     // Per-body and per-articulation momentum balance under sweep tracing, laid out as nuka_momentum_residual_t.
     NUKA_FIELD_BODY_MOMENTUM_RESIDUAL = 159,
-    NUKA_FIELD_ARTICULATION_MOMENTUM_RESIDUAL = 160
+    NUKA_FIELD_ARTICULATION_MOMENTUM_RESIDUAL = 160,
+    // Per-row overlap the split position pass recovers, in m, and the row's accumulated impulse.
+    NUKA_FIELD_ROW_PENETRATION = 161,
+    NUKA_FIELD_ROW_LAMBDA = 162
 } nuka_state_field_t;
 
 // Collider and boundary IDs are environment-local; particle, grid and point-endpoint IDs are global.

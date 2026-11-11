@@ -239,7 +239,8 @@ public:
                                     uint32_t cloth_integrator, uint32_t ogc_contact_capacity,
                                     float baumgarte_max_velocity,
                                     float overlap_recovery_velocity,
-                                    float gravity_x, float gravity_y, float gravity_z) {
+                                    float gravity_x, float gravity_y, float gravity_z,
+                                    uint32_t solver_substeps, uint32_t contact_detection_substeps) {
         if (device == nullptr || !device->valid()) {
             throw std::runtime_error("create_from_scene: invalid device");
         }
@@ -322,6 +323,8 @@ public:
         desc.cloth_integrator = cloth_integrator;
         desc.solver_baumgarte_max_velocity = baumgarte_max_velocity;
         desc.solver_overlap_recovery_velocity = overlap_recovery_velocity;
+        desc.solver_substeps = solver_substeps;
+        desc.contact_detection_substeps = contact_detection_substeps;
         nuka_world_handle h = nullptr;
         check(unlocked([&] { return nuka_world_create_from_scene(device->raw(), &desc, &h); }),
               "nuka_world_create_from_scene");
@@ -2394,6 +2397,8 @@ NB_MODULE(_nuka_ext, m) {
         .value("ENERGY_ROW_TERMS", NUKA_FIELD_ENERGY_ROW_TERMS)
         .value("BODY_MOMENTUM_RESIDUAL", NUKA_FIELD_BODY_MOMENTUM_RESIDUAL)
         .value("ARTICULATION_MOMENTUM_RESIDUAL", NUKA_FIELD_ARTICULATION_MOMENTUM_RESIDUAL)
+        .value("ROW_PENETRATION", NUKA_FIELD_ROW_PENETRATION)
+        .value("ROW_LAMBDA", NUKA_FIELD_ROW_LAMBDA)
         .value("BODY_FORCE", NUKA_FIELD_BODY_FORCE)
         .value("BODY_TORQUE", NUKA_FIELD_BODY_TORQUE)
         .value("LINK_WRENCH", NUKA_FIELD_LINK_WRENCH)
@@ -2589,6 +2594,8 @@ NB_MODULE(_nuka_ext, m) {
                     nb::arg("gravity_x") = 0.0f,
                     nb::arg("gravity_y") = 0.0f,
                     nb::arg("gravity_z") = 0.0f,
+                    nb::arg("solver_substeps") = uint32_t{0},
+                    nb::arg("contact_detection_substeps") = uint32_t{0},
                     nb::rv_policy::take_ownership,
                     nb::keep_alive<0, 1>(),
                     "Create a world from a scene. All six control modes support any positive "

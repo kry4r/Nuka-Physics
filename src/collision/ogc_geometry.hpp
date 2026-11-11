@@ -151,12 +151,13 @@ NUKA_OGC_HD inline bool OgcSurfaceVertexFeasible(
     return found;
 }
 
-// Points farther than `reach` return infeasible before the feasibility tests.
+// Points farther than `reach` return infeasible before the feasibility tests. A solid target keeps
+// its outward interior normal, so a point behind the face reports a negative distance.
 NUKA_OGC_HD inline OgcTriangleFeature OgcFacetFeature(
     const MeshSurfaceView& view, const MeshSurfaceInfo& info,
     const MeshEdge* edges, const uint32_t* triangle_edges,
     const MeshEdgeInfo& edge_info, MeshVertexIncidence incidence,
-    uint32_t triangle, math::Vec3 query, float reach = INFINITY) {
+    uint32_t triangle, math::Vec3 query, float reach = INFINITY, bool solid = false) {
     OgcTriangleFeature result;
     if (!MeshSurfaceRangeValid(view, info) || triangle >= info.triangle_count)
         return result;
@@ -187,8 +188,8 @@ NUKA_OGC_HD inline OgcTriangleFeature OgcFacetFeature(
         for (double& component : normal) component /= length;
         const double distance = (double(query.x) - p[0].x) * normal[0] +
             (double(query.y) - p[0].y) * normal[1] + (double(query.z) - p[0].z) * normal[2];
-        const double sign = distance < 0.0 ? -1.0 : 1.0;
-        result.distance = float(fabs(distance));
+        const double sign = distance < 0.0 && !solid ? -1.0 : 1.0;
+        result.distance = float(sign * distance);
         result.normal = {float(sign * normal[0]), float(sign * normal[1]), float(sign * normal[2])};
         // Interior contact normals follow the plane derivative, without subtracting rounded witness points.
         result.point = {float(double(query.x) - distance * normal[0]),

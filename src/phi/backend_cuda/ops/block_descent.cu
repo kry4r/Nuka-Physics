@@ -4,6 +4,7 @@
 #include <limits>
 #include <type_traits>
 
+#include <cooperative_groups.h>
 #include <cub/device/device_scan.cuh>
 #include <cub/device/device_segmented_radix_sort.cuh>
 #include <cub/device/device_select.cuh>
@@ -26,6 +27,7 @@
 #include "phi/backend_cuda/ops/contact_row_layout.cuh"
 #include "phi/backend_cuda/ops/dense_block_solve.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
+#include "phi/backend_cuda/ops/prims_types.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
 #include "phi/backend_cuda/ops/word_spans.cuh"
 #include "phi/backend_cuda/ops/vertex_blocks.cuh"
@@ -201,6 +203,14 @@ constexpr uint32_t kTileWarps = 4u;
 constexpr uint32_t kTileTeamWarps = 16u;
 constexpr uint32_t kTileColors = kTileLanes;
 constexpr uint32_t kNoTileColor = ~0u;
+// Cooperative blocks that may share an environment's widest blocks, for launches of at most kTileGroupEnvs.
+constexpr uint32_t kTileGroupBlocks = 16u, kTileGroupEnvs = 64u;
+// Group words: the join and block barriers and the job on their own cache lines, then two rounds of partials.
+constexpr uint32_t kTileGroupJoin = 0u, kTileGroupBlock = 32u, kTileGroupJob = 64u, kTileGroupHeader = 96u;
+constexpr uint32_t kTileJobSpread = 1u, kTileJobPosition = 2u, kTileJobStop = 4u;
+// Head passes every cooperative block shares: the dual update with its options, and position marking.
+constexpr uint32_t kTileJobDuals = 8u, kTileJobDualVelocity = 16u, kTileJobDualCommit = 32u,
+                   kTileJobDualMomentum = 64u, kTileJobPositions = 128u;
 constexpr uint32_t kTileHeadGroup = 8u;
 // Per-head fields interleaved in groups of eight: indices, coefficients, normal bound, residual, dual,
 // move, step and scalar response of the current block solve, the relaxation and the unextrapolated dual.
@@ -234,6 +244,12 @@ uint32_t TileWidth(const BlockDescentSolveParams& p) {
                                      : (coordinates + 15u) & ~15u;
 }
 
+// Floats of one cooperative block's partial: a warp tile's rows of H with their force, scale and diagonal.
+uint32_t TileGroupShareFloats(const BlockDescentSolveParams& p) {
+    const uint32_t width = TileWidth(p);
+    return width <= kTileLanes ? width * (width + 4u) : 0u;
+}
+
 __host__ __device__ uint32_t TileJacobianWidth(const BlockDescentSolveParams& p) {
     return ((p.max_independent_dof > kRigidBlockDof ? p.max_independent_dof : kRigidBlockDof) + 3u) & ~3u;
 }
@@ -247,6 +263,10 @@ struct DualMomentum {
     float beta;
     uint32_t restarts;
 };
+
+// A contact point's anchors: the point on each side and each side's witness in that side's body frame, then
+// the detected depth.
+constexpr uint32_t kContactAnchorFloats = 13u;
 
 struct BlockScratch {
     uint32_t* counts;
@@ -352,6 +372,19 @@ struct BlockScratch {
     uint32_t* tile_next;
     uint32_t* tile_order;
     uint32_t* tile_cost;
+    // Each team slot's head count, for the blocks that share its setup.
+    uint32_t* tile_heads;
+    // Each team slot's per-chunk counts, then their offsets, for ordered listing over many warps.
+    uint32_t* tile_chunks;
+    uint32_t tile_chunk_stride;
+    // Each environment's group words for cooperative blocks sharing its widest blocks.
+    uint32_t* tile_group;
+    uint32_t tile_group_stride;
+    uint32_t tile_group_share;
+    // kContactAnchorFloats per contact point, while one detection serves several substeps.
+    float* contact_anchors;
+    // Each contact normal row's contact slot, for the position rows' depths.
+    uint32_t* row_contact;
     uint32_t* tile_incidence;
     float* articulation_pseudo;
     float* rigid_pseudo;
@@ -568,14 +601,26 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     s.tile_fields = reinterpret_cast<float*>(take(tile_slots * kTileFields * s.tile_head_capacity));
     s.tile_jacobian = reinterpret_cast<float*>(take(tile_slots * s.tile_row_capacity * TileJacobianWidth(p)));
     // A slot's blocks' list ends, then their heads: a head lists on each of its at most two blocks. Then the
-    // block colors, the blocks in color order and each color's end.
+    // block colors, the blocks in color order, each color's end and each team warp's block cursors.
     s.tile_incidence_stride = tile
-        ? 3u * ((p.total_body_count + p.articulation_count) / p.env_count) + 2u * s.tile_head_capacity +
-              kTileColors : 0u;
+        ? (3u + kTileTeamWarps) * ((p.total_body_count + p.articulation_count) / p.env_count) +
+              2u * s.tile_head_capacity + kTileColors : 0u;
     s.tile_incidence = take(tile_slots * s.tile_incidence_stride);
     s.tile_next = take(tile ? 1u : 0u);
     s.tile_order = take(tile ? p.env_count : 0u);
     s.tile_cost = take(tile ? p.env_count : 0u);
+    s.tile_heads = take(tile ? p.env_count : 0u);
+    s.tile_chunk_stride = tile ? (std::max(p.rows_per_env, s.tile_head_capacity) + kTileLanes - 1u) / kTileLanes : 0u;
+    s.tile_chunks = take(tile_slots * s.tile_chunk_stride);
+    s.tile_group_share = tile ? TileGroupShareFloats(p) : 0u;
+    s.tile_group_stride = kTileGroupHeader + 2u * kTileGroupBlocks * s.tile_group_share;
+    s.tile_group = take(tile && s.tile_group_share != 0u && p.env_count <= kTileGroupEnvs
+        ? uint64_t{p.env_count} * s.tile_group_stride : 0u);
+    if (s.tile_group_share == 0u || p.env_count > kTileGroupEnvs) s.tile_group = nullptr;
+    s.row_contact = take(p.position_iterations > 0u && p.contact_slots_per_env > 0u ? rows : 0u);
+    if (p.position_iterations == 0u || p.contact_slots_per_env == 0u) s.row_contact = nullptr;
+    s.contact_anchors = reinterpret_cast<float*>(take(p.contact_anchors != 0u
+        ? uint64_t{p.env_count} * p.contact_slots_per_env * nk::kPairDrivenPtsPerSlot * kContactAnchorFloats : 0u));
     // Block coordinates of the tiles' pseudo velocities.
     const bool positions = tile && p.position_iterations > 0u;
     s.articulation_pseudo = reinterpret_cast<float*>(take(positions ? dofs : 0u));
@@ -1676,15 +1721,22 @@ __global__ void MeasureDensePrimalsKernel(DataView data, BlockDescentSolveParams
 #include "phi/backend_cuda/ops/block_descent_grid.cuh"
 #include "phi/backend_cuda/ops/block_descent_coarse.cuh"
 #include "phi/backend_cuda/ops/block_descent_multilevel.cuh"
+// A row's split bias and the overshoot its kept rounding reserve absorbs without overlap;
+// only bias beyond that starts the position pass.
+struct PositionBias {
+    float bias = 0.0f;
+    float rounding = 0.0f;
+    __device__ bool Pushes() const { return bias > rounding; }
+};
+
 // Position rows retain the gap left by physical motion, bounded by the geometric recovery.
 // A velocity-solve residual alone must not generate a split position impulse.
-__device__ float PositionRowBias(DataView data, BlockDescentSolveParams p, const NkRow& row,
-                                  uint32_t slot, float slop) {
+__device__ PositionBias PositionRowBias(DataView data, BlockDescentSolveParams p, BlockScratch s,
+                                        const NkRow& row, uint32_t slot, float slop) {
     const float penetration = fmaxf(data.row_penetration[slot] - slop, 0.0f);
     float physical = penetration;
-    if ((row.flags & nk::nk_row_flags::kSpeculative) != 0u && p.contact_slots_per_env > 0u) {
-        const uint32_t contact = ContactSlotForRow(data.ucontact_row_range,
-            row.env * p.contact_slots_per_env, p.contact_slots_per_env, slot);
+    if ((row.flags & nk::nk_row_flags::kSpeculative) != 0u && s.row_contact != nullptr) {
+        const uint32_t contact = s.row_contact[slot];
         const auto range = ContactRowRangeFor(data.ucontact_row_range, contact);
         const size_t point = size_t{contact} * nk::kPairDrivenPtsPerSlot + (slot - range.first) % range.points;
         const double depth = double(data.ucontact_depth[point]) - slop;
@@ -1693,10 +1745,25 @@ __device__ float PositionRowBias(DataView data, BlockDescentSolveParams p, const
         const double target = fmin(depth, 0.0) + correction;
         const double velocity = RowVelocity(row, slot, data, p, PointMasses(data), data.qdot_flat, nullptr);
         const double limit = fmin(correction / p.dt, double(p.position_max_velocity));
-        return float(fmin(target / p.dt - velocity, limit));
+        const double absorbed = target > 0.0 ? 0.0 : fmax(reserve, 0.0) / p.dt;
+        return {float(fmin(target / p.dt - velocity, limit)), float(absorbed)};
     }
     const float correction = p.position_beta * physical + fmaxf(penetration - physical, 0.0f);
-    return fminf(correction / p.dt, p.position_max_velocity);
+    return {fminf(correction / p.dt, p.position_max_velocity), 0.0f};
+}
+
+// Each live contact's normal rows record its slot; ranges place every live contact's rows apart.
+__global__ void MapRowContactsKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
+    const uint32_t contacts = p.env_count * p.contact_slots_per_env;
+    for (uint32_t contact = blockIdx.x * blockDim.x + threadIdx.x; contact < contacts;
+         contact += gridDim.x * blockDim.x) {
+        const auto range = ContactRowRangeFor(data.ucontact_row_range, contact);
+        const uint32_t env_first = contact / p.contact_slots_per_env * p.rows_per_env;
+        for (uint32_t point = 0u; point < range.points; ++point) {
+            const uint32_t row = range.first + point;
+            if (row - env_first < p.contact_rows_per_env) s.row_contact[row] = contact;
+        }
+    }
 }
 
 #include "phi/backend_cuda/ops/block_descent_tile.cuh"
@@ -2975,6 +3042,8 @@ Status SolveBlockDescent(const ModelView& model, const DataView& data,
         return Status::Failed;
     if (DenseTileRoute(*p)) {
         LaunchCuda(OrderTilesKernel, dim3(1u), dim3(kOrderTileThreads), 0u, stream, *p, s);
+        if (s.row_contact != nullptr && LaunchWork(MapRowContactsKernel, p->env_count * p->contact_slots_per_env,
+                kThreads, stream, data, *p, s) != cudaSuccess) return Status::Failed;
         const cudaError_t launched = VisitTileWidth(*p, [&](auto width) {
             return LaunchDenseTiles<decltype(width)::value>(articulation_state, data, *p, s, stream);
         });
@@ -3299,13 +3368,13 @@ __global__ void InitializePositionRowsKernel(DataView data, BlockDescentSolvePar
                 position.flags = nk::nk_row_flags::kActive | (row.flags & kinds);
                 position.group_first = slot;
                 position.group_normal_count = 1u;
-                const float bias = PositionRowBias(data, p, row, slot, slop);
-                position.rhs = bias / p.dt;
+                const PositionBias bias = PositionRowBias(data, p, s, row, slot, slop);
+                position.rhs = bias.bias / p.dt;
                 position.compliance_alpha = 0.0f;
                 position.lower = 0.0f;
                 position.upper = FLT_MAX;
                 position.mu = position.friction_secondary = 0.0f;
-                if (bias > 0.0f) atomicExch(s.position_active, 1u);
+                if (bias.Pushes()) atomicExch(s.position_active, 1u);
             }
         }
         s.position_rows[slot] = position;
@@ -3379,6 +3448,8 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
     cleared.Fill(s.position_joint_angular, links * sizeof(Vec3));
     cleared.Fill(s.position_active, sizeof(uint32_t));
     if (LaunchWordSpans(cleared, stream) != cudaSuccess ||
+        (s.row_contact != nullptr && LaunchWork(MapRowContactsKernel, p.env_count * p.contact_slots_per_env,
+            kThreads, stream, data, p, s) != cudaSuccess) ||
         LaunchWork(InitializePositionRowsKernel, s.rows, kThreads, stream, data, p, s) != cudaSuccess)
         return Status::Failed;
     cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
@@ -3419,6 +3490,90 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
     return cudaStreamDestroy(body) == cudaSuccess && recorded && ended ? Status::Ok : Status::Failed;
 }
 
+// A contact side's frame: a body moves with its pose, an environment boundary stays put (no pose).
+struct ContactSideFrame {
+    const math::Transform* pose;
+};
+
+__device__ bool LoadContactSide(const DataView& data, uint32_t env, uint32_t bodies_per_env, uint32_t kind,
+                                uint32_t index, ContactSideFrame* frame) {
+    frame->pose = nullptr;
+    if (kind == nk::kUContactSideBoundary) return true;
+    if (kind != nk::kUContactSideBody || index >= bodies_per_env) return false;
+    frame->pose = data.body_pose + size_t{env} * bodies_per_env + index;
+    return true;
+}
+
+__device__ math::Vec3 ContactSideLocal(const ContactSideFrame& frame, math::Vec3 point) {
+    return frame.pose != nullptr ? PrimInverseTransformPoint(*frame.pose, point) : point;
+}
+
+__device__ math::Vec3 ContactSideWorld(const ContactSideFrame& frame, math::Vec3 local) {
+    return frame.pose != nullptr ? PrimRotate(frame.pose->rotation, local) + frame.pose->position : local;
+}
+
+__device__ void StoreAnchor(float* anchor, math::Vec3 v) {
+    anchor[0] = v.x;
+    anchor[1] = v.y;
+    anchor[2] = v.z;
+}
+
+__device__ math::Vec3 LoadAnchor(const float* anchor) { return {anchor[0], anchor[1], anchor[2]}; }
+
+// A thread per contact point anchors it or carries it with its sides' bodies; separation along the detected
+// normal n is n . (p_a - p_b), as the normal row's Jacobian reads it.
+__global__ void ContactRefreshKernel(DataView data, BlockScratch s, uint32_t points, uint32_t slots_per_env,
+                                     uint32_t bodies_per_env, bool anchor_points) {
+    const uint32_t at = blockIdx.x * blockDim.x + threadIdx.x;
+    if (at >= points) return;
+    const uint32_t slot = at / nk::kPairDrivenPtsPerSlot;
+    if (at % nk::kPairDrivenPtsPerSlot >= data.ucontact_count[slot]) return;
+    const uint32_t env = slot / slots_per_env;
+    ContactSideFrame a{}, b{};
+    if (!LoadContactSide(data, env, bodies_per_env, data.ucontact_a_kind[at], data.ucontact_a[at], &a) ||
+        !LoadContactSide(data, env, bodies_per_env, data.ucontact_b_kind[at], data.ucontact_b[at], &b)) {
+        atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
+        return;
+    }
+    float* const anchor = s.contact_anchors + size_t{at} * kContactAnchorFloats;
+    if (anchor_points) {
+        const math::Vec3 point = data.ucontact_point[at];
+        StoreAnchor(anchor, ContactSideLocal(a, point));
+        StoreAnchor(anchor + 3u, ContactSideLocal(b, point));
+        StoreAnchor(anchor + 6u, ContactSideLocal(a, data.ucontact_witness_a[at]));
+        StoreAnchor(anchor + 9u, ContactSideLocal(b, data.ucontact_witness_b[at]));
+        anchor[12] = data.ucontact_depth[at];
+        return;
+    }
+    const math::Vec3 point_a = ContactSideWorld(a, LoadAnchor(anchor));
+    const math::Vec3 point_b = ContactSideWorld(b, LoadAnchor(anchor + 3u));
+    data.ucontact_point[at] = (point_a + point_b) * 0.5f;
+    data.ucontact_witness_a[at] = ContactSideWorld(a, LoadAnchor(anchor + 6u));
+    data.ucontact_witness_b[at] = ContactSideWorld(b, LoadAnchor(anchor + 9u));
+    data.ucontact_depth[at] = anchor[12] - data.ucontact_normal[at].Dot(point_a - point_b);
+}
+
+Status OpContactRefresh(const ModelView& model, const DataView& data, const void* params, cudaStream_t stream) {
+    (void)model;
+    const auto* p = static_cast<const ContactRefreshParams*>(params);
+    if (p == nullptr || p->solve == nullptr || p->solve->contact_anchors == 0u) return Status::InvalidArgument;
+    const BlockDescentSolveParams& solve = *p->solve;
+    BlockScratch s{};
+    const uint64_t words = BindScratch(solve, data.block_descent_scratch, &s);
+    if (words == 0u || words > solve.workspace_words || s.contact_anchors == nullptr || !data.ucontact_count ||
+        !data.ucontact_point || !data.ucontact_normal || !data.ucontact_depth || !data.ucontact_witness_a ||
+        !data.ucontact_witness_b || !data.body_pose)
+        return Status::InvalidArgument;
+    const uint64_t points = uint64_t{solve.env_count} * solve.contact_slots_per_env * nk::kPairDrivenPtsPerSlot;
+    if (points == 0u) return Status::Ok;
+    if (points > std::numeric_limits<uint32_t>::max()) return Status::InvalidArgument;
+    constexpr uint32_t kThreads = 256u;
+    LaunchCuda(ContactRefreshKernel, dim3(static_cast<uint32_t>((points + kThreads - 1u) / kThreads)), dim3(kThreads),
+               0u, stream, data, s, static_cast<uint32_t>(points), solve.contact_slots_per_env, p->bodies_per_env,
+               p->anchor != 0u);
+    return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
+}
+
 }  // namespace
 
 uint64_t BlockDescentScratchWords(const BlockDescentSolveParams& params) {
@@ -3428,6 +3583,7 @@ uint64_t BlockDescentScratchWords(const BlockDescentSolveParams& params) {
 void RegisterNkBlockDescentOps() {
     SetCudaOp(NkOp::BlockDescentSolve, &OpBlockDescentSolve);
     SetCudaOp(NkOp::RecordTelemetry, &OpRecordTelemetry);
+    SetCudaOp(NkOp::ContactRefresh, &OpContactRefresh);
 }
 
 }  // namespace nuka::phi
