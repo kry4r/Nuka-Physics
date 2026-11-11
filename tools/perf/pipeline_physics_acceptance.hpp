@@ -22,14 +22,14 @@ class PipelinePhysicsAcceptance {
     using S = nk::PhysicsStageColumn;
     using C = nk::ContactAuditCount;
     static constexpr size_t kResidualClasses = 4u;
-    static constexpr std::array<const char*, nk::kContactAuditCountSize> kCountNames = {
+    static constexpr std::array kCountNames = {
         "contacts", "rows", "invalid_rows", "linear_closure_violations", "cone_violations",
         "negative_normal_impulses", "unmeasured_gaps", "gap_violations"};
-    static constexpr std::array<const char*, nk::kContactAuditMetricCount> kMetricNames = {
+    static constexpr std::array kMetricNames = {
         "relative_linear_closure", "cone_impulse_excess_Ns", "negative_normal_impulse_Ns",
         "frozen_gap_penetration_m", "normal_displacement_rate_m_s", "tangent_displacement_rate_m_s",
         "gap_penetration_m"};
-    static constexpr std::array<const char*, nk::kEnergyColumnCount> kEnergyNames = {
+    static constexpr std::array kEnergyNames = {
         "begin_kinetic", "begin_gravity", "begin_elastic", "free_kinetic", "solved_kinetic",
         "before_dat_kinetic", "before_dat_gravity", "before_dat_elastic", "end_kinetic",
         "end_gravity", "end_elastic", "drive_work", "aero_work", "external_work",
@@ -40,7 +40,10 @@ class PipelinePhysicsAcceptance {
         "mpm_begin_affine_kinetic", "mpm_end_affine_kinetic", "mpm_p2g_loss", "mpm_g2p_loss",
         "mpm_affine_transport", "mpm_plastic_loss", "mpm_volume_average_work", "mpm_stress_work",
         "mpm_boundary_work", "mpm_viscous_loss", "mpm_grid_begin_kinetic", "mpm_grid_solved_kinetic",
-        "position_kinetic_work"};
+        "position_kinetic_work", "constraint_storage"};
+    static_assert(kCountNames.size() == nk::kContactAuditCountSize);
+    static_assert(kMetricNames.size() == nk::kContactAuditMetricCount);
+    static_assert(kEnergyNames.size() == nk::kEnergyColumnCount);
 
     struct Maximum {
         double value = 0.0;
@@ -249,7 +252,7 @@ public:
         energy.Set("unwritten_records", Json::Int(unwritten_energy_));
         energy.Set("coverage_complete", Json::Bool(records_ != 0u && covered_energy_ == records_ && unwritten_energy_ == 0u));
         energy.Set("balance_criterion_status", Json::Str("unmeasured"));
-        energy.Set("coverage_bit_order", Json::Str("nonfinite,unclassified_rows,other_particle_material,grid_material,external_body_load,floating_position_work,rigid_angular_position_work,armature_energy,physics_failure"));
+        energy.Set("coverage_bit_order", Json::Str("nonfinite,unclassified_rows,other_particle_material,grid_material,external_body_load,floating_position_work,rigid_angular_position_work,armature_energy,physics_failure,storage_capacity"));
         energy.Set("terms", std::move(terms));
         energy.Set("scope", Json::Str("partial measured terms; incomplete coverage cannot establish full energy balance"));
         result.Set("energy", std::move(energy));
@@ -330,7 +333,7 @@ private:
     bool residual_measured_ = false, nonfinite_ = false, physics_failure_ = false;
     uint64_t records_ = 0u, covered_energy_ = 0u, unwritten_energy_ = 0u, residual_violations_ = 0u, dat_visits_ = 0u;
     uint64_t unwritten_stages_ = 0u, unwritten_residuals_ = 0u, work_rate_violations_ = 0u;
-    std::array<uint64_t, 9> coverage_counts_{};
+    std::array<uint64_t, 10> coverage_counts_{};
     std::array<uint64_t, nk::kContactAuditCountSize> count_totals_{};
     std::array<double, nk::kEnergyColumnCount> energy_sums_{};
     std::array<uint64_t, nk::kEnergyColumnCount> energy_samples_{};
